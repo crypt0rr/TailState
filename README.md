@@ -18,12 +18,41 @@ The REST API does not expose authoritative online state. TailState therefore doe
 
 Requirements: Docker with Compose and a Tailscale OAuth client permitted to request `all:read`.
 
+First, create the local environment file and encryption key:
+
 ```console
 cp .env.example .env
 mkdir -p secrets
 openssl rand -base64 32 > secrets/tailstate_master_key
 chmod 600 .env secrets/tailstate_master_key
+```
+
+### Pull the public image
+
+The default image is `ghcr.io/crypt0rr/tailstate:latest`:
+
+```console
+docker compose pull
+docker compose up -d
+```
+
+To pin a specific release instead of `latest`, set `TAILSTATE_IMAGE` in `.env`, for example:
+
+```dotenv
+TAILSTATE_IMAGE=ghcr.io/crypt0rr/tailstate:1.0.0
+```
+
+### Build locally
+
+To build TailState from the source in this repository:
+
+```console
 docker compose up --build -d
+```
+
+After either installation method, inspect the startup log:
+
+```console
 docker compose logs tailstate
 ```
 

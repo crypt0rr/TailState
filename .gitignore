@@ -1,9 +1,8 @@
-/target
-/secrets
-/config.yaml
-/tailstate-data
 .env
-!.env.example
+secrets/
+tailstate-data/
 *.db
 *.db-shm
 *.db-wal
+/tailstate
+coverage.out

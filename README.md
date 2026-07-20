@@ -1,136 +1,169 @@
 # TailState
 
-TailState watches one [Tailscale](https://tailscale.com) tailnet and sends durable notifications to the places where you work. It accepts Tailscale's signed webhooks for real-time administration events and polls the read-only API for inventory and configuration changes.
+TailState polls the read-only Tailscale API, establishes a silent inventory baseline, and posts later changes to Mattermost. It runs as one static Go binary with an embedded setup/status interface and durable SQLite storage.
 
-## Features
+TailState never modifies a tailnet and does not use native Tailscale webhooks.
 
-- Signed Tailscale webhook verification with replay protection and retry deduplication.
-- Silent initial API baseline followed by durable, semantic change notifications.
-- Devices (including routes, posture attributes, and invites), users, DNS, policy fingerprints, key metadata, webhooks, log-streaming status, contacts, posture integrations, and settings.
-- Telegram, Mattermost, Slack, Discord, Microsoft Teams, Google Chat, and versioned generic webhook delivery.
-- Per-destination case-sensitive glob filters and minimum severity.
-- SQLite transactional outbox, exponential retry, dead letters, retention, and restart recovery.
-- Health, readiness, and Prometheus endpoints.
-- OAuth client credentials with token renewal or API-token fallback.
+## What it monitors
 
-TailState is read-only. It never approves or deletes devices, changes policy, or performs remediation.
+- Devices, stable tailnet IPv4/IPv6 addresses, details, authorization, tags, key expiry, client version, routes, posture attributes, and invites.
+- Users and user invites.
+- DNS nameservers, preferences, search paths, and split DNS.
+- Policy section fingerprints without storing policy contents.
+- Credential metadata, webhook configuration inventory, log-streaming configuration/status, contacts, posture integrations, and tailnet settings.
+
+The REST API does not expose authoritative online state. TailState therefore does **not** generate online/offline notifications and ignores `lastSeen`, public endpoints, connectivity metadata, response timestamps, and array ordering.
 
 ## Quick start
 
-1. Create a Tailscale OAuth client with the `all:read` scope. Narrower read scopes work when the corresponding collectors are disabled.
-2. Copy [`config.example.yaml`](config.example.yaml) to `config.yaml` and [`.env.example`](.env.example) to `.env`.
-3. Create the referenced files under `./secrets`, create `./tailstate-data`, then adjust the destinations:
+Requirements: Docker with Compose and a Tailscale OAuth client permitted to request `all:read`.
+
+First, create the local environment file and encryption key:
 
 ```console
-mkdir -p secrets tailstate-data
-chmod 700 tailstate-data
-sudo chown 10001:10001 tailstate-data
-chmod 600 .env secrets/*
+cp .env.example .env
+mkdir -p secrets
+openssl rand -base64 32 > secrets/tailstate_master_key
+chmod 600 .env secrets/tailstate_master_key
 ```
 
-SQLite is stored directly under `./tailstate-data` alongside the Compose file. The directory is ignored by Git and must be writable by the container's non-root UID `10001`.
+### Pull the public image
 
-4. Start the service:
+The default image is `ghcr.io/crypt0rr/tailstate:latest`:
 
 ```console
+docker compose pull
 docker compose up -d
 ```
 
-Validate a configuration without starting the server:
+To pin a specific release instead of `latest`, set `TAILSTATE_IMAGE` in `.env`, for example:
+
+```dotenv
+TAILSTATE_IMAGE=ghcr.io/crypt0rr/tailstate:1.0.0
+```
+
+### Build locally
+
+To build TailState from the source in this repository:
 
 ```console
-tailstate check --config /config/tailstate.yaml
+docker compose up --build -d
 ```
 
-The first successful polling run stores a silent baseline. TailState sends one `tailstate.baseline_ready` summary; later differences become events.
-
-## Configuration
-
-Configuration is YAML. `${ENV_VAR}` expressions are expanded before parsing. Every sensitive field also has a mutually exclusive `_file` variant, suitable for Docker and Kubernetes secrets:
-
-```yaml
-tailscale:
-  tailnet: example.com
-  auth:
-    type: oauth
-    client_id: k1234567890
-    client_secret_file: /run/secrets/tailscale_oauth_secret
-    scope: all:read
-  webhook_secret_file: /run/secrets/tailscale_webhook_secret
-```
-
-Use `type: api_token` with `token` or `token_file` instead of OAuth when required. Tailscale API tokens expire after at most 90 days; OAuth is the recommended unattended mode.
-
-Docker Compose automatically reads `.env` for Compose interpolation, and this project's `env_file` entry also passes those values to TailState so `${TAILSCALE_TAILNET}`, `${TELEGRAM_CHAT_ID}`, and destination URL expressions in `config.yaml` can be expanded. Keep `.env` out of version control.
-
-For secrets, prefer the files mounted at `/run/secrets`:
-
-- `tailscale_oauth_secret`: the long-lived OAuth client secret.
-- `tailscale_webhook_secret`: the inbound webhook HMAC signing secret.
-- `telegram_bot_token`: the Telegram bot credential.
-
-The file locations are configurable from `.env`, but the secret contents remain outside the container environment. Webhook URLs for Mattermost, Slack, Discord, Teams, and Google Chat commonly contain an embedded credential; if supplied through `.env`, protect that file like any other secret (for example, `chmod 600 .env`).
-
-Collectors are named `devices`, `users`, `dns`, `policy`, `keys`, `webhooks`, `log_streaming`, `contacts`, `posture`, and `settings`. Remove collectors for which the credential lacks access. `tailstate check` fails when any enabled collector is inaccessible.
-
-Devices and users use `core_interval_seconds` (60 seconds by default); other collectors use `secondary_interval_seconds` (five minutes). `collector_intervals_seconds` can override any enabled collector, for example `keys: 3600`.
-
-Native webhook ingestion and API polling are independently switchable with `webhook_enabled` and `polling_enabled`.
-
-### Routing
-
-Each enabled destination receives an event when:
-
-1. Its `min_severity` is met.
-2. At least one `include` glob matches (an empty include list matches everything).
-3. No `exclude` glob matches. Exclusions always win.
-
-Globs are case-sensitive and match stable event types. Examples:
-
-- Native: `tailscale.webhook.nodeCreated`, `tailscale.webhook.policyUpdate`
-- API: `tailscale.device.created`, `tailscale.user.changed`, `tailscale.dns.changed`
-- Service: `tailstate.baseline_ready`, `tailstate.source_unhealthy`
-
-The generic webhook body is the normalized event and always contains `schema_version: 1`. Generic endpoints can add headers, bearer or basic authentication, and `X-TailState-Signature: t=<unix>,v1=<hmac-sha256>` signing over `<timestamp>.<raw-body>`.
-
-### Inferred stale devices
-
-The Tailscale REST Devices API does not expose authoritative online state. Optional stale-device events are therefore labelled internally as inferred and are disabled by default. Enabling `stale_device.enabled` compares `lastSeen` with `threshold_seconds`; ordinary `lastSeen` updates never generate changes.
-
-## HTTP endpoints
-
-| Endpoint | Purpose |
-| --- | --- |
-| `POST /webhooks/tailscale` | Signed Tailscale webhook receiver |
-| `GET /healthz` | Process liveness |
-| `GET /readyz` | Baseline/source health and outbox counts |
-| `GET /metrics` | Prometheus text exposition |
-
-Tailscale requires its webhook receiver to be reachable over HTTPS on port 80 or 443. TailState listens on plain HTTP by default and should sit behind a TLS reverse proxy. Alternatively, run it on a Tailscale node and publish port 8080 with [Tailscale Funnel](https://tailscale.com/docs/features/tailscale-funnel):
+After either installation method, inspect the startup log:
 
 ```console
-tailscale funnel --bg 8080
+docker compose logs tailstate
 ```
 
-Configure the resulting HTTPS URL as `https://<device>.<tailnet>.ts.net/webhooks/tailscale`, choose the general Tailscale payload format, subscribe to events, and store the displayed signing secret in TailState.
+The logs contain a one-time setup token. Open [http://127.0.0.1:8080/setup](http://127.0.0.1:8080/setup), enter that token, and create the administrator password.
 
-## Local development
+The setup interface then asks for:
+
+1. Tailnet (`-` uses the OAuth credential's tailnet).
+2. OAuth client ID and secret with `all:read`.
+3. Mattermost incoming webhook URL.
+4. Device and secondary inventory polling intervals.
+
+Saving performs a Tailscale API check and posts an explicit Mattermost test. TailState then builds a silent baseline. The status page shows baseline counts, collector capabilities, source health, and delivery state.
 
 ```console
-cargo fmt --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-targets
-cargo run -- check --config config.example.yaml
+curl -fsS http://127.0.0.1:8080/healthz
+curl -fsS http://127.0.0.1:8080/readyz
+curl -fsS http://127.0.0.1:8080/metrics
 ```
-
-Set `RUST_LOG=tailstate=debug,tower_http=debug` for additional diagnostics. Secrets and API response bodies are never logged.
 
 ## Security and persistence
 
-- Run one TailState instance and SQLite volume per tailnet.
-- Protect `./tailstate-data`: it contains normalized current inventory and retained events, but never configured secrets or OAuth access tokens.
-- Policy contents are represented only by per-section fingerprints. Secret/token fields returned by APIs are removed recursively.
-- The container runs as an unprivileged user and supports a read-only root filesystem.
+Compose creates the Docker-managed `tailstate-data` volume and stores `/data/tailstate.db` there. Snapshots, events, baseline state, sessions, and the delivery outbox survive container replacement.
+
+OAuth secrets and the Mattermost webhook URL are encrypted with AES-256-GCM using `secrets/tailstate_master_key`. OAuth access tokens exist only in memory. Back up the master key separately: TailState intentionally refuses to start if the key is missing or incorrect, and encrypted settings cannot be recovered without it.
+
+The image is scratch-based, runs as UID/GID `10001`, uses a read-only root filesystem, drops every Linux capability, and publishes the UI only on `127.0.0.1` by default. For remote access, place TailState behind an HTTPS reverse proxy and set:
+
+```dotenv
+TAILSTATE_BIND_ADDRESS=0.0.0.0
+TAILSTATE_COOKIE_SECURE=true
+```
+
+Do not expose the setup interface directly to the internet.
+
+### Password reset
+
+Generate a one-time reset token:
+
+```console
+docker compose exec tailstate /tailstate admin reset
+```
+
+Then open `/reset`. Resetting the password invalidates existing sessions.
+
+### Backup
+
+Stop the service before a simple volume backup so the SQLite files are consistent:
+
+```console
+docker compose stop tailstate
+docker run --rm -v tailstate_tailstate-data:/data -v "$PWD:/backup" alpine:3.24 \
+  tar czf /backup/tailstate-data.tar.gz -C /data .
+docker compose start tailstate
+```
+
+Back up `secrets/tailstate_master_key` separately and securely.
+
+## Change and delivery behavior
+
+- The first complete supported inventory is a silent baseline.
+- Stable additions and modifications alert on the next successful poll.
+- Removals require absence from two complete successful polls.
+- Failed or partial polls never delete snapshots.
+- Multiple changes in one poll become one Mattermost digest.
+- Failed Mattermost deliveries retry independently for up to 24 hours across restarts, then remain visible as dead letters.
+- API collector failures alert after three consecutive failures and once on recovery.
+- Plan-specific unavailable endpoints appear as unsupported and retry every six hours.
+
+## Runtime configuration
+
+Only bootstrap settings use environment variables; application credentials are entered in the authenticated UI.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `TAILSTATE_LISTEN_ADDR` | `0.0.0.0:8080` | Listener inside the container |
+| `TAILSTATE_DATA_DIR` | `/data` | SQLite directory |
+| `TAILSTATE_MASTER_KEY_FILE` | `/run/secrets/tailstate_master_key` | 32-byte or base64 master key |
+| `TAILSTATE_COOKIE_SECURE` | `false` | Require HTTPS for session cookies |
+| `TAILSTATE_LOG_LEVEL` | `info` | `info` or `debug` structured logging |
+
+The test-only `TAILSTATE_TS_API_URL` and `TAILSTATE_TS_OAUTH_URL` variables allow local mock servers; production deployments should leave them unset.
+
+## Local development
+
+TailState uses Go 1.26.5.
+
+```console
+gofmt -w cmd internal
+go vet ./...
+go test -race ./...
+docker build -t tailstate:dev .
+```
+
+For a local binary, generate a master key and point TailState at a writable data directory:
+
+```console
+mkdir -p .local-data secrets
+openssl rand -base64 32 > secrets/tailstate_master_key
+TAILSTATE_DATA_DIR="$PWD/.local-data" \
+TAILSTATE_MASTER_KEY_FILE="$PWD/secrets/tailstate_master_key" \
+go run ./cmd/tailstate serve
+```
+
+## Releases
+
+Pushing a semantic tag such as `v1.0.0` publishes signed-build metadata, an SBOM, and `linux/amd64` plus `linux/arm64` images to:
+
+```text
+ghcr.io/crypt0rr/tailstate
+```
 
 ## License
 

@@ -4,26 +4,34 @@ services:
     image: ${TAILSTATE_IMAGE:-ghcr.io/crypt0rr/tailstate:latest}
     restart: unless-stopped
     read_only: true
-    env_file:
-      - .env
+    environment:
+      TAILSTATE_LISTEN_ADDR: 0.0.0.0:8080
+      TAILSTATE_DATA_DIR: /data
+      TAILSTATE_MASTER_KEY_FILE: /run/secrets/tailstate_master_key
+      TAILSTATE_COOKIE_SECURE: ${TAILSTATE_COOKIE_SECURE:-false}
+      TAILSTATE_LOG_LEVEL: ${TAILSTATE_LOG_LEVEL:-info}
     ports:
       - "${TAILSTATE_BIND_ADDRESS:-127.0.0.1}:${TAILSTATE_PORT:-8080}:8080"
     volumes:
-      - ${TAILSTATE_CONFIG_FILE:-./config.yaml}:/config/tailstate.yaml:ro
-      - ./tailstate-data:/data
+      - tailstate-data:/data
     secrets:
-      - tailscale_oauth_secret
-      - tailscale_webhook_secret
-      - telegram_bot_token
+      - tailstate_master_key
     tmpfs:
       - /tmp:noexec,nosuid,size=16m
+    cap_drop:
+      - ALL
     security_opt:
       - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "/tailstate", "healthcheck"]
+      interval: 30s
+      timeout: 3s
+      start_period: 10s
+      retries: 3
+
+volumes:
+  tailstate-data:
 
 secrets:
-  tailscale_oauth_secret:
-    file: ${TAILSCALE_OAUTH_SECRET_FILE:-./secrets/tailscale_oauth_secret}
-  tailscale_webhook_secret:
-    file: ${TAILSCALE_WEBHOOK_SECRET_FILE:-./secrets/tailscale_webhook_secret}
-  telegram_bot_token:
-    file: ${TELEGRAM_BOT_TOKEN_FILE:-./secrets/telegram_bot_token}
+  tailstate_master_key:
+    file: ${TAILSTATE_MASTER_KEY_FILE:-./secrets/tailstate_master_key}

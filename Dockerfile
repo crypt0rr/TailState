@@ -7,8 +7,7 @@ COPY src ./src
 RUN cargo build --locked --release
 
 FROM alpine:3.24
-RUN apk add --no-cache ca-certificates wget \
-    && addgroup -S -g 10001 tailstate \
+RUN addgroup -S -g 10001 tailstate \
     && adduser -S -D -H -u 10001 -G tailstate tailstate \
     && mkdir -p /config /data \
     && chown tailstate:tailstate /data

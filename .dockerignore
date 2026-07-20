@@ -1,0 +1,7 @@
+.git
+.github
+target
+secrets
+tailstate-data
+*.db
+config.yaml

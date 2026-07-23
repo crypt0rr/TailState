@@ -7,8 +7,8 @@ import (
 )
 
 func TestCanonicalIgnoresVolatileAndOrder(t *testing.T) {
-	a := map[string]any{"addresses": []any{"fd7a::1", "100.64.0.1"}, "lastSeen": "now", "clientConnectivity": map[string]any{"endpoints": []any{"1.2.3.4:5"}}}
-	b := map[string]any{"addresses": []any{"100.64.0.1", "fd7a::1"}, "lastSeen": "later"}
+	a := map[string]any{"addresses": []any{"fd7a::1", "100.64.0.1"}, "lastSeen": "now", "connectedToControl": false, "clientConnectivity": map[string]any{"endpoints": []any{"1.2.3.4:5"}}}
+	b := map[string]any{"addresses": []any{"100.64.0.1", "fd7a::1"}, "lastSeen": "later", "connectedToControl": true}
 	_, ha, err := Canonical(a)
 	if err != nil {
 		t.Fatal(err)

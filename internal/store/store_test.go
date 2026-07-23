@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -161,5 +162,46 @@ func TestOutboxSurvivesRestart(t *testing.T) {
 	}
 	if len(items) != 1 || items[0].Payload != "durable digest" {
 		t.Fatalf("outbox did not survive restart: %#v", items)
+	}
+}
+
+func TestNewIgnoredFieldsSilentlyRenormalizeExistingSnapshots(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	generation, err := st.SaveSettings(ctx, settings())
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseline := []model.Collected{{Collector: "device_details", Resources: []model.Resource{{
+		ID: "1", Type: "device_details", Name: "server", Data: map[string]any{
+			"hostname": "server", "connectedToControl": false,
+		},
+	}}}}
+	if _, err := st.ApplyBatch(ctx, generation, baseline, func([]model.Change) string { return "digest" }); err != nil {
+		t.Fatal(err)
+	}
+
+	legacy := `{"connectedToControl":false,"hostname":"server"}`
+	if _, err := st.db.ExecContext(ctx, "UPDATE snapshots SET canonical_json=?,content_hash='legacy-format' WHERE generation=? AND collector='device_details' AND resource_id='1'", legacy, generation); err != nil {
+		t.Fatal(err)
+	}
+	current := []model.Collected{{Collector: "device_details", Resources: []model.Resource{{
+		ID: "1", Type: "device_details", Name: "server", Data: map[string]any{
+			"hostname": "server", "connectedToControl": true,
+		},
+	}}}}
+	changes, err := st.ApplyBatch(ctx, generation, current, func([]model.Change) string { return "digest" })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(changes) != 0 {
+		t.Fatalf("volatile field migration emitted changes: %#v", changes)
+	}
+	var canonical string
+	if err := st.db.QueryRowContext(ctx, "SELECT canonical_json FROM snapshots WHERE generation=? AND collector='device_details' AND resource_id='1'", generation).Scan(&canonical); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(canonical, "connectedToControl") {
+		t.Fatalf("snapshot was not silently re-normalized: %s", canonical)
 	}
 }

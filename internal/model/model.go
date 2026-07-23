@@ -42,7 +42,7 @@ type Change struct {
 }
 
 var ignored = map[string]struct{}{
-	"lastseen": {}, "clientconnectivity": {}, "endpoints": {}, "lastupdated": {},
+	"lastseen": {}, "connectedtocontrol": {}, "clientconnectivity": {}, "endpoints": {}, "lastupdated": {},
 	"createdat": {}, "updatedat": {}, "timestamp": {}, "requestedat": {},
 	"accesstoken": {}, "clientsecret": {}, "secret": {}, "token": {}, "password": {},
 }

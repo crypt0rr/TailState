@@ -354,6 +354,17 @@ func (s *Store) ApplyBatch(ctx context.Context, generation int64, results []mode
 			var oldHash, oldType, oldName string
 			var missing int
 			err = tx.QueryRowContext(ctx, "SELECT canonical_json,content_hash,resource_type,name,missing_count FROM snapshots WHERE generation=? AND collector=? AND resource_id=?", generation, result.Collector, resource.ID).Scan(&oldRaw, &oldHash, &oldType, &oldName, &missing)
+			if err == nil && oldHash != hash {
+				var oldValue any
+				if json.Unmarshal(oldRaw, &oldValue) == nil {
+					normalizedOldRaw, normalizedOldHash, normalizeErr := model.Canonical(oldValue)
+					if normalizeErr != nil {
+						return nil, normalizeErr
+					}
+					oldRaw = normalizedOldRaw
+					oldHash = normalizedOldHash
+				}
+			}
 			switch {
 			case errors.Is(err, sql.ErrNoRows):
 				if baseline == 1 {
@@ -368,7 +379,7 @@ func (s *Store) ApplyBatch(ctx context.Context, generation int64, results []mode
 				}
 				_, err = tx.ExecContext(ctx, "UPDATE snapshots SET resource_type=?,name=?,canonical_json=?,content_hash=?,missing_count=0,updated_at=? WHERE generation=? AND collector=? AND resource_id=?", resource.Type, resource.Name, raw, hash, now.Format(time.RFC3339Nano), generation, result.Collector, resource.ID)
 			default:
-				_, err = tx.ExecContext(ctx, "UPDATE snapshots SET missing_count=0,updated_at=? WHERE generation=? AND collector=? AND resource_id=?", now.Format(time.RFC3339Nano), generation, result.Collector, resource.ID)
+				_, err = tx.ExecContext(ctx, "UPDATE snapshots SET resource_type=?,name=?,canonical_json=?,content_hash=?,missing_count=0,updated_at=? WHERE generation=? AND collector=? AND resource_id=?", resource.Type, resource.Name, raw, hash, now.Format(time.RFC3339Nano), generation, result.Collector, resource.ID)
 			}
 			if err != nil {
 				return nil, err

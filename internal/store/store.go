@@ -346,7 +346,7 @@ func (s *Store) ApplyBatch(ctx context.Context, generation int64, results []mode
 		seen := make(map[string]struct{}, len(result.Resources))
 		for _, resource := range result.Resources {
 			seen[resource.ID] = struct{}{}
-			raw, hash, err := model.Canonical(resource.Data)
+			raw, hash, err := model.CanonicalFor(result.Collector, resource.Data)
 			if err != nil {
 				return nil, err
 			}
@@ -357,7 +357,7 @@ func (s *Store) ApplyBatch(ctx context.Context, generation int64, results []mode
 			if err == nil && oldHash != hash {
 				var oldValue any
 				if json.Unmarshal(oldRaw, &oldValue) == nil {
-					normalizedOldRaw, normalizedOldHash, normalizeErr := model.Canonical(oldValue)
+					normalizedOldRaw, normalizedOldHash, normalizeErr := model.CanonicalFor(result.Collector, oldValue)
 					if normalizeErr != nil {
 						return nil, normalizeErr
 					}

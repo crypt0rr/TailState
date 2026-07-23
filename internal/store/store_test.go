@@ -174,7 +174,12 @@ func TestNewIgnoredFieldsSilentlyRenormalizeExistingSnapshots(t *testing.T) {
 	}
 	baseline := []model.Collected{{Collector: "device_details", Resources: []model.Resource{{
 		ID: "1", Type: "device_details", Name: "server", Data: map[string]any{
-			"hostname": "server", "connectedToControl": false,
+			"detail": map[string]any{
+				"hostname":            "server",
+				"connectedToControl":  false,
+				"multipleConnections": false,
+				"nodeKey":             "node:old",
+			},
 			"deviceInvites": []any{
 				map[string]any{
 					"accepted": true,
@@ -191,13 +196,12 @@ func TestNewIgnoredFieldsSilentlyRenormalizeExistingSnapshots(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	legacy := `{"connectedToControl":false,"deviceInvites":[{"accepted":true,"acceptedBy":{"id":123,"loginName":"user@example.com","profilePicUrl":{"redacted_sha256":"old-hash"}}}],"hostname":"server"}`
+	legacy := `{"detail":{"connectedToControl":false,"hostname":"server","multipleConnections":false,"nodeKey":"node:old"},"deviceInvites":[{"accepted":true,"acceptedBy":{"id":123,"loginName":"user@example.com","profilePicUrl":{"redacted_sha256":"old-hash"}}}]}`
 	if _, err := st.db.ExecContext(ctx, "UPDATE snapshots SET canonical_json=?,content_hash='legacy-format' WHERE generation=? AND collector='device_details' AND resource_id='1'", legacy, generation); err != nil {
 		t.Fatal(err)
 	}
 	current := []model.Collected{{Collector: "device_details", Resources: []model.Resource{{
 		ID: "1", Type: "device_details", Name: "server", Data: map[string]any{
-			"hostname": "server", "connectedToControl": true,
 			"deviceInvites": []any{
 				map[string]any{
 					"accepted": true,
@@ -226,5 +230,49 @@ func TestNewIgnoredFieldsSilentlyRenormalizeExistingSnapshots(t *testing.T) {
 	}
 	if strings.Contains(canonical, "profilePicUrl") {
 		t.Fatalf("profile picture URL was not removed during migration: %s", canonical)
+	}
+	if strings.Contains(canonical, "detail") || strings.Contains(canonical, "nodeKey") {
+		t.Fatalf("duplicated core device data was not removed during migration: %s", canonical)
+	}
+}
+
+func TestDeviceRuntimeMigrationKeepsClientUpdateAlert(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	generation, err := st.SaveSettings(ctx, settings())
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseline := []model.Collected{{Collector: "devices", Resources: []model.Resource{{
+		ID: "1", Type: "device", Name: "server", Data: map[string]any{
+			"hostname": "server", "multipleConnections": false, "machineKey": "machine:old", "nodeKey": "node:old", "updateAvailable": false,
+		},
+	}}}}
+	if _, err := st.ApplyBatch(ctx, generation, baseline, func([]model.Change) string { return "digest" }); err != nil {
+		t.Fatal(err)
+	}
+
+	legacy := `{"hostname":"server","machineKey":"machine:old","multipleConnections":false,"nodeKey":"node:old","updateAvailable":false}`
+	if _, err := st.db.ExecContext(ctx, "UPDATE snapshots SET canonical_json=?,content_hash='legacy-format' WHERE generation=? AND collector='devices' AND resource_id='1'", legacy, generation); err != nil {
+		t.Fatal(err)
+	}
+	runtimeOnly := []model.Collected{{Collector: "devices", Resources: []model.Resource{{
+		ID: "1", Type: "device", Name: "server", Data: map[string]any{
+			"hostname": "server", "multipleConnections": true, "machineKey": "machine:new", "nodeKey": "node:new", "updateAvailable": false,
+		},
+	}}}}
+	changes, err := st.ApplyBatch(ctx, generation, runtimeOnly, func([]model.Change) string { return "digest" })
+	if err != nil || len(changes) != 0 {
+		t.Fatalf("device runtime migration emitted changes: %#v %v", changes, err)
+	}
+
+	clientUpdate := []model.Collected{{Collector: "devices", Resources: []model.Resource{{
+		ID: "1", Type: "device", Name: "server", Data: map[string]any{
+			"hostname": "server", "multipleConnections": true, "machineKey": "machine:new", "nodeKey": "node:new", "updateAvailable": true,
+		},
+	}}}}
+	changes, err = st.ApplyBatch(ctx, generation, clientUpdate, func([]model.Change) string { return "digest" })
+	if err != nil || len(changes) != 1 || len(changes[0].Fields) != 1 || changes[0].Fields[0].Field != "updateAvailable" {
+		t.Fatalf("client update availability was not preserved: %#v %v", changes, err)
 	}
 }

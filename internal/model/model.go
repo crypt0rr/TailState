@@ -48,13 +48,58 @@ var ignored = map[string]struct{}{
 	"profilepicurl": {},
 }
 
+var collectorFields = map[string]map[string]struct{}{
+	"devices": fieldSet(
+		"addresses", "id", "nodeid", "user", "name", "hostname", "clientversion", "updateavailable", "os",
+		"created", "keyexpirydisabled", "expires", "authorized", "isexternal", "blocksincomingconnections",
+		"enabledroutes", "advertisedroutes", "tags", "tailnetlockerror", "tailnetlockkey", "sshenabled",
+		"postureidentity", "isephemeral", "distro",
+	),
+	"users": fieldSet(
+		"id", "displayname", "loginname", "profilepicurl", "tailnetid", "created", "type", "role", "status",
+	),
+	"device_details": fieldSet("routes", "postureattributes", "deviceinvites"),
+	"posture":        fieldSet("provider", "cloudid", "clientid", "tenantid", "id", "configupdated", "status"),
+	"log_streaming":  fieldSet("configuration", "network"),
+}
+
+func fieldSet(fields ...string) map[string]struct{} {
+	out := make(map[string]struct{}, len(fields))
+	for _, field := range fields {
+		out[field] = struct{}{}
+	}
+	return out
+}
+
 func Normalize(value any) any {
+	return NormalizeFor("", value)
+}
+
+func NormalizeFor(collector string, value any) any {
+	return normalizeFor(collector, value, true)
+}
+
+func normalizeFor(collector string, value any, root bool) any {
 	switch v := value.(type) {
 	case map[string]any:
 		out := make(map[string]any, len(v))
 		for key, child := range v {
 			compact := strings.ToLower(strings.ReplaceAll(strings.ReplaceAll(key, "_", ""), "-", ""))
-			if _, drop := ignored[compact]; drop || strings.Contains(compact, "secret") || strings.Contains(compact, "tokenvalue") {
+			if root && !collectorFieldAllowed(collector, compact) {
+				continue
+			}
+			if collector == "device_details" && compact == "detail" {
+				continue
+			}
+			if _, drop := ignored[compact]; drop || ignoredForCollector(collector, compact) || strings.Contains(compact, "secret") || strings.Contains(compact, "tokenvalue") {
+				continue
+			}
+			if collector == "users" && compact == "status" {
+				out[key] = normalizeUserStatus(child)
+				continue
+			}
+			if (collector == "posture" || collector == "log_streaming") && compact == "status" {
+				out[key] = normalizeHealthStatus(child)
 				continue
 			}
 			if strings.Contains(compact, "url") || compact == "endpoint" {
@@ -63,13 +108,13 @@ func Normalize(value any) any {
 				out[key] = map[string]any{"redacted_sha256": hex.EncodeToString(sum[:])}
 				continue
 			}
-			out[key] = Normalize(child)
+			out[key] = normalizeFor(collector, child, false)
 		}
 		return out
 	case []any:
 		out := make([]any, len(v))
 		for i := range v {
-			out[i] = Normalize(v[i])
+			out[i] = normalizeFor(collector, v[i], false)
 		}
 		sort.SliceStable(out, func(i, j int) bool {
 			a, _ := json.Marshal(out[i])
@@ -82,8 +127,56 @@ func Normalize(value any) any {
 	}
 }
 
+func collectorFieldAllowed(collector, field string) bool {
+	fields, restricted := collectorFields[collector]
+	if !restricted {
+		return true
+	}
+	_, allowed := fields[field]
+	return allowed
+}
+
+func ignoredForCollector(collector, key string) bool {
+	switch collector {
+	case "devices":
+		return key == "multipleconnections" || key == "machinekey" || key == "nodekey"
+	case "users":
+		return key == "currentlyconnected"
+	default:
+		return false
+	}
+}
+
+func normalizeUserStatus(value any) any {
+	status, ok := value.(string)
+	if ok && (status == "active" || status == "idle") {
+		return "enabled"
+	}
+	return value
+}
+
+func normalizeHealthStatus(value any) any {
+	status, ok := value.(map[string]any)
+	if !ok {
+		return value
+	}
+	errorMessage, _ := status["error"].(string)
+	if errorMessage == "" {
+		errorMessage, _ = status["lastError"].(string)
+	}
+	state := "healthy"
+	if strings.TrimSpace(errorMessage) != "" {
+		state = "error"
+	}
+	return map[string]any{"state": state}
+}
+
 func Canonical(value any) ([]byte, string, error) {
-	raw, err := json.Marshal(Normalize(value))
+	return CanonicalFor("", value)
+}
+
+func CanonicalFor(collector string, value any) ([]byte, string, error) {
+	raw, err := json.Marshal(NormalizeFor(collector, value))
 	if err != nil {
 		return nil, "", err
 	}

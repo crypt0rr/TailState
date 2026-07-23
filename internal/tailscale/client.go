@@ -93,15 +93,7 @@ func (c *Client) deviceDetails(ctx context.Context) ([]model.Resource, error) {
 		if id == "" {
 			continue
 		}
-		detail, err := c.get(ctx, c.global("device/"+url.PathEscape(id)))
-		if err != nil {
-			var he *HTTPError
-			if errors.As(err, &he) && he.Status == 404 {
-				continue
-			}
-			return nil, err
-		}
-		combined := map[string]any{"detail": detail}
+		combined := map[string]any{}
 		for key, path := range map[string]string{"routes": "routes", "postureAttributes": "attributes", "deviceInvites": "device-invites"} {
 			value, e := c.get(ctx, c.global("device/"+url.PathEscape(id)+"/"+path))
 			if e != nil {
@@ -171,7 +163,7 @@ func (c *Client) logStreaming(ctx context.Context) ([]model.Resource, error) {
 			}
 			return nil, err
 		}
-		status, err := c.get(ctx, c.tailnet("logging/"+kind+"/status"))
+		status, err := c.get(ctx, c.tailnet("logging/"+kind+"/stream/status"))
 		if err != nil {
 			if IsUnsupported(err) {
 				data[kind] = map[string]any{"unsupported": true}

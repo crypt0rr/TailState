@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -80,5 +81,78 @@ func TestDNSKeepsSupportedSubresources(t *testing.T) {
 	resources, err := client.Collect(context.Background(), "dns")
 	if err != nil || len(resources) != 1 {
 		t.Fatalf("DNS collection failed: %#v %v", resources, err)
+	}
+}
+
+func TestDeviceDetailsDoNotRefetchCoreDevice(t *testing.T) {
+	coreDetailCalls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/oauth/token":
+			_, _ = w.Write([]byte(`{"access_token":"access","expires_in":3600}`))
+		case r.URL.Path == "/api/v2/tailnet/-/devices":
+			_, _ = w.Write([]byte(`{"devices":[{"id":"1","hostname":"server","addresses":["100.64.0.1"]}]}`))
+		case r.URL.Path == "/api/v2/device/1":
+			coreDetailCalls++
+			_, _ = w.Write([]byte(`{"id":"1","hostname":"server"}`))
+		case r.URL.Path == "/api/v2/device/1/routes":
+			_, _ = w.Write([]byte(`{"enabledRoutes":["10.0.0.0/24"]}`))
+		case r.URL.Path == "/api/v2/device/1/attributes":
+			_, _ = w.Write([]byte(`{"attributes":{"node:os":"linux"}}`))
+		case r.URL.Path == "/api/v2/device/1/device-invites":
+			_, _ = w.Write([]byte(`[]`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	client := New(server.URL+"/api/v2", server.URL+"/oauth/token", "test", Credentials{ClientID: "id", ClientSecret: "secret"})
+	resources, err := client.Collect(context.Background(), "device_details")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if coreDetailCalls != 0 {
+		t.Fatalf("core device was fetched %d additional time(s)", coreDetailCalls)
+	}
+	if len(resources) != 1 {
+		t.Fatalf("unexpected device details: %#v", resources)
+	}
+	data, ok := resources[0].Data.(map[string]any)
+	if !ok || data["routes"] == nil || data["postureAttributes"] == nil || data["deviceInvites"] == nil {
+		t.Fatalf("secondary details missing: %#v", resources[0].Data)
+	}
+}
+
+func TestLogStreamingUsesCurrentStatusEndpoint(t *testing.T) {
+	var requested []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/oauth/token" {
+			_, _ = w.Write([]byte(`{"access_token":"access","expires_in":3600}`))
+			return
+		}
+		requested = append(requested, r.URL.Path)
+		switch r.URL.Path {
+		case "/api/v2/tailnet/-/logging/configuration/stream",
+			"/api/v2/tailnet/-/logging/network/stream":
+			_, _ = w.Write([]byte(`{"destinationType":"http"}`))
+		case "/api/v2/tailnet/-/logging/configuration/stream/status",
+			"/api/v2/tailnet/-/logging/network/stream/status":
+			_, _ = w.Write([]byte(`{"lastActivity":"now","numEntriesSent":42,"lastError":""}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	client := New(server.URL+"/api/v2", server.URL+"/oauth/token", "test", Credentials{ClientID: "id", ClientSecret: "secret"})
+	resources, err := client.Collect(context.Background(), "log_streaming")
+	if err != nil || len(resources) != 1 {
+		t.Fatalf("log streaming collection failed: %#v %v", resources, err)
+	}
+	for _, path := range requested {
+		if strings.HasSuffix(path, "/logging/configuration/status") || strings.HasSuffix(path, "/logging/network/status") {
+			t.Fatalf("obsolete status endpoint requested: %s", path)
+		}
 	}
 }

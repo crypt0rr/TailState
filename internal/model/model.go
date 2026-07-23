@@ -45,6 +45,7 @@ var ignored = map[string]struct{}{
 	"lastseen": {}, "connectedtocontrol": {}, "clientconnectivity": {}, "endpoints": {}, "lastupdated": {},
 	"createdat": {}, "updatedat": {}, "timestamp": {}, "requestedat": {},
 	"accesstoken": {}, "clientsecret": {}, "secret": {}, "token": {}, "password": {},
+	"profilepicurl": {},
 }
 
 func Normalize(value any) any {

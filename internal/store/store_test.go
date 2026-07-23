@@ -175,19 +175,39 @@ func TestNewIgnoredFieldsSilentlyRenormalizeExistingSnapshots(t *testing.T) {
 	baseline := []model.Collected{{Collector: "device_details", Resources: []model.Resource{{
 		ID: "1", Type: "device_details", Name: "server", Data: map[string]any{
 			"hostname": "server", "connectedToControl": false,
+			"deviceInvites": []any{
+				map[string]any{
+					"accepted": true,
+					"acceptedBy": map[string]any{
+						"id":            float64(123),
+						"loginName":     "user@example.com",
+						"profilePicUrl": "https://avatars.example.com/old",
+					},
+				},
+			},
 		},
 	}}}}
 	if _, err := st.ApplyBatch(ctx, generation, baseline, func([]model.Change) string { return "digest" }); err != nil {
 		t.Fatal(err)
 	}
 
-	legacy := `{"connectedToControl":false,"hostname":"server"}`
+	legacy := `{"connectedToControl":false,"deviceInvites":[{"accepted":true,"acceptedBy":{"id":123,"loginName":"user@example.com","profilePicUrl":{"redacted_sha256":"old-hash"}}}],"hostname":"server"}`
 	if _, err := st.db.ExecContext(ctx, "UPDATE snapshots SET canonical_json=?,content_hash='legacy-format' WHERE generation=? AND collector='device_details' AND resource_id='1'", legacy, generation); err != nil {
 		t.Fatal(err)
 	}
 	current := []model.Collected{{Collector: "device_details", Resources: []model.Resource{{
 		ID: "1", Type: "device_details", Name: "server", Data: map[string]any{
 			"hostname": "server", "connectedToControl": true,
+			"deviceInvites": []any{
+				map[string]any{
+					"accepted": true,
+					"acceptedBy": map[string]any{
+						"id":            float64(123),
+						"loginName":     "user@example.com",
+						"profilePicUrl": "https://avatars.example.com/new",
+					},
+				},
+			},
 		},
 	}}}}
 	changes, err := st.ApplyBatch(ctx, generation, current, func([]model.Change) string { return "digest" })
@@ -203,5 +223,8 @@ func TestNewIgnoredFieldsSilentlyRenormalizeExistingSnapshots(t *testing.T) {
 	}
 	if strings.Contains(canonical, "connectedToControl") {
 		t.Fatalf("snapshot was not silently re-normalized: %s", canonical)
+	}
+	if strings.Contains(canonical, "profilePicUrl") {
+		t.Fatalf("profile picture URL was not removed during migration: %s", canonical)
 	}
 }

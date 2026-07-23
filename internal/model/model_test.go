@@ -38,4 +38,58 @@ func TestSensitiveURLIsHashed(t *testing.T) {
 	if got["url"] == nil {
 		t.Fatal("URL fingerprint missing")
 	}
+
+	_, firstHash, err := Canonical(map[string]any{"url": "https://mattermost.example/hooks/first"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, secondHash, err := Canonical(map[string]any{"url": "https://mattermost.example/hooks/second"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstHash == secondHash {
+		t.Fatal("configuration URL changes must remain detectable")
+	}
+}
+
+func TestCanonicalIgnoresProfilePictureURL(t *testing.T) {
+	before := map[string]any{
+		"deviceInvites": []any{
+			map[string]any{
+				"accepted": true,
+				"acceptedBy": map[string]any{
+					"id":            float64(123),
+					"loginName":     "user@example.com",
+					"profilePicUrl": "https://avatars.example.com/old",
+				},
+			},
+		},
+	}
+	after := map[string]any{
+		"deviceInvites": []any{
+			map[string]any{
+				"accepted": true,
+				"acceptedBy": map[string]any{
+					"id":            float64(123),
+					"loginName":     "user@example.com",
+					"profilePicUrl": "https://avatars.example.com/new",
+				},
+			},
+		},
+	}
+
+	beforeRaw, beforeHash, err := Canonical(before)
+	if err != nil {
+		t.Fatal(err)
+	}
+	afterRaw, afterHash, err := Canonical(after)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if beforeHash != afterHash {
+		t.Fatalf("profile picture URL changed canonical hash:\n%s\n%s", beforeRaw, afterRaw)
+	}
+	if strings.Contains(string(beforeRaw), "profilePicUrl") {
+		t.Fatalf("profile picture URL retained in canonical snapshot: %s", beforeRaw)
+	}
 }

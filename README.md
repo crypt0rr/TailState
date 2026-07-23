@@ -12,7 +12,7 @@ TailState never modifies a tailnet and does not use native Tailscale webhooks.
 - Policy section fingerprints without storing policy contents.
 - Credential metadata, webhook configuration inventory, log-streaming configuration/status, contacts, posture integrations, and tailnet settings.
 
-The REST API does not expose authoritative online state. TailState therefore does **not** generate online/offline notifications and ignores `lastSeen`, `connectedToControl`, public endpoints, connectivity metadata, response timestamps, and array ordering.
+The REST API does not expose authoritative online state. TailState therefore does **not** generate online/offline notifications and ignores `lastSeen`, `connectedToControl`, public endpoints, connectivity metadata, profile-picture URLs, response timestamps, and array ordering.
 
 ## Quick start
 

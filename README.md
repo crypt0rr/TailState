@@ -121,6 +121,9 @@ Back up `secrets/tailstate_master_key` separately and securely.
 - Failed Mattermost deliveries retry independently for up to 24 hours across restarts, then remain visible as dead letters.
 - API collector failures alert after three consecutive failures and once on recovery.
 - Plan-specific unavailable endpoints appear as unsupported and retry every six hours.
+- Starting a different TailState release queues one durable notification containing the previous and current versions.
+
+Version tracking is introduced in v0.3.0. Its first startup records the release silently because earlier releases did not persist their version; subsequent upgrades include both exact versions in the Mattermost notification.
 
 ## Runtime configuration
 

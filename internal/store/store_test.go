@@ -77,6 +77,62 @@ func TestWrongMasterKeyFailsOpen(t *testing.T) {
 	}
 }
 
+func TestTrackAppVersionQueuesConfiguredUpdatesOnce(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	format := func(previous, current string) string {
+		return "updated " + previous + " to " + current
+	}
+
+	notified, err := st.TrackAppVersion(ctx, "0.3.0", format)
+	if err != nil || notified {
+		t.Fatalf("first tracked version should be silent: notified=%v err=%v", notified, err)
+	}
+	if _, err := st.SaveSettings(ctx, settings()); err != nil {
+		t.Fatal(err)
+	}
+	notified, err = st.TrackAppVersion(ctx, "0.3.1", format)
+	if err != nil || !notified {
+		t.Fatalf("configured update was not queued: notified=%v err=%v", notified, err)
+	}
+	notified, err = st.TrackAppVersion(ctx, "0.3.1", format)
+	if err != nil || notified {
+		t.Fatalf("same version was queued again: notified=%v err=%v", notified, err)
+	}
+	items, err := st.DueOutbox(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 || items[0].Payload != "updated 0.3.0 to 0.3.1" {
+		t.Fatalf("unexpected update outbox: %#v", items)
+	}
+}
+
+func TestTrackAppVersionIgnoresDevelopmentBuild(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	if _, err := st.SaveSettings(ctx, settings()); err != nil {
+		t.Fatal(err)
+	}
+	format := func(previous, current string) string { return previous + " to " + current }
+	if notified, err := st.TrackAppVersion(ctx, "0.3.0", format); err != nil || notified {
+		t.Fatalf("first tracked version should be silent: notified=%v err=%v", notified, err)
+	}
+	if notified, err := st.TrackAppVersion(ctx, "dev", format); err != nil || notified {
+		t.Fatalf("development version should be ignored: notified=%v err=%v", notified, err)
+	}
+	if notified, err := st.TrackAppVersion(ctx, "0.3.1", format); err != nil || !notified {
+		t.Fatalf("release update after development build was not queued: notified=%v err=%v", notified, err)
+	}
+	items, err := st.DueOutbox(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 || items[0].Payload != "0.3.0 to 0.3.1" {
+		t.Fatalf("development build replaced tracked release: %#v", items)
+	}
+}
+
 func TestSilentBaselineDiffAndTwoPollRemoval(t *testing.T) {
 	ctx := context.Background()
 	st := testStore(t)

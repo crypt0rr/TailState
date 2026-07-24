@@ -91,6 +91,11 @@ func SourceHealth(collector string, recovered bool) string {
 	}
 	return fmt.Sprintf("### ⚠️ Tailscale API collector unhealthy\n`%s` failed three consecutive polls. TailState will keep retrying.", escape(collector))
 }
+
+func Update(previous, current string) string {
+	return fmt.Sprintf("### 🚀 TailState updated\n**Previous version:** `%s`\n**Current version:** `%s`", escape(previous), escape(current))
+}
+
 func escape(value string) string {
 	return strings.NewReplacer("`", "'", "\n", " ", "\r", " ").Replace(value)
 }

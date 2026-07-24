@@ -27,6 +27,14 @@ func TestSendAndDigest(t *testing.T) {
 		t.Fatalf("unexpected body %s", body)
 	}
 }
+
+func TestUpdateMessage(t *testing.T) {
+	message := Update("0.2.6", "0.3.0")
+	if !strings.Contains(message, "TailState updated") || !strings.Contains(message, "`0.2.6`") || !strings.Contains(message, "`0.3.0`") {
+		t.Fatalf("unexpected update message: %s", message)
+	}
+}
+
 func TestPermanentError(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(400) }))
 	defer server.Close()

@@ -321,6 +321,51 @@ func (s *Store) Settings(ctx context.Context) (Settings, error) {
 	return out, nil
 }
 
+func (s *Store) TrackAppVersion(ctx context.Context, current string, notification func(previous, current string) string) (bool, error) {
+	current = strings.TrimSpace(current)
+	if current == "" || current == "dev" {
+		return false, nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	var previous string
+	err = tx.QueryRowContext(ctx, "SELECT value FROM meta WHERE key='app_version'").Scan(&previous)
+	if errors.Is(err, sql.ErrNoRows) {
+		if _, err = tx.ExecContext(ctx, "INSERT INTO meta(key,value) VALUES('app_version',?)", current); err != nil {
+			return false, err
+		}
+		return false, tx.Commit()
+	}
+	if err != nil {
+		return false, err
+	}
+	if previous == current {
+		return false, nil
+	}
+	if _, err = tx.ExecContext(ctx, "UPDATE meta SET value=? WHERE key='app_version'", current); err != nil {
+		return false, err
+	}
+	var configured int
+	if err = tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM settings").Scan(&configured); err != nil {
+		return false, err
+	}
+	notified := configured > 0
+	if notified {
+		now := time.Now().UTC().Format(time.RFC3339Nano)
+		payload := notification(previous, current)
+		if _, err = tx.ExecContext(ctx, "INSERT INTO outbox(payload,status,next_attempt,first_attempt,created_at) VALUES(?,'pending',?,?,?)", payload, now, now, now); err != nil {
+			return false, err
+		}
+	}
+	if err = tx.Commit(); err != nil {
+		return false, err
+	}
+	return notified, nil
+}
+
 func (s *Store) ApplyBatch(ctx context.Context, generation int64, results []model.Collected, digest func([]model.Change) string) ([]model.Change, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {

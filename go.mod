@@ -3,7 +3,7 @@ module github.com/crypt0rr/tailstate
 go 1.26.5
 
 require (
-	github.com/nicholas-fedor/shoutrrr v0.16.2
+	github.com/nicholas-fedor/shoutrrr v0.16.3
 	golang.org/x/crypto v0.54.0
 	modernc.org/sqlite v1.55.0
 )

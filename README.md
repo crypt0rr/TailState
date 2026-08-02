@@ -73,6 +73,8 @@ curl -fsS http://127.0.0.1:8080/readyz
 curl -fsS http://127.0.0.1:8080/metrics
 ```
 
+`/metrics` exposes readiness, pending/dead delivery counts, resource counts, and low-cardinality collector health gauges (`supported`, `baseline`, failures, last success, and next poll timestamps) for Prometheus-compatible monitoring.
+
 ## Security and persistence
 
 Compose creates the Docker-managed `tailstate-data` volume and stores `/data/tailstate.db` there. Snapshots, events, baseline state, sessions, and the delivery outbox survive container replacement.

@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -154,5 +155,59 @@ func TestLogStreamingUsesCurrentStatusEndpoint(t *testing.T) {
 		if strings.HasSuffix(path, "/logging/configuration/status") || strings.HasSuffix(path, "/logging/network/status") {
 			t.Fatalf("obsolete status endpoint requested: %s", path)
 		}
+	}
+}
+
+func TestSuccessfulNonJSONResponseFailsCollection(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/oauth/token" {
+			_, _ = w.Write([]byte(`{"access_token":"access","expires_in":3600}`))
+			return
+		}
+		_, _ = w.Write([]byte("upstream unavailable"))
+	}))
+	defer server.Close()
+	client := New(server.URL+"/api/v2", server.URL+"/oauth/token", "test", Credentials{ClientID: "id", ClientSecret: "secret"})
+	if _, err := client.Collect(context.Background(), "contacts"); err == nil || !strings.Contains(err.Error(), "valid JSON") {
+		t.Fatalf("expected invalid JSON error, got %v", err)
+	}
+}
+
+func TestOversizedSuccessfulResponseFailsCollection(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/oauth/token" {
+			_, _ = w.Write([]byte(`{"access_token":"access","expires_in":3600}`))
+			return
+		}
+		_, _ = w.Write([]byte(strconv.Quote(strings.Repeat("x", maxAPIResponseBytes))))
+	}))
+	defer server.Close()
+	client := New(server.URL+"/api/v2", server.URL+"/oauth/token", "test", Credentials{ClientID: "id", ClientSecret: "secret"})
+	if _, err := client.Collect(context.Background(), "contacts"); err == nil || !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("expected oversized response error, got %v", err)
+	}
+}
+
+func TestPaginationCannotLeaveConfiguredAPIOrigin(t *testing.T) {
+	var externalCalls int
+	external := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		externalCalls++
+		_, _ = w.Write([]byte(`{"devices":[]}`))
+	}))
+	defer external.Close()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/oauth/token" {
+			_, _ = w.Write([]byte(`{"access_token":"access","expires_in":3600}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"devices":[{"id":"1"}],"next":"` + external.URL + `/api/v2/tailnet/-/devices"}`))
+	}))
+	defer server.Close()
+	client := New(server.URL+"/api/v2", server.URL+"/oauth/token", "test", Credentials{ClientID: "id", ClientSecret: "secret"})
+	if _, err := client.Collect(context.Background(), "devices"); err == nil || !strings.Contains(err.Error(), "outside the configured Tailscale API") {
+		t.Fatalf("expected pagination origin error, got %v", err)
+	}
+	if externalCalls != 0 {
+		t.Fatalf("external pagination target was requested %d time(s)", externalCalls)
 	}
 }

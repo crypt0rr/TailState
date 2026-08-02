@@ -39,6 +39,11 @@ type HTTPError struct {
 	Body   string
 }
 
+const (
+	maxAPIResponseBytes   = 16 << 20
+	maxOAuthResponseBytes = 1 << 20
+)
+
 func (e *HTTPError) Error() string { return fmt.Sprintf("Tailscale GET returned %d", e.Status) }
 func IsUnsupported(err error) bool {
 	var e *HTTPError
@@ -46,8 +51,10 @@ func IsUnsupported(err error) bool {
 }
 
 func New(base, tokenURL, version string, credentials Credentials) *Client {
-	return &Client{base: strings.TrimRight(base, "/"), tokenURL: tokenURL, version: version, credentials: credentials, http: &http.Client{Timeout: 20 * time.Second}}
+	return &Client{base: strings.TrimRight(base, "/"), tokenURL: tokenURL, version: version, credentials: credentials, http: &http.Client{Timeout: 20 * time.Second, CheckRedirect: noRedirect}}
 }
+
+func noRedirect(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }
 
 func (c *Client) Test(ctx context.Context) error { _, err := c.Collect(ctx, "devices"); return err }
 
@@ -235,17 +242,39 @@ func (c *Client) allPages(ctx context.Context, endpoint, arrayKey string) ([]map
 		if candidate == "" {
 			return out, nil
 		}
-		parsed, err := url.Parse(candidate)
+		resolved, err := c.resolvePaginationURL(next, candidate)
 		if err != nil {
 			return nil, err
 		}
-		if !parsed.IsAbs() {
-			base, _ := url.Parse(next)
-			candidate = base.ResolveReference(parsed).String()
-		}
-		next = candidate
+		next = resolved
 	}
 	return nil, errors.New("tailscale pagination exceeded 100 pages")
+}
+
+func (c *Client) resolvePaginationURL(current, candidate string) (string, error) {
+	currentURL, err := url.Parse(current)
+	if err != nil {
+		return "", fmt.Errorf("invalid current pagination URL: %w", err)
+	}
+	pageURL, err := url.Parse(candidate)
+	if err != nil {
+		return "", fmt.Errorf("invalid pagination URL: %w", err)
+	}
+	if !pageURL.IsAbs() {
+		pageURL = currentURL.ResolveReference(pageURL)
+	}
+	apiURL, err := url.Parse(c.base)
+	if err != nil {
+		return "", fmt.Errorf("invalid Tailscale API URL: %w", err)
+	}
+	if pageURL.User != nil || !strings.EqualFold(pageURL.Scheme, apiURL.Scheme) || !strings.EqualFold(pageURL.Host, apiURL.Host) {
+		return "", errors.New("pagination URL points outside the configured Tailscale API")
+	}
+	apiPath := strings.TrimSuffix(apiURL.Path, "/")
+	if apiPath != "" && pageURL.Path != apiPath && !strings.HasPrefix(pageURL.Path, apiPath+"/") {
+		return "", errors.New("pagination URL points outside the configured Tailscale API path")
+	}
+	return pageURL.String(), nil
 }
 
 func nextURL(object map[string]any) string {
@@ -286,10 +315,13 @@ func (c *Client) get(ctx context.Context, endpoint string) (any, error) {
 			}
 			return nil, err
 		}
-		body, readErr := io.ReadAll(io.LimitReader(resp.Body, 16<<20))
+		body, readErr := io.ReadAll(io.LimitReader(resp.Body, maxAPIResponseBytes+1))
 		resp.Body.Close()
 		if readErr != nil {
 			return nil, readErr
+		}
+		if len(body) > maxAPIResponseBytes {
+			return nil, fmt.Errorf("tailscale response exceeds %d bytes", maxAPIResponseBytes)
 		}
 		if resp.StatusCode == 401 && attempt == 0 {
 			c.mu.Lock()
@@ -312,7 +344,7 @@ func (c *Client) get(ctx context.Context, endpoint string) (any, error) {
 		}
 		var value any
 		if err := json.Unmarshal(body, &value); err != nil {
-			return string(body), nil
+			return nil, fmt.Errorf("tailscale response was not valid JSON: %w", err)
 		}
 		return value, nil
 	}
@@ -337,9 +369,12 @@ func (c *Client) accessToken(ctx context.Context) (string, error) {
 		return "", err
 	}
 	defer resp.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxOAuthResponseBytes+1))
 	if err != nil {
 		return "", err
+	}
+	if len(body) > maxOAuthResponseBytes {
+		return "", fmt.Errorf("OAuth response exceeds %d bytes", maxOAuthResponseBytes)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return "", fmt.Errorf("OAuth token request returned %d", resp.StatusCode)

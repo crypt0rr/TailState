@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/crypt0rr/tailstate/internal/model"
 )
@@ -42,5 +43,23 @@ func TestPermanentError(t *testing.T) {
 	delivery, ok := err.(*DeliveryError)
 	if !ok || !delivery.Permanent() {
 		t.Fatalf("expected permanent delivery error: %v", err)
+	}
+}
+
+func TestSendAcceptsAnySuccessfulHTTPStatus(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	if err := New().Send(context.Background(), server.URL, "test"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRetryAfterAcceptsHTTPDate(t *testing.T) {
+	want := time.Now().Add(2 * time.Second)
+	delay := retryAfter(want.UTC().Format(http.TimeFormat))
+	if delay <= 0 {
+		t.Fatalf("expected positive retry delay, got %s", delay)
 	}
 }

@@ -6,8 +6,10 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/crypt0rr/tailstate/internal/boot"
 	"github.com/crypt0rr/tailstate/internal/monitor"
@@ -72,5 +74,43 @@ func TestReadyBeforeSetup(t *testing.T) {
 	server.Handler().ServeHTTP(response, request)
 	if response.Code != http.StatusServiceUnavailable {
 		t.Fatalf("ready status %d", response.Code)
+	}
+}
+
+func TestLoginAttemptTrackingIsBoundedAndPruned(t *testing.T) {
+	server, _, _ := testServer(t)
+	now := time.Now()
+	for i := 0; i < maxTrackedLoginIPs+100; i++ {
+		server.loginAttempts["ip-"+strconv.Itoa(i)] = []time.Time{now}
+	}
+	server.loginAttempts["stale"] = []time.Time{now.Add(-16 * time.Minute)}
+	server.rateLimited("new-ip")
+	server.recordFailure("new-ip")
+	if _, ok := server.loginAttempts["stale"]; ok {
+		t.Fatal("stale login attempt state was retained")
+	}
+	if len(server.loginAttempts) > maxTrackedLoginIPs {
+		t.Fatalf("login attempt state exceeded bound: %d", len(server.loginAttempts))
+	}
+}
+
+func TestMetricsExposeCollectorHealthWithoutErrorDetails(t *testing.T) {
+	server, st, _ := testServer(t)
+	generation, err := st.SaveSettings(context.Background(), store.Settings{Tailnet: "-", OAuthClientID: "client", OAuthClientSecret: "secret", MattermostURL: "https://mattermost.example/hooks/x", DeviceInterval: time.Minute, InventoryInterval: 5 * time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := st.RecordCollectorFailure(context.Background(), generation, "devices", "secret response must not be exported"); err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+	body := response.Body.String()
+	if response.Code != http.StatusOK || !strings.Contains(body, `tailstate_collector_failures{collector="devices"} 1`) {
+		t.Fatalf("collector metric missing: status=%d body=%s", response.Code, body)
+	}
+	if strings.Contains(body, "secret response") {
+		t.Fatal("collector error details leaked into metrics")
 	}
 }

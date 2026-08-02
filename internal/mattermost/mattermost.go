@@ -16,7 +16,11 @@ import (
 
 type Sender struct{ client *http.Client }
 
-func New() *Sender { return &Sender{client: &http.Client{Timeout: 15 * time.Second}} }
+func New() *Sender {
+	return &Sender{client: &http.Client{Timeout: 15 * time.Second, CheckRedirect: noRedirect}}
+}
+
+func noRedirect(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }
 
 type DeliveryError struct {
 	Status     int
@@ -42,11 +46,8 @@ func (s *Sender) Send(ctx context.Context, webhookURL, text string) error {
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
-	if resp.StatusCode != http.StatusOK {
-		retry := time.Duration(0)
-		if seconds, e := strconv.Atoi(resp.Header.Get("Retry-After")); e == nil {
-			retry = time.Duration(seconds) * time.Second
-		}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		retry := retryAfter(resp.Header.Get("Retry-After"))
 		return &DeliveryError{Status: resp.StatusCode, RetryAfter: retry, Message: fmt.Sprintf("Mattermost returned %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))}
 	}
 	return nil
@@ -106,4 +107,14 @@ func short(value any) string {
 		text = text[:179] + "…"
 	}
 	return escape(text)
+}
+
+func retryAfter(value string) time.Duration {
+	if seconds, err := strconv.Atoi(value); err == nil && seconds >= 0 {
+		return time.Duration(seconds) * time.Second
+	}
+	if when, err := http.ParseTime(value); err == nil {
+		return max(time.Until(when), 0)
+	}
+	return 0
 }

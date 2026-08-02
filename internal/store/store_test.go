@@ -127,7 +127,7 @@ func TestNewerSchemaVersionFailsClosed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Exec("UPDATE schema_version SET version=2"); err != nil {
+	if _, err := db.Exec("UPDATE schema_version SET version=3"); err != nil {
 		db.Close()
 		t.Fatal(err)
 	}

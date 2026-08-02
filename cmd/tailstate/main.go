@@ -13,8 +13,8 @@ import (
 	"time"
 
 	"github.com/crypt0rr/tailstate/internal/boot"
-	"github.com/crypt0rr/tailstate/internal/mattermost"
 	"github.com/crypt0rr/tailstate/internal/monitor"
+	"github.com/crypt0rr/tailstate/internal/notify"
 	"github.com/crypt0rr/tailstate/internal/secret"
 	"github.com/crypt0rr/tailstate/internal/store"
 	webui "github.com/crypt0rr/tailstate/internal/web"
@@ -95,7 +95,7 @@ func serve() error {
 		}
 		slog.Warn("installation is unclaimed; open /setup and use the one-time setup token", "setup_token", token)
 	}
-	notified, err := st.TrackAppVersion(ctx, version, mattermost.Update)
+	notified, err := st.TrackAppVersion(ctx, version, notify.Update)
 	if err != nil {
 		return fmt.Errorf("track TailState version: %w", err)
 	}

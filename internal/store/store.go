@@ -15,6 +15,7 @@ import (
 	_ "modernc.org/sqlite"
 
 	"github.com/crypt0rr/tailstate/internal/model"
+	"github.com/crypt0rr/tailstate/internal/notify"
 	"github.com/crypt0rr/tailstate/internal/secret"
 )
 
@@ -27,12 +28,24 @@ type Settings struct {
 	Tailnet           string
 	OAuthClientID     string
 	OAuthClientSecret string
+	// MattermostURL is retained for source compatibility with older callers.
+	// New configuration is stored through NotificationDestination APIs.
 	MattermostURL     string
 	DeviceInterval    time.Duration
 	InventoryInterval time.Duration
 	Generation        int64
 	ConfiguredAt      time.Time
 	BaselineAt        *time.Time
+}
+
+type NotificationDestination struct {
+	ID         int64
+	Name       string
+	ServiceURL string
+	Enabled    bool
+	CreatedAt  time.Time
+	UpdatedAt  time.Time
+	DeletedAt  *time.Time
 }
 
 type CollectorState struct {
@@ -46,22 +59,26 @@ type CollectorState struct {
 }
 
 type Status struct {
-	Configured     bool
-	BaselineAt     *time.Time
-	ResourceCounts map[string]int
-	Collectors     []CollectorState
-	Pending        int
-	Dead           int
+	Configured          bool
+	BaselineAt          *time.Time
+	ResourceCounts      map[string]int
+	Collectors          []CollectorState
+	Pending             int
+	Dead                int
+	Destinations        int
+	EnabledDestinations int
 }
 
 type OutboxItem struct {
-	ID           int64
-	Payload      string
-	Attempts     int
-	FirstAttempt time.Time
+	ID            int64
+	DestinationID int64
+	Destination   NotificationDestination
+	Payload       string
+	Attempts      int
+	FirstAttempt  time.Time
 }
 
-const currentSchemaVersion = 1
+const currentSchemaVersion = 2
 
 func Open(path string, box *secret.Box) (*Store, error) {
 	if err := os.MkdirAll(filepathDir(path), 0o700); err != nil {
@@ -77,7 +94,7 @@ func Open(path string, box *secret.Box) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("migrate database: %w", err)
 	}
-	if err := migrateSchema(db); err != nil {
+	if err := migrateSchema(db, box); err != nil {
 		db.Close()
 		return nil, err
 	}
@@ -114,7 +131,7 @@ func Open(path string, box *secret.Box) (*Store, error) {
 // migrateSchema keeps startup safe as the on-disk schema evolves. The schema
 // bootstrap is intentionally idempotent; versioned migrations belong here so
 // a future release cannot silently run against an incompatible database.
-func migrateSchema(db *sql.DB) error {
+func migrateSchema(db *sql.DB, box *secret.Box) error {
 	var version int
 	if err := db.QueryRow("SELECT version FROM schema_version ORDER BY version DESC LIMIT 1").Scan(&version); err != nil {
 		return fmt.Errorf("read database schema version: %w", err)
@@ -125,7 +142,90 @@ func migrateSchema(db *sql.DB) error {
 	if version == currentSchemaVersion {
 		return nil
 	}
-	return fmt.Errorf("database schema version %d requires a newer migration path", version)
+	if version != 1 {
+		return fmt.Errorf("database schema version %d requires a newer migration path", version)
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin schema migration: %w", err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`CREATE TABLE IF NOT EXISTS notification_destinations (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		name TEXT NOT NULL,
+		service_url_enc TEXT NOT NULL,
+		enabled INTEGER NOT NULL DEFAULT 1,
+		created_at TEXT NOT NULL,
+		updated_at TEXT NOT NULL,
+		deleted_at TEXT
+	)`); err != nil {
+		return fmt.Errorf("create notification destinations: %w", err)
+	}
+	var hasDestination bool
+	rows, err := tx.Query("PRAGMA table_info(outbox)")
+	if err != nil {
+		return fmt.Errorf("inspect outbox schema: %w", err)
+	}
+	for rows.Next() {
+		var cid int
+		var name, typ string
+		var notnull, pk int
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &typ, &notnull, &defaultValue, &pk); err != nil {
+			rows.Close()
+			return err
+		}
+		if name == "destination_id" {
+			hasDestination = true
+		}
+	}
+	rows.Close()
+	if !hasDestination {
+		if _, err := tx.Exec("ALTER TABLE outbox ADD COLUMN destination_id INTEGER"); err != nil {
+			return fmt.Errorf("upgrade outbox destinations: %w", err)
+		}
+	}
+	var legacyEnc string
+	err = tx.QueryRow("SELECT mattermost_url_enc FROM settings WHERE id=1").Scan(&legacyEnc)
+	if errors.Is(err, sql.ErrNoRows) {
+		legacyEnc = ""
+	} else if err != nil {
+		return fmt.Errorf("read legacy Mattermost setting: %w", err)
+	}
+	var destinationID int64
+	if legacyEnc != "" {
+		legacyURL, err := box.Decrypt(legacyEnc)
+		if err != nil {
+			return fmt.Errorf("decrypt legacy Mattermost setting: %w", err)
+		}
+		converted, err := notify.ConvertLegacyMattermostURL(legacyURL)
+		if err != nil {
+			return fmt.Errorf("migrate legacy Mattermost setting: %w", err)
+		}
+		convertedEnc, err := box.Encrypt(converted)
+		if err != nil {
+			return fmt.Errorf("encrypt migrated notification destination: %w", err)
+		}
+		now := time.Now().UTC().Format(time.RFC3339Nano)
+		result, err := tx.Exec("INSERT INTO notification_destinations(name,service_url_enc,enabled,created_at,updated_at) VALUES(?,?,1,?,?)", "Mattermost", convertedEnc, now, now)
+		if err != nil {
+			return fmt.Errorf("store migrated notification destination: %w", err)
+		}
+		destinationID, err = result.LastInsertId()
+		if err != nil {
+			return err
+		}
+		if _, err := tx.Exec("UPDATE outbox SET destination_id=? WHERE destination_id IS NULL", destinationID); err != nil {
+			return fmt.Errorf("assign migrated outbox rows: %w", err)
+		}
+	}
+	if _, err := tx.Exec("UPDATE schema_version SET version=2"); err != nil {
+		return fmt.Errorf("record schema migration: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit schema migration: %w", err)
+	}
+	return nil
 }
 
 func filepathDir(path string) string {
@@ -332,17 +432,13 @@ func (s *Store) SaveSettings(ctx context.Context, in Settings) (int64, error) {
 	if strings.TrimSpace(in.Tailnet) == "" {
 		in.Tailnet = "-"
 	}
-	if in.OAuthClientID == "" || in.OAuthClientSecret == "" || in.MattermostURL == "" {
-		return 0, errors.New("OAuth credentials and Mattermost URL are required")
+	if in.OAuthClientID == "" || in.OAuthClientSecret == "" {
+		return 0, errors.New("OAuth credentials are required")
 	}
 	if in.DeviceInterval < 15*time.Second || in.InventoryInterval < 30*time.Second {
 		return 0, errors.New("poll intervals are too short")
 	}
 	secretEnc, err := s.box.Encrypt(in.OAuthClientSecret)
-	if err != nil {
-		return 0, err
-	}
-	urlEnc, err := s.box.Encrypt(in.MattermostURL)
 	if err != nil {
 		return 0, err
 	}
@@ -354,8 +450,10 @@ func (s *Store) SaveSettings(ctx context.Context, in Settings) (int64, error) {
 	var oldTailnet, oldClient, oldSecretEnc string
 	var generation int64
 	generationChanged := false
+	settingsExists := true
 	err = tx.QueryRowContext(ctx, "SELECT tailnet,oauth_client_id,oauth_secret_enc,generation FROM settings WHERE id=1").Scan(&oldTailnet, &oldClient, &oldSecretEnc, &generation)
 	if errors.Is(err, sql.ErrNoRows) {
+		settingsExists = false
 		generation = 1
 	} else if err != nil {
 		return 0, err
@@ -369,9 +467,35 @@ func (s *Store) SaveSettings(ctx context.Context, in Settings) (int64, error) {
 			generationChanged = true
 		}
 	}
+	legacyURLEnc := ""
+	if err := tx.QueryRowContext(ctx, "SELECT COALESCE(mattermost_url_enc,'') FROM settings WHERE id=1").Scan(&legacyURLEnc); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return 0, err
+	}
+	if in.MattermostURL != "" {
+		converted, convertErr := notify.ConvertLegacyMattermostURL(in.MattermostURL)
+		if convertErr != nil {
+			return 0, convertErr
+		}
+		legacyURLEnc, err = s.box.Encrypt(in.MattermostURL)
+		if err != nil {
+			return 0, err
+		}
+		if _, err := upsertDestinationTx(ctx, tx, s.box, 0, "Mattermost", converted, true); err != nil {
+			return 0, err
+		}
+	}
+	if in.MattermostURL == "" && !settingsExists {
+		var enabled int
+		if err := tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM notification_destinations WHERE enabled=1 AND deleted_at IS NULL").Scan(&enabled); err != nil {
+			return 0, err
+		}
+		if enabled == 0 {
+			return 0, errors.New("at least one enabled notification destination is required")
+		}
+	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	_, err = tx.ExecContext(ctx, `INSERT INTO settings(id,tailnet,oauth_client_id,oauth_secret_enc,mattermost_url_enc,device_interval_seconds,inventory_interval_seconds,generation,configured_at,baseline_at)
-	VALUES(1,?,?,?,?,?,?,?,?,NULL) ON CONFLICT(id) DO UPDATE SET tailnet=excluded.tailnet,oauth_client_id=excluded.oauth_client_id,oauth_secret_enc=excluded.oauth_secret_enc,mattermost_url_enc=excluded.mattermost_url_enc,device_interval_seconds=excluded.device_interval_seconds,inventory_interval_seconds=excluded.inventory_interval_seconds,generation=excluded.generation,configured_at=excluded.configured_at,baseline_at=CASE WHEN settings.generation=excluded.generation THEN settings.baseline_at ELSE NULL END`, in.Tailnet, in.OAuthClientID, secretEnc, urlEnc, int64(in.DeviceInterval.Seconds()), int64(in.InventoryInterval.Seconds()), generation, now)
+	VALUES(1,?,?,?,?,?,?,?,?,NULL) ON CONFLICT(id) DO UPDATE SET tailnet=excluded.tailnet,oauth_client_id=excluded.oauth_client_id,oauth_secret_enc=excluded.oauth_secret_enc,mattermost_url_enc=CASE WHEN excluded.mattermost_url_enc='' THEN settings.mattermost_url_enc ELSE excluded.mattermost_url_enc END,device_interval_seconds=excluded.device_interval_seconds,inventory_interval_seconds=excluded.inventory_interval_seconds,generation=excluded.generation,configured_at=excluded.configured_at,baseline_at=CASE WHEN settings.generation=excluded.generation THEN settings.baseline_at ELSE NULL END`, in.Tailnet, in.OAuthClientID, secretEnc, legacyURLEnc, int64(in.DeviceInterval.Seconds()), int64(in.InventoryInterval.Seconds()), generation, now)
 	if err != nil {
 		return 0, err
 	}
@@ -401,9 +525,11 @@ func (s *Store) Settings(ctx context.Context) (Settings, error) {
 	if err != nil {
 		return Settings{}, err
 	}
-	out.MattermostURL, err = s.box.Decrypt(urlEnc)
-	if err != nil {
-		return Settings{}, err
+	if urlEnc != "" {
+		out.MattermostURL, err = s.box.Decrypt(urlEnc)
+		if err != nil {
+			return Settings{}, err
+		}
 	}
 	out.DeviceInterval = time.Duration(device) * time.Second
 	out.InventoryInterval = time.Duration(inventory) * time.Second
@@ -413,6 +539,165 @@ func (s *Store) Settings(ctx context.Context) (Settings, error) {
 		out.BaselineAt = &t
 	}
 	return out, nil
+}
+
+// ListDestinations returns active notification destinations. Pass true to
+// include soft-deleted destinations (their encrypted URLs are still decrypted
+// only inside the process and are never rendered by the web layer).
+func (s *Store) ListDestinations(ctx context.Context, includeDeleted ...bool) ([]NotificationDestination, error) {
+	query := "SELECT id,name,service_url_enc,enabled,created_at,updated_at,COALESCE(deleted_at,'') FROM notification_destinations"
+	if len(includeDeleted) == 0 || !includeDeleted[0] {
+		query += " WHERE deleted_at IS NULL"
+	}
+	query += " ORDER BY id"
+	rows, err := s.db.QueryContext(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []NotificationDestination
+	for rows.Next() {
+		var d NotificationDestination
+		var encrypted, created, updated, deleted string
+		var enabled int
+		if err := rows.Scan(&d.ID, &d.Name, &encrypted, &enabled, &created, &updated, &deleted); err != nil {
+			return nil, err
+		}
+		d.ServiceURL, err = s.box.Decrypt(encrypted)
+		if err != nil {
+			return nil, err
+		}
+		d.Enabled = enabled == 1
+		d.CreatedAt, _ = time.Parse(time.RFC3339Nano, created)
+		d.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updated)
+		if deleted != "" {
+			value, parseErr := time.Parse(time.RFC3339Nano, deleted)
+			if parseErr == nil {
+				d.DeletedAt = &value
+			}
+		}
+		out = append(out, d)
+	}
+	return out, rows.Err()
+}
+
+// SaveDestination creates or updates a destination. The URL is validated
+// before it is encrypted and stored.
+func (s *Store) SaveDestination(ctx context.Context, destination NotificationDestination) (int64, error) {
+	destination.Name = strings.TrimSpace(destination.Name)
+	destination.ServiceURL = strings.TrimSpace(destination.ServiceURL)
+	if destination.Name == "" {
+		return 0, errors.New("destination name is required")
+	}
+	if err := notify.Validate(destination.ServiceURL); err != nil {
+		return 0, err
+	}
+	encrypted, err := s.box.Encrypt(destination.ServiceURL)
+	if err != nil {
+		return 0, err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	id, err := upsertDestinationTx(ctx, tx, s.box, destination.ID, destination.Name, destination.ServiceURL, destination.Enabled)
+	if err != nil {
+		return 0, err
+	}
+	if _, err := tx.ExecContext(ctx, "UPDATE notification_destinations SET service_url_enc=? WHERE id=?", encrypted, id); err != nil {
+		return 0, err
+	}
+	if !destination.Enabled {
+		if _, err := tx.ExecContext(ctx, "UPDATE outbox SET status='dead',last_error='destination disabled' WHERE destination_id=? AND status='pending'", id); err != nil {
+			return 0, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return id, nil
+}
+
+// SetDestinationEnabled changes delivery state. Pending rows are dead-lettered
+// when a destination is disabled so they cannot resume unexpectedly.
+func (s *Store) SetDestinationEnabled(ctx context.Context, id int64, enabled bool) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	result, err := tx.ExecContext(ctx, "UPDATE notification_destinations SET enabled=?,updated_at=? WHERE id=? AND deleted_at IS NULL", boolInt(enabled), now, id)
+	if err != nil {
+		return err
+	}
+	if n, _ := result.RowsAffected(); n == 0 {
+		return errors.New("notification destination not found")
+	}
+	if !enabled {
+		if _, err := tx.ExecContext(ctx, "UPDATE outbox SET status='dead',last_error='destination disabled' WHERE destination_id=? AND status='pending'", id); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// DeleteDestination soft-deletes a destination and dead-letters its pending
+// notifications. Historical rows remain available for audit and retention.
+func (s *Store) DeleteDestination(ctx context.Context, id int64) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	result, err := tx.ExecContext(ctx, "UPDATE notification_destinations SET enabled=0,deleted_at=?,updated_at=? WHERE id=? AND deleted_at IS NULL", now, now, id)
+	if err != nil {
+		return err
+	}
+	if n, _ := result.RowsAffected(); n == 0 {
+		return errors.New("notification destination not found")
+	}
+	if _, err := tx.ExecContext(ctx, "UPDATE outbox SET status='dead',last_error='destination removed' WHERE destination_id=? AND status='pending'", id); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func upsertDestinationTx(ctx context.Context, tx *sql.Tx, box *secret.Box, id int64, name, serviceURL string, enabled bool) (int64, error) {
+	encoded, err := box.Encrypt(serviceURL)
+	if err != nil {
+		return 0, err
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if id == 0 {
+		if name == "Mattermost" {
+			_ = tx.QueryRowContext(ctx, "SELECT id FROM notification_destinations WHERE name=? AND deleted_at IS NULL ORDER BY id LIMIT 1", name).Scan(&id)
+		}
+	}
+	if id > 0 {
+		result, err := tx.ExecContext(ctx, "UPDATE notification_destinations SET name=?,service_url_enc=?,enabled=?,updated_at=?,deleted_at=NULL WHERE id=?", name, encoded, boolInt(enabled), now, id)
+		if err != nil {
+			return 0, err
+		}
+		if n, _ := result.RowsAffected(); n == 0 {
+			return 0, errors.New("notification destination not found")
+		}
+		return id, nil
+	}
+	result, err := tx.ExecContext(ctx, "INSERT INTO notification_destinations(name,service_url_enc,enabled,created_at,updated_at) VALUES(?,?,?,?,?)", name, encoded, boolInt(enabled), now, now)
+	if err != nil {
+		return 0, err
+	}
+	return result.LastInsertId()
+}
+
+func boolInt(value bool) int {
+	if value {
+		return 1
+	}
+	return 0
 }
 
 func (s *Store) TrackAppVersion(ctx context.Context, current string, notification func(previous, current string) string) (bool, error) {
@@ -446,11 +731,15 @@ func (s *Store) TrackAppVersion(ctx context.Context, current string, notificatio
 	if err = tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM settings").Scan(&configured); err != nil {
 		return false, err
 	}
-	notified := configured > 0
+	var enabledDestinations int
+	if err = tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM notification_destinations WHERE enabled=1 AND deleted_at IS NULL").Scan(&enabledDestinations); err != nil {
+		return false, err
+	}
+	notified := configured > 0 && enabledDestinations > 0
 	if notified {
 		now := time.Now().UTC().Format(time.RFC3339Nano)
 		payload := notification(previous, current)
-		if _, err = tx.ExecContext(ctx, "INSERT INTO outbox(payload,status,next_attempt,first_attempt,created_at) VALUES(?,'pending',?,?,?)", payload, now, now, now); err != nil {
+		if err = enqueueOutboxTx(ctx, tx, payload, now); err != nil {
 			return false, err
 		}
 	}
@@ -578,8 +867,7 @@ func (s *Store) ApplyBatch(ctx context.Context, generation int64, results []mode
 	}
 	if len(changes) > 0 {
 		payload := digest(changes)
-		_, err = tx.ExecContext(ctx, "INSERT INTO outbox(payload,status,next_attempt,first_attempt,created_at) VALUES(?,'pending',?,?,?)", payload, now.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano))
-		if err != nil {
+		if err = enqueueOutboxTx(ctx, tx, payload, now.Format(time.RFC3339Nano)); err != nil {
 			return nil, err
 		}
 	}
@@ -638,12 +926,21 @@ func (s *Store) CollectorWasUnhealthy(ctx context.Context, generation int64, col
 
 func (s *Store) EnqueueSystem(ctx context.Context, payload string) error {
 	now := time.Now().UTC().Format(time.RFC3339Nano)
-	_, err := s.db.ExecContext(ctx, "INSERT INTO outbox(payload,status,next_attempt,first_attempt,created_at) VALUES(?,'pending',?,?,?)", payload, now, now, now)
-	return err
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := enqueueOutboxTx(ctx, tx, payload, now); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (s *Store) DueOutbox(ctx context.Context, limit int) ([]OutboxItem, error) {
-	rows, err := s.db.QueryContext(ctx, "SELECT id,payload,attempts,first_attempt FROM outbox WHERE status='pending' AND next_attempt<=? ORDER BY id LIMIT ?", time.Now().UTC().Format(time.RFC3339Nano), limit)
+	rows, err := s.db.QueryContext(ctx, `SELECT o.id,o.destination_id,o.payload,o.attempts,o.first_attempt,d.name,d.service_url_enc,d.enabled,d.created_at,d.updated_at,COALESCE(d.deleted_at,'')
+		FROM outbox o JOIN notification_destinations d ON d.id=o.destination_id
+		WHERE o.status='pending' AND o.next_attempt<=? AND d.enabled=1 AND d.deleted_at IS NULL ORDER BY o.id LIMIT ?`, time.Now().UTC().Format(time.RFC3339Nano), limit)
 	if err != nil {
 		return nil, err
 	}
@@ -651,20 +948,58 @@ func (s *Store) DueOutbox(ctx context.Context, limit int) ([]OutboxItem, error) 
 	var out []OutboxItem
 	for rows.Next() {
 		var item OutboxItem
-		var first string
-		if err := rows.Scan(&item.ID, &item.Payload, &item.Attempts, &first); err != nil {
+		var first, encrypted, created, updated, deleted, name string
+		var enabled int
+		if err := rows.Scan(&item.ID, &item.DestinationID, &item.Payload, &item.Attempts, &first, &name, &encrypted, &enabled, &created, &updated, &deleted); err != nil {
 			return nil, err
 		}
 		item.FirstAttempt, _ = time.Parse(time.RFC3339Nano, first)
+		item.Destination = NotificationDestination{ID: item.DestinationID, Name: name, Enabled: enabled == 1}
+		item.Destination.ServiceURL, err = s.box.Decrypt(encrypted)
+		if err != nil {
+			return nil, err
+		}
+		item.Destination.CreatedAt, _ = time.Parse(time.RFC3339Nano, created)
+		item.Destination.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updated)
+		if deleted != "" {
+			value, parseErr := time.Parse(time.RFC3339Nano, deleted)
+			if parseErr == nil {
+				item.Destination.DeletedAt = &value
+			}
+		}
 		out = append(out, item)
 	}
 	return out, rows.Err()
+}
+
+func enqueueOutboxTx(ctx context.Context, tx *sql.Tx, payload, now string) error {
+	rows, err := tx.QueryContext(ctx, "SELECT id FROM notification_destinations WHERE enabled=1 AND deleted_at IS NULL ORDER BY id")
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var destinationID int64
+		if err := rows.Scan(&destinationID); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO outbox(destination_id,payload,status,next_attempt,first_attempt,created_at) VALUES(? ,?,'pending',?,?,?)", destinationID, payload, now, now, now); err != nil {
+			return err
+		}
+	}
+	return rows.Err()
 }
 func (s *Store) Delivered(ctx context.Context, id int64) error {
 	_, err := s.db.ExecContext(ctx, "UPDATE outbox SET status='delivered',delivered_at=?,last_error='' WHERE id=?", time.Now().UTC().Format(time.RFC3339Nano), id)
 	return err
 }
 func (s *Store) Retry(ctx context.Context, id int64, next time.Time, message string, dead bool) error {
+	var encrypted string
+	if err := s.db.QueryRowContext(ctx, "SELECT d.service_url_enc FROM outbox o JOIN notification_destinations d ON d.id=o.destination_id WHERE o.id=?", id).Scan(&encrypted); err == nil {
+		if destinationURL, decryptErr := s.box.Decrypt(encrypted); decryptErr == nil {
+			message = strings.ReplaceAll(message, destinationURL, notify.RedactURL(destinationURL))
+		}
+	}
 	status := "pending"
 	if dead {
 		status = "dead"
@@ -739,6 +1074,12 @@ func (s *Store) Status(ctx context.Context) (Status, error) {
 		return out, err
 	}
 	if err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM outbox WHERE status='dead'").Scan(&out.Dead); err != nil {
+		return out, err
+	}
+	if err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM notification_destinations WHERE deleted_at IS NULL").Scan(&out.Destinations); err != nil {
+		return out, err
+	}
+	if err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM notification_destinations WHERE deleted_at IS NULL AND enabled=1").Scan(&out.EnabledDestinations); err != nil {
 		return out, err
 	}
 	return out, nil

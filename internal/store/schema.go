@@ -3,7 +3,7 @@ package store
 const schema = `
 PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);
-INSERT INTO schema_version(version) SELECT 1 WHERE NOT EXISTS (SELECT 1 FROM schema_version);
+INSERT INTO schema_version(version) SELECT 2 WHERE NOT EXISTS (SELECT 1 FROM schema_version);
 
 CREATE TABLE IF NOT EXISTS meta (
   key TEXT PRIMARY KEY,
@@ -33,6 +33,16 @@ CREATE TABLE IF NOT EXISTS settings (
   configured_at TEXT NOT NULL,
   baseline_at TEXT
 );
+CREATE TABLE IF NOT EXISTS notification_destinations (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  service_url_enc TEXT NOT NULL,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  deleted_at TEXT
+);
+CREATE INDEX IF NOT EXISTS notification_destinations_enabled ON notification_destinations(enabled, deleted_at);
 CREATE TABLE IF NOT EXISTS collector_state (
   generation INTEGER NOT NULL,
   collector TEXT NOT NULL,
@@ -70,6 +80,7 @@ CREATE TABLE IF NOT EXISTS events (
 CREATE INDEX IF NOT EXISTS events_observed_at ON events(observed_at);
 CREATE TABLE IF NOT EXISTS outbox (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
+  destination_id INTEGER NOT NULL,
   payload TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT 'pending',
   attempts INTEGER NOT NULL DEFAULT 0,

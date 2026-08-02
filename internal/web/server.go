@@ -35,6 +35,8 @@ type Server struct {
 	loginAttempts map[string][]time.Time
 }
 
+const maxTrackedLoginIPs = 4096
+
 type pageData struct {
 	Error, Message, CSRF            string
 	Configured                      bool
@@ -158,7 +160,9 @@ func (s *Server) claim(w http.ResponseWriter, r *http.Request) {
 		s.render(w, "setup", pageData{Error: err.Error()})
 		return
 	}
-	s.startSession(w, r)
+	if !s.startSession(w, r) {
+		return
+	}
 	http.Redirect(w, r, "/settings", http.StatusSeeOther)
 }
 func (s *Server) login(w http.ResponseWriter, r *http.Request) {
@@ -186,7 +190,9 @@ func (s *Server) loginPost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.clearFailures(ip)
-	s.startSession(w, r)
+	if !s.startSession(w, r) {
+		return
+	}
 	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 func (s *Server) logout(w http.ResponseWriter, r *http.Request) {
@@ -316,19 +322,37 @@ func (s *Server) metrics(w http.ResponseWriter, r *http.Request) {
 	}
 	fmt.Fprintf(w, "# HELP tailstate_ready Whether setup and baseline are complete.\n# TYPE tailstate_ready gauge\ntailstate_ready %d\n", ready)
 	fmt.Fprintf(w, "# TYPE tailstate_outbox_pending gauge\ntailstate_outbox_pending %d\n# TYPE tailstate_outbox_dead gauge\ntailstate_outbox_dead %d\n", status.Pending, status.Dead)
+	fmt.Fprint(w, "# TYPE tailstate_collector_supported gauge\n# TYPE tailstate_collector_baseline gauge\n# TYPE tailstate_collector_failures gauge\n# TYPE tailstate_collector_last_success_timestamp_seconds gauge\n# TYPE tailstate_collector_next_poll_timestamp_seconds gauge\n")
+	for _, collector := range status.Collectors {
+		supported, baseline := 0, 0
+		if collector.Supported {
+			supported = 1
+		}
+		if collector.Baseline {
+			baseline = 1
+		}
+		fmt.Fprintf(w, "tailstate_collector_supported{collector=%q} %d\ntailstate_collector_baseline{collector=%q} %d\ntailstate_collector_failures{collector=%q} %d\n", collector.Name, supported, collector.Name, baseline, collector.Name, collector.FailureCount)
+		if collector.LastSuccess != nil {
+			fmt.Fprintf(w, "tailstate_collector_last_success_timestamp_seconds{collector=%q} %d\n", collector.Name, collector.LastSuccess.Unix())
+		}
+		if collector.NextPoll != nil {
+			fmt.Fprintf(w, "tailstate_collector_next_poll_timestamp_seconds{collector=%q} %d\n", collector.Name, collector.NextPoll.Unix())
+		}
+	}
 	for collector, count := range status.ResourceCounts {
 		fmt.Fprintf(w, "tailstate_resources{collector=%q} %d\n", collector, count)
 	}
 }
 
-func (s *Server) startSession(w http.ResponseWriter, r *http.Request) {
+func (s *Server) startSession(w http.ResponseWriter, r *http.Request) bool {
 	token, csrf, err := s.store.CreateSession(r.Context())
 	if err != nil {
 		http.Error(w, "create session", http.StatusInternalServerError)
-		return
+		return false
 	}
 	http.SetCookie(w, &http.Cookie{Name: "tailstate_session", Value: token, Path: "/", MaxAge: 43200, HttpOnly: true, Secure: s.config.CookieSecure, SameSite: http.SameSiteStrictMode})
 	http.SetCookie(w, &http.Cookie{Name: "tailstate_csrf", Value: csrf, Path: "/", MaxAge: 43200, HttpOnly: false, Secure: s.config.CookieSecure, SameSite: http.SameSiteStrictMode})
+	return true
 }
 func (s *Server) clearCookies(w http.ResponseWriter) {
 	for _, name := range []string{"tailstate_session", "tailstate_csrf"} {
@@ -368,26 +392,67 @@ func (s *Server) requireAuth(w http.ResponseWriter, r *http.Request, csrf bool) 
 func (s *Server) rateLimited(ip string) bool {
 	s.loginMu.Lock()
 	defer s.loginMu.Unlock()
-	cutoff := time.Now().Add(-15 * time.Minute)
-	attempts := s.loginAttempts[ip]
+	now := time.Now()
+	cutoff := now.Add(-15 * time.Minute)
+	s.pruneLoginAttemptsLocked(cutoff)
+	attempts, exists := s.loginAttempts[ip]
+	if !exists {
+		return false
+	}
 	kept := attempts[:0]
 	for _, at := range attempts {
 		if at.After(cutoff) {
 			kept = append(kept, at)
 		}
 	}
-	s.loginAttempts[ip] = kept
+	if len(kept) == 0 {
+		delete(s.loginAttempts, ip)
+	} else {
+		s.loginAttempts[ip] = kept
+	}
 	return len(kept) >= 5
 }
 func (s *Server) recordFailure(ip string) {
 	s.loginMu.Lock()
 	defer s.loginMu.Unlock()
-	s.loginAttempts[ip] = append(s.loginAttempts[ip], time.Now())
+	now := time.Now()
+	s.pruneLoginAttemptsLocked(now.Add(-15 * time.Minute))
+	s.loginAttempts[ip] = append(s.loginAttempts[ip], now)
+	// Keep the map bounded even when this is called without a preceding
+	// rateLimited check (for example, from a future authentication flow).
+	s.pruneLoginAttemptsLocked(now.Add(-15 * time.Minute))
 }
 func (s *Server) clearFailures(ip string) {
 	s.loginMu.Lock()
 	defer s.loginMu.Unlock()
 	delete(s.loginAttempts, ip)
+}
+
+func (s *Server) pruneLoginAttemptsLocked(cutoff time.Time) {
+	for ip, attempts := range s.loginAttempts {
+		kept := attempts[:0]
+		for _, at := range attempts {
+			if at.After(cutoff) {
+				kept = append(kept, at)
+			}
+		}
+		if len(kept) == 0 {
+			delete(s.loginAttempts, ip)
+			continue
+		}
+		s.loginAttempts[ip] = kept
+	}
+	for len(s.loginAttempts) > maxTrackedLoginIPs {
+		var oldestIP string
+		var oldest time.Time
+		for ip, attempts := range s.loginAttempts {
+			candidate := attempts[0]
+			if oldestIP == "" || candidate.Before(oldest) {
+				oldestIP, oldest = ip, candidate
+			}
+		}
+		delete(s.loginAttempts, oldestIP)
+	}
 }
 func remoteIP(r *http.Request) string {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)

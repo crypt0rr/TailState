@@ -61,6 +61,8 @@ type OutboxItem struct {
 	FirstAttempt time.Time
 }
 
+const currentSchemaVersion = 1
+
 func Open(path string, box *secret.Box) (*Store, error) {
 	if err := os.MkdirAll(filepathDir(path), 0o700); err != nil {
 		return nil, err
@@ -74,6 +76,10 @@ func Open(path string, box *secret.Box) (*Store, error) {
 	if _, err := db.Exec(schema); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("migrate database: %w", err)
+	}
+	if err := migrateSchema(db); err != nil {
+		db.Close()
+		return nil, err
 	}
 	st := &Store{db: db, box: box}
 	var keyCheck string
@@ -103,6 +109,23 @@ func Open(path string, box *secret.Box) (*Store, error) {
 		return nil, err
 	}
 	return st, nil
+}
+
+// migrateSchema keeps startup safe as the on-disk schema evolves. The schema
+// bootstrap is intentionally idempotent; versioned migrations belong here so
+// a future release cannot silently run against an incompatible database.
+func migrateSchema(db *sql.DB) error {
+	var version int
+	if err := db.QueryRow("SELECT version FROM schema_version ORDER BY version DESC LIMIT 1").Scan(&version); err != nil {
+		return fmt.Errorf("read database schema version: %w", err)
+	}
+	if version > currentSchemaVersion {
+		return fmt.Errorf("database schema version %d is newer than this TailState release supports (max %d)", version, currentSchemaVersion)
+	}
+	if version == currentSchemaVersion {
+		return nil
+	}
+	return fmt.Errorf("database schema version %d requires a newer migration path", version)
 }
 
 func filepathDir(path string) string {
@@ -135,6 +158,9 @@ func (s *Store) NewSetupToken(ctx context.Context) (string, error) {
 }
 
 func (s *Store) Claim(ctx context.Context, token, password string) error {
+	if err := s.validateSetupToken(ctx, token); err != nil {
+		return err
+	}
 	hash, err := secret.PasswordHash(password)
 	if err != nil {
 		return err
@@ -162,6 +188,17 @@ func (s *Store) Claim(ctx context.Context, token, password string) error {
 	return tx.Commit()
 }
 
+func (s *Store) validateSetupToken(ctx context.Context, token string) error {
+	var want string
+	if err := s.db.QueryRowContext(ctx, "SELECT value FROM meta WHERE key='setup_token_hash'").Scan(&want); err != nil {
+		return errors.New("setup token is unavailable")
+	}
+	if subtle.ConstantTimeCompare([]byte(secret.HashToken(token)), []byte(want)) != 1 {
+		return errors.New("invalid setup token")
+	}
+	return nil
+}
+
 func (s *Store) Authenticate(ctx context.Context, password string) bool {
 	var hash string
 	if s.db.QueryRowContext(ctx, "SELECT password_hash FROM admin WHERE id=1").Scan(&hash) != nil {
@@ -175,17 +212,27 @@ func (s *Store) ResetPassword(ctx context.Context, password string) error {
 	if err != nil {
 		return err
 	}
-	now := time.Now().UTC().Format(time.RFC3339Nano)
-	res, err := s.db.ExecContext(ctx, "UPDATE admin SET password_hash=?,updated_at=? WHERE id=1", hash, now)
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
-	n, _ := res.RowsAffected()
+	defer tx.Rollback()
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	res, err := tx.ExecContext(ctx, "UPDATE admin SET password_hash=?,updated_at=? WHERE id=1", hash, now)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
 	if n == 0 {
 		return errors.New("administrator is not configured")
 	}
-	_, _ = s.db.ExecContext(ctx, "DELETE FROM sessions")
-	return nil
+	if _, err := tx.ExecContext(ctx, "DELETE FROM sessions"); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (s *Store) NewResetToken(ctx context.Context) (string, error) {
@@ -197,18 +244,55 @@ func (s *Store) NewResetToken(ctx context.Context) (string, error) {
 	return token, err
 }
 func (s *Store) ResetWithToken(ctx context.Context, token, password string) error {
+	if err := s.validateResetToken(ctx, token); err != nil {
+		return err
+	}
+	hash, err := secret.PasswordHash(password)
+	if err != nil {
+		return err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
 	var want string
-	if s.db.QueryRowContext(ctx, "SELECT value FROM meta WHERE key='reset_token_hash'").Scan(&want) != nil {
+	if err := tx.QueryRowContext(ctx, "SELECT value FROM meta WHERE key='reset_token_hash'").Scan(&want); err != nil {
 		return errors.New("reset token is unavailable")
 	}
 	if subtle.ConstantTimeCompare([]byte(secret.HashToken(token)), []byte(want)) != 1 {
 		return errors.New("invalid reset token")
 	}
-	if err := s.ResetPassword(ctx, password); err != nil {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	result, err := tx.ExecContext(ctx, "UPDATE admin SET password_hash=?,updated_at=? WHERE id=1", hash, now)
+	if err != nil {
 		return err
 	}
-	_, err := s.db.ExecContext(ctx, "DELETE FROM meta WHERE key='reset_token_hash'")
-	return err
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return errors.New("administrator is not configured")
+	}
+	if _, err := tx.ExecContext(ctx, "DELETE FROM sessions"); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, "DELETE FROM meta WHERE key='reset_token_hash'"); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (s *Store) validateResetToken(ctx context.Context, token string) error {
+	var want string
+	if err := s.db.QueryRowContext(ctx, "SELECT value FROM meta WHERE key='reset_token_hash'").Scan(&want); err != nil {
+		return errors.New("reset token is unavailable")
+	}
+	if subtle.ConstantTimeCompare([]byte(secret.HashToken(token)), []byte(want)) != 1 {
+		return errors.New("invalid reset token")
+	}
+	return nil
 }
 
 func (s *Store) CreateSession(ctx context.Context) (token, csrf string, err error) {
@@ -269,6 +353,7 @@ func (s *Store) SaveSettings(ctx context.Context, in Settings) (int64, error) {
 	defer tx.Rollback()
 	var oldTailnet, oldClient, oldSecretEnc string
 	var generation int64
+	generationChanged := false
 	err = tx.QueryRowContext(ctx, "SELECT tailnet,oauth_client_id,oauth_secret_enc,generation FROM settings WHERE id=1").Scan(&oldTailnet, &oldClient, &oldSecretEnc, &generation)
 	if errors.Is(err, sql.ErrNoRows) {
 		generation = 1
@@ -281,6 +366,7 @@ func (s *Store) SaveSettings(ctx context.Context, in Settings) (int64, error) {
 		}
 		if oldTailnet != in.Tailnet || oldClient != in.OAuthClientID || oldSecret != in.OAuthClientSecret {
 			generation++
+			generationChanged = true
 		}
 	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
@@ -288,6 +374,14 @@ func (s *Store) SaveSettings(ctx context.Context, in Settings) (int64, error) {
 	VALUES(1,?,?,?,?,?,?,?,?,NULL) ON CONFLICT(id) DO UPDATE SET tailnet=excluded.tailnet,oauth_client_id=excluded.oauth_client_id,oauth_secret_enc=excluded.oauth_secret_enc,mattermost_url_enc=excluded.mattermost_url_enc,device_interval_seconds=excluded.device_interval_seconds,inventory_interval_seconds=excluded.inventory_interval_seconds,generation=excluded.generation,configured_at=excluded.configured_at,baseline_at=CASE WHEN settings.generation=excluded.generation THEN settings.baseline_at ELSE NULL END`, in.Tailnet, in.OAuthClientID, secretEnc, urlEnc, int64(in.DeviceInterval.Seconds()), int64(in.InventoryInterval.Seconds()), generation, now)
 	if err != nil {
 		return 0, err
+	}
+	if generationChanged {
+		if _, err := tx.ExecContext(ctx, "DELETE FROM snapshots WHERE generation<>?", generation); err != nil {
+			return 0, err
+		}
+		if _, err := tx.ExecContext(ctx, "DELETE FROM collector_state WHERE generation<>?", generation); err != nil {
+			return 0, err
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return 0, err
@@ -372,6 +466,13 @@ func (s *Store) ApplyBatch(ctx context.Context, generation int64, results []mode
 		return nil, err
 	}
 	defer tx.Rollback()
+	var activeGeneration int64
+	if err := tx.QueryRowContext(ctx, "SELECT generation FROM settings WHERE id=1").Scan(&activeGeneration); err != nil {
+		return nil, err
+	}
+	if activeGeneration != generation {
+		return nil, nil
+	}
 	now := time.Now().UTC()
 	var changes []model.Change
 	for _, result := range results {
@@ -380,7 +481,7 @@ func (s *Store) ApplyBatch(ctx context.Context, generation int64, results []mode
 		}
 		if result.Unsupported {
 			next := now.Add(6 * time.Hour).Format(time.RFC3339Nano)
-			_, err = tx.ExecContext(ctx, `INSERT INTO collector_state(generation,collector,supported,baseline,last_error,next_poll) VALUES(?,?,0,1,'unsupported',?) ON CONFLICT(generation,collector) DO UPDATE SET supported=0,baseline=1,last_error='unsupported',next_poll=excluded.next_poll`, generation, result.Collector, next)
+			_, err = tx.ExecContext(ctx, `INSERT INTO collector_state(generation,collector,supported,baseline,last_error,next_poll) VALUES(?,?,0,0,'unsupported',?) ON CONFLICT(generation,collector) DO UPDATE SET supported=0,baseline=0,last_error='unsupported',next_poll=excluded.next_poll`, generation, result.Collector, next)
 			if err != nil {
 				return nil, err
 			}
@@ -507,6 +608,13 @@ func (s *Store) RecordCollectorFailure(ctx context.Context, generation int64, co
 		return false, false, err
 	}
 	defer tx.Rollback()
+	var activeGeneration int64
+	if err := tx.QueryRowContext(ctx, "SELECT generation FROM settings WHERE id=1").Scan(&activeGeneration); err != nil {
+		return false, false, err
+	}
+	if activeGeneration != generation {
+		return false, false, nil
+	}
 	var failures, notified int
 	_ = tx.QueryRowContext(ctx, "SELECT failure_count,unhealthy_notified FROM collector_state WHERE generation=? AND collector=?", generation, collector).Scan(&failures, &notified)
 	failures++
@@ -579,7 +687,10 @@ func (s *Store) Status(ctx context.Context) (Status, error) {
 		return out, err
 	}
 	if out.Configured {
-		settings, _ := s.Settings(ctx)
+		settings, err := s.Settings(ctx)
+		if err != nil {
+			return out, fmt.Errorf("load settings for status: %w", err)
+		}
 		rows, err := s.db.QueryContext(ctx, "SELECT collector,COUNT(*) FROM snapshots WHERE generation=? GROUP BY collector", settings.Generation)
 		if err != nil {
 			return out, err
@@ -587,15 +698,21 @@ func (s *Store) Status(ctx context.Context) (Status, error) {
 		for rows.Next() {
 			var k string
 			var n int
-			_ = rows.Scan(&k, &n)
+			if err := rows.Scan(&k, &n); err != nil {
+				rows.Close()
+				return out, err
+			}
 			out.ResourceCounts[k] = n
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return out, err
 		}
 		rows.Close()
 		rows, err = s.db.QueryContext(ctx, "SELECT collector,supported,baseline,COALESCE(last_success,''),last_error,failure_count,COALESCE(next_poll,'') FROM collector_state WHERE generation=? ORDER BY collector", settings.Generation)
 		if err != nil {
 			return out, err
 		}
-		defer rows.Close()
 		for rows.Next() {
 			var c CollectorState
 			var last, next string
@@ -612,16 +729,27 @@ func (s *Store) Status(ctx context.Context) (Status, error) {
 			}
 			out.Collectors = append(out.Collectors, c)
 		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return out, err
+		}
+		rows.Close()
 	}
-	_ = s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM outbox WHERE status='pending'").Scan(&out.Pending)
-	_ = s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM outbox WHERE status='dead'").Scan(&out.Dead)
+	if err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM outbox WHERE status='pending'").Scan(&out.Pending); err != nil {
+		return out, err
+	}
+	if err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM outbox WHERE status='dead'").Scan(&out.Dead); err != nil {
+		return out, err
+	}
 	return out, nil
 }
 
 func (s *Store) SetNextPoll(ctx context.Context, generation int64, collectors []string, next time.Time) {
 	sort.Strings(collectors)
 	for _, collector := range collectors {
-		_, _ = s.db.ExecContext(ctx, `INSERT INTO collector_state(generation,collector,next_poll) VALUES(?,?,?) ON CONFLICT(generation,collector) DO UPDATE SET next_poll=excluded.next_poll`, generation, collector, next.UTC().Format(time.RFC3339Nano))
+		_, _ = s.db.ExecContext(ctx, `INSERT INTO collector_state(generation,collector,next_poll)
+		SELECT ?,?,? WHERE EXISTS (SELECT 1 FROM settings WHERE id=1 AND generation=?)
+		ON CONFLICT(generation,collector) DO UPDATE SET next_poll=excluded.next_poll`, generation, collector, next.UTC().Format(time.RFC3339Nano), generation)
 	}
 }
 
@@ -638,7 +766,11 @@ func (s *Store) CollectorDue(ctx context.Context, generation int64, collector st
 	return err != nil || !when.After(time.Now())
 }
 func (s *Store) Cleanup(ctx context.Context, retention time.Duration) error {
-	cutoff := time.Now().UTC().Add(-retention).Format(time.RFC3339Nano)
+	now := time.Now().UTC()
+	if _, err := s.db.ExecContext(ctx, "DELETE FROM sessions WHERE expires_at<=?", now.Format(time.RFC3339Nano)); err != nil {
+		return err
+	}
+	cutoff := now.Add(-retention).Format(time.RFC3339Nano)
 	_, err := s.db.ExecContext(ctx, "DELETE FROM events WHERE observed_at<?", cutoff)
 	if err != nil {
 		return err

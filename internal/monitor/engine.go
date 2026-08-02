@@ -109,11 +109,15 @@ func (e *Engine) poll(ctx context.Context, client *tailscale.Client, settings st
 				slog.Error("record collector failure", "collector", collector, "error", storeErr)
 			}
 			if notify {
-				_ = e.store.EnqueueSystem(ctx, mattermost.SourceHealth(collector, false))
+				if enqueueErr := e.store.EnqueueSystem(ctx, mattermost.SourceHealth(collector, false)); enqueueErr != nil {
+					slog.Error("enqueue collector health notification", "collector", collector, "error", enqueueErr)
+				}
 			}
 			slog.Warn("collector failed", "collector", collector, "error", err)
 		} else if wasUnhealthy {
-			_ = e.store.EnqueueSystem(ctx, mattermost.SourceHealth(collector, true))
+			if enqueueErr := e.store.EnqueueSystem(ctx, mattermost.SourceHealth(collector, true)); enqueueErr != nil {
+				slog.Error("enqueue collector recovery notification", "collector", collector, "error", enqueueErr)
+			}
 		}
 		results = append(results, result)
 	}
@@ -157,7 +161,9 @@ func (e *Engine) delivery(ctx context.Context) {
 			for _, item := range items {
 				err = e.sender.Send(ctx, settings.MattermostURL, item.Payload)
 				if err == nil {
-					_ = e.store.Delivered(ctx, item.ID)
+					if deliveredErr := e.store.Delivered(ctx, item.ID); deliveredErr != nil {
+						slog.Error("mark Mattermost delivery complete", "outbox_id", item.ID, "error", deliveredErr)
+					}
 					continue
 				}
 				dead := time.Since(item.FirstAttempt) >= 24*time.Hour
@@ -169,7 +175,9 @@ func (e *Engine) delivery(ctx context.Context) {
 				if errors.As(err, &delivery) && delivery.RetryAfter > 0 {
 					delay = delivery.RetryAfter
 				}
-				_ = e.store.Retry(ctx, item.ID, time.Now().Add(delay), err.Error(), dead)
+				if retryErr := e.store.Retry(ctx, item.ID, time.Now().Add(delay), err.Error(), dead); retryErr != nil {
+					slog.Error("record Mattermost delivery failure", "outbox_id", item.ID, "error", retryErr)
+				}
 				if dead {
 					slog.Error("Mattermost delivery dead-lettered", "outbox_id", item.ID, "error", err)
 				} else {

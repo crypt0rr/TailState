@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -61,6 +62,41 @@ func TestSetupSessionAndSettingsEncryption(t *testing.T) {
 	}
 }
 
+func TestResetTokenIsSingleUseAndInvalidatesSessions(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	setup, err := st.NewSetupToken(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Claim(ctx, setup, "old secure password"); err != nil {
+		t.Fatal(err)
+	}
+	session, csrf, err := st.CreateSession(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !st.ValidateSession(ctx, session, csrf, true) {
+		t.Fatal("session should be valid before reset")
+	}
+	reset, err := st.NewResetToken(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.ResetWithToken(ctx, reset, "new secure password"); err != nil {
+		t.Fatal(err)
+	}
+	if !st.Authenticate(ctx, "new secure password") || st.Authenticate(ctx, "old secure password") {
+		t.Fatal("password was not replaced correctly")
+	}
+	if st.ValidateSession(ctx, session, csrf, true) {
+		t.Fatal("reset did not invalidate the old session")
+	}
+	if err := st.ResetWithToken(ctx, reset, "another secure password"); err == nil {
+		t.Fatal("reset token was reusable")
+	}
+}
+
 func TestWrongMasterKeyFailsOpen(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "tailstate.db")
 	firstKey := make([]byte, 32)
@@ -74,6 +110,159 @@ func TestWrongMasterKeyFailsOpen(t *testing.T) {
 	otherBox, _ := secret.NewBox(make([]byte, 32))
 	if _, err := Open(path, otherBox); err == nil {
 		t.Fatal("database opened with wrong master key")
+	}
+}
+
+func TestNewerSchemaVersionFailsClosed(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "tailstate.db")
+	box, _ := secret.NewBox(make([]byte, 32))
+	st, err := Open(path, box)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", "file:"+path+"?_pragma=busy_timeout(5000)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec("UPDATE schema_version SET version=2"); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(path, box); err == nil {
+		t.Fatal("database with a newer schema version was accepted")
+	}
+}
+
+func TestCleanupRemovesExpiredSessions(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	setup, err := st.NewSetupToken(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Claim(ctx, setup, "a secure password"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := st.CreateSession(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.db.ExecContext(ctx, "UPDATE sessions SET expires_at=?", time.Now().UTC().Add(-time.Minute).Format(time.RFC3339Nano)); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Cleanup(ctx, 30*24*time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	var count int
+	if err := st.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM sessions").Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("expired session was not removed: %d", count)
+	}
+}
+
+func TestUnsupportedCollectorSilentlyBaselinesWhenItReturns(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	generation, err := st.SaveSettings(ctx, settings())
+	if err != nil {
+		t.Fatal(err)
+	}
+	unsupported := []model.Collected{{Collector: "contacts", Unsupported: true}}
+	if changes, err := st.ApplyBatch(ctx, generation, unsupported, func([]model.Change) string { return "digest" }); err != nil || len(changes) != 0 {
+		t.Fatalf("unsupported collector produced changes: %#v %v", changes, err)
+	}
+	returned := []model.Collected{{Collector: "contacts", Resources: []model.Resource{{ID: "contacts", Type: "contacts", Name: "Tailnet contacts", Data: map[string]any{"email": "owner@example.com"}}}}}
+	changes, err := st.ApplyBatch(ctx, generation, returned, func([]model.Change) string { return "digest" })
+	if err != nil || len(changes) != 0 {
+		t.Fatalf("returning collector did not silently baseline: %#v %v", changes, err)
+	}
+	status, err := st.Status(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, collector := range status.Collectors {
+		if collector.Name == "contacts" {
+			found = true
+			if !collector.Baseline {
+				t.Fatal("returning collector is still marked as baselining")
+			}
+		}
+	}
+	if !found {
+		t.Fatal("returning collector state was not recorded")
+	}
+}
+
+func TestCredentialRotationPrunesOldInventoryAndRejectsStalePolls(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	firstGeneration, err := st.SaveSettings(ctx, settings())
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseline := []model.Collected{{Collector: "devices", Resources: []model.Resource{{ID: "1", Type: "device", Name: "server", Data: map[string]any{"hostname": "server"}}}}}
+	if _, err := st.ApplyBatch(ctx, firstGeneration, baseline, func([]model.Change) string { return "digest" }); err != nil {
+		t.Fatal(err)
+	}
+	rotated := settings()
+	rotated.OAuthClientSecret = "rotated-secret"
+	secondGeneration, err := st.SaveSettings(ctx, rotated)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if secondGeneration == firstGeneration {
+		t.Fatal("credential rotation did not create a new generation")
+	}
+	var count int
+	if err := st.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM snapshots").Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("old snapshots were retained after rotation: %d", count)
+	}
+	st.SetNextPoll(ctx, firstGeneration, []string{"devices"}, time.Now().UTC().Add(time.Minute))
+	if notify, _, err := st.RecordCollectorFailure(ctx, firstGeneration, "devices", "stale failure"); err != nil || notify {
+		t.Fatalf("stale collector failure was not ignored: notify=%v err=%v", notify, err)
+	}
+	var oldStateCount int
+	if err := st.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM collector_state WHERE generation=?", firstGeneration).Scan(&oldStateCount); err != nil {
+		t.Fatal(err)
+	}
+	if oldStateCount != 0 {
+		t.Fatalf("stale poll recreated old collector state: %d", oldStateCount)
+	}
+	stale := []model.Collected{{Collector: "devices", Resources: []model.Resource{{ID: "stale", Type: "device", Name: "stale", Data: map[string]any{"hostname": "stale"}}}}}
+	changes, err := st.ApplyBatch(ctx, firstGeneration, stale, func([]model.Change) string { return "digest" })
+	if err != nil || len(changes) != 0 {
+		t.Fatalf("stale poll was not ignored: %#v %v", changes, err)
+	}
+	if err := st.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM snapshots").Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("stale poll repopulated old snapshots: %d", count)
+	}
+}
+
+func TestStatusFailsWhenConfiguredSecretsCannotBeDecrypted(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	if _, err := st.SaveSettings(ctx, settings()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.db.ExecContext(ctx, "UPDATE settings SET oauth_secret_enc='invalid-envelope'"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Status(ctx); err == nil {
+		t.Fatal("status hid a settings decryption failure")
 	}
 }
 

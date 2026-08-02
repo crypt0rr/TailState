@@ -49,6 +49,71 @@ func TestOAuthPaginationAndCollection(t *testing.T) {
 	}
 }
 
+func TestEmptyCollectionResponses(t *testing.T) {
+	tests := []struct {
+		name      string
+		collector string
+		path      string
+		body      string
+		wantErr   bool
+	}{
+		{name: "user invites empty object", collector: "user_invites", path: "/api/v2/tailnet/-/user-invites", body: `{}`},
+		{name: "user invites top-level array", collector: "user_invites", path: "/api/v2/tailnet/-/user-invites", body: `[]`},
+		{name: "webhooks empty object", collector: "webhooks", path: "/api/v2/tailnet/-/webhooks", body: `{}`},
+		{name: "webhooks empty array", collector: "webhooks", path: "/api/v2/tailnet/-/webhooks", body: `{"webhooks":[]}`},
+		{name: "strict collection still rejects missing array", collector: "users", path: "/api/v2/tailnet/-/users", body: `{}`, wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/oauth/token":
+					_, _ = w.Write([]byte(`{"access_token":"access","expires_in":3600}`))
+				case tt.path:
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = w.Write([]byte(tt.body))
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer server.Close()
+
+			client := New(server.URL+"/api/v2", server.URL+"/oauth/token", "test", Credentials{ClientID: "id", ClientSecret: "secret"})
+			resources, err := client.Collect(context.Background(), tt.collector)
+			if tt.wantErr {
+				if err == nil || !strings.Contains(err.Error(), "response has no") {
+					t.Fatalf("expected missing-array error, got resources=%#v err=%v", resources, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("empty collection failed: %v", err)
+			}
+			if len(resources) != 0 {
+				t.Fatalf("expected no resources, got %#v", resources)
+			}
+		})
+	}
+}
+
+func TestCollectionRejectsWrongArrayType(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/oauth/token" {
+			_, _ = w.Write([]byte(`{"access_token":"access","expires_in":3600}`))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"webhooks":"not-an-array"}`))
+	}))
+	defer server.Close()
+
+	client := New(server.URL+"/api/v2", server.URL+"/oauth/token", "test", Credentials{ClientID: "id", ClientSecret: "secret"})
+	if _, err := client.Collect(context.Background(), "webhooks"); err == nil || !strings.Contains(err.Error(), "webhooks response has no webhooks array") {
+		t.Fatalf("expected wrong-array-type error, got %v", err)
+	}
+}
+
 func TestUnsupportedCollector(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/oauth/token" {

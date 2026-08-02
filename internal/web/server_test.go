@@ -114,3 +114,29 @@ func TestMetricsExposeCollectorHealthWithoutErrorDetails(t *testing.T) {
 		t.Fatal("collector error details leaked into metrics")
 	}
 }
+
+func TestSettingsRedactsDestinationCredentials(t *testing.T) {
+	server, st, token := testServer(t)
+	claim := url.Values{"token": {token}, "password": {"a secure password"}, "confirm": {"a secure password"}}
+	request := httptest.NewRequest(http.MethodPost, "/setup/claim", strings.NewReader(claim.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+	cookies := response.Result().Cookies()
+	if _, err := st.SaveSettings(context.Background(), store.Settings{Tailnet: "-", OAuthClientID: "client", OAuthClientSecret: "secret", MattermostURL: "https://mattermost.example/hooks/super-secret-token", DeviceInterval: time.Minute, InventoryInterval: 5 * time.Minute}); err != nil {
+		t.Fatal(err)
+	}
+	settingsRequest := httptest.NewRequest(http.MethodGet, "/settings", nil)
+	for _, cookie := range cookies {
+		settingsRequest.AddCookie(cookie)
+	}
+	settingsResponse := httptest.NewRecorder()
+	server.Handler().ServeHTTP(settingsResponse, settingsRequest)
+	body := settingsResponse.Body.String()
+	if strings.Contains(body, "super-secret-token") || strings.Contains(body, "/hooks/") {
+		t.Fatalf("destination credential leaked into settings HTML: %s", body)
+	}
+	if !strings.Contains(body, "mattermost://mattermost.example") {
+		t.Fatal("redacted destination endpoint missing")
+	}
+}

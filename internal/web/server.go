@@ -17,8 +17,8 @@ import (
 	"time"
 
 	"github.com/crypt0rr/tailstate/internal/boot"
-	"github.com/crypt0rr/tailstate/internal/mattermost"
 	"github.com/crypt0rr/tailstate/internal/monitor"
+	"github.com/crypt0rr/tailstate/internal/notify"
 	"github.com/crypt0rr/tailstate/internal/store"
 	"github.com/crypt0rr/tailstate/internal/tailscale"
 )
@@ -43,6 +43,15 @@ type pageData struct {
 	Settings                        store.Settings
 	DeviceSeconds, InventorySeconds int64
 	Status                          store.Status
+	Destinations                    []destinationPage
+	NotificationsPaused             bool
+}
+
+type destinationPage struct {
+	ID         int64
+	Name       string
+	DisplayURL string
+	Enabled    bool
 }
 
 func New(config boot.Config, st *store.Store, engine *monitor.Engine) (*Server, error) {
@@ -75,6 +84,16 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /status", s.status)
 	mux.HandleFunc("GET /settings", s.settings)
 	mux.HandleFunc("POST /settings", s.settingsPost)
+	mux.HandleFunc("POST /settings/destinations", s.destinationPost)
+	mux.HandleFunc("POST /settings/destinations/add", s.destinationPost)
+	mux.HandleFunc("POST /settings/destinations/edit", s.destinationPost)
+	mux.HandleFunc("POST /settings/destinations/save", s.destinationPost)
+	mux.HandleFunc("POST /settings/destinations/test", s.destinationPost)
+	mux.HandleFunc("POST /settings/destinations/toggle", s.destinationPost)
+	mux.HandleFunc("POST /settings/destinations/enable", s.destinationPost)
+	mux.HandleFunc("POST /settings/destinations/disable", s.destinationPost)
+	mux.HandleFunc("POST /settings/destinations/delete", s.destinationPost)
+	mux.HandleFunc("POST /settings/destinations/remove", s.destinationPost)
 	return s.security(mux)
 }
 
@@ -242,7 +261,8 @@ func (s *Server) settings(w http.ResponseWriter, r *http.Request) {
 	if !configured {
 		current = store.Settings{Tailnet: "-", DeviceInterval: 60 * time.Second, InventoryInterval: 5 * time.Minute}
 	}
-	s.render(w, "settings", pageData{CSRF: csrf, Configured: configured, Settings: current, DeviceSeconds: int64(current.DeviceInterval.Seconds()), InventorySeconds: int64(current.InventoryInterval.Seconds())})
+	data := s.settingsData(r.Context(), csrf, configured, current)
+	s.render(w, "settings", data)
 }
 func (s *Server) settingsPost(w http.ResponseWriter, r *http.Request) {
 	csrf, ok := s.requireAuth(w, r, true)
@@ -257,16 +277,14 @@ func (s *Server) settingsPost(w http.ResponseWriter, r *http.Request) {
 	inventory, err2 := strconv.ParseInt(r.FormValue("inventory_interval"), 10, 64)
 	current, currentErr := s.store.Settings(r.Context())
 	configured := currentErr == nil
-	input := store.Settings{Tailnet: strings.TrimSpace(r.FormValue("tailnet")), OAuthClientID: strings.TrimSpace(r.FormValue("client_id")), OAuthClientSecret: r.FormValue("client_secret"), MattermostURL: r.FormValue("mattermost_url"), DeviceInterval: time.Duration(device) * time.Second, InventoryInterval: time.Duration(inventory) * time.Second}
+	input := store.Settings{Tailnet: strings.TrimSpace(r.FormValue("tailnet")), OAuthClientID: strings.TrimSpace(r.FormValue("client_id")), OAuthClientSecret: r.FormValue("client_secret"), DeviceInterval: time.Duration(device) * time.Second, InventoryInterval: time.Duration(inventory) * time.Second}
 	if configured {
 		if input.OAuthClientSecret == "" {
 			input.OAuthClientSecret = current.OAuthClientSecret
 		}
-		if input.MattermostURL == "" {
-			input.MattermostURL = current.MattermostURL
-		}
 	}
-	data := pageData{CSRF: csrf, Configured: configured, Settings: input, DeviceSeconds: device, InventorySeconds: inventory}
+	data := s.settingsData(r.Context(), csrf, configured, input)
+	data.DeviceSeconds, data.InventorySeconds = device, inventory
 	if err1 != nil || err2 != nil {
 		data.Error = "Poll intervals must be whole seconds."
 		s.render(w, "settings", data)
@@ -280,10 +298,22 @@ func (s *Server) settingsPost(w http.ResponseWriter, r *http.Request) {
 		s.render(w, "settings", data)
 		return
 	}
-	if err := mattermost.New().Test(testCtx, input.MattermostURL); err != nil {
-		data.Error = "Mattermost test failed: " + err.Error()
+	if destinations, err := s.store.ListDestinations(r.Context()); err != nil {
+		data.Error = "load notification destinations failed: " + err.Error()
 		s.render(w, "settings", data)
 		return
+	} else {
+		enabled := 0
+		for _, destination := range destinations {
+			if destination.Enabled {
+				enabled++
+			}
+		}
+		if !configured && enabled == 0 {
+			data.Error = "Add at least one enabled notification destination before saving the initial configuration."
+			s.render(w, "settings", data)
+			return
+		}
 	}
 	if _, err := s.store.SaveSettings(r.Context(), input); err != nil {
 		data.Error = err.Error()
@@ -292,6 +322,126 @@ func (s *Server) settingsPost(w http.ResponseWriter, r *http.Request) {
 	}
 	s.engine.Wake()
 	http.Redirect(w, r, "/status", http.StatusSeeOther)
+}
+
+func (s *Server) settingsData(ctx context.Context, csrf string, configured bool, settings store.Settings) pageData {
+	data := pageData{CSRF: csrf, Configured: configured, Settings: settings, DeviceSeconds: int64(settings.DeviceInterval.Seconds()), InventorySeconds: int64(settings.InventoryInterval.Seconds())}
+	destinations, err := s.store.ListDestinations(ctx)
+	if err == nil {
+		data.Destinations = make([]destinationPage, 0, len(destinations))
+		for _, destination := range destinations {
+			data.Destinations = append(data.Destinations, destinationPage{ID: destination.ID, Name: destination.Name, DisplayURL: notify.RedactURL(destination.ServiceURL), Enabled: destination.Enabled})
+		}
+		data.NotificationsPaused = configured
+		for _, destination := range data.Destinations {
+			if destination.Enabled {
+				data.NotificationsPaused = false
+				break
+			}
+		}
+	}
+	return data
+}
+
+func (s *Server) currentSettingsData(ctx context.Context, csrf string) pageData {
+	settings, err := s.store.Settings(ctx)
+	if err != nil {
+		settings = store.Settings{Tailnet: "-", DeviceInterval: time.Minute, InventoryInterval: 5 * time.Minute}
+		return s.settingsData(ctx, csrf, false, settings)
+	}
+	return s.settingsData(ctx, csrf, true, settings)
+}
+
+func (s *Server) destinationPost(w http.ResponseWriter, r *http.Request) {
+	csrf, ok := s.requireAuth(w, r, true)
+	if !ok {
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "invalid form", http.StatusBadRequest)
+		return
+	}
+	action := r.FormValue("action")
+	if action == "" {
+		switch r.URL.Path {
+		case "/settings/destinations/test":
+			action = "test"
+		case "/settings/destinations/toggle", "/settings/destinations/enable", "/settings/destinations/disable":
+			action = "toggle"
+		case "/settings/destinations/delete", "/settings/destinations/remove":
+			action = "delete"
+		default:
+			action = "save"
+		}
+	}
+	id, _ := strconv.ParseInt(r.FormValue("id"), 10, 64)
+	ctx := r.Context()
+	switch action {
+	case "save":
+		serviceURL := strings.TrimSpace(r.FormValue("service_url"))
+		if serviceURL == "" && id > 0 {
+			if existing, err := s.store.ListDestinations(ctx); err == nil {
+				for _, destination := range existing {
+					if destination.ID == id {
+						serviceURL = destination.ServiceURL
+						break
+					}
+				}
+			}
+		}
+		enabled := r.FormValue("enabled") == "on" || r.FormValue("enabled") == "true"
+		if _, err := s.store.SaveDestination(ctx, store.NotificationDestination{ID: id, Name: r.FormValue("name"), ServiceURL: serviceURL, Enabled: enabled}); err != nil {
+			data := s.currentSettingsData(ctx, csrf)
+			data.Error = "Notification destination was not saved: " + err.Error()
+			s.render(w, "settings", data)
+			return
+		}
+		s.engine.Wake()
+		http.Redirect(w, r, "/settings", http.StatusSeeOther)
+	case "test":
+		serviceURL := strings.TrimSpace(r.FormValue("service_url"))
+		if serviceURL == "" && id > 0 {
+			if existing, err := s.store.ListDestinations(ctx); err == nil {
+				for _, destination := range existing {
+					if destination.ID == id {
+						serviceURL = destination.ServiceURL
+						break
+					}
+				}
+			}
+		}
+		testCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		defer cancel()
+		data := s.currentSettingsData(ctx, csrf)
+		if err := notify.New().Test(testCtx, serviceURL); err != nil {
+			data.Error = "Notification test failed: " + err.Error()
+		} else {
+			data.Message = "Notification test sent."
+		}
+		s.render(w, "settings", data)
+	case "toggle":
+		enabled := r.FormValue("enabled") == "true" || r.FormValue("enabled") == "on"
+		if r.URL.Path == "/settings/destinations/enable" {
+			enabled = true
+		} else if r.URL.Path == "/settings/destinations/disable" {
+			enabled = false
+		}
+		if err := s.store.SetDestinationEnabled(ctx, id, enabled); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		s.engine.Wake()
+		http.Redirect(w, r, "/settings", http.StatusSeeOther)
+	case "delete":
+		if err := s.store.DeleteDestination(ctx, id); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		s.engine.Wake()
+		http.Redirect(w, r, "/settings", http.StatusSeeOther)
+	default:
+		http.Error(w, "unknown destination action", http.StatusBadRequest)
+	}
 }
 
 func (s *Server) health(w http.ResponseWriter, r *http.Request) {

@@ -7,8 +7,8 @@ import (
 	"math/rand/v2"
 	"time"
 
-	"github.com/crypt0rr/tailstate/internal/mattermost"
 	"github.com/crypt0rr/tailstate/internal/model"
+	"github.com/crypt0rr/tailstate/internal/notify"
 	"github.com/crypt0rr/tailstate/internal/store"
 	"github.com/crypt0rr/tailstate/internal/tailscale"
 )
@@ -16,12 +16,16 @@ import (
 type Engine struct {
 	store                      *store.Store
 	baseURL, tokenURL, version string
-	sender                     *mattermost.Sender
+	sender                     notify.Sender
 	wake                       chan struct{}
 }
 
-func New(st *store.Store, baseURL, tokenURL, version string) *Engine {
-	return &Engine{store: st, baseURL: baseURL, tokenURL: tokenURL, version: version, sender: mattermost.New(), wake: make(chan struct{}, 1)}
+func New(st *store.Store, baseURL, tokenURL, version string, senders ...notify.Sender) *Engine {
+	var sender notify.Sender = notify.New()
+	if len(senders) > 0 && senders[0] != nil {
+		sender = senders[0]
+	}
+	return &Engine{store: st, baseURL: baseURL, tokenURL: tokenURL, version: version, sender: sender, wake: make(chan struct{}, 1)}
 }
 func (e *Engine) Wake() {
 	select {
@@ -104,18 +108,18 @@ func (e *Engine) poll(ctx context.Context, client *tailscale.Client, settings st
 			result.Unsupported = true
 			slog.Info("collector unsupported", "collector", collector)
 		} else if err != nil {
-			notify, _, storeErr := e.store.RecordCollectorFailure(ctx, settings.Generation, collector, err.Error())
+			shouldNotify, _, storeErr := e.store.RecordCollectorFailure(ctx, settings.Generation, collector, err.Error())
 			if storeErr != nil {
 				slog.Error("record collector failure", "collector", collector, "error", storeErr)
 			}
-			if notify {
-				if enqueueErr := e.store.EnqueueSystem(ctx, mattermost.SourceHealth(collector, false)); enqueueErr != nil {
+			if shouldNotify {
+				if enqueueErr := e.store.EnqueueSystem(ctx, notify.SourceHealth(collector, false)); enqueueErr != nil {
 					slog.Error("enqueue collector health notification", "collector", collector, "error", enqueueErr)
 				}
 			}
 			slog.Warn("collector failed", "collector", collector, "error", err)
 		} else if wasUnhealthy {
-			if enqueueErr := e.store.EnqueueSystem(ctx, mattermost.SourceHealth(collector, true)); enqueueErr != nil {
+			if enqueueErr := e.store.EnqueueSystem(ctx, notify.SourceHealth(collector, true)); enqueueErr != nil {
 				slog.Error("enqueue collector recovery notification", "collector", collector, "error", enqueueErr)
 			}
 		}
@@ -131,7 +135,7 @@ func (e *Engine) poll(ctx context.Context, client *tailscale.Client, settings st
 		}
 		e.store.SetNextPoll(ctx, settings.Generation, []string{collector}, time.Now().Add(interval))
 	}
-	changes, err := e.store.ApplyBatch(ctx, settings.Generation, results, mattermost.Digest)
+	changes, err := e.store.ApplyBatch(ctx, settings.Generation, results, notify.Digest)
 	if err != nil {
 		slog.Error("apply collected inventory", "error", err)
 		return
@@ -149,39 +153,32 @@ func (e *Engine) delivery(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			settings, err := e.store.Settings(ctx)
-			if err != nil {
-				continue
-			}
 			items, err := e.store.DueOutbox(ctx, 10)
 			if err != nil {
 				slog.Error("load outbox", "error", err)
 				continue
 			}
 			for _, item := range items {
-				err = e.sender.Send(ctx, settings.MattermostURL, item.Payload)
+				err = e.sender.Send(ctx, item.Destination.ServiceURL, item.Payload)
 				if err == nil {
 					if deliveredErr := e.store.Delivered(ctx, item.ID); deliveredErr != nil {
-						slog.Error("mark Mattermost delivery complete", "outbox_id", item.ID, "error", deliveredErr)
+						slog.Error("mark notification delivery complete", "outbox_id", item.ID, "destination_id", item.DestinationID, "error", deliveredErr)
 					}
 					continue
 				}
 				dead := time.Since(item.FirstAttempt) >= 24*time.Hour
-				var delivery *mattermost.DeliveryError
-				if errors.As(err, &delivery) && delivery.Permanent() {
-					dead = true
-				}
+				var delivery *notify.DeliveryError
 				delay := retryDelay(item.Attempts)
 				if errors.As(err, &delivery) && delivery.RetryAfter > 0 {
 					delay = delivery.RetryAfter
 				}
 				if retryErr := e.store.Retry(ctx, item.ID, time.Now().Add(delay), err.Error(), dead); retryErr != nil {
-					slog.Error("record Mattermost delivery failure", "outbox_id", item.ID, "error", retryErr)
+					slog.Error("record notification delivery failure", "outbox_id", item.ID, "destination_id", item.DestinationID, "error", retryErr)
 				}
 				if dead {
-					slog.Error("Mattermost delivery dead-lettered", "outbox_id", item.ID, "error", err)
+					slog.Error("notification delivery dead-lettered", "outbox_id", item.ID, "destination_id", item.DestinationID, "error", err)
 				} else {
-					slog.Warn("Mattermost delivery failed", "outbox_id", item.ID, "error", err)
+					slog.Warn("notification delivery failed", "outbox_id", item.ID, "destination_id", item.DestinationID, "error", err)
 				}
 			}
 		}

@@ -1,6 +1,6 @@
 # TailState
 
-TailState polls the read-only Tailscale API, establishes a silent inventory baseline, and posts later changes to Mattermost. It runs as one static Go binary with an embedded setup/status interface and durable SQLite storage.
+TailState polls the read-only Tailscale API, establishes a silent inventory baseline, and posts later changes to one or more Shoutrrr destinations. It runs as one static Go binary with an embedded setup/status interface and durable SQLite storage.
 
 TailState never modifies a tailnet and does not use native Tailscale webhooks.
 
@@ -62,10 +62,18 @@ The setup interface then asks for:
 
 1. Tailnet (`-` uses the OAuth credential's tailnet).
 2. OAuth client ID and secret with `all:read`.
-3. Mattermost incoming webhook URL.
+3. At least one notification destination using a Shoutrrr URL.
 4. Device and secondary inventory polling intervals.
 
-Saving performs a Tailscale API check and posts an explicit Mattermost test. TailState then builds a silent baseline. The status page shows baseline counts, collector capabilities, source health, and delivery state.
+Add destinations on the authenticated Settings page, then save monitoring settings. Each destination is validated and can be tested independently. TailState then performs a Tailscale API check and builds a silent baseline. The status page shows baseline counts, collector capabilities, source health, and delivery state.
+
+Shoutrrr supports Mattermost natively, for example:
+
+```text
+mattermost://TailState@mattermost.example/hooks-token?icon=satellite
+```
+
+Any service registered by the pinned Shoutrrr release is accepted. See the [Shoutrrr service overview](https://containrrr.dev/shoutrrr/dev/services/overview/) for supported endpoint schemes and provider-specific URL formats. Generic webhooks can be configured with `generic://` URLs and Shoutrrr query options such as `template=json&messagekey=text`.
 
 ```console
 curl -fsS http://127.0.0.1:8080/healthz
@@ -79,7 +87,7 @@ curl -fsS http://127.0.0.1:8080/metrics
 
 Compose creates the Docker-managed `tailstate-data` volume and stores `/data/tailstate.db` there. Snapshots, events, baseline state, sessions, and the delivery outbox survive container replacement.
 
-OAuth secrets and the Mattermost webhook URL are encrypted with AES-256-GCM using `secrets/tailstate_master_key`. OAuth access tokens exist only in memory. Back up the master key separately: TailState intentionally refuses to start if the key is missing or incorrect, and encrypted settings cannot be recovered without it.
+OAuth secrets and every Shoutrrr destination URL are encrypted with AES-256-GCM using `secrets/tailstate_master_key`. Destination credentials are never echoed into HTML, logs, or persisted delivery errors. OAuth access tokens exist only in memory. Back up the master key separately: TailState intentionally refuses to start if the key is missing or incorrect, and encrypted settings cannot be recovered without it.
 
 The image is scratch-based, runs as UID/GID `10001`, uses a read-only root filesystem, drops every Linux capability, and publishes the UI only on `127.0.0.1` by default. For remote access, place TailState behind an HTTPS reverse proxy and set:
 
@@ -119,13 +127,18 @@ Back up `secrets/tailstate_master_key` separately and securely.
 - Stable additions and modifications alert on the next successful poll.
 - Removals require absence from two complete successful polls.
 - Failed or partial polls never delete snapshots.
-- Multiple changes in one poll become one Mattermost digest.
-- Failed Mattermost deliveries retry independently for up to 24 hours across restarts, then remain visible as dead letters.
+- Multiple changes in one poll become one digest, fanned out into one durable outbox item per enabled destination.
+- Shoutrrr deliveries retry independently for up to 24 hours across restarts, then remain visible as dead letters. Disabling or removing a destination dead-letters its pending items; newly added destinations receive only future notifications.
+- If every destination is disabled, monitoring continues and notifications are reported as paused.
 - API collector failures alert after three consecutive failures and once on recovery.
 - Plan-specific unavailable endpoints appear as unsupported and retry every six hours.
 - Starting a different TailState release queues one durable notification containing the previous and current versions.
 
-Version tracking is introduced in v0.3.0. Its first startup records the release silently because earlier releases did not persist their version; subsequent upgrades include both exact versions in the Mattermost notification.
+Version tracking is introduced in v0.3.0. Its first startup records the release silently because earlier releases did not persist their version; subsequent upgrades include both exact versions in the notification.
+
+### Migration from older releases
+
+On the first startup after this upgrade, an existing encrypted Mattermost webhook is converted automatically to a native `mattermost://` destination when it uses the standard `/hooks/<token>` path. Other paths are preserved as a `generic://` JSON webhook with the existing TailState username and satellite icon. Existing pending outbox items are assigned to the migrated destination. The legacy encrypted column is retained but no longer used for new configuration.
 
 ## Runtime configuration
 

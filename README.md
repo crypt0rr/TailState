@@ -73,7 +73,7 @@ Shoutrrr supports Mattermost natively, for example:
 mattermost://TailState@mattermost.example/hooks-token?icon=satellite
 ```
 
-Any service registered by the pinned Shoutrrr release is accepted. Generic webhooks can be configured with `generic://` URLs and Shoutrrr query options such as `template=json&messagekey=text`.
+Any service registered by the pinned Shoutrrr release is accepted. See the [Shoutrrr service overview](https://containrrr.dev/shoutrrr/dev/services/overview/) for supported endpoint schemes and provider-specific URL formats. Generic webhooks can be configured with `generic://` URLs and Shoutrrr query options such as `template=json&messagekey=text`.
 
 ```console
 curl -fsS http://127.0.0.1:8080/healthz

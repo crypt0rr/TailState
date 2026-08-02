@@ -165,7 +165,7 @@ func ConvertLegacyMattermostURL(raw string) (string, error) {
 		return "", fmt.Errorf("invalid Mattermost webhook URL (%s)", RedactURL(raw))
 	}
 	if u.Scheme != "http" && u.Scheme != "https" {
-		return "", fmt.Errorf("Mattermost webhook must use http or https (%s)", RedactURL(raw))
+		return "", fmt.Errorf("mattermost webhook must use http or https (%s)", RedactURL(raw))
 	}
 	segments := strings.Split(strings.Trim(u.Path, "/"), "/")
 	if len(segments) == 2 && segments[0] == "hooks" && segments[1] != "" && u.RawQuery == "" && u.Fragment == "" {

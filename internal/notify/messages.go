@@ -3,10 +3,7 @@ package notify
 import (
 	"encoding/json"
 	"fmt"
-	"net/http"
-	"strconv"
 	"strings"
-	"time"
 
 	"github.com/crypt0rr/tailstate/internal/model"
 )
@@ -63,14 +60,4 @@ func short(value any) string {
 		text = text[:179] + "…"
 	}
 	return escape(text)
-}
-
-func retryAfter(value string) time.Duration {
-	if seconds, err := strconv.Atoi(value); err == nil && seconds >= 0 {
-		return time.Duration(seconds) * time.Second
-	}
-	if when, err := http.ParseTime(value); err == nil {
-		return max(time.Until(when), 0)
-	}
-	return 0
 }

@@ -67,11 +67,11 @@ func (c *Client) Collect(ctx context.Context, collector string) ([]model.Resourc
 	case "users":
 		return c.collection(ctx, c.tailnet("users"), "users", collector, "user", []string{"id", "userId", "userID", "loginName"})
 	case "user_invites":
-		return c.collection(ctx, c.tailnet("user-invites"), "userInvites", collector, "user_invite", []string{"id", "inviteId", "inviteID"})
+		return c.collectionAllowEmptyResponse(ctx, c.tailnet("user-invites"), "userInvites", collector, "user_invite", []string{"id", "inviteId", "inviteID"})
 	case "keys":
 		return c.collection(ctx, c.tailnet("keys?all=true"), "keys", collector, "credential", []string{"id", "keyId", "keyID"})
 	case "webhooks":
-		return c.collection(ctx, c.tailnet("webhooks"), "webhooks", collector, "webhook_configuration", []string{"id", "endpointId", "endpointID"})
+		return c.collectionAllowEmptyResponse(ctx, c.tailnet("webhooks"), "webhooks", collector, "webhook_configuration", []string{"id", "endpointId", "endpointID"})
 	case "dns":
 		return c.dns(ctx)
 	case "policy":
@@ -196,7 +196,15 @@ func (c *Client) single(ctx context.Context, endpoint, collector, typ, name stri
 }
 
 func (c *Client) collection(ctx context.Context, endpoint, arrayKey, collector, typ string, ids []string) ([]model.Resource, error) {
-	values, err := c.allPages(ctx, endpoint, arrayKey)
+	return c.collectionWithOptions(ctx, endpoint, arrayKey, collector, typ, ids, false)
+}
+
+func (c *Client) collectionAllowEmptyResponse(ctx context.Context, endpoint, arrayKey, collector, typ string, ids []string) ([]model.Resource, error) {
+	return c.collectionWithOptions(ctx, endpoint, arrayKey, collector, typ, ids, true)
+}
+
+func (c *Client) collectionWithOptions(ctx context.Context, endpoint, arrayKey, collector, typ string, ids []string, allowEmptyResponse bool) ([]model.Resource, error) {
+	values, err := c.allPagesWithOptions(ctx, endpoint, arrayKey, allowEmptyResponse)
 	if err != nil {
 		return nil, err
 	}
@@ -213,6 +221,10 @@ func (c *Client) collection(ctx context.Context, endpoint, arrayKey, collector, 
 }
 
 func (c *Client) allPages(ctx context.Context, endpoint, arrayKey string) ([]map[string]any, error) {
+	return c.allPagesWithOptions(ctx, endpoint, arrayKey, false)
+}
+
+func (c *Client) allPagesWithOptions(ctx context.Context, endpoint, arrayKey string, allowEmptyResponse bool) ([]map[string]any, error) {
 	next := endpoint
 	var out []map[string]any
 	for page := 0; page < 100; page++ {
@@ -223,7 +235,13 @@ func (c *Client) allPages(ctx context.Context, endpoint, arrayKey string) ([]map
 		object, objectOK := value.(map[string]any)
 		var items []any
 		if objectOK {
-			items, _ = object[arrayKey].([]any)
+			raw, present := object[arrayKey]
+			if present && raw != nil {
+				items, _ = raw.([]any)
+			} else if allowEmptyResponse {
+				// Some Tailscale deployments omit or null the collection field when it is empty.
+				items = []any{}
+			}
 		} else {
 			items, _ = value.([]any)
 		}

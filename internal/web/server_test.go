@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/crypt0rr/tailstate/internal/boot"
+	"github.com/crypt0rr/tailstate/internal/model"
 	"github.com/crypt0rr/tailstate/internal/monitor"
 	"github.com/crypt0rr/tailstate/internal/secret"
 	"github.com/crypt0rr/tailstate/internal/store"
@@ -138,5 +139,49 @@ func TestSettingsRedactsDestinationCredentials(t *testing.T) {
 	}
 	if !strings.Contains(body, "mattermost://mattermost.example") {
 		t.Fatal("redacted destination endpoint missing")
+	}
+}
+
+func TestHistoryRequiresAuthenticationAndShowsExplainableChanges(t *testing.T) {
+	server, st, setupToken := testServer(t)
+	ctx := context.Background()
+	claim := url.Values{"token": {setupToken}, "password": {"a secure password"}, "confirm": {"a secure password"}}
+	claimRequest := httptest.NewRequest(http.MethodPost, "/setup/claim", strings.NewReader(claim.Encode()))
+	claimRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	claimResponse := httptest.NewRecorder()
+	server.Handler().ServeHTTP(claimResponse, claimRequest)
+	if claimResponse.Code != http.StatusSeeOther {
+		t.Fatalf("claim status %d: %s", claimResponse.Code, claimResponse.Body.String())
+	}
+
+	unauthenticated := httptest.NewRecorder()
+	server.Handler().ServeHTTP(unauthenticated, httptest.NewRequest(http.MethodGet, "/history", nil))
+	if unauthenticated.Code != http.StatusSeeOther || unauthenticated.Header().Get("Location") != "/login" {
+		t.Fatalf("history was not protected: status=%d location=%q", unauthenticated.Code, unauthenticated.Header().Get("Location"))
+	}
+	generation, err := st.SaveSettings(ctx, store.Settings{Tailnet: "-", OAuthClientID: "client", OAuthClientSecret: "secret", MattermostURL: "https://mattermost.example/hooks/token", DeviceInterval: time.Minute, InventoryInterval: 5 * time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseline := []model.Collected{{Collector: "devices", Resources: []model.Resource{{ID: "device-1", Type: "device", Name: "server", Data: map[string]any{"hostname": "server"}}}}}
+	changed := []model.Collected{{Collector: "devices", Resources: []model.Resource{{ID: "device-1", Type: "device", Name: "server", Data: map[string]any{"hostname": "server-new"}}}}}
+	if _, err := st.ApplyBatch(ctx, generation, baseline, func([]model.Change) string { return "baseline" }); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.ApplyBatch(ctx, generation, changed, func([]model.Change) string { return "digest" }); err != nil {
+		t.Fatal(err)
+	}
+	authenticated := httptest.NewRequest(http.MethodGet, "/history?event_type=changed&resource=device-1", nil)
+	for _, cookie := range claimResponse.Result().Cookies() {
+		authenticated.AddCookie(cookie)
+	}
+	historyResponse := httptest.NewRecorder()
+	server.Handler().ServeHTTP(historyResponse, authenticated)
+	body := historyResponse.Body.String()
+	if historyResponse.Code != http.StatusOK || !strings.Contains(body, "Change history") || !strings.Contains(body, "changed") || !strings.Contains(body, "server-new") {
+		t.Fatalf("history page missing explainable change: status=%d body=%s", historyResponse.Code, body)
+	}
+	if strings.Contains(body, "mattermost.example") || strings.Contains(body, "token") {
+		t.Fatalf("history page leaked notification credentials: %s", body)
 	}
 }

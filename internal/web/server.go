@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -43,6 +44,11 @@ type pageData struct {
 	Settings                        store.Settings
 	DeviceSeconds, InventorySeconds int64
 	Status                          store.Status
+	History                         store.HistoryPage
+	HistoryFilter                   store.HistoryFilter
+	HistoryCollectors               []string
+	HistoryEventTypes               []string
+	HistoryNextURL                  string
 	Destinations                    []destinationPage
 	NotificationsPaused             bool
 }
@@ -56,7 +62,7 @@ type destinationPage struct {
 
 func New(config boot.Config, st *store.Store, engine *monitor.Engine) (*Server, error) {
 	templates := map[string]*template.Template{}
-	for _, name := range []string{"setup", "login", "reset", "settings", "status"} {
+	for _, name := range []string{"setup", "login", "reset", "settings", "status", "history"} {
 		parsed, err := template.ParseFS(assets, "templates/"+name+".html")
 		if err != nil {
 			return nil, err
@@ -82,6 +88,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /reset", s.reset)
 	mux.HandleFunc("POST /reset", s.resetPost)
 	mux.HandleFunc("GET /status", s.status)
+	mux.HandleFunc("GET /history", s.history)
 	mux.HandleFunc("GET /settings", s.settings)
 	mux.HandleFunc("POST /settings", s.settingsPost)
 	mux.HandleFunc("POST /settings/destinations", s.destinationPost)
@@ -251,6 +258,61 @@ func (s *Server) status(w http.ResponseWriter, r *http.Request) {
 	}
 	s.render(w, "status", pageData{CSRF: csrf, Status: status})
 }
+
+func (s *Server) history(w http.ResponseWriter, r *http.Request) {
+	csrf, ok := s.requireAuth(w, r, false)
+	if !ok {
+		return
+	}
+	filter := historyFilter(r)
+	history, err := s.store.ListHistory(r.Context(), filter)
+	if err != nil {
+		http.Error(w, "load history", http.StatusInternalServerError)
+		return
+	}
+	collectors := append([]string{}, tailscale.CoreCollectors...)
+	collectors = append(collectors, tailscale.InventoryCollectors...)
+	data := pageData{
+		CSRF:              csrf,
+		History:           history,
+		HistoryFilter:     filter,
+		HistoryCollectors: collectors,
+		HistoryEventTypes: []string{"created", "changed", "removed"},
+	}
+	if history.HasNext {
+		data.HistoryNextURL = historyURL(filter, history.NextCursor)
+	}
+	s.render(w, "history", data)
+}
+
+func historyFilter(r *http.Request) store.HistoryFilter {
+	filter := store.HistoryFilter{
+		Collector:  strings.TrimSpace(r.URL.Query().Get("collector")),
+		EventType:  strings.TrimSpace(r.URL.Query().Get("event_type")),
+		ResourceID: strings.TrimSpace(r.URL.Query().Get("resource")),
+		Limit:      20,
+	}
+	if cursor, err := strconv.ParseInt(r.URL.Query().Get("cursor"), 10, 64); err == nil && cursor > 0 {
+		filter.Cursor = cursor
+	}
+	return filter
+}
+
+func historyURL(filter store.HistoryFilter, cursor int64) string {
+	values := url.Values{}
+	if filter.Collector != "" {
+		values.Set("collector", filter.Collector)
+	}
+	if filter.EventType != "" {
+		values.Set("event_type", filter.EventType)
+	}
+	if filter.ResourceID != "" {
+		values.Set("resource", filter.ResourceID)
+	}
+	values.Set("cursor", strconv.FormatInt(cursor, 10))
+	return "/history?" + values.Encode()
+}
+
 func (s *Server) settings(w http.ResponseWriter, r *http.Request) {
 	csrf, ok := s.requireAuth(w, r, false)
 	if !ok {

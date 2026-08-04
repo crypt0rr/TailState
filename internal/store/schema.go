@@ -3,7 +3,7 @@ package store
 const schema = `
 PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);
-INSERT INTO schema_version(version) SELECT 2 WHERE NOT EXISTS (SELECT 1 FROM schema_version);
+INSERT INTO schema_version(version) SELECT 3 WHERE NOT EXISTS (SELECT 1 FROM schema_version);
 
 CREATE TABLE IF NOT EXISTS meta (
   key TEXT PRIMARY KEY,
@@ -67,19 +67,31 @@ CREATE TABLE IF NOT EXISTS snapshots (
   updated_at TEXT NOT NULL,
   PRIMARY KEY(generation, collector, resource_id)
 );
+CREATE TABLE IF NOT EXISTS event_batches (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  generation INTEGER NOT NULL,
+  observed_at TEXT NOT NULL,
+  change_count INTEGER NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS event_batches_observed_at ON event_batches(observed_at DESC, id DESC);
 CREATE TABLE IF NOT EXISTS events (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
+  batch_id INTEGER,
   generation INTEGER NOT NULL,
   observed_at TEXT NOT NULL,
   collector TEXT NOT NULL,
   event_type TEXT NOT NULL,
   resource_id TEXT NOT NULL,
   name TEXT NOT NULL,
-  changes_json BLOB NOT NULL
+  changes_json BLOB NOT NULL,
+  before_json BLOB,
+  after_json BLOB
 );
 CREATE INDEX IF NOT EXISTS events_observed_at ON events(observed_at);
 CREATE TABLE IF NOT EXISTS outbox (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
+  batch_id INTEGER,
   destination_id INTEGER NOT NULL,
   payload TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT 'pending',

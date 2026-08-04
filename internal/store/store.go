@@ -71,6 +71,7 @@ type Status struct {
 
 type OutboxItem struct {
 	ID            int64
+	BatchID       int64
 	DestinationID int64
 	Destination   NotificationDestination
 	Payload       string
@@ -78,7 +79,72 @@ type OutboxItem struct {
 	FirstAttempt  time.Time
 }
 
-const currentSchemaVersion = 2
+type ChangeBatch struct {
+	ID          int64
+	Generation  int64
+	ObservedAt  time.Time
+	ChangeCount int
+}
+
+type ChangeBatchResult struct {
+	ChangeBatch
+	Changes []model.Change
+}
+
+type HistoryFieldChange struct {
+	Field  string
+	Old    string
+	New    string
+	HasOld bool
+	HasNew bool
+}
+
+type HistoryEvent struct {
+	ID         int64
+	BatchID    int64
+	Generation int64
+	ObservedAt time.Time
+	Collector  string
+	EventType  string
+	ResourceID string
+	Name       string
+	Fields     []HistoryFieldChange
+	BeforeJSON string
+	AfterJSON  string
+}
+
+type HistoryDelivery struct {
+	ID            int64
+	DestinationID int64
+	Destination   string
+	Status        string
+	Attempts      int
+	LastError     string
+	NextAttempt   *time.Time
+	DeliveredAt   *time.Time
+}
+
+type HistoryBatch struct {
+	ChangeBatch
+	Events     []HistoryEvent
+	Deliveries []HistoryDelivery
+}
+
+type HistoryFilter struct {
+	Collector  string
+	EventType  string
+	ResourceID string
+	Cursor     int64
+	Limit      int
+}
+
+type HistoryPage struct {
+	Batches    []HistoryBatch
+	NextCursor int64
+	HasNext    bool
+}
+
+const currentSchemaVersion = 3
 
 func Open(path string, box *secret.Box) (*Store, error) {
 	if err := os.MkdirAll(filepathDir(path), 0o700); err != nil {
@@ -97,6 +163,10 @@ func Open(path string, box *secret.Box) (*Store, error) {
 	if err := migrateSchema(db, box); err != nil {
 		db.Close()
 		return nil, err
+	}
+	if _, err := db.Exec("CREATE INDEX IF NOT EXISTS events_batch_id ON events(batch_id, id)"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("create event history index: %w", err)
 	}
 	st := &Store{db: db, box: box}
 	var keyCheck string
@@ -141,6 +211,9 @@ func migrateSchema(db *sql.DB, box *secret.Box) error {
 	}
 	if version == currentSchemaVersion {
 		return nil
+	}
+	if version == 2 {
+		return migrateSchemaV2ToV3(db)
 	}
 	if version != 1 {
 		return fmt.Errorf("database schema version %d requires a newer migration path", version)
@@ -224,6 +297,88 @@ func migrateSchema(db *sql.DB, box *secret.Box) error {
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit schema migration: %w", err)
+	}
+	return migrateSchema(db, box)
+}
+
+func migrateSchemaV2ToV3(db *sql.DB) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin event history migration: %w", err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`CREATE TABLE IF NOT EXISTS event_batches (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		generation INTEGER NOT NULL,
+		observed_at TEXT NOT NULL,
+		change_count INTEGER NOT NULL,
+		created_at TEXT NOT NULL
+	)`); err != nil {
+		return fmt.Errorf("create event batches: %w", err)
+	}
+	for _, column := range []struct {
+		table, name, definition string
+	}{
+		{table: "events", name: "batch_id", definition: "INTEGER"},
+		{table: "events", name: "before_json", definition: "BLOB"},
+		{table: "events", name: "after_json", definition: "BLOB"},
+		{table: "outbox", name: "batch_id", definition: "INTEGER"},
+	} {
+		if err := addColumnIfMissing(tx, column.table, column.name, column.definition); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.Exec(`INSERT INTO event_batches(generation,observed_at,change_count,created_at)
+		SELECT generation,observed_at,COUNT(*),observed_at
+		FROM events WHERE batch_id IS NULL GROUP BY generation,observed_at`); err != nil {
+		return fmt.Errorf("backfill event batches: %w", err)
+	}
+	if _, err := tx.Exec(`UPDATE events SET batch_id=(
+		SELECT id FROM event_batches b
+		WHERE b.generation=events.generation AND b.observed_at=events.observed_at
+		ORDER BY b.id LIMIT 1
+	) WHERE batch_id IS NULL`); err != nil {
+		return fmt.Errorf("assign event batches: %w", err)
+	}
+	if _, err := tx.Exec(`UPDATE outbox SET batch_id=(
+		SELECT id FROM event_batches b
+		WHERE b.observed_at=outbox.created_at
+		ORDER BY b.id DESC LIMIT 1
+	) WHERE batch_id IS NULL`); err != nil {
+		return fmt.Errorf("assign outbox event batches: %w", err)
+	}
+	if _, err := tx.Exec("UPDATE schema_version SET version=3"); err != nil {
+		return fmt.Errorf("record event history migration: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit event history migration: %w", err)
+	}
+	return nil
+}
+
+func addColumnIfMissing(tx *sql.Tx, table, column, definition string) error {
+	rows, err := tx.Query("PRAGMA table_info(" + table + ")")
+	if err != nil {
+		return fmt.Errorf("inspect %s schema: %w", table, err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var name, typ string
+		var notnull, pk int
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &typ, &notnull, &defaultValue, &pk); err != nil {
+			return err
+		}
+		if name == column {
+			return nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if _, err := tx.Exec("ALTER TABLE " + table + " ADD COLUMN " + column + " " + definition); err != nil {
+		return fmt.Errorf("add %s.%s: %w", table, column, err)
 	}
 	return nil
 }
@@ -739,7 +894,7 @@ func (s *Store) TrackAppVersion(ctx context.Context, current string, notificatio
 	if notified {
 		now := time.Now().UTC().Format(time.RFC3339Nano)
 		payload := notification(previous, current)
-		if err = enqueueOutboxTx(ctx, tx, payload, now); err != nil {
+		if err = enqueueOutboxTx(ctx, tx, payload, now, 0); err != nil {
 			return false, err
 		}
 	}
@@ -749,21 +904,38 @@ func (s *Store) TrackAppVersion(ctx context.Context, current string, notificatio
 	return notified, nil
 }
 
+type recordedChange struct {
+	Change model.Change
+	Before []byte
+	After  []byte
+}
+
 func (s *Store) ApplyBatch(ctx context.Context, generation int64, results []model.Collected, digest func([]model.Change) string) ([]model.Change, error) {
+	batch, err := s.ApplyBatchWithBatch(ctx, generation, results, digest)
+	return batch.Changes, err
+}
+
+func (s *Store) ApplyBatchWithBatch(ctx context.Context, generation int64, results []model.Collected, digest func([]model.Change) string) (ChangeBatchResult, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return nil, err
+		return ChangeBatchResult{}, err
 	}
 	defer tx.Rollback()
 	var activeGeneration int64
 	if err := tx.QueryRowContext(ctx, "SELECT generation FROM settings WHERE id=1").Scan(&activeGeneration); err != nil {
-		return nil, err
+		return ChangeBatchResult{}, err
 	}
 	if activeGeneration != generation {
-		return nil, nil
+		return ChangeBatchResult{}, nil
 	}
 	now := time.Now().UTC()
+	observedAt := now.Format(time.RFC3339Nano)
 	var changes []model.Change
+	var recorded []recordedChange
+	record := func(change model.Change, before, after []byte) {
+		changes = append(changes, change)
+		recorded = append(recorded, recordedChange{Change: change, Before: append([]byte(nil), before...), After: append([]byte(nil), after...)})
+	}
 	for _, result := range results {
 		if result.Error != nil {
 			continue
@@ -772,7 +944,7 @@ func (s *Store) ApplyBatch(ctx context.Context, generation int64, results []mode
 			next := now.Add(6 * time.Hour).Format(time.RFC3339Nano)
 			_, err = tx.ExecContext(ctx, `INSERT INTO collector_state(generation,collector,supported,baseline,last_error,next_poll) VALUES(?,?,0,0,'unsupported',?) ON CONFLICT(generation,collector) DO UPDATE SET supported=0,baseline=0,last_error='unsupported',next_poll=excluded.next_poll`, generation, result.Collector, next)
 			if err != nil {
-				return nil, err
+				return ChangeBatchResult{}, err
 			}
 			continue
 		}
@@ -783,7 +955,7 @@ func (s *Store) ApplyBatch(ctx context.Context, generation int64, results []mode
 			seen[resource.ID] = struct{}{}
 			raw, hash, err := model.CanonicalFor(result.Collector, resource.Data)
 			if err != nil {
-				return nil, err
+				return ChangeBatchResult{}, err
 			}
 			var oldRaw []byte
 			var oldHash, oldType, oldName string
@@ -794,7 +966,7 @@ func (s *Store) ApplyBatch(ctx context.Context, generation int64, results []mode
 				if json.Unmarshal(oldRaw, &oldValue) == nil {
 					normalizedOldRaw, normalizedOldHash, normalizeErr := model.CanonicalFor(result.Collector, oldValue)
 					if normalizeErr != nil {
-						return nil, normalizeErr
+						return ChangeBatchResult{}, normalizeErr
 					}
 					oldRaw = normalizedOldRaw
 					oldHash = normalizedOldHash
@@ -803,91 +975,116 @@ func (s *Store) ApplyBatch(ctx context.Context, generation int64, results []mode
 			switch {
 			case errors.Is(err, sql.ErrNoRows):
 				if baseline == 1 {
-					changes = append(changes, model.Change{Kind: "created", Collector: result.Collector, ResourceID: resource.ID, Type: resource.Type, Name: resource.Name})
+					record(model.Change{Kind: "created", Collector: result.Collector, ResourceID: resource.ID, Type: resource.Type, Name: resource.Name}, nil, raw)
 				}
 				_, err = tx.ExecContext(ctx, `INSERT INTO snapshots(generation,collector,resource_id,resource_type,name,canonical_json,content_hash,missing_count,updated_at) VALUES(?,?,?,?,?,?,?,?,?)`, generation, result.Collector, resource.ID, resource.Type, resource.Name, raw, hash, 0, now.Format(time.RFC3339Nano))
 			case err != nil:
-				return nil, err
+				return ChangeBatchResult{}, err
 			case oldHash != hash:
 				if baseline == 1 {
-					changes = append(changes, model.Change{Kind: "changed", Collector: result.Collector, ResourceID: resource.ID, Type: resource.Type, Name: resource.Name, Fields: model.Diff(oldRaw, raw)})
+					record(model.Change{Kind: "changed", Collector: result.Collector, ResourceID: resource.ID, Type: resource.Type, Name: resource.Name, Fields: model.Diff(oldRaw, raw)}, oldRaw, raw)
 				}
 				_, err = tx.ExecContext(ctx, "UPDATE snapshots SET resource_type=?,name=?,canonical_json=?,content_hash=?,missing_count=0,updated_at=? WHERE generation=? AND collector=? AND resource_id=?", resource.Type, resource.Name, raw, hash, now.Format(time.RFC3339Nano), generation, result.Collector, resource.ID)
 			default:
 				_, err = tx.ExecContext(ctx, "UPDATE snapshots SET resource_type=?,name=?,canonical_json=?,content_hash=?,missing_count=0,updated_at=? WHERE generation=? AND collector=? AND resource_id=?", resource.Type, resource.Name, raw, hash, now.Format(time.RFC3339Nano), generation, result.Collector, resource.ID)
 			}
 			if err != nil {
-				return nil, err
+				return ChangeBatchResult{}, err
 			}
 		}
-		rows, err := tx.QueryContext(ctx, "SELECT resource_id,resource_type,name,missing_count FROM snapshots WHERE generation=? AND collector=?", generation, result.Collector)
+		rows, err := tx.QueryContext(ctx, "SELECT resource_id,resource_type,name,canonical_json,missing_count FROM snapshots WHERE generation=? AND collector=?", generation, result.Collector)
 		if err != nil {
-			return nil, err
+			return ChangeBatchResult{}, err
 		}
 		type absent struct {
 			id, typ, name string
+			raw           []byte
 			missing       int
 		}
 		var missingRows []absent
 		for rows.Next() {
 			var a absent
-			if err := rows.Scan(&a.id, &a.typ, &a.name, &a.missing); err != nil {
+			if err := rows.Scan(&a.id, &a.typ, &a.name, &a.raw, &a.missing); err != nil {
 				rows.Close()
-				return nil, err
+				return ChangeBatchResult{}, err
 			}
 			if _, ok := seen[a.id]; !ok {
 				missingRows = append(missingRows, a)
 			}
 		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return ChangeBatchResult{}, err
+		}
 		rows.Close()
 		for _, a := range missingRows {
 			if a.missing+1 >= 2 {
 				if baseline == 1 {
-					changes = append(changes, model.Change{Kind: "removed", Collector: result.Collector, ResourceID: a.id, Type: a.typ, Name: a.name})
+					record(model.Change{Kind: "removed", Collector: result.Collector, ResourceID: a.id, Type: a.typ, Name: a.name}, a.raw, nil)
 				}
 				_, err = tx.ExecContext(ctx, "DELETE FROM snapshots WHERE generation=? AND collector=? AND resource_id=?", generation, result.Collector, a.id)
 			} else {
 				_, err = tx.ExecContext(ctx, "UPDATE snapshots SET missing_count=missing_count+1 WHERE generation=? AND collector=? AND resource_id=?", generation, result.Collector, a.id)
 			}
 			if err != nil {
-				return nil, err
+				return ChangeBatchResult{}, err
 			}
 		}
-		_, err = tx.ExecContext(ctx, `INSERT INTO collector_state(generation,collector,supported,baseline,last_success,last_error,failure_count,unhealthy_notified) VALUES(?,?,1,1,?,'',0,0) ON CONFLICT(generation,collector) DO UPDATE SET supported=1,baseline=1,last_success=excluded.last_success,last_error='',failure_count=0,unhealthy_notified=0`, generation, result.Collector, now.Format(time.RFC3339Nano))
+		_, err = tx.ExecContext(ctx, `INSERT INTO collector_state(generation,collector,supported,baseline,last_success,last_error,failure_count,unhealthy_notified) VALUES(?,?,1,1,?,'',0,0) ON CONFLICT(generation,collector) DO UPDATE SET supported=1,baseline=1,last_success=excluded.last_success,last_error='',failure_count=0,unhealthy_notified=0`, generation, result.Collector, observedAt)
 		if err != nil {
-			return nil, err
+			return ChangeBatchResult{}, err
 		}
 	}
-	for _, change := range changes {
-		raw, _ := json.Marshal(change.Fields)
-		_, err = tx.ExecContext(ctx, "INSERT INTO events(generation,observed_at,collector,event_type,resource_id,name,changes_json) VALUES(?,?,?,?,?,?,?)", generation, now.Format(time.RFC3339Nano), change.Collector, change.Kind, change.ResourceID, change.Name, raw)
+	result := ChangeBatchResult{ChangeBatch: ChangeBatch{Generation: generation, ObservedAt: now}, Changes: changes}
+	if len(recorded) > 0 {
+		batchResult, err := tx.ExecContext(ctx, "INSERT INTO event_batches(generation,observed_at,change_count,created_at) VALUES(?,?,?,?)", generation, observedAt, len(recorded), observedAt)
 		if err != nil {
-			return nil, err
+			return ChangeBatchResult{}, err
 		}
-	}
-	if len(changes) > 0 {
+		batchID, err := batchResult.LastInsertId()
+		if err != nil {
+			return ChangeBatchResult{}, err
+		}
+		result.ID, result.ChangeCount = batchID, len(recorded)
+		for _, entry := range recorded {
+			fields, marshalErr := json.Marshal(entry.Change.Fields)
+			if marshalErr != nil {
+				return ChangeBatchResult{}, marshalErr
+			}
+			_, err = tx.ExecContext(ctx, "INSERT INTO events(batch_id,generation,observed_at,collector,event_type,resource_id,name,changes_json,before_json,after_json) VALUES(?,?,?,?,?,?,?,?,?,?)", batchID, generation, observedAt, entry.Change.Collector, entry.Change.Kind, entry.Change.ResourceID, entry.Change.Name, fields, nullableJSON(entry.Before), nullableJSON(entry.After))
+			if err != nil {
+				return ChangeBatchResult{}, err
+			}
+		}
 		payload := digest(changes)
-		if err = enqueueOutboxTx(ctx, tx, payload, now.Format(time.RFC3339Nano)); err != nil {
-			return nil, err
+		if err = enqueueOutboxTx(ctx, tx, payload, observedAt, batchID); err != nil {
+			return ChangeBatchResult{}, err
 		}
 	}
 	var remaining int
 	err = tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM collector_state WHERE generation=? AND supported=1 AND baseline=0", generation).Scan(&remaining)
 	if err != nil {
-		return nil, err
+		return ChangeBatchResult{}, err
 	}
 	var supported int
 	_ = tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM collector_state WHERE generation=? AND supported=1", generation).Scan(&supported)
 	if supported > 0 && remaining == 0 {
-		_, err = tx.ExecContext(ctx, "UPDATE settings SET baseline_at=COALESCE(baseline_at,?) WHERE id=1 AND generation=?", now.Format(time.RFC3339Nano), generation)
+		_, err = tx.ExecContext(ctx, "UPDATE settings SET baseline_at=COALESCE(baseline_at,?) WHERE id=1 AND generation=?", observedAt, generation)
 		if err != nil {
-			return nil, err
+			return ChangeBatchResult{}, err
 		}
 	}
 	if err := tx.Commit(); err != nil {
-		return nil, err
+		return ChangeBatchResult{}, err
 	}
-	return changes, nil
+	return result, nil
+}
+
+func nullableJSON(raw []byte) any {
+	if len(raw) == 0 {
+		return nil
+	}
+	return raw
 }
 
 func (s *Store) RecordCollectorFailure(ctx context.Context, generation int64, collector, message string) (notify bool, recovered bool, err error) {
@@ -931,14 +1128,14 @@ func (s *Store) EnqueueSystem(ctx context.Context, payload string) error {
 		return err
 	}
 	defer tx.Rollback()
-	if err := enqueueOutboxTx(ctx, tx, payload, now); err != nil {
+	if err := enqueueOutboxTx(ctx, tx, payload, now, 0); err != nil {
 		return err
 	}
 	return tx.Commit()
 }
 
 func (s *Store) DueOutbox(ctx context.Context, limit int) ([]OutboxItem, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT o.id,o.destination_id,o.payload,o.attempts,o.first_attempt,d.name,d.service_url_enc,d.enabled,d.created_at,d.updated_at,COALESCE(d.deleted_at,'')
+	rows, err := s.db.QueryContext(ctx, `SELECT o.id,COALESCE(o.batch_id,0),o.destination_id,o.payload,o.attempts,o.first_attempt,d.name,d.service_url_enc,d.enabled,d.created_at,d.updated_at,COALESCE(d.deleted_at,'')
 		FROM outbox o JOIN notification_destinations d ON d.id=o.destination_id
 		WHERE o.status='pending' AND o.next_attempt<=? AND d.enabled=1 AND d.deleted_at IS NULL ORDER BY o.id LIMIT ?`, time.Now().UTC().Format(time.RFC3339Nano), limit)
 	if err != nil {
@@ -948,10 +1145,14 @@ func (s *Store) DueOutbox(ctx context.Context, limit int) ([]OutboxItem, error) 
 	var out []OutboxItem
 	for rows.Next() {
 		var item OutboxItem
+		var batchID sql.NullInt64
 		var first, encrypted, created, updated, deleted, name string
 		var enabled int
-		if err := rows.Scan(&item.ID, &item.DestinationID, &item.Payload, &item.Attempts, &first, &name, &encrypted, &enabled, &created, &updated, &deleted); err != nil {
+		if err := rows.Scan(&item.ID, &batchID, &item.DestinationID, &item.Payload, &item.Attempts, &first, &name, &encrypted, &enabled, &created, &updated, &deleted); err != nil {
 			return nil, err
+		}
+		if batchID.Valid {
+			item.BatchID = batchID.Int64
 		}
 		item.FirstAttempt, _ = time.Parse(time.RFC3339Nano, first)
 		item.Destination = NotificationDestination{ID: item.DestinationID, Name: name, Enabled: enabled == 1}
@@ -972,7 +1173,7 @@ func (s *Store) DueOutbox(ctx context.Context, limit int) ([]OutboxItem, error) 
 	return out, rows.Err()
 }
 
-func enqueueOutboxTx(ctx context.Context, tx *sql.Tx, payload, now string) error {
+func enqueueOutboxTx(ctx context.Context, tx *sql.Tx, payload, now string, batchID int64) error {
 	rows, err := tx.QueryContext(ctx, "SELECT id FROM notification_destinations WHERE enabled=1 AND deleted_at IS NULL ORDER BY id")
 	if err != nil {
 		return err
@@ -983,7 +1184,11 @@ func enqueueOutboxTx(ctx context.Context, tx *sql.Tx, payload, now string) error
 		if err := rows.Scan(&destinationID); err != nil {
 			return err
 		}
-		if _, err := tx.ExecContext(ctx, "INSERT INTO outbox(destination_id,payload,status,next_attempt,first_attempt,created_at) VALUES(? ,?,'pending',?,?,?)", destinationID, payload, now, now, now); err != nil {
+		var batchValue any
+		if batchID > 0 {
+			batchValue = batchID
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO outbox(batch_id,destination_id,payload,status,next_attempt,first_attempt,created_at) VALUES(?,?,?,'pending',?,?,?)", batchValue, destinationID, payload, now, now, now); err != nil {
 			return err
 		}
 	}
@@ -1116,9 +1321,202 @@ func (s *Store) Cleanup(ctx context.Context, retention time.Duration) error {
 	if err != nil {
 		return err
 	}
+	if _, err := s.db.ExecContext(ctx, "DELETE FROM event_batches WHERE NOT EXISTS (SELECT 1 FROM events WHERE events.batch_id=event_batches.id)"); err != nil {
+		return err
+	}
 	_, err = s.db.ExecContext(ctx, "DELETE FROM outbox WHERE status='delivered' AND delivered_at<?", cutoff)
 	return err
 }
+
+func (s *Store) ListHistory(ctx context.Context, filter HistoryFilter) (HistoryPage, error) {
+	limit := filter.Limit
+	if limit <= 0 {
+		limit = 20
+	}
+	if limit > 100 {
+		limit = 100
+	}
+	where := []string{"1=1"}
+	args := make([]any, 0, 5)
+	if filter.Cursor > 0 {
+		where = append(where, "b.id < ?")
+		args = append(args, filter.Cursor)
+	}
+	if filter.Collector != "" {
+		where = append(where, "EXISTS (SELECT 1 FROM events e WHERE e.batch_id=b.id AND e.collector=?)")
+		args = append(args, filter.Collector)
+	}
+	if filter.EventType != "" {
+		where = append(where, "EXISTS (SELECT 1 FROM events e WHERE e.batch_id=b.id AND e.event_type=?)")
+		args = append(args, filter.EventType)
+	}
+	if filter.ResourceID != "" {
+		where = append(where, "EXISTS (SELECT 1 FROM events e WHERE e.batch_id=b.id AND (e.resource_id LIKE ? OR e.name LIKE ?))")
+		term := "%" + filter.ResourceID + "%"
+		args = append(args, term, term)
+	}
+	args = append(args, limit+1)
+	rows, err := s.db.QueryContext(ctx, `SELECT b.id,b.generation,b.observed_at,b.change_count
+		FROM event_batches b WHERE `+strings.Join(where, " AND ")+` ORDER BY b.id DESC LIMIT ?`, args...)
+	if err != nil {
+		return HistoryPage{}, err
+	}
+	defer rows.Close()
+	page := HistoryPage{Batches: make([]HistoryBatch, 0, limit)}
+	for rows.Next() {
+		var batch HistoryBatch
+		var observed string
+		if err := rows.Scan(&batch.ID, &batch.Generation, &observed, &batch.ChangeCount); err != nil {
+			return HistoryPage{}, err
+		}
+		batch.ObservedAt, _ = time.Parse(time.RFC3339Nano, observed)
+		page.Batches = append(page.Batches, batch)
+	}
+	if err := rows.Err(); err != nil {
+		return HistoryPage{}, err
+	}
+	if len(page.Batches) > limit {
+		page.HasNext = true
+		page.NextCursor = page.Batches[limit-1].ID
+		page.Batches = page.Batches[:limit]
+	}
+	loadedBatches := make([]HistoryBatch, 0, len(page.Batches))
+	for _, batch := range page.Batches {
+		loaded, err := s.loadHistoryBatch(ctx, batch, filter)
+		if err != nil {
+			return HistoryPage{}, err
+		}
+		if len(loaded.Events) > 0 {
+			if filter.Collector != "" || filter.EventType != "" || filter.ResourceID != "" {
+				loaded.ChangeCount = len(loaded.Events)
+			}
+			loadedBatches = append(loadedBatches, loaded)
+		}
+	}
+	page.Batches = loadedBatches
+	return page, nil
+}
+
+func (s *Store) loadHistoryBatch(ctx context.Context, batch HistoryBatch, filter HistoryFilter) (HistoryBatch, error) {
+	eventWhere := []string{"batch_id=?"}
+	eventArgs := []any{batch.ID}
+	if filter.Collector != "" {
+		eventWhere = append(eventWhere, "collector=?")
+		eventArgs = append(eventArgs, filter.Collector)
+	}
+	if filter.EventType != "" {
+		eventWhere = append(eventWhere, "event_type=?")
+		eventArgs = append(eventArgs, filter.EventType)
+	}
+	if filter.ResourceID != "" {
+		eventWhere = append(eventWhere, "(resource_id LIKE ? OR name LIKE ?)")
+		term := "%" + filter.ResourceID + "%"
+		eventArgs = append(eventArgs, term, term)
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT id,batch_id,generation,observed_at,collector,event_type,resource_id,name,changes_json,before_json,after_json
+		FROM events WHERE `+strings.Join(eventWhere, " AND ")+` ORDER BY id`, eventArgs...)
+	if err != nil {
+		return HistoryBatch{}, err
+	}
+	defer rows.Close()
+	batch.Events = make([]HistoryEvent, 0, batch.ChangeCount)
+	for rows.Next() {
+		var event HistoryEvent
+		var observed string
+		var fieldsRaw, beforeRaw, afterRaw []byte
+		if err := rows.Scan(&event.ID, &event.BatchID, &event.Generation, &observed, &event.Collector, &event.EventType, &event.ResourceID, &event.Name, &fieldsRaw, &beforeRaw, &afterRaw); err != nil {
+			return HistoryBatch{}, err
+		}
+		event.ObservedAt, _ = time.Parse(time.RFC3339Nano, observed)
+		var fields []model.FieldChange
+		if err := json.Unmarshal(fieldsRaw, &fields); err != nil && len(fieldsRaw) > 0 {
+			return HistoryBatch{}, fmt.Errorf("decode history fields: %w", err)
+		}
+		event.Fields = formatHistoryFields(fields)
+		event.BeforeJSON = prettyJSON(beforeRaw)
+		event.AfterJSON = prettyJSON(afterRaw)
+		batch.Events = append(batch.Events, event)
+	}
+	if err := rows.Err(); err != nil {
+		return HistoryBatch{}, err
+	}
+	if err := rows.Close(); err != nil {
+		return HistoryBatch{}, err
+	}
+	rows, err = s.db.QueryContext(ctx, `SELECT o.id,o.destination_id,COALESCE(d.name,'Removed destination'),o.status,o.attempts,o.last_error,o.next_attempt,COALESCE(o.delivered_at,''),COALESCE(d.service_url_enc,'')
+		FROM outbox o LEFT JOIN notification_destinations d ON d.id=o.destination_id
+		WHERE o.batch_id=? ORDER BY o.id`, batch.ID)
+	if err != nil {
+		return HistoryBatch{}, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var delivery HistoryDelivery
+		var nextAttempt, deliveredAt string
+		var encryptedURL string
+		if err := rows.Scan(&delivery.ID, &delivery.DestinationID, &delivery.Destination, &delivery.Status, &delivery.Attempts, &delivery.LastError, &nextAttempt, &deliveredAt, &encryptedURL); err != nil {
+			return HistoryBatch{}, err
+		}
+		if encryptedURL != "" {
+			if destinationURL, decryptErr := s.box.Decrypt(encryptedURL); decryptErr == nil {
+				delivery.LastError = strings.ReplaceAll(delivery.LastError, destinationURL, notify.RedactURL(destinationURL))
+			}
+		}
+		delivery.NextAttempt = parseOptionalTime(nextAttempt)
+		delivery.DeliveredAt = parseOptionalTime(deliveredAt)
+		batch.Deliveries = append(batch.Deliveries, delivery)
+	}
+	if err := rows.Err(); err != nil {
+		return HistoryBatch{}, err
+	}
+	return batch, nil
+}
+
+func formatHistoryFields(fields []model.FieldChange) []HistoryFieldChange {
+	out := make([]HistoryFieldChange, 0, len(fields))
+	for _, field := range fields {
+		formatted := HistoryFieldChange{Field: field.Field, HasOld: field.Old != nil, HasNew: field.New != nil}
+		if formatted.HasOld {
+			formatted.Old = prettyValue(field.Old)
+		}
+		if formatted.HasNew {
+			formatted.New = prettyValue(field.New)
+		}
+		out = append(out, formatted)
+	}
+	return out
+}
+
+func prettyJSON(raw []byte) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var value any
+	if json.Unmarshal(raw, &value) != nil {
+		return string(raw)
+	}
+	return prettyValue(value)
+}
+
+func prettyValue(value any) string {
+	encoded, err := json.MarshalIndent(value, "", "  ")
+	if err != nil {
+		return fmt.Sprint(value)
+	}
+	return string(encoded)
+}
+
+func parseOptionalTime(value string) *time.Time {
+	if value == "" {
+		return nil
+	}
+	t, err := time.Parse(time.RFC3339Nano, value)
+	if err != nil {
+		return nil
+	}
+	return &t
+}
+
 func truncate(value string, n int) string {
 	if len(value) <= n {
 		return value

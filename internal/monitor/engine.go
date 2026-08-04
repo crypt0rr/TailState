@@ -135,13 +135,13 @@ func (e *Engine) poll(ctx context.Context, client *tailscale.Client, settings st
 		}
 		e.store.SetNextPoll(ctx, settings.Generation, []string{collector}, time.Now().Add(interval))
 	}
-	changes, err := e.store.ApplyBatch(ctx, settings.Generation, results, notify.Digest)
+	batch, err := e.store.ApplyBatchWithBatch(ctx, settings.Generation, results, notify.Digest)
 	if err != nil {
 		slog.Error("apply collected inventory", "error", err)
 		return
 	}
-	if len(changes) > 0 {
-		slog.Info("inventory changes detected", "count", len(changes))
+	if len(batch.Changes) > 0 {
+		slog.Info("inventory changes detected", "batch_id", batch.ID, "count", len(batch.Changes))
 	}
 }
 

@@ -159,6 +159,11 @@ func TestHistoryRequiresAuthenticationAndShowsExplainableChanges(t *testing.T) {
 	if unauthenticated.Code != http.StatusSeeOther || unauthenticated.Header().Get("Location") != "/login" {
 		t.Fatalf("history was not protected: status=%d location=%q", unauthenticated.Code, unauthenticated.Header().Get("Location"))
 	}
+	unauthenticatedExport := httptest.NewRecorder()
+	server.Handler().ServeHTTP(unauthenticatedExport, httptest.NewRequest(http.MethodGet, "/history/export", nil))
+	if unauthenticatedExport.Code != http.StatusSeeOther || unauthenticatedExport.Header().Get("Location") != "/login" {
+		t.Fatalf("history export was not protected: status=%d location=%q", unauthenticatedExport.Code, unauthenticatedExport.Header().Get("Location"))
+	}
 	generation, err := st.SaveSettings(ctx, store.Settings{Tailnet: "-", OAuthClientID: "client", OAuthClientSecret: "secret", MattermostURL: "https://mattermost.example/hooks/token", DeviceInterval: time.Minute, InventoryInterval: 5 * time.Minute})
 	if err != nil {
 		t.Fatal(err)
@@ -183,5 +188,23 @@ func TestHistoryRequiresAuthenticationAndShowsExplainableChanges(t *testing.T) {
 	}
 	if strings.Contains(body, "mattermost.example") || strings.Contains(body, "token") {
 		t.Fatalf("history page leaked notification credentials: %s", body)
+	}
+	if !strings.Contains(body, "Download evidence pack") || !strings.Contains(body, "/history/export") {
+		t.Fatalf("history page is missing the evidence export action: %s", body)
+	}
+	exportRequest := httptest.NewRequest(http.MethodGet, "/history/export?event_type=changed&resource=device-1", nil)
+	for _, cookie := range claimResponse.Result().Cookies() {
+		exportRequest.AddCookie(cookie)
+	}
+	exportResponse := httptest.NewRecorder()
+	server.Handler().ServeHTTP(exportResponse, exportRequest)
+	if exportResponse.Code != http.StatusOK || !strings.Contains(exportResponse.Header().Get("Content-Disposition"), "tailstate-drift-evidence-") {
+		t.Fatalf("evidence export failed: status=%d headers=%v body=%s", exportResponse.Code, exportResponse.Header(), exportResponse.Body.String())
+	}
+	if err := store.VerifyEvidencePack(exportResponse.Body.Bytes()); err != nil {
+		t.Fatalf("web evidence export did not verify: %v", err)
+	}
+	if strings.Contains(exportResponse.Body.String(), "mattermost.example") || strings.Contains(exportResponse.Body.String(), "/hooks/") {
+		t.Fatal("web evidence export leaked destination credentials")
 	}
 }

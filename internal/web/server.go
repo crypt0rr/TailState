@@ -49,6 +49,7 @@ type pageData struct {
 	HistoryCollectors               []string
 	HistoryEventTypes               []string
 	HistoryNextURL                  string
+	HistoryExportURL                string
 	Destinations                    []destinationPage
 	NotificationsPaused             bool
 }
@@ -89,6 +90,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /reset", s.resetPost)
 	mux.HandleFunc("GET /status", s.status)
 	mux.HandleFunc("GET /history", s.history)
+	mux.HandleFunc("GET /history/export", s.historyExport)
 	mux.HandleFunc("GET /settings", s.settings)
 	mux.HandleFunc("POST /settings", s.settingsPost)
 	mux.HandleFunc("POST /settings/destinations", s.destinationPost)
@@ -282,7 +284,28 @@ func (s *Server) history(w http.ResponseWriter, r *http.Request) {
 	if history.HasNext {
 		data.HistoryNextURL = historyURL(filter, history.NextCursor)
 	}
+	data.HistoryExportURL = historyExportURL(filter)
 	s.render(w, "history", data)
+}
+
+func (s *Server) historyExport(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.requireAuth(w, r, false); !ok {
+		return
+	}
+	pack, err := s.store.ExportEvidencePack(r.Context(), historyFilter(r))
+	if err != nil {
+		if errors.Is(err, store.ErrEvidencePackTooLarge) {
+			http.Error(w, "history export is too large; narrow the filters and try again", http.StatusRequestEntityTooLarge)
+			return
+		}
+		http.Error(w, "export history", http.StatusInternalServerError)
+		return
+	}
+	filename := "tailstate-drift-evidence-" + time.Now().UTC().Format("20060102T150405Z") + ".json"
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Content-Disposition", `attachment; filename="`+filename+`"`)
+	w.Header().Set("Cache-Control", "no-store")
+	_, _ = w.Write(pack)
 }
 
 func historyFilter(r *http.Request) store.HistoryFilter {
@@ -311,6 +334,23 @@ func historyURL(filter store.HistoryFilter, cursor int64) string {
 	}
 	values.Set("cursor", strconv.FormatInt(cursor, 10))
 	return "/history?" + values.Encode()
+}
+
+func historyExportURL(filter store.HistoryFilter) string {
+	values := url.Values{}
+	if filter.Collector != "" {
+		values.Set("collector", filter.Collector)
+	}
+	if filter.EventType != "" {
+		values.Set("event_type", filter.EventType)
+	}
+	if filter.ResourceID != "" {
+		values.Set("resource", filter.ResourceID)
+	}
+	if encoded := values.Encode(); encoded != "" {
+		return "/history/export?" + encoded
+	}
+	return "/history/export"
 }
 
 func (s *Server) settings(w http.ResponseWriter, r *http.Request) {

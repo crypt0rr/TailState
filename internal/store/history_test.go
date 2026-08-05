@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -96,6 +97,54 @@ func TestHistoryPersistsExplainableChangesAndDeliveryState(t *testing.T) {
 		t.Fatal(err)
 	} else if len(filtered.Batches) != 1 {
 		t.Fatalf("resource filter missed event: %#v", filtered)
+	}
+}
+
+func TestEvidencePackExportIsRedactedAndVerifiable(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	generation, err := st.SaveSettings(ctx, settings())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.ApplyBatch(ctx, generation, []model.Collected{historyResource("server", "100.64.0.1")}, func([]model.Change) string { return "baseline" }); err != nil {
+		t.Fatal(err)
+	}
+	batch, err := st.ApplyBatchWithBatch(ctx, generation, []model.Collected{historyResource("server-new", "100.64.0.2")}, func([]model.Change) string { return "changed" })
+	if err != nil {
+		t.Fatal(err)
+	}
+	items, err := st.DueOutbox(ctx, 10)
+	if err != nil || len(items) != 1 {
+		t.Fatalf("expected one outbox item: %d %v", len(items), err)
+	}
+	if err := st.Retry(ctx, items[0].ID, time.Now().UTC().Add(time.Minute), "delivery failed for "+items[0].Destination.ServiceURL, true); err != nil {
+		t.Fatal(err)
+	}
+
+	export, err := st.ExportEvidencePack(ctx, HistoryFilter{EventType: "changed", ResourceID: "device-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := VerifyEvidencePack(export); err != nil {
+		t.Fatalf("evidence pack did not verify: %v", err)
+	}
+	var pack EvidencePack
+	if err := json.Unmarshal(export, &pack); err != nil {
+		t.Fatal(err)
+	}
+	if pack.Format != evidencePackFormat || pack.Version != evidencePackVersion || len(pack.Batches) != 1 || pack.Batches[0].ID != batch.ID {
+		t.Fatalf("unexpected evidence pack: %#v", pack)
+	}
+	if len(pack.Batches[0].Events) != 1 || len(pack.Batches[0].Events[0].Fields) == 0 {
+		t.Fatalf("evidence pack lost event details: %#v", pack.Batches)
+	}
+	if strings.Contains(string(export), "/hooks/") || strings.Contains(string(export), "super-secret") {
+		t.Fatalf("evidence pack leaked destination credentials: %s", export)
+	}
+	tampered := strings.Replace(string(export), pack.ContentSHA256, strings.Repeat("0", len(pack.ContentSHA256)), 1)
+	if err := VerifyEvidencePack([]byte(tampered)); err == nil {
+		t.Fatal("tampered evidence pack unexpectedly verified")
 	}
 }
 

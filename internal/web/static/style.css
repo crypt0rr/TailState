@@ -151,7 +151,7 @@ code { overflow-wrap: anywhere; }
 .history-filters { display: grid; grid-template-columns: 1fr 1fr 1.4fr auto; align-items: end; gap: 14px; margin: 26px 0; padding: 16px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); }
 .history-filters label { margin: 0; }
 select { width: 100%; border: 1px solid var(--border); border-radius: 6px; background: var(--card); color: var(--text); padding: 11px; font: inherit; }
-.filter-actions { display: flex; align-items: center; gap: 14px; padding-bottom: 18px; }
+.filter-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 14px; padding-bottom: 18px; }
 .history-list { display: grid; gap: 16px; }
 .history-batch { border: 1px solid var(--border); border-radius: 8px; background: var(--card-raised); overflow: hidden; }
 .history-batch-heading { display: flex; justify-content: space-between; align-items: center; gap: 16px; padding: 16px 18px; border-bottom: 1px solid var(--border); }

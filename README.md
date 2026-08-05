@@ -131,6 +131,7 @@ Back up `secrets/tailstate_master_key` separately and securely.
 - Failed or partial polls never delete snapshots.
 - Multiple changes in one poll become one digest, fanned out into one durable outbox item per enabled destination.
 - Every change batch is also recorded in the authenticated History page with field-level diffs and redacted normalized before/after snapshots. Filters support collector, change type, and resource name or ID; history is retained for 30 days.
+- The History page can download a filtered, redacted JSON evidence pack for incident reports and offline review. Packs include normalized snapshots, field diffs, destination delivery outcomes, and a SHA-256 content hash; exports are limited to 100 batches, 2,000 events, and 5 MiB. The hash detects tampering but is not a digital signature.
 - Shoutrrr deliveries retry independently for up to 24 hours across restarts, then remain visible as dead letters. Disabling or removing a destination dead-letters its pending items; newly added destinations receive only future notifications.
 - If every destination is disabled, monitoring continues and notifications are reported as paused.
 - API collector failures alert after three consecutive failures and once on recovery.

@@ -32,12 +32,15 @@ func TestHistoryPersistsExplainableChangesAndDeliveryState(t *testing.T) {
 	if _, err := st.ApplyBatchWithBatch(ctx, generation, []model.Collected{historyResource("server", "100.64.0.1")}, func([]model.Change) string { return "baseline" }); err != nil {
 		t.Fatal(err)
 	}
-	batch, err := st.ApplyBatchWithBatch(ctx, generation, []model.Collected{historyResource("server-new", "100.64.0.2")}, func([]model.Change) string { return "digest" })
+	batch, err := st.ApplyBatchWithBatch(ctx, generation, []model.Collected{historyResource("server-new", "100.64.0.2")}, func([]model.Change) string { return "digest" }, 12)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if batch.ID == 0 || batch.ChangeCount != 1 || len(batch.Changes) != 1 {
 		t.Fatalf("unexpected change batch: %#v", batch)
+	}
+	if batch.TriggerID != 12 {
+		t.Fatalf("webhook trigger correlation was lost: %#v", batch)
 	}
 
 	page, err := st.ListHistory(ctx, HistoryFilter{Limit: 10})
@@ -48,6 +51,9 @@ func TestHistoryPersistsExplainableChangesAndDeliveryState(t *testing.T) {
 		t.Fatalf("unexpected history page: %#v", page)
 	}
 	history := page.Batches[0]
+	if history.TriggerID != 12 {
+		t.Fatalf("history did not retain webhook trigger correlation: %#v", history)
+	}
 	if len(history.Events) != 1 {
 		t.Fatalf("unexpected history events: %#v", history.Events)
 	}
@@ -261,6 +267,20 @@ CREATE TABLE outbox(id INTEGER PRIMARY KEY AUTOINCREMENT,destination_id INTEGER 
 	}
 	if version != currentSchemaVersion {
 		t.Fatalf("migration left schema version %d", version)
+	}
+	var webhookColumn int
+	if err := st.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM pragma_table_info('settings') WHERE name='webhook_secret_enc'").Scan(&webhookColumn); err != nil {
+		t.Fatal(err)
+	}
+	if webhookColumn != 1 {
+		t.Fatal("schema migration did not add the encrypted webhook secret column")
+	}
+	var triggerTable int
+	if err := st.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='webhook_triggers'").Scan(&triggerTable); err != nil {
+		t.Fatal(err)
+	}
+	if triggerTable != 1 {
+		t.Fatal("schema migration did not create webhook trigger storage")
 	}
 	var batchID, eventBatchID, outboxBatchID int64
 	if err := st.db.QueryRowContext(ctx, "SELECT id FROM event_batches LIMIT 1").Scan(&batchID); err != nil {

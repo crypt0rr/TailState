@@ -5,6 +5,8 @@ import (
 	"errors"
 	"log/slog"
 	"math/rand/v2"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/crypt0rr/tailstate/internal/model"
@@ -18,6 +20,16 @@ type Engine struct {
 	baseURL, tokenURL, version string
 	sender                     notify.Sender
 	wake                       chan struct{}
+	trigger                    chan ReconcileRequest
+}
+
+// ReconcileRequest asks the scheduler to poll a set of collectors immediately.
+// A zero TriggerID is used for a broad, coalesced wakeup without history
+// correlation; normal webhook requests carry their durable trigger ID.
+type ReconcileRequest struct {
+	TriggerID  int64
+	TriggerIDs []int64
+	Collectors []string
 }
 
 func New(st *store.Store, baseURL, tokenURL, version string, senders ...notify.Sender) *Engine {
@@ -25,12 +37,44 @@ func New(st *store.Store, baseURL, tokenURL, version string, senders ...notify.S
 	if len(senders) > 0 && senders[0] != nil {
 		sender = senders[0]
 	}
-	return &Engine{store: st, baseURL: baseURL, tokenURL: tokenURL, version: version, sender: sender, wake: make(chan struct{}, 1)}
+	return &Engine{store: st, baseURL: baseURL, tokenURL: tokenURL, version: version, sender: sender, wake: make(chan struct{}, 1), trigger: make(chan ReconcileRequest, 4)}
 }
 func (e *Engine) Wake() {
 	select {
 	case e.wake <- struct{}{}:
 	default:
+	}
+}
+
+// Trigger queues a targeted reconciliation. If several deliveries arrive
+// while a poll is active, they are safely coalesced into one broad poll rather
+// than dropping the freshness signal entirely.
+func (e *Engine) Trigger(request ReconcileRequest) {
+	request.Collectors = normalizeCollectors(request.Collectors)
+	select {
+	case e.trigger <- request:
+		return
+	default:
+	}
+	ids := append([]int64{}, request.TriggerIDs...)
+	if request.TriggerID > 0 {
+		ids = append(ids, request.TriggerID)
+	}
+	for {
+		select {
+		case pending := <-e.trigger:
+			ids = append(ids, pending.TriggerIDs...)
+			if pending.TriggerID > 0 {
+				ids = append(ids, pending.TriggerID)
+			}
+		default:
+			request = ReconcileRequest{TriggerIDs: uniquePositive(ids)}
+			select {
+			case e.trigger <- request:
+			default:
+			}
+			return
+		}
 	}
 }
 
@@ -70,7 +114,7 @@ func (e *Engine) scheduler(ctx context.Context) {
 			generation = current.Generation
 			settings = current
 			client = tailscale.New(e.baseURL, e.tokenURL, e.version, tailscale.Credentials{Tailnet: settings.Tailnet, ClientID: settings.OAuthClientID, ClientSecret: settings.OAuthClientSecret})
-			e.poll(ctx, client, settings, append(append([]string{}, tailscale.CoreCollectors...), tailscale.InventoryCollectors...))
+			e.poll(ctx, client, settings, allCollectors(), false, 0)
 			stop(deviceTimer)
 			stop(inventoryTimer)
 			deviceTimer = time.NewTimer(jitter(settings.DeviceInterval))
@@ -82,21 +126,32 @@ func (e *Engine) scheduler(ctx context.Context) {
 		case <-e.wake:
 			client = nil
 			continue
+		case request := <-e.trigger:
+			collectors := request.Collectors
+			if len(collectors) == 0 {
+				collectors = allCollectors()
+			}
+			e.poll(ctx, client, settings, collectors, true, request.TriggerID)
+			for _, triggerID := range requestTriggerIDs(request) {
+				if err := e.store.MarkWebhookTriggerProcessed(ctx, triggerID); err != nil {
+					slog.Error("mark webhook trigger processed", "trigger_id", triggerID, "error", err)
+				}
+			}
 		case <-deviceTimer.C:
-			e.poll(ctx, client, settings, tailscale.CoreCollectors)
+			e.poll(ctx, client, settings, tailscale.CoreCollectors, false, 0)
 			deviceTimer.Reset(jitter(settings.DeviceInterval))
 		case <-inventoryTimer.C:
-			e.poll(ctx, client, settings, tailscale.InventoryCollectors)
+			e.poll(ctx, client, settings, tailscale.InventoryCollectors, false, 0)
 			inventoryTimer.Reset(jitter(settings.InventoryInterval))
 		}
 	}
 }
 
-func (e *Engine) poll(ctx context.Context, client *tailscale.Client, settings store.Settings, collectors []string) {
+func (e *Engine) poll(ctx context.Context, client *tailscale.Client, settings store.Settings, collectors []string, force bool, triggerID int64) {
 	results := make([]model.Collected, 0, len(collectors))
 	polled := make([]string, 0, len(collectors))
 	for _, collector := range collectors {
-		if !e.store.CollectorDue(ctx, settings.Generation, collector) {
+		if !force && !e.store.CollectorDue(ctx, settings.Generation, collector) {
 			continue
 		}
 		polled = append(polled, collector)
@@ -135,7 +190,7 @@ func (e *Engine) poll(ctx context.Context, client *tailscale.Client, settings st
 		}
 		e.store.SetNextPoll(ctx, settings.Generation, []string{collector}, time.Now().Add(interval))
 	}
-	batch, err := e.store.ApplyBatchWithBatch(ctx, settings.Generation, results, notify.Digest)
+	batch, err := e.store.ApplyBatchWithBatch(ctx, settings.Generation, results, notify.Digest, triggerID)
 	if err != nil {
 		slog.Error("apply collected inventory", "error", err)
 		return
@@ -143,6 +198,51 @@ func (e *Engine) poll(ctx context.Context, client *tailscale.Client, settings st
 	if len(batch.Changes) > 0 {
 		slog.Info("inventory changes detected", "batch_id", batch.ID, "count", len(batch.Changes))
 	}
+}
+
+func allCollectors() []string {
+	collectors := append([]string{}, tailscale.CoreCollectors...)
+	collectors = append(collectors, tailscale.InventoryCollectors...)
+	return collectors
+}
+
+func normalizeCollectors(collectors []string) []string {
+	seen := make(map[string]struct{}, len(collectors))
+	for _, collector := range collectors {
+		collector = strings.TrimSpace(collector)
+		if collector != "" {
+			seen[collector] = struct{}{}
+		}
+	}
+	out := make([]string, 0, len(seen))
+	for collector := range seen {
+		out = append(out, collector)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func requestTriggerIDs(request ReconcileRequest) []int64 {
+	ids := append([]int64{}, request.TriggerIDs...)
+	if request.TriggerID > 0 {
+		ids = append(ids, request.TriggerID)
+	}
+	return uniquePositive(ids)
+}
+
+func uniquePositive(values []int64) []int64 {
+	seen := make(map[int64]struct{}, len(values))
+	for _, value := range values {
+		if value > 0 {
+			seen[value] = struct{}{}
+		}
+	}
+	out := make([]int64, 0, len(seen))
+	for value := range seen {
+		out = append(out, value)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out
 }
 
 func (e *Engine) delivery(ctx context.Context) {

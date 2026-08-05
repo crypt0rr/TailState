@@ -54,6 +54,7 @@ type EvidenceBatch struct {
 	Generation  int64              `json:"generation"`
 	ObservedAt  time.Time          `json:"observed_at"`
 	ChangeCount int                `json:"change_count"`
+	TriggerID   int64              `json:"trigger_id,omitempty"`
 	Events      []EvidenceEvent    `json:"events"`
 	Deliveries  []EvidenceDelivery `json:"deliveries"`
 }
@@ -190,6 +191,7 @@ func evidenceBatch(batch HistoryBatch) EvidenceBatch {
 		Generation:  batch.Generation,
 		ObservedAt:  batch.ObservedAt,
 		ChangeCount: batch.ChangeCount,
+		TriggerID:   batch.TriggerID,
 		Events:      make([]EvidenceEvent, 0, len(batch.Events)),
 		Deliveries:  make([]EvidenceDelivery, 0, len(batch.Deliveries)),
 	}

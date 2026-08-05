@@ -2,7 +2,9 @@
 
 TailState polls the read-only Tailscale API, establishes a silent inventory baseline, and posts later changes to one or more Shoutrrr destinations. It runs as one static Go binary with an embedded setup/status interface and durable SQLite storage.
 
-TailState never modifies a tailnet and does not use native Tailscale webhooks.
+TailState never modifies a tailnet. Optional signed Tailscale webhooks can
+accelerate reconciliation; the read-only polling schedule remains the source
+of truth and the safety net for missed events.
 
 ## What it monitors
 
@@ -69,6 +71,25 @@ Add destinations on the authenticated Settings page, then save monitoring settin
 
 The authenticated **History** page keeps a 30-day, searchable ledger of semantic inventory changes. Each poll is grouped into a batch with the affected collector, resource, previous/current normalized snapshots, field-level differences, and the delivery state for every destination. Use it to investigate a notification without exposing credentials or volatile API fields.
 
+### Faster reconciliation with Tailscale webhooks
+
+Polling remains enabled even when webhooks are configured. To reduce the time
+between a tailnet change and its explanation in TailState, create a webhook in
+the Tailscale admin console and enter its signing secret in **Settings**. Point
+the webhook at:
+
+```text
+https://tailstate.example/webhooks/tailscale
+```
+
+The endpoint accepts the signed event arrays described in the [Tailscale
+webhook documentation](https://tailscale.com/docs/features/webhooks). TailState
+verifies the HMAC signature and timestamp, rejects oversized or replayed
+requests, stores only a body hash and event metadata, and immediately polls the
+affected collectors. Unknown event types trigger a complete reconciliation.
+Tailscale retries failed webhook deliveries, while the normal TailState poll
+interval remains the fallback if the endpoint is unavailable.
+
 Shoutrrr supports Mattermost natively, for example:
 
 ```text
@@ -89,7 +110,7 @@ curl -fsS http://127.0.0.1:8080/metrics
 
 Compose creates the Docker-managed `tailstate-data` volume and stores `/data/tailstate.db` there. Snapshots, events, baseline state, sessions, and the delivery outbox survive container replacement.
 
-OAuth secrets and every Shoutrrr destination URL are encrypted with AES-256-GCM using `secrets/tailstate_master_key`. Destination credentials are never echoed into HTML, logs, persisted delivery errors, or the history ledger. Normalized history snapshots are retained for 30 days and exclude volatile and secret fields. OAuth access tokens exist only in memory. Back up the master key separately: TailState intentionally refuses to start if the key is missing or incorrect, and encrypted settings cannot be recovered without it.
+OAuth secrets, the Tailscale webhook secret, and every Shoutrrr destination URL are encrypted with AES-256-GCM using `secrets/tailstate_master_key`. Destination credentials and webhook secrets are never echoed into HTML, logs, persisted delivery errors, or the history ledger. Normalized history snapshots are retained for 30 days and exclude volatile and secret fields. OAuth access tokens exist only in memory. Back up the master key separately: TailState intentionally refuses to start if the key is missing or incorrect, and encrypted settings cannot be recovered without it.
 
 The image is scratch-based, runs as UID/GID `10001`, uses a read-only root filesystem, drops every Linux capability, and publishes the UI only on `127.0.0.1` by default. For remote access, place TailState behind an HTTPS reverse proxy and set:
 
@@ -144,9 +165,15 @@ Version tracking is introduced in v0.3.0. Its first startup records the release 
 
 On the first startup after this upgrade, an existing encrypted Mattermost webhook is converted automatically to a native `mattermost://` destination when it uses the standard `/hooks/<token>` path. Other paths are preserved as a `generic://` JSON webhook with the existing TailState username and satellite icon. Existing pending outbox items are assigned to the migrated destination. The legacy encrypted column is retained but no longer used for new configuration.
 
+The schema v4 migration also adds encrypted storage for the optional Tailscale
+webhook secret, a deduplicated webhook trigger ledger, and trigger IDs on
+history batches. Existing installations start with webhook acceleration
+disabled until a secret is entered in Settings.
+
 ## Runtime configuration
 
-Only bootstrap settings use environment variables; application credentials are entered in the authenticated UI.
+Only bootstrap settings use environment variables; application credentials and
+the optional webhook secret are entered in the authenticated UI.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |

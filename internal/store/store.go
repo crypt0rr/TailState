@@ -28,6 +28,7 @@ type Settings struct {
 	Tailnet           string
 	OAuthClientID     string
 	OAuthClientSecret string
+	WebhookSecret     string
 	// MattermostURL is retained for source compatibility with older callers.
 	// New configuration is stored through NotificationDestination APIs.
 	MattermostURL     string
@@ -84,6 +85,19 @@ type ChangeBatch struct {
 	Generation  int64
 	ObservedAt  time.Time
 	ChangeCount int
+	TriggerID   int64
+}
+
+// WebhookTrigger records verified provider metadata without retaining the
+// signed request body or its potentially sensitive data payload.
+type WebhookTrigger struct {
+	ID          int64
+	BodyHash    string
+	ReceivedAt  time.Time
+	EventTypes  []string
+	Collectors  []string
+	Status      string
+	ProcessedAt *time.Time
 }
 
 type ChangeBatchResult struct {
@@ -144,7 +158,7 @@ type HistoryPage struct {
 	HasNext    bool
 }
 
-const currentSchemaVersion = 3
+const currentSchemaVersion = 4
 
 func Open(path string, box *secret.Box) (*Store, error) {
 	if err := os.MkdirAll(filepathDir(path), 0o700); err != nil {
@@ -213,7 +227,16 @@ func migrateSchema(db *sql.DB, box *secret.Box) error {
 		return nil
 	}
 	if version == 2 {
-		return migrateSchemaV2ToV3(db)
+		if err := migrateSchemaV2ToV3(db); err != nil {
+			return err
+		}
+		return migrateSchema(db, box)
+	}
+	if version == 3 {
+		if err := migrateSchemaV3ToV4(db); err != nil {
+			return err
+		}
+		return migrateSchema(db, box)
 	}
 	if version != 1 {
 		return fmt.Errorf("database schema version %d requires a newer migration path", version)
@@ -312,7 +335,8 @@ func migrateSchemaV2ToV3(db *sql.DB) error {
 		generation INTEGER NOT NULL,
 		observed_at TEXT NOT NULL,
 		change_count INTEGER NOT NULL,
-		created_at TEXT NOT NULL
+		created_at TEXT NOT NULL,
+		trigger_id INTEGER
 	)`); err != nil {
 		return fmt.Errorf("create event batches: %w", err)
 	}
@@ -352,6 +376,41 @@ func migrateSchemaV2ToV3(db *sql.DB) error {
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit event history migration: %w", err)
+	}
+	return nil
+}
+
+func migrateSchemaV3ToV4(db *sql.DB) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin webhook migration: %w", err)
+	}
+	defer tx.Rollback()
+	if err := addColumnIfMissing(tx, "settings", "webhook_secret_enc", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := addColumnIfMissing(tx, "event_batches", "trigger_id", "INTEGER"); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`CREATE TABLE IF NOT EXISTS webhook_triggers (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		body_hash TEXT NOT NULL UNIQUE,
+		received_at TEXT NOT NULL,
+		event_types_json BLOB NOT NULL,
+		collectors_json BLOB NOT NULL,
+		status TEXT NOT NULL DEFAULT 'accepted',
+		processed_at TEXT
+	)`); err != nil {
+		return fmt.Errorf("create webhook triggers: %w", err)
+	}
+	if _, err := tx.Exec("CREATE INDEX IF NOT EXISTS webhook_triggers_received_at ON webhook_triggers(received_at DESC, id DESC)"); err != nil {
+		return fmt.Errorf("create webhook trigger index: %w", err)
+	}
+	if _, err := tx.Exec("UPDATE schema_version SET version=4"); err != nil {
+		return fmt.Errorf("record webhook migration: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit webhook migration: %w", err)
 	}
 	return nil
 }
@@ -587,6 +646,10 @@ func (s *Store) SaveSettings(ctx context.Context, in Settings) (int64, error) {
 	if strings.TrimSpace(in.Tailnet) == "" {
 		in.Tailnet = "-"
 	}
+	in.WebhookSecret = strings.TrimSpace(in.WebhookSecret)
+	if len(in.WebhookSecret) > 1024 {
+		return 0, errors.New("webhook secret is too long")
+	}
 	if in.OAuthClientID == "" || in.OAuthClientSecret == "" {
 		return 0, errors.New("OAuth credentials are required")
 	}
@@ -602,11 +665,11 @@ func (s *Store) SaveSettings(ctx context.Context, in Settings) (int64, error) {
 		return 0, err
 	}
 	defer tx.Rollback()
-	var oldTailnet, oldClient, oldSecretEnc string
+	var oldTailnet, oldClient, oldSecretEnc, oldWebhookSecretEnc string
 	var generation int64
 	generationChanged := false
 	settingsExists := true
-	err = tx.QueryRowContext(ctx, "SELECT tailnet,oauth_client_id,oauth_secret_enc,generation FROM settings WHERE id=1").Scan(&oldTailnet, &oldClient, &oldSecretEnc, &generation)
+	err = tx.QueryRowContext(ctx, "SELECT tailnet,oauth_client_id,oauth_secret_enc,COALESCE(webhook_secret_enc,''),generation FROM settings WHERE id=1").Scan(&oldTailnet, &oldClient, &oldSecretEnc, &oldWebhookSecretEnc, &generation)
 	if errors.Is(err, sql.ErrNoRows) {
 		settingsExists = false
 		generation = 1
@@ -620,6 +683,13 @@ func (s *Store) SaveSettings(ctx context.Context, in Settings) (int64, error) {
 		if oldTailnet != in.Tailnet || oldClient != in.OAuthClientID || oldSecret != in.OAuthClientSecret {
 			generation++
 			generationChanged = true
+		}
+	}
+	webhookSecretEnc := oldWebhookSecretEnc
+	if in.WebhookSecret != "" {
+		webhookSecretEnc, err = s.box.Encrypt(in.WebhookSecret)
+		if err != nil {
+			return 0, err
 		}
 	}
 	legacyURLEnc := ""
@@ -649,8 +719,8 @@ func (s *Store) SaveSettings(ctx context.Context, in Settings) (int64, error) {
 		}
 	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
-	_, err = tx.ExecContext(ctx, `INSERT INTO settings(id,tailnet,oauth_client_id,oauth_secret_enc,mattermost_url_enc,device_interval_seconds,inventory_interval_seconds,generation,configured_at,baseline_at)
-	VALUES(1,?,?,?,?,?,?,?,?,NULL) ON CONFLICT(id) DO UPDATE SET tailnet=excluded.tailnet,oauth_client_id=excluded.oauth_client_id,oauth_secret_enc=excluded.oauth_secret_enc,mattermost_url_enc=CASE WHEN excluded.mattermost_url_enc='' THEN settings.mattermost_url_enc ELSE excluded.mattermost_url_enc END,device_interval_seconds=excluded.device_interval_seconds,inventory_interval_seconds=excluded.inventory_interval_seconds,generation=excluded.generation,configured_at=excluded.configured_at,baseline_at=CASE WHEN settings.generation=excluded.generation THEN settings.baseline_at ELSE NULL END`, in.Tailnet, in.OAuthClientID, secretEnc, legacyURLEnc, int64(in.DeviceInterval.Seconds()), int64(in.InventoryInterval.Seconds()), generation, now)
+	_, err = tx.ExecContext(ctx, `INSERT INTO settings(id,tailnet,oauth_client_id,oauth_secret_enc,mattermost_url_enc,webhook_secret_enc,device_interval_seconds,inventory_interval_seconds,generation,configured_at,baseline_at)
+	VALUES(1,?,?,?,?,?,?,?,?,?,NULL) ON CONFLICT(id) DO UPDATE SET tailnet=excluded.tailnet,oauth_client_id=excluded.oauth_client_id,oauth_secret_enc=excluded.oauth_secret_enc,mattermost_url_enc=CASE WHEN excluded.mattermost_url_enc='' THEN settings.mattermost_url_enc ELSE excluded.mattermost_url_enc END,webhook_secret_enc=CASE WHEN excluded.webhook_secret_enc='' THEN settings.webhook_secret_enc ELSE excluded.webhook_secret_enc END,device_interval_seconds=excluded.device_interval_seconds,inventory_interval_seconds=excluded.inventory_interval_seconds,generation=excluded.generation,configured_at=excluded.configured_at,baseline_at=CASE WHEN settings.generation=excluded.generation THEN settings.baseline_at ELSE NULL END`, in.Tailnet, in.OAuthClientID, secretEnc, legacyURLEnc, webhookSecretEnc, int64(in.DeviceInterval.Seconds()), int64(in.InventoryInterval.Seconds()), generation, now)
 	if err != nil {
 		return 0, err
 	}
@@ -670,9 +740,9 @@ func (s *Store) SaveSettings(ctx context.Context, in Settings) (int64, error) {
 
 func (s *Store) Settings(ctx context.Context) (Settings, error) {
 	var out Settings
-	var secretEnc, urlEnc, configured, baseline string
+	var secretEnc, urlEnc, webhookSecretEnc, configured, baseline string
 	var device, inventory int64
-	err := s.db.QueryRowContext(ctx, "SELECT tailnet,oauth_client_id,oauth_secret_enc,mattermost_url_enc,device_interval_seconds,inventory_interval_seconds,generation,configured_at,COALESCE(baseline_at,'') FROM settings WHERE id=1").Scan(&out.Tailnet, &out.OAuthClientID, &secretEnc, &urlEnc, &device, &inventory, &out.Generation, &configured, &baseline)
+	err := s.db.QueryRowContext(ctx, "SELECT tailnet,oauth_client_id,oauth_secret_enc,mattermost_url_enc,COALESCE(webhook_secret_enc,''),device_interval_seconds,inventory_interval_seconds,generation,configured_at,COALESCE(baseline_at,'') FROM settings WHERE id=1").Scan(&out.Tailnet, &out.OAuthClientID, &secretEnc, &urlEnc, &webhookSecretEnc, &device, &inventory, &out.Generation, &configured, &baseline)
 	if err != nil {
 		return Settings{}, err
 	}
@@ -686,6 +756,12 @@ func (s *Store) Settings(ctx context.Context) (Settings, error) {
 			return Settings{}, err
 		}
 	}
+	if webhookSecretEnc != "" {
+		out.WebhookSecret, err = s.box.Decrypt(webhookSecretEnc)
+		if err != nil {
+			return Settings{}, err
+		}
+	}
 	out.DeviceInterval = time.Duration(device) * time.Second
 	out.InventoryInterval = time.Duration(inventory) * time.Second
 	out.ConfiguredAt, _ = time.Parse(time.RFC3339Nano, configured)
@@ -694,6 +770,100 @@ func (s *Store) Settings(ctx context.Context) (Settings, error) {
 		out.BaselineAt = &t
 	}
 	return out, nil
+}
+
+// WebhookSecret returns the decrypted Tailscale webhook secret only to the
+// request verifier. It is never included in rendered settings data.
+func (s *Store) WebhookSecret(ctx context.Context) (string, error) {
+	var encrypted string
+	if err := s.db.QueryRowContext(ctx, "SELECT COALESCE(webhook_secret_enc,'') FROM settings WHERE id=1").Scan(&encrypted); err != nil {
+		return "", err
+	}
+	if encrypted == "" {
+		return "", nil
+	}
+	return s.box.Decrypt(encrypted)
+}
+
+// RecordWebhookTrigger persists verified event metadata and returns whether
+// this body hash was newly accepted. A unique hash makes provider retries and
+// accidental replay harmless while keeping the original body out of SQLite.
+func (s *Store) RecordWebhookTrigger(ctx context.Context, bodyHash string, eventTypes, collectors []string) (WebhookTrigger, bool, error) {
+	bodyHash = strings.TrimSpace(bodyHash)
+	if len(bodyHash) != 64 {
+		return WebhookTrigger{}, false, errors.New("invalid webhook body hash")
+	}
+	eventTypes = sortedUnique(eventTypes)
+	collectors = sortedUnique(collectors)
+	eventJSON, err := json.Marshal(eventTypes)
+	if err != nil {
+		return WebhookTrigger{}, false, err
+	}
+	collectorJSON, err := json.Marshal(collectors)
+	if err != nil {
+		return WebhookTrigger{}, false, err
+	}
+	now := time.Now().UTC()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return WebhookTrigger{}, false, err
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `INSERT INTO webhook_triggers(body_hash,received_at,event_types_json,collectors_json,status) VALUES(?,?,?,?, 'accepted') ON CONFLICT(body_hash) DO NOTHING`, bodyHash, now.Format(time.RFC3339Nano), eventJSON, collectorJSON)
+	if err != nil {
+		return WebhookTrigger{}, false, err
+	}
+	created := false
+	if affected, affectedErr := result.RowsAffected(); affectedErr == nil {
+		created = affected == 1
+	}
+	var trigger WebhookTrigger
+	var received, eventRaw, collectorRaw, processed string
+	if err := tx.QueryRowContext(ctx, "SELECT id,body_hash,received_at,event_types_json,collectors_json,status,COALESCE(processed_at,'') FROM webhook_triggers WHERE body_hash=?", bodyHash).Scan(&trigger.ID, &trigger.BodyHash, &received, &eventRaw, &collectorRaw, &trigger.Status, &processed); err != nil {
+		return WebhookTrigger{}, false, err
+	}
+	trigger.ReceivedAt, _ = time.Parse(time.RFC3339Nano, received)
+	if err := json.Unmarshal([]byte(eventRaw), &trigger.EventTypes); err != nil {
+		return WebhookTrigger{}, false, fmt.Errorf("decode webhook event metadata: %w", err)
+	}
+	if err := json.Unmarshal([]byte(collectorRaw), &trigger.Collectors); err != nil {
+		return WebhookTrigger{}, false, fmt.Errorf("decode webhook collector metadata: %w", err)
+	}
+	if processed != "" {
+		value, parseErr := time.Parse(time.RFC3339Nano, processed)
+		if parseErr == nil {
+			trigger.ProcessedAt = &value
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return WebhookTrigger{}, false, err
+	}
+	return trigger, created, nil
+}
+
+func (s *Store) MarkWebhookTriggerProcessed(ctx context.Context, id int64) error {
+	if id <= 0 {
+		return nil
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	_, err := s.db.ExecContext(ctx, "UPDATE webhook_triggers SET status='processed',processed_at=? WHERE id=? AND processed_at IS NULL", now, id)
+	return err
+}
+
+func sortedUnique(values []string) []string {
+	seen := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value != "" {
+			seen[value] = struct{}{}
+		}
+	}
+	out := make([]string, 0, len(seen))
+	for value := range seen {
+		out = append(out, value)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // ListDestinations returns active notification destinations. Pass true to
@@ -915,7 +1085,7 @@ func (s *Store) ApplyBatch(ctx context.Context, generation int64, results []mode
 	return batch.Changes, err
 }
 
-func (s *Store) ApplyBatchWithBatch(ctx context.Context, generation int64, results []model.Collected, digest func([]model.Change) string) (ChangeBatchResult, error) {
+func (s *Store) ApplyBatchWithBatch(ctx context.Context, generation int64, results []model.Collected, digest func([]model.Change) string, triggerIDs ...int64) (ChangeBatchResult, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return ChangeBatchResult{}, err
@@ -1035,9 +1205,17 @@ func (s *Store) ApplyBatchWithBatch(ctx context.Context, generation int64, resul
 			return ChangeBatchResult{}, err
 		}
 	}
-	result := ChangeBatchResult{ChangeBatch: ChangeBatch{Generation: generation, ObservedAt: now}, Changes: changes}
+	var triggerID int64
+	if len(triggerIDs) > 0 && triggerIDs[0] > 0 {
+		triggerID = triggerIDs[0]
+	}
+	result := ChangeBatchResult{ChangeBatch: ChangeBatch{Generation: generation, ObservedAt: now, TriggerID: triggerID}, Changes: changes}
 	if len(recorded) > 0 {
-		batchResult, err := tx.ExecContext(ctx, "INSERT INTO event_batches(generation,observed_at,change_count,created_at) VALUES(?,?,?,?)", generation, observedAt, len(recorded), observedAt)
+		var triggerValue any
+		if triggerID > 0 {
+			triggerValue = triggerID
+		}
+		batchResult, err := tx.ExecContext(ctx, "INSERT INTO event_batches(generation,observed_at,change_count,created_at,trigger_id) VALUES(?,?,?,?,?)", generation, observedAt, len(recorded), observedAt, triggerValue)
 		if err != nil {
 			return ChangeBatchResult{}, err
 		}
@@ -1324,6 +1502,9 @@ func (s *Store) Cleanup(ctx context.Context, retention time.Duration) error {
 	if _, err := s.db.ExecContext(ctx, "DELETE FROM event_batches WHERE NOT EXISTS (SELECT 1 FROM events WHERE events.batch_id=event_batches.id)"); err != nil {
 		return err
 	}
+	if _, err := s.db.ExecContext(ctx, "DELETE FROM webhook_triggers WHERE received_at<?", cutoff); err != nil {
+		return err
+	}
 	_, err = s.db.ExecContext(ctx, "DELETE FROM outbox WHERE status='delivered' AND delivered_at<?", cutoff)
 	return err
 }
@@ -1356,7 +1537,7 @@ func (s *Store) ListHistory(ctx context.Context, filter HistoryFilter) (HistoryP
 		args = append(args, term, term)
 	}
 	args = append(args, limit+1)
-	rows, err := s.db.QueryContext(ctx, `SELECT b.id,b.generation,b.observed_at,b.change_count
+	rows, err := s.db.QueryContext(ctx, `SELECT b.id,b.generation,b.observed_at,b.change_count,COALESCE(b.trigger_id,0)
 		FROM event_batches b WHERE `+strings.Join(where, " AND ")+` ORDER BY b.id DESC LIMIT ?`, args...)
 	if err != nil {
 		return HistoryPage{}, err
@@ -1366,7 +1547,7 @@ func (s *Store) ListHistory(ctx context.Context, filter HistoryFilter) (HistoryP
 	for rows.Next() {
 		var batch HistoryBatch
 		var observed string
-		if err := rows.Scan(&batch.ID, &batch.Generation, &observed, &batch.ChangeCount); err != nil {
+		if err := rows.Scan(&batch.ID, &batch.Generation, &observed, &batch.ChangeCount, &batch.TriggerID); err != nil {
 			return HistoryPage{}, err
 		}
 		batch.ObservedAt, _ = time.Parse(time.RFC3339Nano, observed)

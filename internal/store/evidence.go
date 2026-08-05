@@ -119,16 +119,10 @@ func (s *Store) ExportEvidencePack(ctx context.Context, filter HistoryFilter) ([
 		Format:      evidencePackFormat,
 		Version:     evidencePackVersion,
 		GeneratedAt: time.Now().UTC().Format(time.RFC3339Nano),
-		Filter: EvidenceFilter{
-			Collector:  filter.Collector,
-			EventType:  filter.EventType,
-			ResourceID: filter.ResourceID,
-			Cursor:     filter.Cursor,
-			Limit:      filter.Limit,
-		},
-		Batches:    make([]EvidenceBatch, 0, len(page.Batches)),
-		Truncated:  page.HasNext,
-		NextCursor: page.NextCursor,
+		Filter:      EvidenceFilter(filter),
+		Batches:     make([]EvidenceBatch, 0, len(page.Batches)),
+		Truncated:   page.HasNext,
+		NextCursor:  page.NextCursor,
 	}
 
 	eventCount := 0
@@ -223,16 +217,7 @@ func evidenceBatch(batch HistoryBatch) EvidenceBatch {
 		out.Events = append(out.Events, converted)
 	}
 	for _, delivery := range batch.Deliveries {
-		out.Deliveries = append(out.Deliveries, EvidenceDelivery{
-			ID:            delivery.ID,
-			DestinationID: delivery.DestinationID,
-			Destination:   delivery.Destination,
-			Status:        delivery.Status,
-			Attempts:      delivery.Attempts,
-			LastError:     delivery.LastError,
-			NextAttempt:   delivery.NextAttempt,
-			DeliveredAt:   delivery.DeliveredAt,
-		})
+		out.Deliveries = append(out.Deliveries, EvidenceDelivery(delivery))
 	}
 	return out
 }

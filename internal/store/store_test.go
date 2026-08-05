@@ -127,7 +127,7 @@ func TestNewerSchemaVersionFailsClosed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Exec("UPDATE schema_version SET version=4"); err != nil {
+	if _, err := db.Exec("UPDATE schema_version SET version=?", currentSchemaVersion+1); err != nil {
 		db.Close()
 		t.Fatal(err)
 	}
@@ -136,6 +136,42 @@ func TestNewerSchemaVersionFailsClosed(t *testing.T) {
 	}
 	if _, err := Open(path, box); err == nil {
 		t.Fatal("database with a newer schema version was accepted")
+	}
+}
+
+func TestWebhookSecretIsEncryptedAndTriggerBodiesAreDeduplicated(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	settings := settings()
+	settings.WebhookSecret = "webhook-secret"
+	if _, err := st.SaveSettings(ctx, settings); err != nil {
+		t.Fatal(err)
+	}
+	var encrypted string
+	if err := st.db.QueryRowContext(ctx, "SELECT webhook_secret_enc FROM settings").Scan(&encrypted); err != nil {
+		t.Fatal(err)
+	}
+	if encrypted == "" || strings.Contains(encrypted, settings.WebhookSecret) {
+		t.Fatalf("webhook secret was not encrypted: %q", encrypted)
+	}
+	loaded, err := st.WebhookSecret(ctx)
+	if err != nil || loaded != settings.WebhookSecret {
+		t.Fatalf("webhook secret round trip failed: %q %v", loaded, err)
+	}
+	first, created, err := st.RecordWebhookTrigger(ctx, strings.Repeat("a", 64), []string{"policyUpdate"}, []string{"policy"})
+	if err != nil || !created || first.ID == 0 {
+		t.Fatalf("record first trigger: %#v created=%v err=%v", first, created, err)
+	}
+	second, created, err := st.RecordWebhookTrigger(ctx, strings.Repeat("a", 64), []string{"different"}, nil)
+	if err != nil || created || second.ID != first.ID || len(second.EventTypes) != 1 || second.EventTypes[0] != "policyUpdate" {
+		t.Fatalf("deduplication failed: %#v created=%v err=%v", second, created, err)
+	}
+	if err := st.MarkWebhookTriggerProcessed(ctx, first.ID); err != nil {
+		t.Fatal(err)
+	}
+	processed, _, err := st.RecordWebhookTrigger(ctx, strings.Repeat("a", 64), nil, nil)
+	if err != nil || processed.Status != "processed" || processed.ProcessedAt == nil {
+		t.Fatalf("processed trigger was not retained: %#v err=%v", processed, err)
 	}
 }
 

@@ -3,7 +3,7 @@ package store
 const schema = `
 PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);
-INSERT INTO schema_version(version) SELECT 3 WHERE NOT EXISTS (SELECT 1 FROM schema_version);
+INSERT INTO schema_version(version) SELECT 4 WHERE NOT EXISTS (SELECT 1 FROM schema_version);
 
 CREATE TABLE IF NOT EXISTS meta (
   key TEXT PRIMARY KEY,
@@ -27,6 +27,7 @@ CREATE TABLE IF NOT EXISTS settings (
   oauth_client_id TEXT NOT NULL,
   oauth_secret_enc TEXT NOT NULL,
   mattermost_url_enc TEXT NOT NULL,
+  webhook_secret_enc TEXT NOT NULL DEFAULT '',
   device_interval_seconds INTEGER NOT NULL,
   inventory_interval_seconds INTEGER NOT NULL,
   generation INTEGER NOT NULL,
@@ -72,9 +73,20 @@ CREATE TABLE IF NOT EXISTS event_batches (
   generation INTEGER NOT NULL,
   observed_at TEXT NOT NULL,
   change_count INTEGER NOT NULL,
-  created_at TEXT NOT NULL
+  created_at TEXT NOT NULL,
+  trigger_id INTEGER
 );
 CREATE INDEX IF NOT EXISTS event_batches_observed_at ON event_batches(observed_at DESC, id DESC);
+CREATE TABLE IF NOT EXISTS webhook_triggers (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  body_hash TEXT NOT NULL UNIQUE,
+  received_at TEXT NOT NULL,
+  event_types_json BLOB NOT NULL,
+  collectors_json BLOB NOT NULL,
+  status TEXT NOT NULL DEFAULT 'accepted',
+  processed_at TEXT
+);
+CREATE INDEX IF NOT EXISTS webhook_triggers_received_at ON webhook_triggers(received_at DESC, id DESC);
 CREATE TABLE IF NOT EXISTS events (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   batch_id INTEGER,

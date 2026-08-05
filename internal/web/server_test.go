@@ -16,6 +16,7 @@ import (
 	"github.com/crypt0rr/tailstate/internal/monitor"
 	"github.com/crypt0rr/tailstate/internal/secret"
 	"github.com/crypt0rr/tailstate/internal/store"
+	"github.com/crypt0rr/tailstate/internal/webhook"
 )
 
 func testServer(t *testing.T) (*Server, *store.Store, string) {
@@ -78,6 +79,61 @@ func TestReadyBeforeSetup(t *testing.T) {
 	}
 }
 
+func TestTailscaleWebhookAcceptsSignedDeliveryAndDeduplicates(t *testing.T) {
+	server, st, _ := testServer(t)
+	if _, err := st.SaveSettings(context.Background(), store.Settings{
+		Tailnet:           "-",
+		OAuthClientID:     "client",
+		OAuthClientSecret: "secret",
+		WebhookSecret:     "webhook-secret",
+		MattermostURL:     "https://mattermost.example/hooks/token",
+		DeviceInterval:    time.Minute,
+		InventoryInterval: 5 * time.Minute,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	body := []byte(`[{"timestamp":"2026-08-05T10:00:00Z","version":1,"type":"policyUpdate","tailnet":"example.ts.net"}]`)
+	timestamp := time.Now().Unix()
+	request := httptest.NewRequest(http.MethodPost, "/webhooks/tailscale", strings.NewReader(string(body)))
+	request.Header.Set("Tailscale-Webhook-Signature", webhook.SignatureForTest(body, "webhook-secret", timestamp))
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusAccepted || !strings.Contains(response.Body.String(), `"status":"accepted"`) {
+		t.Fatalf("webhook response %d: %s", response.Code, response.Body.String())
+	}
+
+	duplicate := httptest.NewRequest(http.MethodPost, "/webhooks/tailscale", strings.NewReader(string(body)))
+	duplicate.Header.Set("Tailscale-Webhook-Signature", webhook.SignatureForTest(body, "webhook-secret", timestamp))
+	duplicateResponse := httptest.NewRecorder()
+	server.Handler().ServeHTTP(duplicateResponse, duplicate)
+	if duplicateResponse.Code != http.StatusAccepted || !strings.Contains(duplicateResponse.Body.String(), `"status":"duplicate"`) {
+		t.Fatalf("duplicate webhook response %d: %s", duplicateResponse.Code, duplicateResponse.Body.String())
+	}
+}
+
+func TestTailscaleWebhookRejectsInvalidSignature(t *testing.T) {
+	server, st, _ := testServer(t)
+	if _, err := st.SaveSettings(context.Background(), store.Settings{
+		Tailnet:           "-",
+		OAuthClientID:     "client",
+		OAuthClientSecret: "secret",
+		WebhookSecret:     "webhook-secret",
+		MattermostURL:     "https://mattermost.example/hooks/token",
+		DeviceInterval:    time.Minute,
+		InventoryInterval: 5 * time.Minute,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	body := []byte(`[{"type":"nodeCreated"}]`)
+	request := httptest.NewRequest(http.MethodPost, "/webhooks/tailscale", strings.NewReader(string(body)))
+	request.Header.Set("Tailscale-Webhook-Signature", "t=1,v1=invalid")
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("invalid signature status %d: %s", response.Code, response.Body.String())
+	}
+}
+
 func TestLoginAttemptTrackingIsBoundedAndPruned(t *testing.T) {
 	server, _, _ := testServer(t)
 	now := time.Now()
@@ -124,7 +180,7 @@ func TestSettingsRedactsDestinationCredentials(t *testing.T) {
 	response := httptest.NewRecorder()
 	server.Handler().ServeHTTP(response, request)
 	cookies := response.Result().Cookies()
-	if _, err := st.SaveSettings(context.Background(), store.Settings{Tailnet: "-", OAuthClientID: "client", OAuthClientSecret: "secret", MattermostURL: "https://mattermost.example/hooks/super-secret-token", DeviceInterval: time.Minute, InventoryInterval: 5 * time.Minute}); err != nil {
+	if _, err := st.SaveSettings(context.Background(), store.Settings{Tailnet: "-", OAuthClientID: "client", OAuthClientSecret: "secret", WebhookSecret: "webhook-super-secret", MattermostURL: "https://mattermost.example/hooks/super-secret-token", DeviceInterval: time.Minute, InventoryInterval: 5 * time.Minute}); err != nil {
 		t.Fatal(err)
 	}
 	settingsRequest := httptest.NewRequest(http.MethodGet, "/settings", nil)
@@ -134,7 +190,7 @@ func TestSettingsRedactsDestinationCredentials(t *testing.T) {
 	settingsResponse := httptest.NewRecorder()
 	server.Handler().ServeHTTP(settingsResponse, settingsRequest)
 	body := settingsResponse.Body.String()
-	if strings.Contains(body, "super-secret-token") || strings.Contains(body, "/hooks/") {
+	if strings.Contains(body, "super-secret-token") || strings.Contains(body, "webhook-super-secret") || strings.Contains(body, "/hooks/") {
 		t.Fatalf("destination credential leaked into settings HTML: %s", body)
 	}
 	if !strings.Contains(body, "mattermost://mattermost.example") {

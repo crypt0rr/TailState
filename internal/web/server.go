@@ -2,11 +2,13 @@ package web
 
 import (
 	"context"
+	"database/sql"
 	"embed"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"html/template"
+	"io"
 	"io/fs"
 	"log/slog"
 	"net"
@@ -22,6 +24,7 @@ import (
 	"github.com/crypt0rr/tailstate/internal/notify"
 	"github.com/crypt0rr/tailstate/internal/store"
 	"github.com/crypt0rr/tailstate/internal/tailscale"
+	"github.com/crypt0rr/tailstate/internal/webhook"
 )
 
 //go:embed templates/*.html static/*
@@ -80,6 +83,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /healthz", s.health)
 	mux.HandleFunc("GET /readyz", s.ready)
 	mux.HandleFunc("GET /metrics", s.metrics)
+	mux.HandleFunc("POST /webhooks/tailscale", s.tailscaleWebhook)
 	mux.HandleFunc("GET /", s.home)
 	mux.HandleFunc("GET /setup", s.setup)
 	mux.HandleFunc("POST /setup/claim", s.claim)
@@ -379,10 +383,13 @@ func (s *Server) settingsPost(w http.ResponseWriter, r *http.Request) {
 	inventory, err2 := strconv.ParseInt(r.FormValue("inventory_interval"), 10, 64)
 	current, currentErr := s.store.Settings(r.Context())
 	configured := currentErr == nil
-	input := store.Settings{Tailnet: strings.TrimSpace(r.FormValue("tailnet")), OAuthClientID: strings.TrimSpace(r.FormValue("client_id")), OAuthClientSecret: r.FormValue("client_secret"), DeviceInterval: time.Duration(device) * time.Second, InventoryInterval: time.Duration(inventory) * time.Second}
+	input := store.Settings{Tailnet: strings.TrimSpace(r.FormValue("tailnet")), OAuthClientID: strings.TrimSpace(r.FormValue("client_id")), OAuthClientSecret: r.FormValue("client_secret"), WebhookSecret: strings.TrimSpace(r.FormValue("webhook_secret")), DeviceInterval: time.Duration(device) * time.Second, InventoryInterval: time.Duration(inventory) * time.Second}
 	if configured {
 		if input.OAuthClientSecret == "" {
 			input.OAuthClientSecret = current.OAuthClientSecret
+		}
+		if input.WebhookSecret == "" {
+			input.WebhookSecret = current.WebhookSecret
 		}
 	}
 	data := s.settingsData(r.Context(), csrf, configured, input)
@@ -544,6 +551,48 @@ func (s *Server) destinationPost(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.Error(w, "unknown destination action", http.StatusBadRequest)
 	}
+}
+
+func (s *Server) tailscaleWebhook(w http.ResponseWriter, r *http.Request) {
+	if !webhook.Method(r.Method) {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	secret, err := s.store.WebhookSecret(r.Context())
+	if errors.Is(err, sql.ErrNoRows) || secret == "" {
+		http.Error(w, "webhook not configured", http.StatusNotFound)
+		return
+	}
+	if err != nil {
+		http.Error(w, "webhook unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "invalid webhook body", http.StatusRequestEntityTooLarge)
+		return
+	}
+	delivery, err := webhook.Verify(body, r.Header.Get("Tailscale-Webhook-Signature"), secret, time.Now().UTC())
+	if err != nil {
+		// Keep verification details out of responses and logs; callers only need
+		// to know that Tailscale should not retry this malformed delivery.
+		http.Error(w, "invalid webhook signature or body", http.StatusUnauthorized)
+		return
+	}
+	trigger, created, err := s.store.RecordWebhookTrigger(r.Context(), delivery.BodyHash, delivery.EventTypes, delivery.Collectors)
+	if err != nil {
+		http.Error(w, "record webhook", http.StatusInternalServerError)
+		return
+	}
+	if created && s.engine != nil {
+		s.engine.Trigger(monitor.ReconcileRequest{TriggerID: trigger.ID, Collectors: delivery.Collectors})
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	status := "accepted"
+	if !created {
+		status = "duplicate"
+	}
+	writeJSON(w, http.StatusAccepted, map[string]any{"status": status, "trigger_id": trigger.ID})
 }
 
 func (s *Server) health(w http.ResponseWriter, r *http.Request) {

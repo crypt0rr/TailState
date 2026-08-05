@@ -101,3 +101,29 @@ func TestRetryDelayIsBounded(t *testing.T) {
 		}
 	}
 }
+
+func TestTriggerQueuesTargetedCollectorsAndCoalescesOverflow(t *testing.T) {
+	engine := New(nil, "", "", "test", &scriptedSender{})
+	engine.Trigger(ReconcileRequest{TriggerID: 7, Collectors: []string{"policy", "devices", "policy"}})
+	request := <-engine.trigger
+	if request.TriggerID != 7 || len(request.Collectors) != 2 || request.Collectors[0] != "devices" || request.Collectors[1] != "policy" {
+		t.Fatalf("unexpected targeted trigger: %#v", request)
+	}
+	for i := 0; i < cap(engine.trigger)+1; i++ {
+		engine.Trigger(ReconcileRequest{TriggerID: int64(i + 1), Collectors: []string{"policy"}})
+	}
+	seenBroad := false
+	for {
+		select {
+		case request := <-engine.trigger:
+			if request.TriggerID == 0 && len(request.Collectors) == 0 && len(request.TriggerIDs) == cap(engine.trigger)+1 {
+				seenBroad = true
+			}
+		default:
+			if !seenBroad {
+				t.Fatal("overflow did not retain a broad reconciliation")
+			}
+			return
+		}
+	}
+}

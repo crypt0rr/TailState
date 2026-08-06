@@ -175,6 +175,64 @@ func TestWebhookSecretIsEncryptedAndTriggerBodiesAreDeduplicated(t *testing.T) {
 	}
 }
 
+func TestWebhookTriggersAreDurableAndRetryable(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	first, created, err := st.RecordWebhookTrigger(ctx, strings.Repeat("b", 64), []string{"policyUpdate"}, []string{"policy"})
+	if err != nil || !created {
+		t.Fatalf("record trigger: %#v created=%v err=%v", first, created, err)
+	}
+	if first.Status != "pending" || first.Attempts != 0 || first.NextAttempt.IsZero() {
+		t.Fatalf("trigger was not queued durably: %#v", first)
+	}
+	claimed, err := st.ClaimWebhookTriggers(ctx, 1, time.Minute)
+	if err != nil || len(claimed) != 1 {
+		t.Fatalf("claim trigger: %#v err=%v", claimed, err)
+	}
+	if claimed[0].Status != "processing" || claimed[0].Attempts != 1 || claimed[0].LeaseUntil == nil {
+		t.Fatalf("trigger was not leased: %#v", claimed[0])
+	}
+	if err := st.RetryWebhookTriggers(ctx, []int64{first.ID}, time.Now().UTC().Add(time.Hour), "temporary collector failure"); err != nil {
+		t.Fatal(err)
+	}
+	if retry, _, err := st.RecordWebhookTrigger(ctx, strings.Repeat("b", 64), nil, nil); err != nil || retry.Status != "pending" || retry.Attempts != 1 {
+		t.Fatalf("retry state was not persisted: %#v err=%v", retry, err)
+	}
+	if due, err := st.ClaimWebhookTriggers(ctx, 1, time.Minute); err != nil || len(due) != 0 {
+		t.Fatalf("future retry was claimed early: %#v err=%v", due, err)
+	}
+	if _, err := st.db.ExecContext(ctx, "UPDATE webhook_triggers SET next_attempt_at=? WHERE id=?", time.Now().UTC().Add(-time.Second).Format(time.RFC3339Nano), first.ID); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err = st.ClaimWebhookTriggers(ctx, 1, time.Minute)
+	if err != nil || len(claimed) != 1 || claimed[0].Attempts != 2 {
+		t.Fatalf("retry was not reclaimed: %#v err=%v", claimed, err)
+	}
+	if err := st.CompleteWebhookTriggers(ctx, []int64{first.ID}); err != nil {
+		t.Fatal(err)
+	}
+	processed, _, err := st.RecordWebhookTrigger(ctx, strings.Repeat("b", 64), nil, nil)
+	if err != nil || processed.Status != "processed" || processed.ProcessedAt == nil {
+		t.Fatalf("completed trigger was not retained: %#v err=%v", processed, err)
+	}
+
+	dead, created, err := st.RecordWebhookTrigger(ctx, strings.Repeat("c", 64), nil, nil)
+	if err != nil || !created {
+		t.Fatalf("record dead-letter candidate: %#v created=%v err=%v", dead, created, err)
+	}
+	old := time.Now().UTC().Add(-webhookTriggerRetryWindow - time.Minute).Format(time.RFC3339Nano)
+	if _, err := st.db.ExecContext(ctx, "UPDATE webhook_triggers SET received_at=?,next_attempt_at=? WHERE id=?", old, old, dead.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.RetryWebhookTriggers(ctx, []int64{dead.ID}, time.Now().UTC(), "collector failure"); err != nil {
+		t.Fatal(err)
+	}
+	deadState, _, err := st.RecordWebhookTrigger(ctx, strings.Repeat("c", 64), nil, nil)
+	if err != nil || deadState.Status != "dead" || deadState.LastError != "collector failure" {
+		t.Fatalf("expired trigger was not dead-lettered: %#v err=%v", deadState, err)
+	}
+}
+
 func TestCleanupRemovesExpiredSessions(t *testing.T) {
 	ctx := context.Background()
 	st := testStore(t)

@@ -2,6 +2,8 @@ package web
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -100,6 +102,11 @@ func TestTailscaleWebhookAcceptsSignedDeliveryAndDeduplicates(t *testing.T) {
 	server.Handler().ServeHTTP(response, request)
 	if response.Code != http.StatusAccepted || !strings.Contains(response.Body.String(), `"status":"accepted"`) {
 		t.Fatalf("webhook response %d: %s", response.Code, response.Body.String())
+	}
+	bodyHash := sha256.Sum256(body)
+	trigger, created, err := st.RecordWebhookTrigger(context.Background(), hex.EncodeToString(bodyHash[:]), nil, nil)
+	if err != nil || created || trigger.Status != "pending" {
+		t.Fatalf("accepted webhook was not durably queued: %#v created=%v err=%v", trigger, created, err)
 	}
 
 	duplicate := httptest.NewRequest(http.MethodPost, "/webhooks/tailscale", strings.NewReader(string(body)))

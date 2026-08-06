@@ -85,10 +85,12 @@ https://tailstate.example/webhooks/tailscale
 The endpoint accepts the signed event arrays described in the [Tailscale
 webhook documentation](https://tailscale.com/docs/features/webhooks). TailState
 verifies the HMAC signature and timestamp, rejects oversized or replayed
-requests, stores only a body hash and event metadata, and immediately polls the
-affected collectors. Unknown event types trigger a complete reconciliation.
-Tailscale retries failed webhook deliveries, while the normal TailState poll
-interval remains the fallback if the endpoint is unavailable.
+requests, and stores only a body hash and event metadata before acknowledging
+the delivery. A durable worker leases queued triggers, polls the affected
+collectors, and retries failures for up to 24 hours across restarts. Unknown
+event types trigger a complete reconciliation. The normal TailState poll
+interval remains the fallback if the endpoint is unavailable; accepted webhook
+triggers are never lost between the HTTP response and reconciliation.
 
 Shoutrrr supports Mattermost natively, for example:
 
@@ -104,7 +106,7 @@ curl -fsS http://127.0.0.1:8080/readyz
 curl -fsS http://127.0.0.1:8080/metrics
 ```
 
-`/metrics` exposes readiness, pending/dead delivery counts, resource counts, and low-cardinality collector health gauges (`supported`, `baseline`, failures, last success, and next poll timestamps) for Prometheus-compatible monitoring.
+`/metrics` exposes readiness, pending/dead delivery counts, pending/processing/dead webhook trigger counts, resource counts, and low-cardinality collector health gauges (`supported`, `baseline`, failures, last success, and next poll timestamps) for Prometheus-compatible monitoring.
 
 ## Security and persistence
 
@@ -167,8 +169,9 @@ On the first startup after this upgrade, an existing encrypted Mattermost webhoo
 
 The schema v4 migration also adds encrypted storage for the optional Tailscale
 webhook secret, a deduplicated webhook trigger ledger, and trigger IDs on
-history batches. Existing installations start with webhook acceleration
-disabled until a secret is entered in Settings.
+history batches. Schema v5 adds trigger leases, retry state, and many-to-many
+links between coalesced triggers and history batches. Existing installations
+start with webhook acceleration disabled until a secret is entered in Settings.
 
 ## Runtime configuration
 

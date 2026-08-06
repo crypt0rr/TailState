@@ -189,7 +189,7 @@ select { width: 100%; border: 1px solid var(--border); border-radius: 6px; backg
 .delivery-error { color: #ff7b72; overflow-wrap: anywhere; }
 .history-pagination { display: flex; justify-content: center; padding-top: 20px; }
 
-.summary { display: grid; grid-template-columns: repeat(3, 1fr); gap: 18px; }
+.summary { display: grid; grid-template-columns: repeat(4, 1fr); gap: 18px; }
 .summary span { display: block; color: var(--muted); }
 .summary strong { display: block; margin-top: 8px; }
 .chips { display: flex; flex-wrap: wrap; gap: 8px; }

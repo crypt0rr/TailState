@@ -2,8 +2,10 @@ package store
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/subtle"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -68,6 +70,9 @@ type Status struct {
 	Dead                int
 	Destinations        int
 	EnabledDestinations int
+	WebhookPending      int
+	WebhookProcessing   int
+	WebhookDead         int
 }
 
 type OutboxItem struct {
@@ -86,6 +91,7 @@ type ChangeBatch struct {
 	ObservedAt  time.Time
 	ChangeCount int
 	TriggerID   int64
+	TriggerIDs  []int64
 }
 
 // WebhookTrigger records verified provider metadata without retaining the
@@ -97,6 +103,10 @@ type WebhookTrigger struct {
 	EventTypes  []string
 	Collectors  []string
 	Status      string
+	Attempts    int
+	NextAttempt time.Time
+	LeaseUntil  *time.Time
+	LastError   string
 	ProcessedAt *time.Time
 }
 
@@ -158,7 +168,13 @@ type HistoryPage struct {
 	HasNext    bool
 }
 
-const currentSchemaVersion = 4
+const currentSchemaVersion = 5
+
+const (
+	webhookTriggerRetryWindow = 24 * time.Hour
+	webhookTriggerLease       = 2 * time.Minute
+	webhookTriggerBatchSize   = 8
+)
 
 func Open(path string, box *secret.Box) (*Store, error) {
 	if err := os.MkdirAll(filepathDir(path), 0o700); err != nil {
@@ -234,6 +250,12 @@ func migrateSchema(db *sql.DB, box *secret.Box) error {
 	}
 	if version == 3 {
 		if err := migrateSchemaV3ToV4(db); err != nil {
+			return err
+		}
+		return migrateSchema(db, box)
+	}
+	if version == 4 {
+		if err := migrateSchemaV4ToV5(db); err != nil {
 			return err
 		}
 		return migrateSchema(db, box)
@@ -411,6 +433,55 @@ func migrateSchemaV3ToV4(db *sql.DB) error {
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit webhook migration: %w", err)
+	}
+	return nil
+}
+
+func migrateSchemaV4ToV5(db *sql.DB) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin durable webhook migration: %w", err)
+	}
+	defer tx.Rollback()
+	for _, column := range []struct {
+		table, name, definition string
+	}{
+		{table: "webhook_triggers", name: "attempts", definition: "INTEGER NOT NULL DEFAULT 0"},
+		{table: "webhook_triggers", name: "next_attempt_at", definition: "TEXT NOT NULL DEFAULT ''"},
+		{table: "webhook_triggers", name: "lease_until", definition: "TEXT"},
+		{table: "webhook_triggers", name: "last_error", definition: "TEXT NOT NULL DEFAULT ''"},
+	} {
+		if err := addColumnIfMissing(tx, column.table, column.name, column.definition); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.Exec(`CREATE TABLE IF NOT EXISTS event_batch_triggers (
+		batch_id INTEGER NOT NULL,
+		trigger_id INTEGER NOT NULL,
+		PRIMARY KEY(batch_id, trigger_id)
+	)`); err != nil {
+		return fmt.Errorf("create event batch trigger links: %w", err)
+	}
+	if _, err := tx.Exec("CREATE INDEX IF NOT EXISTS event_batch_triggers_trigger_id ON event_batch_triggers(trigger_id, batch_id)"); err != nil {
+		return fmt.Errorf("create event batch trigger link index: %w", err)
+	}
+	if _, err := tx.Exec(`UPDATE webhook_triggers
+		SET status=CASE WHEN status='accepted' THEN 'pending' ELSE status END,
+			next_attempt_at=CASE WHEN next_attempt_at='' THEN received_at ELSE next_attempt_at END`); err != nil {
+		return fmt.Errorf("backfill durable webhook state: %w", err)
+	}
+	if _, err := tx.Exec(`INSERT OR IGNORE INTO event_batch_triggers(batch_id,trigger_id)
+		SELECT id,trigger_id FROM event_batches WHERE trigger_id IS NOT NULL AND trigger_id>0`); err != nil {
+		return fmt.Errorf("backfill event batch trigger links: %w", err)
+	}
+	if _, err := tx.Exec("CREATE INDEX IF NOT EXISTS webhook_triggers_due ON webhook_triggers(status, next_attempt_at, id)"); err != nil {
+		return fmt.Errorf("create durable webhook index: %w", err)
+	}
+	if _, err := tx.Exec("UPDATE schema_version SET version=5"); err != nil {
+		return fmt.Errorf("record durable webhook migration: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit durable webhook migration: %w", err)
 	}
 	return nil
 }
@@ -786,15 +857,21 @@ func (s *Store) WebhookSecret(ctx context.Context) (string, error) {
 }
 
 // RecordWebhookTrigger persists verified event metadata and returns whether
-// this body hash was newly accepted. A unique hash makes provider retries and
+// this body hash was newly queued. A unique hash makes provider retries and
 // accidental replay harmless while keeping the original body out of SQLite.
 func (s *Store) RecordWebhookTrigger(ctx context.Context, bodyHash string, eventTypes, collectors []string) (WebhookTrigger, bool, error) {
 	bodyHash = strings.TrimSpace(bodyHash)
-	if len(bodyHash) != 64 {
+	if len(bodyHash) != sha256HexLength {
+		return WebhookTrigger{}, false, errors.New("invalid webhook body hash")
+	}
+	if _, err := hex.DecodeString(bodyHash); err != nil {
 		return WebhookTrigger{}, false, errors.New("invalid webhook body hash")
 	}
 	eventTypes = sortedUnique(eventTypes)
 	collectors = sortedUnique(collectors)
+	if len(eventTypes) > 100 || len(collectors) > 32 {
+		return WebhookTrigger{}, false, errors.New("webhook metadata is too large")
+	}
 	eventJSON, err := json.Marshal(eventTypes)
 	if err != nil {
 		return WebhookTrigger{}, false, err
@@ -804,12 +881,13 @@ func (s *Store) RecordWebhookTrigger(ctx context.Context, bodyHash string, event
 		return WebhookTrigger{}, false, err
 	}
 	now := time.Now().UTC()
+	nowValue := now.Format(time.RFC3339Nano)
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return WebhookTrigger{}, false, err
 	}
 	defer tx.Rollback()
-	result, err := tx.ExecContext(ctx, `INSERT INTO webhook_triggers(body_hash,received_at,event_types_json,collectors_json,status) VALUES(?,?,?,?, 'accepted') ON CONFLICT(body_hash) DO NOTHING`, bodyHash, now.Format(time.RFC3339Nano), eventJSON, collectorJSON)
+	result, err := tx.ExecContext(ctx, `INSERT INTO webhook_triggers(body_hash,received_at,event_types_json,collectors_json,status,next_attempt_at) VALUES(?,?,?,?, 'pending',?) ON CONFLICT(body_hash) DO NOTHING`, bodyHash, nowValue, eventJSON, collectorJSON, nowValue)
 	if err != nil {
 		return WebhookTrigger{}, false, err
 	}
@@ -817,23 +895,9 @@ func (s *Store) RecordWebhookTrigger(ctx context.Context, bodyHash string, event
 	if affected, affectedErr := result.RowsAffected(); affectedErr == nil {
 		created = affected == 1
 	}
-	var trigger WebhookTrigger
-	var received, eventRaw, collectorRaw, processed string
-	if err := tx.QueryRowContext(ctx, "SELECT id,body_hash,received_at,event_types_json,collectors_json,status,COALESCE(processed_at,'') FROM webhook_triggers WHERE body_hash=?", bodyHash).Scan(&trigger.ID, &trigger.BodyHash, &received, &eventRaw, &collectorRaw, &trigger.Status, &processed); err != nil {
+	trigger, err := readWebhookTrigger(tx.QueryRowContext(ctx, webhookTriggerSelect+" WHERE body_hash=?", bodyHash))
+	if err != nil {
 		return WebhookTrigger{}, false, err
-	}
-	trigger.ReceivedAt, _ = time.Parse(time.RFC3339Nano, received)
-	if err := json.Unmarshal([]byte(eventRaw), &trigger.EventTypes); err != nil {
-		return WebhookTrigger{}, false, fmt.Errorf("decode webhook event metadata: %w", err)
-	}
-	if err := json.Unmarshal([]byte(collectorRaw), &trigger.Collectors); err != nil {
-		return WebhookTrigger{}, false, fmt.Errorf("decode webhook collector metadata: %w", err)
-	}
-	if processed != "" {
-		value, parseErr := time.Parse(time.RFC3339Nano, processed)
-		if parseErr == nil {
-			trigger.ProcessedAt = &value
-		}
 	}
 	if err := tx.Commit(); err != nil {
 		return WebhookTrigger{}, false, err
@@ -841,13 +905,186 @@ func (s *Store) RecordWebhookTrigger(ctx context.Context, bodyHash string, event
 	return trigger, created, nil
 }
 
-func (s *Store) MarkWebhookTriggerProcessed(ctx context.Context, id int64) error {
-	if id <= 0 {
+const (
+	sha256HexLength      = sha256.Size * 2
+	webhookTriggerSelect = `SELECT id,body_hash,received_at,event_types_json,collectors_json,status,attempts,next_attempt_at,COALESCE(lease_until,''),last_error,COALESCE(processed_at,'') FROM webhook_triggers`
+)
+
+type webhookTriggerScanner interface {
+	Scan(dest ...any) error
+}
+
+func readWebhookTrigger(scanner webhookTriggerScanner) (WebhookTrigger, error) {
+	var trigger WebhookTrigger
+	var received, eventRaw, collectorRaw, nextAttempt, leaseUntil, processed string
+	if err := scanner.Scan(&trigger.ID, &trigger.BodyHash, &received, &eventRaw, &collectorRaw, &trigger.Status, &trigger.Attempts, &nextAttempt, &leaseUntil, &trigger.LastError, &processed); err != nil {
+		return WebhookTrigger{}, err
+	}
+	trigger.ReceivedAt = parseTime(received)
+	trigger.NextAttempt = parseTime(nextAttempt)
+	if leaseUntil != "" {
+		value := parseTime(leaseUntil)
+		trigger.LeaseUntil = &value
+	}
+	if processed != "" {
+		value := parseTime(processed)
+		trigger.ProcessedAt = &value
+	}
+	if err := json.Unmarshal([]byte(eventRaw), &trigger.EventTypes); err != nil {
+		return WebhookTrigger{}, fmt.Errorf("decode webhook event metadata: %w", err)
+	}
+	if err := json.Unmarshal([]byte(collectorRaw), &trigger.Collectors); err != nil {
+		return WebhookTrigger{}, fmt.Errorf("decode webhook collector metadata: %w", err)
+	}
+	return trigger, nil
+}
+
+func parseTime(value string) time.Time {
+	parsed, _ := time.Parse(time.RFC3339Nano, value)
+	return parsed
+}
+
+// ClaimWebhookTriggers leases queued triggers for one reconciliation worker.
+// Expired leases are returned to the queue, while triggers older than the
+// retry horizon become dead letters instead of being retried forever.
+func (s *Store) ClaimWebhookTriggers(ctx context.Context, limit int, lease time.Duration) ([]WebhookTrigger, error) {
+	if limit <= 0 {
+		limit = webhookTriggerBatchSize
+	}
+	if limit > 64 {
+		limit = 64
+	}
+	if lease < time.Second {
+		lease = webhookTriggerLease
+	}
+	now := time.Now().UTC()
+	nowValue := now.Format(time.RFC3339Nano)
+	deadline := now.Add(-webhookTriggerRetryWindow).Format(time.RFC3339Nano)
+	leaseValue := now.Add(lease).Format(time.RFC3339Nano)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `UPDATE webhook_triggers SET status='pending',lease_until=NULL WHERE status='processing' AND (lease_until IS NULL OR lease_until<=?)`, nowValue); err != nil {
+		return nil, err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE webhook_triggers SET status='dead',lease_until=NULL,last_error='reconciliation retry window expired' WHERE status IN ('pending','processing') AND received_at<=? AND (status='pending' OR lease_until IS NULL OR lease_until<=?)`, deadline, nowValue); err != nil {
+		return nil, err
+	}
+	rows, err := tx.QueryContext(ctx, webhookTriggerSelect+` WHERE status='pending' AND next_attempt_at<=? ORDER BY id LIMIT ?`, nowValue, limit)
+	if err != nil {
+		return nil, err
+	}
+	triggers := make([]WebhookTrigger, 0, limit)
+	for rows.Next() {
+		trigger, scanErr := readWebhookTrigger(rows)
+		if scanErr != nil {
+			rows.Close()
+			return nil, scanErr
+		}
+		triggers = append(triggers, trigger)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	for i := range triggers {
+		if _, err := tx.ExecContext(ctx, "UPDATE webhook_triggers SET status='processing',attempts=attempts+1,lease_until=? WHERE id=? AND status='pending'", leaseValue, triggers[i].ID); err != nil {
+			return nil, err
+		}
+		triggers[i].Status = "processing"
+		triggers[i].Attempts++
+		value := now.Add(lease)
+		triggers[i].LeaseUntil = &value
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return triggers, nil
+}
+
+// CompleteWebhookTriggers marks successfully reconciled triggers only after
+// the associated inventory transaction has committed.
+func (s *Store) CompleteWebhookTriggers(ctx context.Context, ids []int64) error {
+	ids = uniquePositiveIDs(ids)
+	if len(ids) == 0 {
 		return nil
 	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
-	_, err := s.db.ExecContext(ctx, "UPDATE webhook_triggers SET status='processed',processed_at=? WHERE id=? AND processed_at IS NULL", now, id)
-	return err
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, id := range ids {
+		if _, err := tx.ExecContext(ctx, "UPDATE webhook_triggers SET status='processed',processed_at=?,lease_until=NULL,last_error='' WHERE id=? AND status IN ('pending','processing')", now, id); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// RetryWebhookTriggers returns failed triggers to the durable queue, or
+// dead-letters them once their 24-hour retry horizon has elapsed.
+func (s *Store) RetryWebhookTriggers(ctx context.Context, ids []int64, next time.Time, message string) error {
+	ids = uniquePositiveIDs(ids)
+	if len(ids) == 0 {
+		return nil
+	}
+	message = truncate(strings.TrimSpace(message), 500)
+	now := time.Now().UTC()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, id := range ids {
+		var received string
+		if err := tx.QueryRowContext(ctx, "SELECT received_at FROM webhook_triggers WHERE id=?", id).Scan(&received); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				continue
+			}
+			return err
+		}
+		dead := now.Sub(parseTime(received)) >= webhookTriggerRetryWindow
+		status := "pending"
+		attempt := next.UTC()
+		if dead {
+			status = "dead"
+			attempt = now
+			if message == "" {
+				message = "reconciliation retry window expired"
+			}
+		}
+		if _, err := tx.ExecContext(ctx, "UPDATE webhook_triggers SET status=?,next_attempt_at=?,lease_until=NULL,last_error=? WHERE id=? AND status IN ('pending','processing')", status, attempt.Format(time.RFC3339Nano), message, id); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// MarkWebhookTriggerProcessed remains for compatibility with older callers.
+func (s *Store) MarkWebhookTriggerProcessed(ctx context.Context, id int64) error {
+	return s.CompleteWebhookTriggers(ctx, []int64{id})
+}
+
+func uniquePositiveIDs(values []int64) []int64 {
+	seen := make(map[int64]struct{}, len(values))
+	for _, value := range values {
+		if value > 0 {
+			seen[value] = struct{}{}
+		}
+	}
+	out := make([]int64, 0, len(seen))
+	for value := range seen {
+		out = append(out, value)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out
 }
 
 func sortedUnique(values []string) []string {
@@ -1086,6 +1323,7 @@ func (s *Store) ApplyBatch(ctx context.Context, generation int64, results []mode
 }
 
 func (s *Store) ApplyBatchWithBatch(ctx context.Context, generation int64, results []model.Collected, digest func([]model.Change) string, triggerIDs ...int64) (ChangeBatchResult, error) {
+	triggerIDs = uniquePositiveIDs(triggerIDs)
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return ChangeBatchResult{}, err
@@ -1209,7 +1447,7 @@ func (s *Store) ApplyBatchWithBatch(ctx context.Context, generation int64, resul
 	if len(triggerIDs) > 0 && triggerIDs[0] > 0 {
 		triggerID = triggerIDs[0]
 	}
-	result := ChangeBatchResult{ChangeBatch: ChangeBatch{Generation: generation, ObservedAt: now, TriggerID: triggerID}, Changes: changes}
+	result := ChangeBatchResult{ChangeBatch: ChangeBatch{Generation: generation, ObservedAt: now, TriggerID: triggerID, TriggerIDs: append([]int64(nil), triggerIDs...)}, Changes: changes}
 	if len(recorded) > 0 {
 		var triggerValue any
 		if triggerID > 0 {
@@ -1224,6 +1462,11 @@ func (s *Store) ApplyBatchWithBatch(ctx context.Context, generation int64, resul
 			return ChangeBatchResult{}, err
 		}
 		result.ID, result.ChangeCount = batchID, len(recorded)
+		for _, triggerID := range triggerIDs {
+			if _, err := tx.ExecContext(ctx, "INSERT OR IGNORE INTO event_batch_triggers(batch_id,trigger_id) VALUES(?,?)", batchID, triggerID); err != nil {
+				return ChangeBatchResult{}, err
+			}
+		}
 		for _, entry := range recorded {
 			fields, marshalErr := json.Marshal(entry.Change.Fields)
 			if marshalErr != nil {
@@ -1465,6 +1708,15 @@ func (s *Store) Status(ctx context.Context) (Status, error) {
 	if err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM notification_destinations WHERE deleted_at IS NULL AND enabled=1").Scan(&out.EnabledDestinations); err != nil {
 		return out, err
 	}
+	if err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM webhook_triggers WHERE status='pending'").Scan(&out.WebhookPending); err != nil {
+		return out, err
+	}
+	if err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM webhook_triggers WHERE status='processing'").Scan(&out.WebhookProcessing); err != nil {
+		return out, err
+	}
+	if err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM webhook_triggers WHERE status='dead'").Scan(&out.WebhookDead); err != nil {
+		return out, err
+	}
 	return out, nil
 }
 
@@ -1500,6 +1752,9 @@ func (s *Store) Cleanup(ctx context.Context, retention time.Duration) error {
 		return err
 	}
 	if _, err := s.db.ExecContext(ctx, "DELETE FROM event_batches WHERE NOT EXISTS (SELECT 1 FROM events WHERE events.batch_id=event_batches.id)"); err != nil {
+		return err
+	}
+	if _, err := s.db.ExecContext(ctx, "DELETE FROM event_batch_triggers WHERE NOT EXISTS (SELECT 1 FROM event_batches WHERE event_batches.id=event_batch_triggers.batch_id)"); err != nil {
 		return err
 	}
 	if _, err := s.db.ExecContext(ctx, "DELETE FROM webhook_triggers WHERE received_at<?", cutoff); err != nil {
@@ -1579,6 +1834,30 @@ func (s *Store) ListHistory(ctx context.Context, filter HistoryFilter) (HistoryP
 }
 
 func (s *Store) loadHistoryBatch(ctx context.Context, batch HistoryBatch, filter HistoryFilter) (HistoryBatch, error) {
+	triggerRows, err := s.db.QueryContext(ctx, "SELECT trigger_id FROM event_batch_triggers WHERE batch_id=? ORDER BY trigger_id", batch.ID)
+	if err != nil {
+		return HistoryBatch{}, err
+	}
+	for triggerRows.Next() {
+		var triggerID int64
+		if err := triggerRows.Scan(&triggerID); err != nil {
+			triggerRows.Close()
+			return HistoryBatch{}, err
+		}
+		if triggerID > 0 {
+			batch.TriggerIDs = append(batch.TriggerIDs, triggerID)
+		}
+	}
+	if err := triggerRows.Err(); err != nil {
+		triggerRows.Close()
+		return HistoryBatch{}, err
+	}
+	if err := triggerRows.Close(); err != nil {
+		return HistoryBatch{}, err
+	}
+	if len(batch.TriggerIDs) == 0 && batch.TriggerID > 0 {
+		batch.TriggerIDs = []int64{batch.TriggerID}
+	}
 	eventWhere := []string{"batch_id=?"}
 	eventArgs := []any{batch.ID}
 	if filter.Collector != "" {

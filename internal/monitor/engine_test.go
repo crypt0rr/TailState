@@ -127,3 +127,33 @@ func TestTriggerQueuesTargetedCollectorsAndCoalescesOverflow(t *testing.T) {
 		}
 	}
 }
+
+func TestFinishTriggersKeepsPendingWorkDurable(t *testing.T) {
+	ctx := context.Background()
+	box, err := secret.NewBox(make([]byte, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.Open(t.TempDir()+"/tailstate.db", box)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	trigger, created, err := st.RecordWebhookTrigger(ctx, strings.Repeat("f", 64), nil, nil)
+	if err != nil || !created {
+		t.Fatalf("record trigger: %#v created=%v err=%v", trigger, created, err)
+	}
+	engine := New(st, "", "", "test", &scriptedSender{})
+	engine.finishTriggers(ctx, []int64{trigger.ID}, false, 1)
+	retried, _, err := st.RecordWebhookTrigger(ctx, strings.Repeat("f", 64), nil, nil)
+	if err != nil || retried.Status != "pending" || retried.LastError == "" {
+		t.Fatalf("failed trigger was not retained for retry: %#v err=%v", retried, err)
+	}
+	if err := st.CompleteWebhookTriggers(ctx, []int64{trigger.ID}); err != nil {
+		t.Fatal(err)
+	}
+	completed, _, err := st.RecordWebhookTrigger(ctx, strings.Repeat("f", 64), nil, nil)
+	if err != nil || completed.Status != "processed" {
+		t.Fatalf("pending trigger could not be completed after retry: %#v err=%v", completed, err)
+	}
+}

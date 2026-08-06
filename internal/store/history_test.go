@@ -106,6 +106,40 @@ func TestHistoryPersistsExplainableChangesAndDeliveryState(t *testing.T) {
 	}
 }
 
+func TestHistoryCorrelatesCoalescedWebhookTriggers(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	generation, err := st.SaveSettings(ctx, settings())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.ApplyBatch(ctx, generation, []model.Collected{historyResource("server", "100.64.0.1")}, func([]model.Change) string { return "baseline" }); err != nil {
+		t.Fatal(err)
+	}
+	first, _, err := st.RecordWebhookTrigger(ctx, strings.Repeat("d", 64), []string{"policyUpdate"}, []string{"devices"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, _, err := st.RecordWebhookTrigger(ctx, strings.Repeat("e", 64), []string{"deviceUpdate"}, []string{"devices"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	batch, err := st.ApplyBatchWithBatch(ctx, generation, []model.Collected{historyResource("server-new", "100.64.0.2")}, func([]model.Change) string { return "digest" }, first.ID, second.ID, first.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(batch.TriggerIDs) != 2 || batch.TriggerIDs[0] != first.ID || batch.TriggerIDs[1] != second.ID {
+		t.Fatalf("coalesced trigger IDs were not normalized: %#v", batch)
+	}
+	page, err := st.ListHistory(ctx, HistoryFilter{Limit: 10})
+	if err != nil || len(page.Batches) != 1 {
+		t.Fatalf("load correlated history: %#v err=%v", page, err)
+	}
+	if len(page.Batches[0].TriggerIDs) != 2 || page.Batches[0].TriggerIDs[0] != first.ID || page.Batches[0].TriggerIDs[1] != second.ID {
+		t.Fatalf("history lost coalesced trigger IDs: %#v", page.Batches[0])
+	}
+}
+
 func TestEvidencePackExportIsRedactedAndVerifiable(t *testing.T) {
 	ctx := context.Background()
 	st := testStore(t)
@@ -281,6 +315,22 @@ CREATE TABLE outbox(id INTEGER PRIMARY KEY AUTOINCREMENT,destination_id INTEGER 
 	}
 	if triggerTable != 1 {
 		t.Fatal("schema migration did not create webhook trigger storage")
+	}
+	for _, column := range []string{"attempts", "next_attempt_at", "lease_until", "last_error"} {
+		var found int
+		if err := st.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM pragma_table_info('webhook_triggers') WHERE name=?", column).Scan(&found); err != nil {
+			t.Fatal(err)
+		}
+		if found != 1 {
+			t.Fatalf("schema migration did not add webhook trigger column %q", column)
+		}
+	}
+	var linkTable int
+	if err := st.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='event_batch_triggers'").Scan(&linkTable); err != nil {
+		t.Fatal(err)
+	}
+	if linkTable != 1 {
+		t.Fatal("schema migration did not create event batch trigger links")
 	}
 	var batchID, eventBatchID, outboxBatchID int64
 	if err := st.db.QueryRowContext(ctx, "SELECT id FROM event_batches LIMIT 1").Scan(&batchID); err != nil {

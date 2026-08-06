@@ -32,6 +32,8 @@ type ReconcileRequest struct {
 	Collectors []string
 }
 
+const durableTriggerPollInterval = time.Second
+
 func New(st *store.Store, baseURL, tokenURL, version string, senders ...notify.Sender) *Engine {
 	var sender notify.Sender = notify.New()
 	if len(senders) > 0 && senders[0] != nil {
@@ -85,6 +87,8 @@ func (e *Engine) scheduler(ctx context.Context) {
 	var client *tailscale.Client
 	var settings store.Settings
 	var deviceTimer, inventoryTimer *time.Timer
+	triggerTimer := time.NewTicker(durableTriggerPollInterval)
+	defer triggerTimer.Stop()
 	stop := func(t *time.Timer) {
 		if t != nil && !t.Stop() {
 			select {
@@ -114,11 +118,17 @@ func (e *Engine) scheduler(ctx context.Context) {
 			generation = current.Generation
 			settings = current
 			client = tailscale.New(e.baseURL, e.tokenURL, e.version, tailscale.Credentials{Tailnet: settings.Tailnet, ClientID: settings.OAuthClientID, ClientSecret: settings.OAuthClientSecret})
-			e.poll(ctx, client, settings, allCollectors(), false, 0)
+			e.poll(ctx, client, settings, allCollectors(), false)
 			stop(deviceTimer)
 			stop(inventoryTimer)
 			deviceTimer = time.NewTimer(jitter(settings.DeviceInterval))
 			inventoryTimer = time.NewTimer(jitter(settings.InventoryInterval))
+		}
+		// Handle the low-latency in-memory request first when one is queued.
+		// The durable queue remains the source of truth and is replayed once
+		// the fast path has drained.
+		if len(e.trigger) == 0 && e.processDurableTriggers(ctx, client, settings) {
+			continue
 		}
 		select {
 		case <-ctx.Done():
@@ -131,23 +141,26 @@ func (e *Engine) scheduler(ctx context.Context) {
 			if len(collectors) == 0 {
 				collectors = allCollectors()
 			}
-			e.poll(ctx, client, settings, collectors, true, request.TriggerID)
-			for _, triggerID := range requestTriggerIDs(request) {
-				if err := e.store.MarkWebhookTriggerProcessed(ctx, triggerID); err != nil {
-					slog.Error("mark webhook trigger processed", "trigger_id", triggerID, "error", err)
-				}
-			}
+			triggerIDs := requestTriggerIDs(request)
+			success := e.poll(ctx, client, settings, collectors, true, triggerIDs...)
+			e.finishTriggers(ctx, triggerIDs, success, 1)
+		case <-triggerTimer.C:
+			// The durable queue is checked at the top of the loop. This timer
+			// also wakes the scheduler when a retry becomes due after a crash.
+			continue
 		case <-deviceTimer.C:
-			e.poll(ctx, client, settings, tailscale.CoreCollectors, false, 0)
+			e.poll(ctx, client, settings, tailscale.CoreCollectors, false)
 			deviceTimer.Reset(jitter(settings.DeviceInterval))
 		case <-inventoryTimer.C:
-			e.poll(ctx, client, settings, tailscale.InventoryCollectors, false, 0)
+			e.poll(ctx, client, settings, tailscale.InventoryCollectors, false)
 			inventoryTimer.Reset(jitter(settings.InventoryInterval))
 		}
 	}
 }
 
-func (e *Engine) poll(ctx context.Context, client *tailscale.Client, settings store.Settings, collectors []string, force bool, triggerID int64) {
+func (e *Engine) poll(ctx context.Context, client *tailscale.Client, settings store.Settings, collectors []string, force bool, triggerIDs ...int64) bool {
+	triggerIDs = uniquePositive(triggerIDs)
+	success := true
 	results := make([]model.Collected, 0, len(collectors))
 	polled := make([]string, 0, len(collectors))
 	for _, collector := range collectors {
@@ -163,6 +176,7 @@ func (e *Engine) poll(ctx context.Context, client *tailscale.Client, settings st
 			result.Unsupported = true
 			slog.Info("collector unsupported", "collector", collector)
 		} else if err != nil {
+			success = false
 			shouldNotify, _, storeErr := e.store.RecordCollectorFailure(ctx, settings.Generation, collector, err.Error())
 			if storeErr != nil {
 				slog.Error("record collector failure", "collector", collector, "error", storeErr)
@@ -181,7 +195,7 @@ func (e *Engine) poll(ctx context.Context, client *tailscale.Client, settings st
 		results = append(results, result)
 	}
 	if len(polled) == 0 {
-		return
+		return success
 	}
 	for _, collector := range polled {
 		interval := settings.InventoryInterval
@@ -190,13 +204,72 @@ func (e *Engine) poll(ctx context.Context, client *tailscale.Client, settings st
 		}
 		e.store.SetNextPoll(ctx, settings.Generation, []string{collector}, time.Now().Add(interval))
 	}
-	batch, err := e.store.ApplyBatchWithBatch(ctx, settings.Generation, results, notify.Digest, triggerID)
+	batch, err := e.store.ApplyBatchWithBatch(ctx, settings.Generation, results, notify.Digest, triggerIDs...)
 	if err != nil {
 		slog.Error("apply collected inventory", "error", err)
-		return
+		return false
+	}
+	if len(triggerIDs) > 0 && batch.Generation == 0 {
+		// Settings changed while the poll was running. Keep the durable
+		// triggers queued so the new generation can reconcile them.
+		return false
 	}
 	if len(batch.Changes) > 0 {
 		slog.Info("inventory changes detected", "batch_id", batch.ID, "count", len(batch.Changes))
+	}
+	return success
+}
+
+func (e *Engine) processDurableTriggers(ctx context.Context, client *tailscale.Client, settings store.Settings) bool {
+	triggers, err := e.store.ClaimWebhookTriggers(ctx, 0, 0)
+	if err != nil {
+		slog.Error("claim durable webhook triggers", "error", err)
+		return false
+	}
+	if len(triggers) == 0 {
+		return false
+	}
+	ids := make([]int64, 0, len(triggers))
+	collectors := make([]string, 0)
+	broad := false
+	maxAttempts := 1
+	for _, trigger := range triggers {
+		ids = append(ids, trigger.ID)
+		if trigger.Attempts > maxAttempts {
+			maxAttempts = trigger.Attempts
+		}
+		if len(trigger.Collectors) == 0 {
+			broad = true
+			continue
+		}
+		collectors = append(collectors, trigger.Collectors...)
+	}
+	if broad || len(collectors) == 0 {
+		collectors = allCollectors()
+	} else {
+		collectors = normalizeCollectors(collectors)
+	}
+	success := e.poll(ctx, client, settings, collectors, true, ids...)
+	e.finishTriggers(ctx, ids, success, maxAttempts)
+	return true
+}
+
+func (e *Engine) finishTriggers(ctx context.Context, ids []int64, success bool, attempts int) {
+	ids = uniquePositive(ids)
+	if len(ids) == 0 {
+		return
+	}
+	if success {
+		if err := e.store.CompleteWebhookTriggers(ctx, ids); err != nil {
+			slog.Error("complete durable webhook triggers", "trigger_ids", ids, "error", err)
+		}
+		return
+	}
+	if attempts <= 0 {
+		attempts = 1
+	}
+	if err := e.store.RetryWebhookTriggers(ctx, ids, time.Now().Add(retryDelay(attempts)), "collector reconciliation failed"); err != nil {
+		slog.Error("retry durable webhook triggers", "trigger_ids", ids, "error", err)
 	}
 }
 

@@ -255,6 +255,9 @@ func TestHistoryRequiresAuthenticationAndShowsExplainableChanges(t *testing.T) {
 	if !strings.Contains(body, "Download evidence pack") || !strings.Contains(body, "/history/export") {
 		t.Fatalf("history page is missing the evidence export action: %s", body)
 	}
+	if !strings.Contains(body, "Signed key") || !strings.Contains(body, "ed25519:") {
+		t.Fatalf("history page is missing the evidence signing fingerprint: %s", body)
+	}
 	exportRequest := httptest.NewRequest(http.MethodGet, "/history/export?event_type=changed&resource=device-1", nil)
 	for _, cookie := range claimResponse.Result().Cookies() {
 		exportRequest.AddCookie(cookie)

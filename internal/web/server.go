@@ -53,6 +53,7 @@ type pageData struct {
 	HistoryEventTypes               []string
 	HistoryNextURL                  string
 	HistoryExportURL                string
+	EvidenceSigningKeyID            string
 	Destinations                    []destinationPage
 	NotificationsPaused             bool
 }
@@ -285,6 +286,7 @@ func (s *Server) history(w http.ResponseWriter, r *http.Request) {
 		HistoryCollectors: collectors,
 		HistoryEventTypes: []string{"created", "changed", "removed"},
 	}
+	data.EvidenceSigningKeyID, _ = s.store.EvidenceSigningKeyID(r.Context())
 	if history.HasNext {
 		data.HistoryNextURL = historyURL(filter, history.NextCursor)
 	}

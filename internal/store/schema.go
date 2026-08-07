@@ -3,7 +3,7 @@ package store
 const schema = `
 PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);
-INSERT INTO schema_version(version) SELECT 5 WHERE NOT EXISTS (SELECT 1 FROM schema_version);
+INSERT INTO schema_version(version) SELECT 6 WHERE NOT EXISTS (SELECT 1 FROM schema_version);
 
 CREATE TABLE IF NOT EXISTS meta (
   key TEXT PRIMARY KEY,
@@ -112,6 +112,18 @@ CREATE TABLE IF NOT EXISTS events (
   after_json BLOB
 );
 CREATE INDEX IF NOT EXISTS events_observed_at ON events(observed_at);
+CREATE TABLE IF NOT EXISTS evidence_ledger (
+  sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+  batch_id INTEGER NOT NULL UNIQUE,
+  generation INTEGER NOT NULL,
+  observed_at TEXT NOT NULL,
+  prev_hash TEXT NOT NULL,
+  entry_hash TEXT NOT NULL UNIQUE,
+  signature TEXT NOT NULL,
+  key_id TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS evidence_ledger_batch_id ON evidence_ledger(batch_id);
 CREATE TABLE IF NOT EXISTS outbox (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   batch_id INTEGER,

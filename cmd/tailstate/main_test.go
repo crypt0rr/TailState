@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/base64"
 	"net/http"
 	"net/http/httptest"
@@ -8,6 +9,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/crypt0rr/tailstate/internal/store"
 )
 
 func configureCommandEnvironment(t *testing.T, dataDir string) string {
@@ -41,6 +44,10 @@ func TestRunCommandDispatchAndHealthcheck(t *testing.T) {
 	os.Args = []string{"tailstate", "unknown"}
 	if err := run(); err == nil || !strings.Contains(err.Error(), "unknown command") {
 		t.Fatalf("unknown command error=%v", err)
+	}
+	os.Args = []string{"tailstate", "evidence"}
+	if err := run(); err == nil || !strings.Contains(err.Error(), "evidence verify") {
+		t.Fatalf("invalid evidence command error=%v", err)
 	}
 
 	health := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) }))
@@ -109,5 +116,41 @@ func TestLoadRejectsMissingMasterKey(t *testing.T) {
 	t.Setenv("TAILSTATE_COOKIE_SECURE", "false")
 	if _, _, err := load(); err == nil || !strings.Contains(err.Error(), "master key") {
 		t.Fatalf("missing master key error=%v", err)
+	}
+}
+
+func TestEvidenceVerifyCommand(t *testing.T) {
+	dataDir := t.TempDir()
+	configureCommandEnvironment(t, dataDir)
+	_, st, err := load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pack, err := st.ExportEvidencePack(context.Background(), store.HistoryFilter{})
+	if err != nil {
+		st.Close()
+		t.Fatal(err)
+	}
+	public, err := st.EvidenceSigningPublicKey(context.Background())
+	if err != nil {
+		st.Close()
+		t.Fatal(err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	packPath := filepath.Join(dataDir, "evidence.json")
+	keyPath := filepath.Join(dataDir, "evidence.key")
+	if err := os.WriteFile(packPath, pack, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(keyPath, []byte(base64.RawStdEncoding.EncodeToString(public)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := evidenceVerify([]string{"-file", packPath}); err != nil {
+		t.Fatalf("embedded-key verification failed: %v", err)
+	}
+	if err := evidenceVerify([]string{"-file", packPath, "-public-key", keyPath}); err != nil {
+		t.Fatalf("trusted-key verification failed: %v", err)
 	}
 }

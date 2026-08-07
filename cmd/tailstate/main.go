@@ -2,9 +2,11 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -44,11 +46,21 @@ func run() error {
 			return adminReset()
 		}
 		return errors.New("usage: tailstate admin reset")
+	case "evidence":
+		if len(os.Args) > 2 {
+			switch os.Args[2] {
+			case "verify":
+				return evidenceVerify(os.Args[3:])
+			case "public-key":
+				return evidencePublicKey()
+			}
+		}
+		return errors.New("usage: tailstate evidence verify [-file evidence.json] [-public-key public.key] or tailstate evidence public-key")
 	case "version", "--version", "-version":
 		fmt.Printf("tailstate %s\n", version)
 		return nil
 	default:
-		return fmt.Errorf("unknown command %q (use serve, healthcheck, admin reset, or version)", command)
+		return fmt.Errorf("unknown command %q (use serve, healthcheck, admin reset, evidence verify, evidence public-key, or version)", command)
 	}
 }
 
@@ -140,5 +152,55 @@ func adminReset() error {
 		return err
 	}
 	fmt.Printf("Password reset token: %s\nOpen /reset to choose a new administrator password.\n", token)
+	return nil
+}
+
+func evidenceVerify(args []string) error {
+	flags := flag.NewFlagSet("evidence verify", flag.ContinueOnError)
+	file := flags.String("file", "-", "evidence pack path, or - to read standard input")
+	publicKeyPath := flags.String("public-key", "", "trusted Ed25519 public key path (base64, hexadecimal, or raw)")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	var data []byte
+	var err error
+	if *file == "-" {
+		data, err = io.ReadAll(os.Stdin)
+	} else {
+		data, err = os.ReadFile(*file)
+	}
+	if err != nil {
+		return fmt.Errorf("read evidence pack: %w", err)
+	}
+	if *publicKeyPath != "" {
+		keyData, err := os.ReadFile(*publicKeyPath)
+		if err != nil {
+			return fmt.Errorf("read evidence public key: %w", err)
+		}
+		publicKey, err := store.ParseEvidencePublicKey(keyData)
+		if err != nil {
+			return fmt.Errorf("parse evidence public key: %w", err)
+		}
+		if err := store.VerifyEvidencePackWithKey(data, publicKey); err != nil {
+			return err
+		}
+	} else if err := store.VerifyEvidencePack(data); err != nil {
+		return err
+	}
+	fmt.Println("evidence pack verified")
+	return nil
+}
+
+func evidencePublicKey() error {
+	_, st, err := load()
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+	public, err := st.EvidenceSigningPublicKey(context.Background())
+	if err != nil {
+		return err
+	}
+	fmt.Println(base64.RawStdEncoding.EncodeToString(public))
 	return nil
 }

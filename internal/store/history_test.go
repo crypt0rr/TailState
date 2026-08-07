@@ -345,6 +345,13 @@ CREATE TABLE outbox(id INTEGER PRIMARY KEY AUTOINCREMENT,destination_id INTEGER 
 	if batchID == 0 || eventBatchID != batchID || outboxBatchID != batchID {
 		t.Fatalf("migration did not correlate legacy rows: batch=%d event=%d outbox=%d", batchID, eventBatchID, outboxBatchID)
 	}
+	var ledgerRows int
+	if err := st.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM evidence_ledger").Scan(&ledgerRows); err != nil {
+		t.Fatal(err)
+	}
+	if ledgerRows != 1 {
+		t.Fatalf("schema migration did not backfill the evidence ledger: %d", ledgerRows)
+	}
 }
 
 func TestCleanupRemovesExpiredHistoryBatches(t *testing.T) {

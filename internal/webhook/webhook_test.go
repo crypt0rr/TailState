@@ -1,10 +1,22 @@
 package webhook
 
 import (
+	"net/http"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestMethodOnlyAcceptsPOST(t *testing.T) {
+	if !Method(http.MethodPost) {
+		t.Fatal("POST was rejected")
+	}
+	for _, method := range []string{http.MethodGet, http.MethodPut, http.MethodDelete} {
+		if Method(method) {
+			t.Fatalf("%s was accepted", method)
+		}
+	}
+}
 
 func TestVerifyAcceptsSignedEventArrayAndClassifiesCollectors(t *testing.T) {
 	body := []byte(`[{"timestamp":"2026-08-05T10:00:00Z","version":1,"type":"policyUpdate","tailnet":"example.ts.net","data":{"actor":"user"}}]`)
@@ -54,5 +66,26 @@ func TestVerifyRejectsNonArrayAndOversizedBody(t *testing.T) {
 	large := make([]byte, MaxBodyBytes+1)
 	if _, err := Verify(large, SignatureForTest(large, "secret", now.Unix()), "secret", now); err == nil {
 		t.Fatal("oversized body was accepted")
+	}
+}
+
+func TestCollectorsForCoversDocumentedEventFamilies(t *testing.T) {
+	tests := []struct {
+		event string
+		want  string
+	}{
+		{event: "nodeCreated", want: "device_details,devices"},
+		{event: "userRoleUpdated", want: "user_invites,users"},
+		{event: "policyUpdate", want: "policy"},
+		{event: "webhookDeleted", want: "webhooks"},
+	}
+	for _, tt := range tests {
+		collectors := CollectorsFor([]Event{{Type: tt.event}})
+		if strings.Join(collectors, ",") != tt.want {
+			t.Fatalf("%s collectors=%v, want %s", tt.event, collectors, tt.want)
+		}
+	}
+	if got := CollectorsFor(nil); len(got) != 0 {
+		t.Fatalf("empty event list collectors=%v, want empty", got)
 	}
 }

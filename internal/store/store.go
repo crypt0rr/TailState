@@ -22,8 +22,9 @@ import (
 )
 
 type Store struct {
-	db  *sql.DB
-	box *secret.Box
+	db          *sql.DB
+	box         *secret.Box
+	evidenceKey evidenceSigningKey
 }
 
 type Settings struct {
@@ -150,8 +151,13 @@ type HistoryDelivery struct {
 
 type HistoryBatch struct {
 	ChangeBatch
-	Events     []HistoryEvent
-	Deliveries []HistoryDelivery
+	Events          []HistoryEvent
+	Deliveries      []HistoryDelivery
+	LedgerSequence  int64
+	LedgerPrevHash  string
+	LedgerHash      string
+	LedgerSignature string
+	LedgerKeyID     string
 }
 
 type HistoryFilter struct {
@@ -168,7 +174,7 @@ type HistoryPage struct {
 	HasNext    bool
 }
 
-const currentSchemaVersion = 5
+const currentSchemaVersion = 6
 
 const (
 	webhookTriggerRetryWindow = 24 * time.Hour
@@ -221,6 +227,15 @@ func Open(path string, box *secret.Box) (*Store, error) {
 			return nil, errors.New("master key does not match this TailState database")
 		}
 	}
+	st.evidenceKey, err = loadOrCreateEvidenceSigningKey(context.Background(), db, box)
+	if err != nil {
+		db.Close()
+		return nil, fmt.Errorf("load evidence signing key: %w", err)
+	}
+	if err := st.backfillEvidenceLedger(context.Background()); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("backfill evidence ledger: %w", err)
+	}
 	if err := os.Chmod(path, 0o600); err != nil {
 		db.Close()
 		return nil, err
@@ -256,6 +271,12 @@ func migrateSchema(db *sql.DB, box *secret.Box) error {
 	}
 	if version == 4 {
 		if err := migrateSchemaV4ToV5(db); err != nil {
+			return err
+		}
+		return migrateSchema(db, box)
+	}
+	if version == 5 {
+		if err := migrateSchemaV5ToV6(db); err != nil {
 			return err
 		}
 		return migrateSchema(db, box)
@@ -482,6 +503,37 @@ func migrateSchemaV4ToV5(db *sql.DB) error {
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit durable webhook migration: %w", err)
+	}
+	return nil
+}
+
+func migrateSchemaV5ToV6(db *sql.DB) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin evidence ledger migration: %w", err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`CREATE TABLE IF NOT EXISTS evidence_ledger (
+		sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+		batch_id INTEGER NOT NULL UNIQUE,
+		generation INTEGER NOT NULL,
+		observed_at TEXT NOT NULL,
+		prev_hash TEXT NOT NULL,
+		entry_hash TEXT NOT NULL UNIQUE,
+		signature TEXT NOT NULL,
+		key_id TEXT NOT NULL,
+		created_at TEXT NOT NULL
+	)`); err != nil {
+		return fmt.Errorf("create evidence ledger: %w", err)
+	}
+	if _, err := tx.Exec("CREATE INDEX IF NOT EXISTS evidence_ledger_batch_id ON evidence_ledger(batch_id)"); err != nil {
+		return fmt.Errorf("create evidence ledger index: %w", err)
+	}
+	if _, err := tx.Exec("UPDATE schema_version SET version=6"); err != nil {
+		return fmt.Errorf("record evidence ledger migration: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit evidence ledger migration: %w", err)
 	}
 	return nil
 }
@@ -1481,6 +1533,9 @@ func (s *Store) ApplyBatchWithBatch(ctx context.Context, generation int64, resul
 		if err = enqueueOutboxTx(ctx, tx, payload, observedAt, batchID); err != nil {
 			return ChangeBatchResult{}, err
 		}
+		if err = s.appendEvidenceLedgerTx(ctx, tx, batchID); err != nil {
+			return ChangeBatchResult{}, err
+		}
 	}
 	var remaining int
 	err = tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM collector_state WHERE generation=? AND supported=1 AND baseline=0", generation).Scan(&remaining)
@@ -1757,6 +1812,9 @@ func (s *Store) Cleanup(ctx context.Context, retention time.Duration) error {
 	if _, err := s.db.ExecContext(ctx, "DELETE FROM event_batch_triggers WHERE NOT EXISTS (SELECT 1 FROM event_batches WHERE event_batches.id=event_batch_triggers.batch_id)"); err != nil {
 		return err
 	}
+	if _, err := s.db.ExecContext(ctx, "DELETE FROM evidence_ledger WHERE NOT EXISTS (SELECT 1 FROM event_batches WHERE event_batches.id=evidence_ledger.batch_id)"); err != nil {
+		return err
+	}
 	if _, err := s.db.ExecContext(ctx, "DELETE FROM webhook_triggers WHERE received_at<?", cutoff); err != nil {
 		return err
 	}
@@ -1857,6 +1915,9 @@ func (s *Store) loadHistoryBatch(ctx context.Context, batch HistoryBatch, filter
 	}
 	if len(batch.TriggerIDs) == 0 && batch.TriggerID > 0 {
 		batch.TriggerIDs = []int64{batch.TriggerID}
+	}
+	if err := s.db.QueryRowContext(ctx, "SELECT sequence,prev_hash,entry_hash,signature,key_id FROM evidence_ledger WHERE batch_id=?", batch.ID).Scan(&batch.LedgerSequence, &batch.LedgerPrevHash, &batch.LedgerHash, &batch.LedgerSignature, &batch.LedgerKeyID); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return HistoryBatch{}, err
 	}
 	eventWhere := []string{"batch_id=?"}
 	eventArgs := []any{batch.ID}

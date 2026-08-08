@@ -90,6 +90,16 @@ func TestEvidenceSigningKeyAccessorsAndLedgerHeadFallbacks(t *testing.T) {
 	if head, err := st.evidenceLedgerHead(ctx); err != nil || head != "row-head" {
 		t.Fatalf("row evidence ledger head = %q, %v", head, err)
 	}
+	tx, err := st.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if head, err := ledgerHeadTx(ctx, tx); err != nil || head != "row-head" {
+		t.Fatalf("transaction evidence ledger head = %q, %v", head, err)
+	}
+	if err := tx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func signedEvidencePackFixture(t *testing.T) ([]byte, ed25519.PublicKey) {

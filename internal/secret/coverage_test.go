@@ -1,10 +1,18 @@
 package secret
 
 import (
+	"crypto/rand"
 	"encoding/base64"
+	"errors"
 	"strings"
 	"testing"
 )
+
+type failingRandomReader struct{}
+
+func (failingRandomReader) Read([]byte) (int, error) {
+	return 0, errors.New("random source unavailable")
+}
 
 func TestTokenHashAndMalformedPasswordValues(t *testing.T) {
 	token, err := Token(24)
@@ -63,5 +71,24 @@ func TestBoxRejectsInvalidInternalKey(t *testing.T) {
 	encoded := base64.RawURLEncoding.EncodeToString(make([]byte, 16))
 	if _, err := box.Decrypt(envelopeVersion + ":" + encoded); err == nil {
 		t.Fatal("Decrypt accepted an invalid internal key")
+	}
+}
+
+func TestRandomSourceFailuresAreReturned(t *testing.T) {
+	original := rand.Reader
+	rand.Reader = failingRandomReader{}
+	t.Cleanup(func() { rand.Reader = original })
+	box, err := NewBox(make([]byte, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := box.Encrypt("secret"); err == nil {
+		t.Fatal("Encrypt hid a random source failure")
+	}
+	if _, err := PasswordHash("a secure password"); err == nil {
+		t.Fatal("PasswordHash hid a random source failure")
+	}
+	if _, err := Token(16); err == nil {
+		t.Fatal("Token hid a random source failure")
 	}
 }

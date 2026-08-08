@@ -2,11 +2,24 @@ package notify
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 )
+
+type roundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripperFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+type trackingBody struct{ closed bool }
+
+func (b *trackingBody) Read([]byte) (int, error) { return 0, errors.New("end") }
+func (b *trackingBody) Close() error {
+	b.closed = true
+	return nil
+}
 
 func TestNotifyTestAndErrorHelpers(t *testing.T) {
 	var body string
@@ -78,5 +91,59 @@ func TestNewConfiguresBoundedHTTPClient(t *testing.T) {
 	}
 	if sender.client.Transport == nil {
 		t.Fatal("sender must configure a transport")
+	}
+}
+
+func TestRejectRedirectTransportHandlesDefaultsErrorsAndRedirects(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	request, err := http.NewRequest(http.MethodGet, server.URL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := (rejectRedirectTransport{}).RoundTrip(request)
+	if err != nil {
+		t.Fatalf("default transport error = %v", err)
+	}
+	response.Body.Close()
+
+	transportError := errors.New("transport unavailable")
+	if _, err := (rejectRedirectTransport{base: roundTripperFunc(func(*http.Request) (*http.Response, error) {
+		return nil, transportError
+	})}).RoundTrip(request); !errors.Is(err, transportError) {
+		t.Fatalf("transport error = %v", err)
+	}
+	body := &trackingBody{}
+	if _, err := (rejectRedirectTransport{base: roundTripperFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusFound, Status: "302 Found", Body: body}, nil
+	})}).RoundTrip(request); err == nil || !strings.Contains(err.Error(), "redirect response 302 Found") {
+		t.Fatalf("redirect error = %v", err)
+	}
+	if !body.closed {
+		t.Fatal("redirect response body was not closed")
+	}
+}
+
+func TestSendReturnsRedactedDeliveryError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	defer server.Close()
+	serviceURL := strings.Replace(server.URL, "http://", "generic://", 1) + "/hooks/super-secret?disabletls=true"
+	err := New().Send(context.Background(), serviceURL, "hello")
+	if err == nil {
+		t.Fatal("failed notification unexpectedly succeeded")
+	}
+	var delivery *DeliveryError
+	if !errors.As(err, &delivery) {
+		t.Fatalf("error type = %T (%v), want DeliveryError", err, err)
+	}
+	if delivery.Status != http.StatusBadGateway {
+		t.Fatalf("delivery status = %d, want %d", delivery.Status, http.StatusBadGateway)
+	}
+	if strings.Contains(err.Error(), "super-secret") || strings.Contains(err.Error(), serviceURL) {
+		t.Fatalf("delivery error leaked destination: %v", err)
 	}
 }

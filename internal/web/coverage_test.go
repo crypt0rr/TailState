@@ -368,3 +368,92 @@ func TestSettingsAndDestinationMutationBranches(t *testing.T) {
 		t.Fatalf("soft-deleted destination missing: %#v err=%v", all, err)
 	}
 }
+
+func TestDestinationTestAndUnknownMutationErrors(t *testing.T) {
+	server, st, setupToken := testServer(t)
+	cookies := claimCoverageAdmin(t, server, setupToken)
+	csrf := coverageCSRF(t, cookies)
+	server.config.TailscaleBase = "http://127.0.0.1:1/api/v2"
+	server.config.OAuthTokenURL = "http://127.0.0.1:1/oauth/token"
+	failedSettings := coveragePost(t, server, "/settings", url.Values{
+		"_csrf": {csrf}, "tailnet": {"-"}, "client_id": {"client"}, "client_secret": {"secret"}, "device_interval": {"60"}, "inventory_interval": {"300"},
+	}, cookies)
+	if failedSettings.Code != http.StatusOK || !strings.Contains(failedSettings.Body.String(), "Tailscale test failed") {
+		t.Fatalf("failed Tailscale settings status=%d body=%s", failedSettings.Code, failedSettings.Body.String())
+	}
+
+	invalid := coveragePost(t, server, "/settings/destinations", url.Values{
+		"_csrf": {csrf}, "action": {"save"}, "name": {"Invalid"}, "service_url": {"not-a-shoutrrr-url"}, "enabled": {"on"},
+	}, cookies)
+	if invalid.Code != http.StatusOK || !strings.Contains(invalid.Body.String(), "Notification destination was not saved") {
+		t.Fatalf("invalid destination save status=%d body=%s", invalid.Code, invalid.Body.String())
+	}
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Errorf("notification test method=%s, want POST", r.Method)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+	serviceURL := strings.Replace(upstream.URL, "http://", "generic://", 1) + "?disabletls=true&template=json&messagekey=text"
+	saved := coveragePost(t, server, "/settings/destinations", url.Values{
+		"_csrf": {csrf}, "action": {"save"}, "name": {"Webhook"}, "service_url": {serviceURL}, "enabled": {"on"},
+	}, cookies)
+	if saved.Code != http.StatusSeeOther {
+		t.Fatalf("valid destination save status=%d body=%s", saved.Code, saved.Body.String())
+	}
+	destinations, err := st.ListDestinations(context.Background())
+	if err != nil || len(destinations) != 1 {
+		t.Fatalf("saved destinations=%#v err=%v", destinations, err)
+	}
+	id := strconv.FormatInt(destinations[0].ID, 10)
+
+	tested := coveragePost(t, server, "/settings/destinations/test", url.Values{"_csrf": {csrf}, "id": {id}}, cookies)
+	if tested.Code != http.StatusOK || !strings.Contains(tested.Body.String(), "Notification test sent") {
+		t.Fatalf("successful destination test status=%d body=%s", tested.Code, tested.Body.String())
+	}
+	unknownToggle := coveragePost(t, server, "/settings/destinations/toggle", url.Values{"_csrf": {csrf}, "id": {"999999"}, "enabled": {"true"}}, cookies)
+	if unknownToggle.Code != http.StatusBadRequest || !strings.Contains(unknownToggle.Body.String(), "notification destination not found") {
+		t.Fatalf("unknown destination toggle status=%d body=%s", unknownToggle.Code, unknownToggle.Body.String())
+	}
+	unknownDelete := coveragePost(t, server, "/settings/destinations/remove", url.Values{"_csrf": {csrf}, "id": {"999999"}}, cookies)
+	if unknownDelete.Code != http.StatusBadRequest || !strings.Contains(unknownDelete.Body.String(), "notification destination not found") {
+		t.Fatalf("unknown destination delete status=%d body=%s", unknownDelete.Code, unknownDelete.Body.String())
+	}
+}
+
+func TestWebAuthenticationAndHelperErrorBranches(t *testing.T) {
+	server, st, _ := testServer(t)
+	unauthorized := coveragePost(t, server, "/logout", nil, nil)
+	if unauthorized.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated logout status=%d body=%s", unauthorized.Code, unauthorized.Body.String())
+	}
+	if got := remoteIP(&http.Request{RemoteAddr: "198.51.100.7"}); got != "198.51.100.7" {
+		t.Fatalf("remoteIP without port=%q", got)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	response := httptest.NewRecorder()
+	if server.startSession(response, httptest.NewRequest(http.MethodPost, "/login", nil)) {
+		t.Fatal("startSession succeeded with a closed store")
+	}
+	if response.Code != http.StatusInternalServerError {
+		t.Fatalf("closed-store startSession status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestResetRejectsInvalidToken(t *testing.T) {
+	server, st, setupToken := testServer(t)
+	claimCoverageAdmin(t, server, setupToken)
+	if _, err := st.NewResetToken(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	response := coveragePost(t, server, "/reset", url.Values{
+		"token": {"invalid-reset-token"}, "password": {"new secure password"}, "confirm": {"new secure password"},
+	}, nil)
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "invalid reset token") {
+		t.Fatalf("invalid reset response status=%d body=%s", response.Code, response.Body.String())
+	}
+}

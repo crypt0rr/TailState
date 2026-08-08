@@ -54,3 +54,14 @@ func TestHealthAndUpdateMessagesEscapeInput(t *testing.T) {
 		t.Fatalf("update message did not escape input: %s", got)
 	}
 }
+
+func TestDigestStopsAddingFieldsNearBound(t *testing.T) {
+	fields := make([]model.FieldChange, 100)
+	for i := range fields {
+		fields[i] = model.FieldChange{Field: "field", Old: strings.Repeat("o", 180), New: strings.Repeat("n", 180)}
+	}
+	message := Digest([]model.Change{{Kind: "changed", Collector: "devices", Name: "server", Fields: fields}})
+	if len(message) > 12000 {
+		t.Fatalf("bounded digest length=%d", len(message))
+	}
+}

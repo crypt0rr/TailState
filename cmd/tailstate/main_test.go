@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/crypt0rr/tailstate/internal/store"
 )
@@ -49,6 +50,10 @@ func TestRunCommandDispatchAndHealthcheck(t *testing.T) {
 	if err := run(); err == nil || !strings.Contains(err.Error(), "evidence verify") {
 		t.Fatalf("invalid evidence command error=%v", err)
 	}
+	os.Args = []string{"tailstate", "evidence", "verify", "-file", filepath.Join(t.TempDir(), "missing-evidence.json")}
+	if err := run(); err == nil || !strings.Contains(err.Error(), "read evidence pack") {
+		t.Fatalf("evidence verify dispatch error=%v", err)
+	}
 
 	health := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) }))
 	defer health.Close()
@@ -81,6 +86,53 @@ func TestMainAndServeRejectInvalidConfiguration(t *testing.T) {
 	}
 	if err := serve(); err == nil || !strings.Contains(err.Error(), "master key") {
 		t.Fatalf("direct serve with invalid configuration error=%v", err)
+	}
+}
+
+func TestServeContextCompletesWhenCanceled(t *testing.T) {
+	configureCommandEnvironment(t, t.TempDir())
+	t.Setenv("TAILSTATE_LOG_LEVEL", "debug")
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	timer := time.AfterFunc(500*time.Millisecond, cancel)
+	t.Cleanup(func() { timer.Stop() })
+	if err := serveContext(ctx); err != nil {
+		t.Fatalf("serveContext returned error: %v", err)
+	}
+}
+
+func TestEvidenceVerifyReportsTrustedKeyAndPackErrors(t *testing.T) {
+	dataDir := t.TempDir()
+	configureCommandEnvironment(t, dataDir)
+	_, st, err := load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pack, err := st.ExportEvidencePack(context.Background(), store.HistoryFilter{})
+	if err != nil {
+		st.Close()
+		t.Fatal(err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	packPath := filepath.Join(dataDir, "pack.json")
+	if err := os.WriteFile(packPath, pack, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	badPackPath := filepath.Join(dataDir, "bad-pack.json")
+	if err := os.WriteFile(badPackPath, []byte("not-json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := evidenceVerify([]string{"-file", badPackPath}); err == nil || !strings.Contains(err.Error(), "decode evidence pack") {
+		t.Fatalf("bad evidence pack error=%v", err)
+	}
+	keyPath := filepath.Join(dataDir, "wrong.key")
+	if err := os.WriteFile(keyPath, make([]byte, 32), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := evidenceVerify([]string{"-file", packPath, "-public-key", keyPath}); err == nil || !strings.Contains(err.Error(), "not trusted") {
+		t.Fatalf("wrong trusted key error=%v", err)
 	}
 }
 
@@ -152,5 +204,95 @@ func TestEvidenceVerifyCommand(t *testing.T) {
 	}
 	if err := evidenceVerify([]string{"-file", packPath, "-public-key", keyPath}); err != nil {
 		t.Fatalf("trusted-key verification failed: %v", err)
+	}
+}
+
+func TestCommandDispatchesConfiguredOperations(t *testing.T) {
+	dataDir := t.TempDir()
+	configureCommandEnvironment(t, dataDir)
+	originalArgs := os.Args
+	t.Cleanup(func() { os.Args = originalArgs })
+
+	health := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	os.Args = []string{"tailstate", "healthcheck", "-url", health.URL}
+	if err := run(); err != nil {
+		health.Close()
+		t.Fatalf("healthcheck dispatch failed: %v", err)
+	}
+	health.Close()
+
+	os.Args = []string{"tailstate", "admin", "reset"}
+	if err := run(); err != nil {
+		t.Fatalf("admin reset dispatch failed: %v", err)
+	}
+	os.Args = []string{"tailstate", "evidence", "public-key"}
+	if err := run(); err != nil {
+		t.Fatalf("evidence public-key dispatch failed: %v", err)
+	}
+}
+
+func TestEvidenceVerifyReadsStandardInputAndReportsReadErrors(t *testing.T) {
+	dataDir := t.TempDir()
+	configureCommandEnvironment(t, dataDir)
+	_, st, err := load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pack, err := st.ExportEvidencePack(context.Background(), store.HistoryFilter{})
+	if err != nil {
+		st.Close()
+		t.Fatal(err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writer.Write(pack); err != nil {
+		reader.Close()
+		writer.Close()
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		reader.Close()
+		t.Fatal(err)
+	}
+	originalStdin := os.Stdin
+	os.Stdin = reader
+	t.Cleanup(func() {
+		os.Stdin = originalStdin
+		reader.Close()
+	})
+	if err := evidenceVerify(nil); err != nil {
+		t.Fatalf("stdin evidence verification failed: %v", err)
+	}
+
+	if err := evidenceVerify([]string{"-file", filepath.Join(dataDir, "missing.json")}); err == nil || !strings.Contains(err.Error(), "read evidence pack") {
+		t.Fatalf("missing evidence file error = %v", err)
+	}
+	badKey := filepath.Join(dataDir, "bad.key")
+	if err := os.WriteFile(badKey, []byte("not-a-public-key"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	packPath := filepath.Join(dataDir, "pack.json")
+	if err := os.WriteFile(packPath, pack, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := evidenceVerify([]string{"-file", packPath, "-public-key", badKey}); err == nil || !strings.Contains(err.Error(), "parse evidence public key") {
+		t.Fatalf("bad public key error = %v", err)
+	}
+}
+
+func TestHealthcheckReportsTransportErrors(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	url := server.URL
+	server.Close()
+	if err := healthcheck([]string{"-url", url}); err == nil {
+		t.Fatal("healthcheck against a closed server unexpectedly succeeded")
 	}
 }

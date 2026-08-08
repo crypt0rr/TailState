@@ -32,7 +32,12 @@ type ReconcileRequest struct {
 	Collectors []string
 }
 
-const durableTriggerPollInterval = time.Second
+var (
+	durableTriggerPollInterval = time.Second
+	schedulerWaitInterval      = 5 * time.Second
+	deliveryPollInterval       = 2 * time.Second
+	cleanupPollInterval        = time.Hour
+)
 
 func New(st *store.Store, baseURL, tokenURL, version string, senders ...notify.Sender) *Engine {
 	var sender notify.Sender = notify.New()
@@ -110,7 +115,7 @@ func (e *Engine) scheduler(ctx context.Context) {
 				return
 			case <-e.wake:
 				continue
-			case <-time.After(5 * time.Second):
+			case <-time.After(schedulerWaitInterval):
 				continue
 			}
 		}
@@ -319,7 +324,7 @@ func uniquePositive(values []int64) []int64 {
 }
 
 func (e *Engine) delivery(ctx context.Context) {
-	ticker := time.NewTicker(2 * time.Second)
+	ticker := time.NewTicker(deliveryPollInterval)
 	defer ticker.Stop()
 	for {
 		select {
@@ -359,7 +364,7 @@ func (e *Engine) delivery(ctx context.Context) {
 }
 
 func (e *Engine) cleanup(ctx context.Context) {
-	ticker := time.NewTicker(time.Hour)
+	ticker := time.NewTicker(cleanupPollInterval)
 	defer ticker.Stop()
 	for {
 		select {

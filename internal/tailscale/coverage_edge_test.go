@@ -154,6 +154,10 @@ func TestPaginationHelpersAndGetRetryBranches(t *testing.T) {
 	if got := nextURL(map[string]any{"pagination": map[string]any{"nextCursor": ""}}); got != "" {
 		t.Fatalf("empty cursor next URL=%q", got)
 	}
+	badBase := New("://invalid", "https://oauth.example.test/token", "test", Credentials{})
+	if _, err := badBase.resolvePaginationURL("https://api.example.test/devices", "/devices"); err == nil {
+		t.Fatal("invalid API base URL succeeded")
+	}
 
 	responses := []int{http.StatusUnauthorized, http.StatusNoContent}
 	getAttempts := 0
@@ -205,6 +209,10 @@ func TestCollectorHTTPErrorBranches(t *testing.T) {
 	mode := "details-unsupported"
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasSuffix(r.URL.Path, "/devices") {
+			if mode == "details-list-error" {
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
 			if mode == "details-unsupported" || mode == "details-error" {
 				_, _ = w.Write([]byte(`{"devices":[{"id":"device-1","hostname":"server"}]}`))
 				return
@@ -236,6 +244,11 @@ func TestCollectorHTTPErrorBranches(t *testing.T) {
 				w.WriteHeader(http.StatusInternalServerError)
 				return
 			}
+		case "log-unsupported":
+			if strings.Contains(r.URL.Path, "/logging/") {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
 		}
 		http.NotFound(w, r)
 	}))
@@ -253,6 +266,10 @@ func TestCollectorHTTPErrorBranches(t *testing.T) {
 	if _, err := newClient().Collect(context.Background(), "device_details"); err == nil {
 		t.Fatal("device details server error was ignored")
 	}
+	mode = "details-list-error"
+	if _, err := newClient().Collect(context.Background(), "device_details"); err == nil {
+		t.Fatal("device list server error was ignored")
+	}
 	mode = "dns-error"
 	if _, err := newClient().Collect(context.Background(), "dns"); err == nil {
 		t.Fatal("DNS server error was ignored")
@@ -264,6 +281,10 @@ func TestCollectorHTTPErrorBranches(t *testing.T) {
 	mode = "log-error"
 	if _, err := newClient().Collect(context.Background(), "log_streaming"); err == nil {
 		t.Fatal("log streaming server error was ignored")
+	}
+	mode = "log-unsupported"
+	if _, err := newClient().Collect(context.Background(), "log_streaming"); err == nil {
+		t.Fatal("unsupported log streaming was not reported")
 	}
 }
 
@@ -284,6 +305,11 @@ func TestClientTransportAndOAuthErrorBranches(t *testing.T) {
 	if _, err := client.get(ctx, "https://api.example.test/api/v2/devices"); err == nil {
 		t.Fatal("transport failure was ignored")
 	}
+	invalidRequest := New("https://api.example.test/api/v2", "https://oauth.example.test/token", "test", Credentials{})
+	invalidRequest.token, invalidRequest.expires = "cached", time.Now().Add(time.Hour)
+	if _, err := invalidRequest.get(context.Background(), "://invalid"); err == nil {
+		t.Fatal("invalid API request URL succeeded")
+	}
 	badURL := New("https://api.example.test/api/v2", "://invalid", "test", Credentials{})
 	if _, err := badURL.accessToken(context.Background()); err == nil {
 		t.Fatal("invalid OAuth URL succeeded")
@@ -299,5 +325,22 @@ func TestClientTransportAndOAuthErrorBranches(t *testing.T) {
 	readError.token = ""
 	if _, err := readError.accessToken(context.Background()); err == nil || !strings.Contains(err.Error(), "body read failed") {
 		t.Fatalf("OAuth body read error=%v", err)
+	}
+	largeOAuth := New("https://api.example.test/api/v2", "https://oauth.example.test/token", "test", Credentials{})
+	largeOAuth.http = &http.Client{Transport: coverageRoundTripper(func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusOK, Status: "200", Body: io.NopCloser(strings.NewReader(strings.Repeat("x", maxOAuthResponseBytes+1)))}, nil
+	})}
+	if _, err := largeOAuth.accessToken(context.Background()); err == nil || !strings.Contains(err.Error(), "OAuth response exceeds") {
+		t.Fatalf("large OAuth response error=%v", err)
+	}
+	tooMany := New("https://api.example.test/api/v2", "https://oauth.example.test/token", "test", Credentials{})
+	tooMany.token, tooMany.expires = "cached", time.Now().Add(time.Hour)
+	tooMany.http = &http.Client{Transport: coverageRoundTripper(func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusTooManyRequests, Status: "429", Header: http.Header{"Retry-After": []string{"1"}}, Body: io.NopCloser(strings.NewReader("busy"))}, nil
+	})}
+	canceled, stop := context.WithCancel(context.Background())
+	stop()
+	if _, err := tooMany.get(canceled, "https://api.example.test/api/v2/devices"); err == nil {
+		t.Fatal("canceled rate limit request succeeded")
 	}
 }

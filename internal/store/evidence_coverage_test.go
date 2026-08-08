@@ -73,3 +73,17 @@ func TestExportEvidencePackRejectsTooManyEvents(t *testing.T) {
 		t.Fatalf("large encoded evidence export error=%v, want %v", err, ErrEvidencePackTooLarge)
 	}
 }
+
+func TestExportEvidencePackLedgerAndDecodeErrors(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	if _, err := st.db.ExecContext(ctx, "DROP TABLE evidence_ledger"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.ExportEvidencePack(ctx, HistoryFilter{}); err == nil {
+		t.Fatal("ExportEvidencePack succeeded without the evidence ledger")
+	}
+	if err := VerifyEvidencePack([]byte("{")); err == nil || !strings.Contains(err.Error(), "decode evidence pack") {
+		t.Fatalf("malformed evidence pack error=%v", err)
+	}
+}

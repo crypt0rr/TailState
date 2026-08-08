@@ -288,6 +288,30 @@ func TestCollectorHTTPErrorBranches(t *testing.T) {
 	}
 }
 
+func TestLogStreamingStatusUnsupportedBranch(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/oauth/token" {
+			_, _ = w.Write([]byte(`{"access_token":"access","expires_in":3600}`))
+			return
+		}
+		switch r.URL.Path {
+		case "/api/v2/tailnet/-/logging/configuration/stream":
+			_, _ = w.Write([]byte(`{"enabled":true}`))
+		case "/api/v2/tailnet/-/logging/configuration/stream/status":
+			w.WriteHeader(http.StatusNotFound)
+		case "/api/v2/tailnet/-/logging/network/stream":
+			w.WriteHeader(http.StatusNotFound)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	client := New(server.URL+"/api/v2", server.URL+"/oauth/token", "test", Credentials{Tailnet: "-", ClientID: "id", ClientSecret: "secret"})
+	if _, err := client.Collect(context.Background(), "log_streaming"); err == nil || !IsUnsupported(err) {
+		t.Fatalf("status-unsupported log streaming error=%v", err)
+	}
+}
+
 type failingBody struct{}
 
 func (failingBody) Read([]byte) (int, error) { return 0, fmt.Errorf("body read failed") }
@@ -342,5 +366,24 @@ func TestClientTransportAndOAuthErrorBranches(t *testing.T) {
 	stop()
 	if _, err := tooMany.get(canceled, "https://api.example.test/api/v2/devices"); err == nil {
 		t.Fatal("canceled rate limit request succeeded")
+	}
+}
+
+func TestClientExhaustsTransportRetries(t *testing.T) {
+	originalWait := waitForRetry
+	waitForRetry = func(context.Context, time.Duration) bool { return true }
+	t.Cleanup(func() { waitForRetry = originalWait })
+	client := New("https://api.example.test/api/v2", "https://oauth.example.test/token", "test", Credentials{})
+	client.token, client.expires = "cached", time.Now().Add(time.Hour)
+	attempts := 0
+	client.http = &http.Client{Transport: coverageRoundTripper(func(*http.Request) (*http.Response, error) {
+		attempts++
+		return nil, fmt.Errorf("transport failed")
+	})}
+	if _, err := client.get(context.Background(), "https://api.example.test/api/v2/devices"); err == nil || !strings.Contains(err.Error(), "transport failed") {
+		t.Fatalf("transport exhaustion error=%v", err)
+	}
+	if attempts != 4 {
+		t.Fatalf("transport attempts=%d, want 4", attempts)
 	}
 }

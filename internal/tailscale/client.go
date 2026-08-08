@@ -326,7 +326,7 @@ func (c *Client) get(ctx context.Context, endpoint string) (any, error) {
 		resp, err := c.http.Do(req)
 		if err != nil {
 			if attempt < 3 {
-				if !sleep(ctx, time.Duration(1<<attempt)*time.Second) {
+				if !waitForRetry(ctx, time.Duration(1<<attempt)*time.Second) {
 					return nil, ctx.Err()
 				}
 				continue
@@ -349,7 +349,7 @@ func (c *Client) get(ctx context.Context, endpoint string) (any, error) {
 		}
 		if resp.StatusCode == 429 && attempt < 3 {
 			delay := retryAfter(resp.Header.Get("Retry-After"), time.Duration(1<<attempt)*time.Second)
-			if !sleep(ctx, delay) {
+			if !waitForRetry(ctx, delay) {
 				return nil, ctx.Err()
 			}
 			continue
@@ -461,6 +461,9 @@ func sleep(ctx context.Context, d time.Duration) bool {
 		return true
 	}
 }
+
+var waitForRetry = sleep
+
 func safeBody(body []byte) string {
 	value := strings.TrimSpace(string(body))
 	if len(value) > 200 {

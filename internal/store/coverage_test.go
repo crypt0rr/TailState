@@ -646,6 +646,115 @@ func TestWebhookTriggerCollectorMetadataError(t *testing.T) {
 	}
 }
 
+func TestWebhookTriggerDurabilityErrorBranches(t *testing.T) {
+	ctx := context.Background()
+	t.Run("claim dead-letter update", func(t *testing.T) {
+		st := testStore(t)
+		bodyHash := strings.Repeat("b", 64)
+		if _, _, err := st.RecordWebhookTrigger(ctx, bodyHash, nil, nil); err != nil {
+			t.Fatal(err)
+		}
+		old := time.Now().UTC().Add(-48 * time.Hour).Format(time.RFC3339Nano)
+		if _, err := st.db.ExecContext(ctx, "UPDATE webhook_triggers SET received_at=? WHERE body_hash=?", old, bodyHash); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.db.ExecContext(ctx, `CREATE TRIGGER fail_webhook_dead BEFORE UPDATE OF status ON webhook_triggers WHEN NEW.status='dead' BEGIN SELECT RAISE(ABORT,'dead-letter update failed'); END`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.ClaimWebhookTriggers(ctx, 1, time.Minute); err == nil {
+			t.Fatal("ClaimWebhookTriggers ignored dead-letter update failure")
+		}
+	})
+
+	t.Run("claim malformed metadata", func(t *testing.T) {
+		st := testStore(t)
+		bodyHash := strings.Repeat("c", 64)
+		if _, _, err := st.RecordWebhookTrigger(ctx, bodyHash, []string{"policyUpdate"}, []string{"policy"}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.db.ExecContext(ctx, "UPDATE webhook_triggers SET event_types_json='invalid-json' WHERE body_hash=?", bodyHash); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.ClaimWebhookTriggers(ctx, 1, time.Minute); err == nil || !strings.Contains(err.Error(), "decode webhook event metadata") {
+			t.Fatalf("malformed claim metadata error=%v", err)
+		}
+	})
+
+	t.Run("claim processing update", func(t *testing.T) {
+		st := testStore(t)
+		if _, _, err := st.RecordWebhookTrigger(ctx, strings.Repeat("d", 64), nil, nil); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.db.ExecContext(ctx, `CREATE TRIGGER fail_webhook_processing BEFORE UPDATE OF status ON webhook_triggers WHEN NEW.status='processing' BEGIN SELECT RAISE(ABORT,'processing update failed'); END`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.ClaimWebhookTriggers(ctx, 1, time.Minute); err == nil {
+			t.Fatal("ClaimWebhookTriggers ignored processing update failure")
+		}
+	})
+
+	t.Run("complete update", func(t *testing.T) {
+		st := testStore(t)
+		if _, err := st.db.ExecContext(ctx, "DROP TABLE webhook_triggers"); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.CompleteWebhookTriggers(ctx, []int64{1}); err == nil {
+			t.Fatal("CompleteWebhookTriggers succeeded without its table")
+		}
+	})
+
+	t.Run("retry unknown trigger", func(t *testing.T) {
+		st := testStore(t)
+		if err := st.RetryWebhookTriggers(ctx, []int64{99999}, time.Now(), ""); err != nil {
+			t.Fatalf("unknown trigger retry error=%v", err)
+		}
+	})
+
+	t.Run("retry query failure", func(t *testing.T) {
+		st := testStore(t)
+		if _, err := st.db.ExecContext(ctx, "DROP TABLE webhook_triggers"); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.RetryWebhookTriggers(ctx, []int64{1}, time.Now(), "retry"); err == nil {
+			t.Fatal("RetryWebhookTriggers succeeded without its table")
+		}
+	})
+
+	t.Run("retry dead default message", func(t *testing.T) {
+		st := testStore(t)
+		bodyHash := strings.Repeat("e", 64)
+		trigger, _, err := st.RecordWebhookTrigger(ctx, bodyHash, nil, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		old := time.Now().UTC().Add(-48 * time.Hour).Format(time.RFC3339Nano)
+		if _, err := st.db.ExecContext(ctx, "UPDATE webhook_triggers SET received_at=? WHERE id=?", old, trigger.ID); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.RetryWebhookTriggers(ctx, []int64{trigger.ID}, time.Now(), ""); err != nil {
+			t.Fatal(err)
+		}
+		dead, _, err := st.RecordWebhookTrigger(ctx, bodyHash, nil, nil)
+		if err != nil || dead.Status != "dead" || dead.LastError == "" {
+			t.Fatalf("dead trigger=%#v err=%v", dead, err)
+		}
+	})
+
+	t.Run("retry update failure", func(t *testing.T) {
+		st := testStore(t)
+		trigger, _, err := st.RecordWebhookTrigger(ctx, strings.Repeat("f", 64), nil, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.db.ExecContext(ctx, `CREATE TRIGGER fail_webhook_retry BEFORE UPDATE OF status ON webhook_triggers BEGIN SELECT RAISE(ABORT,'retry update failed'); END`); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.RetryWebhookTriggers(ctx, []int64{trigger.ID}, time.Now(), "retry"); err == nil {
+			t.Fatal("RetryWebhookTriggers ignored update failure")
+		}
+	})
+}
+
 func storeWithHistoryBatch(t *testing.T) (*Store, int64) {
 	t.Helper()
 	ctx := context.Background()

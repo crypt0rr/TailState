@@ -512,9 +512,11 @@ func TestWebAdditionalErrorAndMetricsBranches(t *testing.T) {
 	if !strings.Contains(metrics.Body.String(), "tailstate_collector_next_poll_timestamp_seconds") {
 		t.Fatal("next-poll metric missing")
 	}
-	invalidServer := *server
-	invalidServer.config.ListenAddr = "bad"
-	if err := invalidServer.Serve(context.Background()); err == nil {
+	oldListenAddr := server.config.ListenAddr
+	server.config.ListenAddr = "bad"
+	serveErr := server.Serve(context.Background())
+	server.config.ListenAddr = oldListenAddr
+	if serveErr == nil {
 		t.Fatal("invalid listen address unexpectedly succeeded")
 	}
 	webhookBody := httptest.NewRequest(http.MethodPost, "/webhooks/tailscale", nil)

@@ -290,6 +290,31 @@ func TestEvidenceSigningMetadataValidation(t *testing.T) {
 	}
 }
 
+func TestEvidenceLedgerOperationalErrors(t *testing.T) {
+	st := testStore(t)
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.backfillEvidenceLedger(context.Background()); err == nil {
+		t.Fatal("backfillEvidenceLedger succeeded on a closed store")
+	}
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	box, err := secret.NewBox(make([]byte, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadOrCreateEvidenceSigningKey(context.Background(), db, box); err == nil || !strings.Contains(err.Error(), "read evidence_signing_private_key_enc") {
+		t.Fatalf("missing metadata table error=%v", err)
+	}
+	if _, _, err := evidenceLedgerPayload(context.Background(), db, 1); err == nil {
+		t.Fatal("evidenceLedgerPayload succeeded without event batch storage")
+	}
+}
+
 func mustEncryptForTest(t *testing.T, box *secret.Box, value string) string {
 	t.Helper()
 	encrypted, err := box.Encrypt(value)

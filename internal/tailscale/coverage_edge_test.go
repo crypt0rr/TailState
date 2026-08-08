@@ -3,11 +3,17 @@ package tailscale
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
+
+type coverageRoundTripper func(*http.Request) (*http.Response, error)
+
+func (f coverageRoundTripper) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
 
 func TestOAuthResponseValidation(t *testing.T) {
 	tests := []struct {
@@ -132,5 +138,65 @@ func TestPaginationURLValidationAndExhaustion(t *testing.T) {
 	}
 	if requests != 100 {
 		t.Fatalf("pagination requests = %d, want 100", requests)
+	}
+}
+
+func TestPaginationHelpersAndGetRetryBranches(t *testing.T) {
+	if got := nextURL(map[string]any{"next": "/next"}); got != "/next" {
+		t.Fatalf("direct next URL=%q", got)
+	}
+	if got := nextURL(map[string]any{"pagination": map[string]any{"next": "/page"}}); got != "/page" {
+		t.Fatalf("nested next URL=%q", got)
+	}
+	if got := nextURL(map[string]any{"pagination": map[string]any{"nextCursor": "a b"}}); got != "?cursor=a+b" {
+		t.Fatalf("cursor next URL=%q", got)
+	}
+	if got := nextURL(map[string]any{"pagination": map[string]any{"nextCursor": ""}}); got != "" {
+		t.Fatalf("empty cursor next URL=%q", got)
+	}
+
+	responses := []int{http.StatusUnauthorized, http.StatusNoContent}
+	getAttempts := 0
+	client := New("https://api.example.test/api/v2", "https://oauth.example.test/token", "test", Credentials{})
+	client.token = "cached"
+	client.expires = time.Now().Add(time.Hour)
+	client.http = &http.Client{Transport: coverageRoundTripper(func(r *http.Request) (*http.Response, error) {
+		if r.Method == http.MethodPost {
+			return &http.Response{StatusCode: http.StatusOK, Status: "200", Body: io.NopCloser(strings.NewReader(`{"access_token":"refreshed","expires_in":3600}`))}, nil
+		}
+		status := responses[0]
+		responses = responses[1:]
+		getAttempts++
+		body := "{}"
+		if status == http.StatusNoContent {
+			body = ""
+		}
+		return &http.Response{StatusCode: status, Status: fmt.Sprintf("%d", status), Body: io.NopCloser(strings.NewReader(body))}, nil
+	})}
+	value, err := client.get(context.Background(), "https://api.example.test/api/v2/devices")
+	if err != nil || value != nil || len(responses) != 0 || getAttempts != 2 {
+		t.Fatalf("401 retry/empty response value=%#v err=%v remaining=%d attempts=%d", value, err, len(responses), getAttempts)
+	}
+
+	badJSON := New("https://api.example.test/api/v2", "https://oauth.example.test/token", "test", Credentials{})
+	badJSON.token, badJSON.expires = "cached", time.Now().Add(time.Hour)
+	badJSON.http = &http.Client{Transport: coverageRoundTripper(func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusOK, Status: "200", Body: io.NopCloser(strings.NewReader("{"))}, nil
+	})}
+	if _, err := badJSON.get(context.Background(), "https://api.example.test/api/v2/devices"); err == nil || !strings.Contains(err.Error(), "not valid JSON") {
+		t.Fatalf("invalid JSON error=%v", err)
+	}
+	rate := New("https://api.example.test/api/v2", "https://oauth.example.test/token", "test", Credentials{})
+	rate.token, rate.expires = "cached", time.Now().Add(time.Hour)
+	rateAttempts := 0
+	rate.http = &http.Client{Transport: coverageRoundTripper(func(*http.Request) (*http.Response, error) {
+		rateAttempts++
+		if rateAttempts == 1 {
+			return &http.Response{StatusCode: http.StatusTooManyRequests, Status: "429", Header: http.Header{"Retry-After": []string{"0"}}, Body: io.NopCloser(strings.NewReader("busy"))}, nil
+		}
+		return &http.Response{StatusCode: http.StatusOK, Status: "200", Body: io.NopCloser(strings.NewReader(`{"devices":[]}`))}, nil
+	})}
+	if value, err := rate.get(context.Background(), "https://api.example.test/api/v2/devices"); err != nil || value == nil || rateAttempts != 2 {
+		t.Fatalf("429 retry value=%#v err=%v attempts=%d", value, err, rateAttempts)
 	}
 }

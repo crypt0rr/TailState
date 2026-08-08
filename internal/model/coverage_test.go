@@ -29,6 +29,10 @@ func TestNormalizeAndHealthEdgeCases(t *testing.T) {
 	if fingerprint, ok := redactedFingerprint(map[string]any{"redacted_sha256": strings.Repeat("AB", 32)}); !ok || fingerprint != strings.Repeat("ab", 32) {
 		t.Fatalf("valid fingerprint=%q ok=%v", fingerprint, ok)
 	}
+	nested := NormalizeFor("device_details", map[string]any{"routes": map[string]any{"detail": "duplicate", "enabled": true}}).(map[string]any)
+	if routes := nested["routes"].(map[string]any); routes["detail"] != nil {
+		t.Fatalf("nested device detail duplicate was retained: %#v", routes)
+	}
 	for _, invalid := range []any{nil, map[string]any{}, map[string]any{"redacted_sha256": "short"}, map[string]any{"redacted_sha256": strings.Repeat("gg", 32)}, map[string]any{"redacted_sha256": strings.Repeat("aa", 32), "extra": true}} {
 		if got, ok := redactedFingerprint(invalid); ok || got != "" {
 			t.Fatalf("invalid fingerprint accepted: %#v -> %q,%v", invalid, got, ok)
@@ -37,6 +41,12 @@ func TestNormalizeAndHealthEdgeCases(t *testing.T) {
 }
 
 func TestDiffAndCanonicalErrorBranches(t *testing.T) {
+	if changes := Diff([]byte(`1`), []byte(`2`)); len(changes) != 1 || changes[0].Field != "value" {
+		t.Fatalf("root scalar diff=%#v", changes)
+	}
+	if changes := Diff([]byte(`{"nested":{"old":1}}`), []byte(`{"nested":{"old":2}}`)); len(changes) != 1 || changes[0].Field != "nested.old" {
+		t.Fatalf("nested diff=%#v", changes)
+	}
 	if changes := Diff([]byte("not-json"), []byte(`{"value":true}`)); len(changes) != 1 || changes[0].Field != "value" {
 		t.Fatalf("invalid JSON diff=%#v", changes)
 	}

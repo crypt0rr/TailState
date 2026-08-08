@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/crypt0rr/tailstate/internal/model"
+	"github.com/crypt0rr/tailstate/internal/secret"
 )
 
 func TestStoreLifecycleAndCollectorStateBranches(t *testing.T) {
@@ -1093,5 +1094,384 @@ func TestDestinationDecryptionErrorBranches(t *testing.T) {
 	}
 	if _, err := st.DueOutbox(ctx, 10); err == nil {
 		t.Fatal("DueOutbox accepted a corrupt encrypted URL")
+	}
+}
+
+func TestDestinationAndVersionWriteErrorBranches(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("destination insert trigger", func(t *testing.T) {
+		st := testStore(t)
+		if _, err := st.db.ExecContext(ctx, `CREATE TRIGGER fail_destination_insert BEFORE INSERT ON notification_destinations BEGIN SELECT RAISE(ABORT,'destination insert failed'); END`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.SaveDestination(ctx, NotificationDestination{Name: "test", ServiceURL: "generic://example.invalid/path", Enabled: true}); err == nil {
+			t.Fatal("SaveDestination ignored destination insert failure")
+		}
+	})
+
+	t.Run("destination update trigger", func(t *testing.T) {
+		st := testStore(t)
+		if _, err := st.SaveSettings(ctx, settings()); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.db.ExecContext(ctx, `CREATE TRIGGER fail_destination_update BEFORE UPDATE OF service_url_enc ON notification_destinations BEGIN SELECT RAISE(ABORT,'destination update failed'); END`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.SaveDestination(ctx, NotificationDestination{Name: "renamed", ServiceURL: "generic://example.invalid/updated", Enabled: true}); err == nil {
+			t.Fatal("SaveDestination ignored destination update failure")
+		}
+	})
+
+	t.Run("set enabled update trigger", func(t *testing.T) {
+		st := testStore(t)
+		if _, err := st.SaveSettings(ctx, settings()); err != nil {
+			t.Fatal(err)
+		}
+		id := int64(1)
+		if _, err := st.db.ExecContext(ctx, `CREATE TRIGGER fail_destination_enabled BEFORE UPDATE OF enabled ON notification_destinations BEGIN SELECT RAISE(ABORT,'destination enabled update failed'); END`); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.SetDestinationEnabled(ctx, id, false); err == nil {
+			t.Fatal("SetDestinationEnabled ignored destination update failure")
+		}
+	})
+
+	t.Run("delete update trigger", func(t *testing.T) {
+		st := testStore(t)
+		if _, err := st.SaveSettings(ctx, settings()); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.db.ExecContext(ctx, `CREATE TRIGGER fail_destination_delete BEFORE UPDATE OF deleted_at ON notification_destinations BEGIN SELECT RAISE(ABORT,'destination delete update failed'); END`); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.DeleteDestination(ctx, 1); err == nil {
+			t.Fatal("DeleteDestination ignored destination update failure")
+		}
+	})
+
+	t.Run("track version insert trigger", func(t *testing.T) {
+		st := testStore(t)
+		if _, err := st.db.ExecContext(ctx, `CREATE TRIGGER fail_app_version_insert BEFORE INSERT ON meta WHEN NEW.key='app_version' BEGIN SELECT RAISE(ABORT,'app version insert failed'); END`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.TrackAppVersion(ctx, "1.0.0", nil); err == nil {
+			t.Fatal("TrackAppVersion ignored insert failure")
+		}
+	})
+
+	t.Run("track version update trigger", func(t *testing.T) {
+		st := testStore(t)
+		if _, err := st.TrackAppVersion(ctx, "1.0.0", nil); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.db.ExecContext(ctx, `CREATE TRIGGER fail_app_version_update BEFORE UPDATE OF value ON meta WHEN OLD.key='app_version' BEGIN SELECT RAISE(ABORT,'app version update failed'); END`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.TrackAppVersion(ctx, "1.1.0", nil); err == nil {
+			t.Fatal("TrackAppVersion ignored update failure")
+		}
+	})
+
+	t.Run("settings insert trigger", func(t *testing.T) {
+		st := testStore(t)
+		if _, err := st.db.ExecContext(ctx, `CREATE TRIGGER fail_settings_insert BEFORE INSERT ON settings BEGIN SELECT RAISE(ABORT,'settings insert failed'); END`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.SaveSettings(ctx, settings()); err == nil {
+			t.Fatal("SaveSettings ignored settings insert failure")
+		}
+	})
+
+	t.Run("collector due query failure", func(t *testing.T) {
+		st := testStore(t)
+		if _, err := st.db.ExecContext(ctx, "DROP TABLE collector_state"); err != nil {
+			t.Fatal(err)
+		}
+		if !st.CollectorDue(ctx, 1, "devices") {
+			t.Fatal("CollectorDue did not treat a query failure as due")
+		}
+	})
+
+	t.Run("blank tailnet normalization", func(t *testing.T) {
+		st := testStore(t)
+		input := settings()
+		input.Tailnet = "   "
+		if _, err := st.SaveSettings(ctx, input); err != nil {
+			t.Fatal(err)
+		}
+		current, err := st.Settings(ctx)
+		if err != nil || current.Tailnet != "-" {
+			t.Fatalf("normalized tailnet=%q err=%v", current.Tailnet, err)
+		}
+	})
+
+	t.Run("initial destination count query", func(t *testing.T) {
+		st := testStore(t)
+		if _, err := st.db.ExecContext(ctx, "DROP TABLE notification_destinations"); err != nil {
+			t.Fatal(err)
+		}
+		input := settings()
+		input.MattermostURL = ""
+		if _, err := st.SaveSettings(ctx, input); err == nil {
+			t.Fatal("SaveSettings succeeded without destination table")
+		}
+	})
+}
+
+func TestApplyBatchWriteErrorBranches(t *testing.T) {
+	ctx := context.Background()
+	baseline := []model.Collected{{Collector: "devices", Resources: []model.Resource{{ID: "device-1", Type: "device", Name: "server", Data: map[string]any{"hostname": "server"}}}}}
+	changed := []model.Collected{{Collector: "devices", Resources: []model.Resource{{ID: "device-1", Type: "device", Name: "changed", Data: map[string]any{"hostname": "changed"}}}}}
+
+	t.Run("settings baseline update", func(t *testing.T) {
+		st, generation := configuredCoverageStore(t)
+		if _, err := st.db.ExecContext(ctx, `CREATE TRIGGER fail_baseline_update BEFORE UPDATE OF baseline_at ON settings BEGIN SELECT RAISE(ABORT,'baseline update failed'); END`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.ApplyBatch(ctx, generation, baseline, func([]model.Change) string { return "baseline" }); err == nil {
+			t.Fatal("ApplyBatch ignored baseline update failure")
+		}
+	})
+
+	t.Run("snapshot insert", func(t *testing.T) {
+		st, generation := configuredCoverageStore(t)
+		if _, err := st.db.ExecContext(ctx, `CREATE TRIGGER fail_snapshot_insert BEFORE INSERT ON snapshots BEGIN SELECT RAISE(ABORT,'snapshot insert failed'); END`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.ApplyBatch(ctx, generation, baseline, func([]model.Change) string { return "baseline" }); err == nil {
+			t.Fatal("ApplyBatch ignored snapshot insert failure")
+		}
+	})
+
+	t.Run("snapshot update", func(t *testing.T) {
+		st, generation := configuredCoverageStore(t)
+		if _, err := st.ApplyBatch(ctx, generation, baseline, func([]model.Change) string { return "baseline" }); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.db.ExecContext(ctx, `CREATE TRIGGER fail_snapshot_update BEFORE UPDATE ON snapshots BEGIN SELECT RAISE(ABORT,'snapshot update failed'); END`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.ApplyBatch(ctx, generation, changed, func([]model.Change) string { return "changed" }); err == nil {
+			t.Fatal("ApplyBatch ignored snapshot update failure")
+		}
+	})
+
+	t.Run("snapshot delete", func(t *testing.T) {
+		st, generation := configuredCoverageStore(t)
+		if _, err := st.ApplyBatch(ctx, generation, baseline, func([]model.Change) string { return "baseline" }); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.ApplyBatch(ctx, generation, []model.Collected{{Collector: "devices"}}, func([]model.Change) string { return "missing" }); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.db.ExecContext(ctx, `CREATE TRIGGER fail_snapshot_delete BEFORE DELETE ON snapshots BEGIN SELECT RAISE(ABORT,'snapshot delete failed'); END`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.ApplyBatch(ctx, generation, []model.Collected{{Collector: "devices"}}, func([]model.Change) string { return "removed" }); err == nil {
+			t.Fatal("ApplyBatch ignored snapshot delete failure")
+		}
+	})
+
+	t.Run("collector state update", func(t *testing.T) {
+		st, generation := configuredCoverageStore(t)
+		if _, err := st.ApplyBatch(ctx, generation, baseline, func([]model.Change) string { return "baseline" }); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.db.ExecContext(ctx, `CREATE TRIGGER fail_collector_state_update BEFORE UPDATE ON collector_state WHEN NEW.collector='devices' BEGIN SELECT RAISE(ABORT,'collector state update failed'); END`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.ApplyBatch(ctx, generation, changed, func([]model.Change) string { return "changed" }); err == nil {
+			t.Fatal("ApplyBatch ignored collector state update failure")
+		}
+	})
+
+	for _, table := range []string{"event_batch_triggers", "events"} {
+		t.Run(table+" insert", func(t *testing.T) {
+			st, generation := configuredCoverageStore(t)
+			if _, err := st.ApplyBatch(ctx, generation, baseline, func([]model.Change) string { return "baseline" }); err != nil {
+				t.Fatal(err)
+			}
+			trigger := "fail_" + table + "_insert"
+			if _, err := st.db.ExecContext(ctx, "CREATE TRIGGER "+trigger+" BEFORE INSERT ON "+table+" BEGIN SELECT RAISE(ABORT,'"+table+" insert failed'); END"); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := st.ApplyBatchWithBatch(ctx, generation, changed, func([]model.Change) string { return "changed" }, 1); err == nil {
+				t.Fatalf("ApplyBatch ignored %s insert failure", table)
+			}
+		})
+	}
+}
+
+func TestAuthenticationAndOutboxBoundaryBranches(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("claim admin insert", func(t *testing.T) {
+		st := testStore(t)
+		token, err := st.NewSetupToken(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.db.ExecContext(ctx, `CREATE TRIGGER fail_admin_insert BEFORE INSERT ON admin BEGIN SELECT RAISE(ABORT,'admin insert failed'); END`); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.Claim(ctx, token, "a secure password"); err == nil {
+			t.Fatal("Claim ignored admin insert failure")
+		}
+	})
+
+	t.Run("claim setup token delete", func(t *testing.T) {
+		st := testStore(t)
+		token, err := st.NewSetupToken(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.db.ExecContext(ctx, `CREATE TRIGGER fail_setup_token_delete BEFORE DELETE ON meta WHEN OLD.key='setup_token_hash' BEGIN SELECT RAISE(ABORT,'setup token delete failed'); END`); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.Claim(ctx, token, "a secure password"); err == nil {
+			t.Fatal("Claim ignored setup token delete failure")
+		}
+	})
+
+	t.Run("reset rows affected zero", func(t *testing.T) {
+		st := testStore(t)
+		setupCoverageAdmin(t, st)
+		token, err := st.NewResetToken(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.db.ExecContext(ctx, "DELETE FROM admin WHERE id=1"); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.ResetWithToken(ctx, token, "new secure password"); err == nil || !strings.Contains(err.Error(), "not configured") {
+			t.Fatalf("ResetWithToken rows=0 error=%v", err)
+		}
+	})
+
+	t.Run("invalid session expiry", func(t *testing.T) {
+		st := testStore(t)
+		if _, err := st.db.ExecContext(ctx, "INSERT INTO sessions(token_hash,csrf_hash,expires_at,created_at) VALUES(?,?,?,?)", "hash", "csrf", "not-a-time", "not-a-time"); err != nil {
+			t.Fatal(err)
+		}
+		if st.ValidateSession(ctx, "token", "csrf", false) {
+			t.Fatal("ValidateSession accepted malformed expiry")
+		}
+		token, csrf, err := st.CreateSession(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.db.ExecContext(ctx, "UPDATE sessions SET expires_at=? WHERE token_hash=?", time.Now().UTC().Add(-time.Minute).Format(time.RFC3339Nano), secret.HashToken(token)); err != nil {
+			t.Fatal(err)
+		}
+		if st.ValidateSession(ctx, token, csrf, false) {
+			t.Fatal("ValidateSession accepted expired session")
+		}
+	})
+
+	t.Run("collector failure update", func(t *testing.T) {
+		st, generation := configuredCoverageStore(t)
+		if _, _, err := st.RecordCollectorFailure(ctx, generation, "devices", "first"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.db.ExecContext(ctx, `CREATE TRIGGER fail_collector_failure_update BEFORE UPDATE ON collector_state BEGIN SELECT RAISE(ABORT,'collector failure update failed'); END`); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := st.RecordCollectorFailure(ctx, generation, "devices", "second"); err == nil {
+			t.Fatal("RecordCollectorFailure ignored update failure")
+		}
+	})
+
+	t.Run("enqueue destination query", func(t *testing.T) {
+		st, _ := configuredCoverageStore(t)
+		if _, err := st.db.ExecContext(ctx, "DROP TABLE notification_destinations"); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.EnqueueSystem(ctx, "payload"); err == nil {
+			t.Fatal("EnqueueSystem succeeded without destinations")
+		}
+	})
+
+	t.Run("delivered and retry update", func(t *testing.T) {
+		st, _ := configuredCoverageStore(t)
+		if err := st.EnqueueSystem(ctx, "payload"); err != nil {
+			t.Fatal(err)
+		}
+		items, err := st.DueOutbox(ctx, 1)
+		if err != nil || len(items) != 1 {
+			t.Fatalf("outbox=%#v err=%v", items, err)
+		}
+		if _, err := st.db.ExecContext(ctx, `CREATE TRIGGER fail_outbox_delivered BEFORE UPDATE OF status,attempts ON outbox WHEN NEW.status IN ('delivered','pending') BEGIN SELECT RAISE(ABORT,'delivery update failed'); END`); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.Delivered(ctx, items[0].ID); err == nil {
+			t.Fatal("Delivered ignored update failure")
+		}
+		if err := st.Retry(ctx, items[0].ID, time.Now(), "retry", false); err == nil {
+			t.Fatal("Retry ignored update failure")
+		}
+	})
+
+	t.Run("history limit clamp", func(t *testing.T) {
+		st, _ := storeWithHistoryBatch(t)
+		page, err := st.ListHistory(ctx, HistoryFilter{Limit: 1000})
+		if err != nil || len(page.Batches) != 1 {
+			t.Fatalf("clamped history page=%#v err=%v", page, err)
+		}
+	})
+
+	t.Run("empty webhook lifecycle operations", func(t *testing.T) {
+		st := testStore(t)
+		if err := st.CompleteWebhookTriggers(ctx, nil); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.RetryWebhookTriggers(ctx, nil, time.Now(), ""); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("collector filter and trigger fallback", func(t *testing.T) {
+		st, batchID := storeWithHistoryBatch(t)
+		if _, err := st.db.ExecContext(ctx, "DELETE FROM event_batch_triggers WHERE batch_id=?", batchID); err != nil {
+			t.Fatal(err)
+		}
+		page, err := st.ListHistory(ctx, HistoryFilter{Collector: "devices", Limit: 10})
+		if err != nil || len(page.Batches) != 1 || len(page.Batches[0].TriggerIDs) != 0 {
+			t.Fatalf("collector-filtered history=%#v err=%v", page, err)
+		}
+		if _, err := st.db.ExecContext(ctx, "UPDATE event_batches SET trigger_id=77 WHERE id=?", batchID); err != nil {
+			t.Fatal(err)
+		}
+		page, err = st.ListHistory(ctx, HistoryFilter{Collector: "devices", Limit: 10})
+		if err != nil || len(page.Batches) != 1 || len(page.Batches[0].TriggerIDs) != 1 || page.Batches[0].TriggerIDs[0] != 77 {
+			t.Fatalf("trigger fallback history=%#v err=%v", page, err)
+		}
+	})
+
+	t.Run("collector failure settings query", func(t *testing.T) {
+		st, generation := configuredCoverageStore(t)
+		if _, err := st.db.ExecContext(ctx, "DROP TABLE settings"); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := st.RecordCollectorFailure(ctx, generation, "devices", "failure"); err == nil {
+			t.Fatal("RecordCollectorFailure succeeded without settings")
+		}
+	})
+}
+
+func TestApplyBatchCreatesNewBaselineResourceChange(t *testing.T) {
+	ctx := context.Background()
+	st, generation := configuredCoverageStore(t)
+	baseline := []model.Collected{{Collector: "devices", Resources: []model.Resource{{ID: "device-1", Type: "device", Name: "one", Data: map[string]any{"hostname": "one"}}}}}
+	if _, err := st.ApplyBatch(ctx, generation, baseline, func([]model.Change) string { return "baseline" }); err != nil {
+		t.Fatal(err)
+	}
+	withNewResource := []model.Collected{{Collector: "devices", Resources: []model.Resource{
+		{ID: "device-1", Type: "device", Name: "one", Data: map[string]any{"hostname": "one"}},
+		{ID: "device-2", Type: "device", Name: "two", Data: map[string]any{"hostname": "two"}},
+	}}}
+	batch, err := st.ApplyBatchWithBatch(ctx, generation, withNewResource, func([]model.Change) string { return "created" })
+	if err != nil || len(batch.Changes) != 1 || batch.Changes[0].Kind != "created" {
+		t.Fatalf("new resource change=%#v err=%v", batch, err)
 	}
 }

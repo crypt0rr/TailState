@@ -11,6 +11,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/crypt0rr/tailstate/internal/secret"
 )
@@ -344,6 +345,231 @@ func (failingWebhookTriggerScanner) Scan(...any) error {
 func TestWebhookTriggerScannerErrors(t *testing.T) {
 	if _, err := readWebhookTrigger(failingWebhookTriggerScanner{}); err == nil {
 		t.Fatal("readWebhookTrigger accepted a failing scanner")
+	}
+}
+
+func insertSigningBatch(t *testing.T, st *Store) int64 {
+	t.Helper()
+	result, err := st.db.ExecContext(context.Background(), "INSERT INTO event_batches(generation,observed_at,change_count,created_at) VALUES(1,?,?,?)", time.Now().UTC().Format(time.RFC3339Nano), 0, time.Now().UTC().Format(time.RFC3339Nano))
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := result.LastInsertId()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
+func TestEvidenceSigningDatabaseErrorBranches(t *testing.T) {
+	ctx := context.Background()
+	t.Run("backfill event batch query", func(t *testing.T) {
+		st := testStore(t)
+		if _, err := st.db.ExecContext(ctx, "DROP TABLE event_batches"); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.backfillEvidenceLedger(ctx); err == nil {
+			t.Fatal("backfillEvidenceLedger succeeded without event batches")
+		}
+	})
+
+	t.Run("backfill event payload", func(t *testing.T) {
+		st := testStore(t)
+		insertSigningBatch(t, st)
+		if _, err := st.db.ExecContext(ctx, "DROP TABLE events"); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.backfillEvidenceLedger(ctx); err == nil {
+			t.Fatal("backfillEvidenceLedger succeeded without events")
+		}
+	})
+
+	t.Run("append payload query", func(t *testing.T) {
+		st := testStore(t)
+		if _, err := st.db.ExecContext(ctx, "DROP TABLE event_batches"); err != nil {
+			t.Fatal(err)
+		}
+		tx, err := st.db.BeginTx(ctx, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer tx.Rollback()
+		if err := st.appendEvidenceLedgerTx(ctx, tx, 1); err == nil {
+			t.Fatal("appendEvidenceLedgerTx succeeded without event batches")
+		}
+	})
+
+	t.Run("append ledger insert", func(t *testing.T) {
+		st := testStore(t)
+		batchID := insertSigningBatch(t, st)
+		if _, err := st.db.ExecContext(ctx, `CREATE TRIGGER fail_evidence_ledger_insert BEFORE INSERT ON evidence_ledger BEGIN SELECT RAISE(ABORT,'ledger insert failed'); END`); err != nil {
+			t.Fatal(err)
+		}
+		tx, err := st.db.BeginTx(ctx, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer tx.Rollback()
+		if err := st.appendEvidenceLedgerTx(ctx, tx, batchID); err == nil {
+			t.Fatal("appendEvidenceLedgerTx ignored ledger insert failure")
+		}
+	})
+
+	t.Run("append ledger head update", func(t *testing.T) {
+		st := testStore(t)
+		batchID := insertSigningBatch(t, st)
+		if _, err := st.db.ExecContext(ctx, `CREATE TRIGGER fail_evidence_ledger_head BEFORE INSERT ON meta WHEN NEW.key='evidence_ledger_head' BEGIN SELECT RAISE(ABORT,'ledger head update failed'); END`); err != nil {
+			t.Fatal(err)
+		}
+		tx, err := st.db.BeginTx(ctx, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer tx.Rollback()
+		if err := st.appendEvidenceLedgerTx(ctx, tx, batchID); err == nil {
+			t.Fatal("appendEvidenceLedgerTx ignored ledger head failure")
+		}
+	})
+
+	t.Run("evidence trigger payload query", func(t *testing.T) {
+		st := testStore(t)
+		batchID := insertSigningBatch(t, st)
+		if _, err := st.db.ExecContext(ctx, "DROP TABLE event_batch_triggers"); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := evidenceLedgerPayload(ctx, st.db, batchID); err == nil {
+			t.Fatal("evidenceLedgerPayload succeeded without trigger links")
+		}
+	})
+
+	t.Run("evidence event payload query", func(t *testing.T) {
+		st := testStore(t)
+		batchID := insertSigningBatch(t, st)
+		if _, err := st.db.ExecContext(ctx, "DROP TABLE events"); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := evidenceLedgerPayload(ctx, st.db, batchID); err == nil {
+			t.Fatal("evidenceLedgerPayload succeeded without events")
+		}
+	})
+}
+
+func TestEvidenceSigningStorageAndFallbackBranches(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("signing key insert", func(t *testing.T) {
+		box, err := secret.NewBox(make([]byte, 32))
+		if err != nil {
+			t.Fatal(err)
+		}
+		db, err := sql.Open("sqlite", ":memory:")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer db.Close()
+		if _, err := db.ExecContext(ctx, "CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT NOT NULL)"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.ExecContext(ctx, `CREATE TRIGGER fail_signing_key_insert BEFORE INSERT ON meta BEGIN SELECT RAISE(ABORT,'signing key insert failed'); END`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := loadOrCreateEvidenceSigningKey(ctx, db, box); err == nil || !strings.Contains(err.Error(), "store") {
+			t.Fatalf("signing key insert error=%v", err)
+		}
+	})
+
+	t.Run("append ledger query", func(t *testing.T) {
+		st := testStore(t)
+		batchID := insertSigningBatch(t, st)
+		if _, err := st.db.ExecContext(ctx, "DROP TABLE evidence_ledger"); err != nil {
+			t.Fatal(err)
+		}
+		tx, err := st.db.BeginTx(ctx, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer tx.Rollback()
+		if err := st.appendEvidenceLedgerTx(ctx, tx, batchID); err == nil {
+			t.Fatal("appendEvidenceLedgerTx ignored ledger query failure")
+		}
+	})
+
+	t.Run("append ledger head metadata query", func(t *testing.T) {
+		st := testStore(t)
+		batchID := insertSigningBatch(t, st)
+		if _, err := st.db.ExecContext(ctx, "DROP TABLE meta"); err != nil {
+			t.Fatal(err)
+		}
+		tx, err := st.db.BeginTx(ctx, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer tx.Rollback()
+		if err := st.appendEvidenceLedgerTx(ctx, tx, batchID); err == nil {
+			t.Fatal("appendEvidenceLedgerTx ignored ledger head metadata failure")
+		}
+	})
+
+	t.Run("payload trigger fallback", func(t *testing.T) {
+		st := testStore(t)
+		result, err := st.db.ExecContext(ctx, "INSERT INTO event_batches(generation,observed_at,change_count,created_at,trigger_id) VALUES(1,?,?,?,77)", time.Now().UTC().Format(time.RFC3339Nano), 0, time.Now().UTC().Format(time.RFC3339Nano))
+		if err != nil {
+			t.Fatal(err)
+		}
+		batchID, err := result.LastInsertId()
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, batch, err := evidenceLedgerPayload(ctx, st.db, batchID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(batch.TriggerIDs) != 1 || batch.TriggerIDs[0] != 77 {
+			t.Fatalf("trigger fallback=%v", batch.TriggerIDs)
+		}
+	})
+
+	t.Run("ledger head metadata error", func(t *testing.T) {
+		st := testStore(t)
+		if _, err := st.db.ExecContext(ctx, "DROP TABLE evidence_ledger"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.db.ExecContext(ctx, "DROP TABLE meta"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.evidenceLedgerHead(ctx); err == nil {
+			t.Fatal("evidenceLedgerHead ignored metadata query failure")
+		}
+	})
+}
+
+func TestVerifyEvidencePackReportsLedgerLinkErrors(t *testing.T) {
+	public, private, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pack := EvidencePack{
+		Format:           evidencePackFormat,
+		Version:          evidencePackVersion,
+		Filter:           EvidenceFilter{Limit: 1},
+		Batches:          []EvidenceBatch{{ID: 1, LedgerKeyID: "ed25519:other"}},
+		SigningKeyID:     evidenceKeyID(public),
+		SigningPublicKey: base64.RawStdEncoding.EncodeToString(public),
+		GeneratedAt:      "2026-01-01T00:00:00Z",
+	}
+	content, err := evidencePayload(pack)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256Sum(content)
+	pack.ContentSHA256 = digest
+	pack.Signature = base64.RawStdEncoding.EncodeToString(ed25519.Sign(private, evidenceSignaturePayload(pack)))
+	data, err := json.Marshal(pack)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := VerifyEvidencePack(data); err == nil || !strings.Contains(err.Error(), "ledger signing key mismatch") {
+		t.Fatalf("ledger link error=%v", err)
 	}
 }
 

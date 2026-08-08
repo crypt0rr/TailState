@@ -2,6 +2,8 @@ package monitor
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -16,12 +18,18 @@ import (
 )
 
 func monitorTestStore(t *testing.T) (*store.Store, store.Settings) {
+	st, settings, _ := openMonitorTestStore(t)
+	return st, settings
+}
+
+func openMonitorTestStore(t *testing.T) (*store.Store, store.Settings, string) {
 	t.Helper()
 	box, err := secret.NewBox(make([]byte, 32))
 	if err != nil {
 		t.Fatal(err)
 	}
-	st, err := store.Open(t.TempDir()+"/tailstate.db", box)
+	path := t.TempDir() + "/tailstate.db"
+	st, err := store.Open(path, box)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -42,7 +50,19 @@ func monitorTestStore(t *testing.T) (*store.Store, store.Settings) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return st, saved
+	return st, saved, path
+}
+
+func monitorTestStoreWithDB(t *testing.T) (*store.Store, store.Settings, *sql.DB) {
+	t.Helper()
+	st, settings, path := openMonitorTestStore(t)
+	db, err := sql.Open("sqlite", "file:"+path+"?_pragma=busy_timeout(5000)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.SetMaxOpenConns(1)
+	t.Cleanup(func() { _ = db.Close() })
+	return st, settings, db
 }
 
 func monitorTestAPI(t *testing.T, status *atomic.Int32) *httptest.Server {
@@ -219,6 +239,365 @@ func TestMonitorRequestHelpersAndWakeAreCoalesced(t *testing.T) {
 	if allCollectors()[0] != first {
 		t.Fatal("allCollectors did not return an independent copy")
 	}
+}
+
+type monitorOutcomeSender struct {
+	calls chan struct{}
+	err   error
+}
+
+func (s *monitorOutcomeSender) Send(context.Context, string, string) error {
+	select {
+	case s.calls <- struct{}{}:
+	default:
+	}
+	return s.err
+}
+
+func (s *monitorOutcomeSender) Test(context.Context, string) error { return nil }
+
+func TestMonitorDeliveryAndCleanupErrorBranches(t *testing.T) {
+	ctx := context.Background()
+	setDeliveryInterval := func(t *testing.T, interval time.Duration) {
+		t.Helper()
+		previous := deliveryPollInterval
+		deliveryPollInterval = interval
+		t.Cleanup(func() { deliveryPollInterval = previous })
+	}
+
+	t.Run("delivered update error", func(t *testing.T) {
+		st, _, db := monitorTestStoreWithDB(t)
+		if err := st.EnqueueSystem(ctx, "delivery complete"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.ExecContext(ctx, `CREATE TRIGGER fail_delivered_update BEFORE UPDATE OF status ON outbox WHEN NEW.status='delivered' BEGIN SELECT RAISE(ABORT,'delivered update failed'); END`); err != nil {
+			t.Fatal(err)
+		}
+		setDeliveryInterval(t, time.Millisecond)
+		sender := &monitorOutcomeSender{calls: make(chan struct{}, 1)}
+		engine := New(st, "", "", "test", sender)
+		deliveryCtx, cancel := context.WithCancel(ctx)
+		done := make(chan struct{})
+		go func() {
+			engine.delivery(deliveryCtx)
+			close(done)
+		}()
+		select {
+		case <-sender.calls:
+		case <-time.After(time.Second):
+			cancel()
+			t.Fatal("delivery did not attempt the successful notification")
+		}
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatal("delivery did not stop after cancellation")
+		}
+	})
+
+	t.Run("dead letter logging", func(t *testing.T) {
+		st, _, db := monitorTestStoreWithDB(t)
+		if err := st.EnqueueSystem(ctx, "delivery dead letter"); err != nil {
+			t.Fatal(err)
+		}
+		old := time.Now().UTC().Add(-48 * time.Hour).Format(time.RFC3339Nano)
+		if _, err := db.ExecContext(ctx, "UPDATE outbox SET first_attempt=?", old); err != nil {
+			t.Fatal(err)
+		}
+		setDeliveryInterval(t, time.Millisecond)
+		sender := &monitorOutcomeSender{calls: make(chan struct{}, 1), err: errors.New("permanent failure")}
+		engine := New(st, "", "", "test", sender)
+		deliveryCtx, cancel := context.WithCancel(ctx)
+		done := make(chan struct{})
+		go func() {
+			engine.delivery(deliveryCtx)
+			close(done)
+		}()
+		select {
+		case <-sender.calls:
+		case <-time.After(time.Second):
+			cancel()
+			t.Fatal("delivery did not attempt the dead-letter notification")
+		}
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatal("delivery did not stop after cancellation")
+		}
+	})
+
+	t.Run("cleanup error", func(t *testing.T) {
+		st, _, db := monitorTestStoreWithDB(t)
+		if _, err := db.ExecContext(ctx, "DROP TABLE sessions"); err != nil {
+			t.Fatal(err)
+		}
+		previous := cleanupPollInterval
+		cleanupPollInterval = time.Millisecond
+		t.Cleanup(func() { cleanupPollInterval = previous })
+		engine := New(st, "", "", "test", &scriptedSender{})
+		cleanupCtx, cancel := context.WithCancel(ctx)
+		done := make(chan struct{})
+		go func() {
+			engine.cleanup(cleanupCtx)
+			close(done)
+		}()
+		time.Sleep(20 * time.Millisecond)
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatal("cleanup did not stop after cancellation")
+		}
+	})
+
+	t.Run("durable completion and retry errors", func(t *testing.T) {
+		st, _, db := monitorTestStoreWithDB(t)
+		if _, err := db.ExecContext(ctx, "DROP TABLE webhook_triggers"); err != nil {
+			t.Fatal(err)
+		}
+		engine := New(st, "", "", "test", &scriptedSender{})
+		engine.finishTriggers(ctx, []int64{1}, true, 1)
+		engine.finishTriggers(ctx, []int64{1}, false, 2)
+	})
+}
+
+func TestMonitorHealthNotificationWriteErrors(t *testing.T) {
+	ctx := context.Background()
+	status := &atomic.Int32{}
+	status.Store(http.StatusInternalServerError)
+	api := monitorTestAPI(t, status)
+	defer api.Close()
+	clientFor := func(t *testing.T) (*store.Store, store.Settings, *tailscale.Client, *Engine, *sql.DB) {
+		t.Helper()
+		st, settings, db := monitorTestStoreWithDB(t)
+		client := tailscale.New(api.URL+"/api/v2", api.URL+"/oauth/token", "test", tailscale.Credentials{Tailnet: "-", ClientID: "client", ClientSecret: "secret"})
+		return st, settings, client, New(st, api.URL+"/api/v2", api.URL+"/oauth/token", "test", &scriptedSender{}), db
+	}
+
+	t.Run("unhealthy notification enqueue", func(t *testing.T) {
+		_, settings, client, engine, db := clientFor(t)
+		for i := 0; i < 2; i++ {
+			if engine.poll(ctx, client, settings, []string{"devices"}, true) {
+				t.Fatal("failed collector poll unexpectedly succeeded")
+			}
+		}
+		if _, err := db.ExecContext(ctx, "DROP TABLE outbox"); err != nil {
+			t.Fatal(err)
+		}
+		if engine.poll(ctx, client, settings, []string{"devices"}, true) {
+			t.Fatal("failed collector poll unexpectedly succeeded")
+		}
+	})
+
+	t.Run("recovery notification enqueue", func(t *testing.T) {
+		_, settings, client, engine, db := clientFor(t)
+		for i := 0; i < 3; i++ {
+			if engine.poll(ctx, client, settings, []string{"devices"}, true) {
+				t.Fatal("failed collector poll unexpectedly succeeded")
+			}
+		}
+		if _, err := db.ExecContext(ctx, "DROP TABLE outbox"); err != nil {
+			t.Fatal(err)
+		}
+		status.Store(http.StatusOK)
+		if !engine.poll(ctx, client, settings, []string{"devices"}, true) {
+			t.Fatal("recovery poll failed")
+		}
+	})
+}
+
+func TestSchedulerTimerBranches(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2500*time.Millisecond)
+	defer cancel()
+	st, _, db := monitorTestStoreWithDB(t)
+	if _, err := db.ExecContext(ctx, "UPDATE settings SET device_interval_seconds=1,inventory_interval_seconds=1"); err != nil {
+		t.Fatal(err)
+	}
+	api := monitorTestAPI(t, nil)
+	defer api.Close()
+	previous := durableTriggerPollInterval
+	durableTriggerPollInterval = 10 * time.Millisecond
+	t.Cleanup(func() { durableTriggerPollInterval = previous })
+	engine := New(st, api.URL+"/api/v2", api.URL+"/oauth/token", "test", &scriptedSender{})
+	done := make(chan struct{})
+	go func() {
+		engine.scheduler(ctx)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(4 * time.Second):
+		cancel()
+		t.Fatal("scheduler timer branch test did not stop")
+	}
+}
+
+func TestMonitorSchedulerWaitTimerAndDurableRetryAttempts(t *testing.T) {
+	ctx := context.Background()
+	t.Run("configuration wait timer", func(t *testing.T) {
+		box, err := secret.NewBox(make([]byte, 32))
+		if err != nil {
+			t.Fatal(err)
+		}
+		st, err := store.Open(t.TempDir()+"/tailstate.db", box)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = st.Close() })
+		previous := schedulerWaitInterval
+		schedulerWaitInterval = time.Millisecond
+		t.Cleanup(func() { schedulerWaitInterval = previous })
+		engine := New(st, "", "", "test", &scriptedSender{})
+		waitCtx, cancel := context.WithTimeout(ctx, 20*time.Millisecond)
+		defer cancel()
+		done := make(chan struct{})
+		go func() {
+			engine.scheduler(waitCtx)
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatal("scheduler did not stop while waiting for configuration")
+		}
+	})
+
+	t.Run("configuration wake", func(t *testing.T) {
+		box, err := secret.NewBox(make([]byte, 32))
+		if err != nil {
+			t.Fatal(err)
+		}
+		st, err := store.Open(t.TempDir()+"/tailstate.db", box)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = st.Close() })
+		engine := New(st, "", "", "test", &scriptedSender{})
+		waitCtx, cancel := context.WithTimeout(ctx, 40*time.Millisecond)
+		defer cancel()
+		done := make(chan struct{})
+		go func() {
+			engine.scheduler(waitCtx)
+			close(done)
+		}()
+		time.Sleep(5 * time.Millisecond)
+		engine.Wake()
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatal("scheduler did not stop after wake")
+		}
+	})
+
+	t.Run("durable retry attempts", func(t *testing.T) {
+		status := &atomic.Int32{}
+		status.Store(http.StatusInternalServerError)
+		api := monitorTestAPI(t, status)
+		defer api.Close()
+		st, settings := monitorTestStore(t)
+		trigger, created, err := st.RecordWebhookTrigger(ctx, strings.Repeat("9", 64), nil, []string{"devices"})
+		if err != nil || !created {
+			t.Fatalf("record trigger: %#v created=%v err=%v", trigger, created, err)
+		}
+		client := tailscale.New(api.URL+"/api/v2", api.URL+"/oauth/token", "test", tailscale.Credentials{Tailnet: "-", ClientID: "client", ClientSecret: "secret"})
+		engine := New(st, api.URL+"/api/v2", api.URL+"/oauth/token", "test", &scriptedSender{})
+		if !engine.processDurableTriggers(ctx, client, settings) {
+			t.Fatal("durable retry trigger was not processed")
+		}
+		if err := st.RetryWebhookTriggers(ctx, []int64{trigger.ID}, time.Now().Add(-time.Minute), "previous failure"); err != nil {
+			t.Fatal(err)
+		}
+		if !engine.processDurableTriggers(ctx, client, settings) {
+			t.Fatal("durable retry trigger was not processed a second time")
+		}
+	})
+
+	t.Run("empty finish ids", func(t *testing.T) {
+		engine := New(nil, "", "", "test", &scriptedSender{})
+		engine.finishTriggers(ctx, nil, true, 1)
+	})
+}
+
+func TestMonitorSchedulerRequestAndPollChangeBranches(t *testing.T) {
+	ctx := context.Background()
+	t.Run("in-memory request", func(t *testing.T) {
+		st, _ := monitorTestStore(t)
+		api := monitorTestAPI(t, nil)
+		defer api.Close()
+		previous := durableTriggerPollInterval
+		durableTriggerPollInterval = time.Second
+		t.Cleanup(func() { durableTriggerPollInterval = previous })
+		engine := New(st, api.URL+"/api/v2", api.URL+"/oauth/token", "test", &scriptedSender{})
+		schedulerCtx, cancel := context.WithCancel(ctx)
+		done := make(chan struct{})
+		go func() {
+			engine.scheduler(schedulerCtx)
+			close(done)
+		}()
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			status, err := st.Status(ctx)
+			if err == nil && status.BaselineAt != nil {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		engine.Trigger(ReconcileRequest{Collectors: []string{"users"}})
+		time.Sleep(50 * time.Millisecond)
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatal("scheduler did not stop after request")
+		}
+	})
+
+	t.Run("inventory change log", func(t *testing.T) {
+		st, settings := monitorTestStore(t)
+		var calls atomic.Int32
+		api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/oauth/token" {
+				_, _ = w.Write([]byte(`{"access_token":"access","expires_in":3600}`))
+				return
+			}
+			if r.URL.Path == "/api/v2/tailnet/-/devices" {
+				name := "server"
+				if calls.Add(1) > 1 {
+					name = "server-new"
+				}
+				_, _ = w.Write([]byte(`{"devices":[{"id":"device-1","hostname":"` + name + `"}]}`))
+				return
+			}
+			http.NotFound(w, r)
+		}))
+		defer api.Close()
+		client := tailscale.New(api.URL+"/api/v2", api.URL+"/oauth/token", "test", tailscale.Credentials{Tailnet: "-", ClientID: "client", ClientSecret: "secret"})
+		engine := New(st, api.URL+"/api/v2", api.URL+"/oauth/token", "test", &scriptedSender{})
+		if !engine.poll(ctx, client, settings, []string{"devices"}, true) {
+			t.Fatal("baseline poll failed")
+		}
+		if !engine.poll(ctx, client, settings, []string{"devices"}, true) {
+			t.Fatal("changed poll failed")
+		}
+	})
+
+	t.Run("collector failure store error", func(t *testing.T) {
+		st, settings, db := monitorTestStoreWithDB(t)
+		status := &atomic.Int32{}
+		status.Store(http.StatusInternalServerError)
+		api := monitorTestAPI(t, status)
+		defer api.Close()
+		if _, err := db.ExecContext(ctx, "DROP TABLE collector_state"); err != nil {
+			t.Fatal(err)
+		}
+		client := tailscale.New(api.URL+"/api/v2", api.URL+"/oauth/token", "test", tailscale.Credentials{Tailnet: "-", ClientID: "client", ClientSecret: "secret"})
+		engine := New(st, api.URL+"/api/v2", api.URL+"/oauth/token", "test", &scriptedSender{})
+		if engine.poll(ctx, client, settings, []string{"devices"}, true) {
+			t.Fatal("collector failure with store error unexpectedly succeeded")
+		}
+	})
 }
 
 func int64Strings(values []int64) []string {

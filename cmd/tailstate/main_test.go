@@ -50,6 +50,10 @@ func TestRunCommandDispatchAndHealthcheck(t *testing.T) {
 	if err := run(); err == nil || !strings.Contains(err.Error(), "evidence verify") {
 		t.Fatalf("invalid evidence command error=%v", err)
 	}
+	os.Args = []string{"tailstate", "evidence", "verify", "-file", filepath.Join(t.TempDir(), "missing-evidence.json")}
+	if err := run(); err == nil || !strings.Contains(err.Error(), "read evidence pack") {
+		t.Fatalf("evidence verify dispatch error=%v", err)
+	}
 
 	health := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) }))
 	defer health.Close()
@@ -87,12 +91,48 @@ func TestMainAndServeRejectInvalidConfiguration(t *testing.T) {
 
 func TestServeContextCompletesWhenCanceled(t *testing.T) {
 	configureCommandEnvironment(t, t.TempDir())
+	t.Setenv("TAILSTATE_LOG_LEVEL", "debug")
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	timer := time.AfterFunc(500*time.Millisecond, cancel)
 	t.Cleanup(func() { timer.Stop() })
 	if err := serveContext(ctx); err != nil {
 		t.Fatalf("serveContext returned error: %v", err)
+	}
+}
+
+func TestEvidenceVerifyReportsTrustedKeyAndPackErrors(t *testing.T) {
+	dataDir := t.TempDir()
+	configureCommandEnvironment(t, dataDir)
+	_, st, err := load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pack, err := st.ExportEvidencePack(context.Background(), store.HistoryFilter{})
+	if err != nil {
+		st.Close()
+		t.Fatal(err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	packPath := filepath.Join(dataDir, "pack.json")
+	if err := os.WriteFile(packPath, pack, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	badPackPath := filepath.Join(dataDir, "bad-pack.json")
+	if err := os.WriteFile(badPackPath, []byte("not-json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := evidenceVerify([]string{"-file", badPackPath}); err == nil || !strings.Contains(err.Error(), "decode evidence pack") {
+		t.Fatalf("bad evidence pack error=%v", err)
+	}
+	keyPath := filepath.Join(dataDir, "wrong.key")
+	if err := os.WriteFile(keyPath, make([]byte, 32), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := evidenceVerify([]string{"-file", packPath, "-public-key", keyPath}); err == nil || !strings.Contains(err.Error(), "not trusted") {
+		t.Fatalf("wrong trusted key error=%v", err)
 	}
 }
 

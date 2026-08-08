@@ -354,6 +354,33 @@ func TestClosedStoreReturnsOperationalErrors(t *testing.T) {
 	expectErr("ExportEvidencePack", func() error { _, err := st.ExportEvidencePack(ctx, HistoryFilter{}); return err })
 }
 
+func TestStoreSchemaErrorPaths(t *testing.T) {
+	ctx := context.Background()
+	dropAndExpect := func(t *testing.T, table string, call func(*Store) error) {
+		t.Helper()
+		st := testStore(t)
+		if _, err := st.db.Exec("DROP TABLE " + table); err != nil {
+			t.Fatal(err)
+		}
+		if err := call(st); err == nil {
+			t.Fatalf("operation succeeded after dropping %s", table)
+		}
+	}
+	dropAndExpect(t, "admin", func(st *Store) error { _, err := st.AdminExists(ctx); return err })
+	dropAndExpect(t, "meta", func(st *Store) error { _, err := st.NewSetupToken(ctx); return err })
+	dropAndExpect(t, "settings", func(st *Store) error { _, err := st.Settings(ctx); return err })
+	dropAndExpect(t, "settings", func(st *Store) error { _, err := st.WebhookSecret(ctx); return err })
+	dropAndExpect(t, "webhook_triggers", func(st *Store) error {
+		_, _, err := st.RecordWebhookTrigger(ctx, strings.Repeat("a", 64), nil, nil)
+		return err
+	})
+	dropAndExpect(t, "webhook_triggers", func(st *Store) error { _, err := st.ClaimWebhookTriggers(ctx, 1, time.Minute); return err })
+	dropAndExpect(t, "notification_destinations", func(st *Store) error { _, err := st.ListDestinations(ctx); return err })
+	dropAndExpect(t, "outbox", func(st *Store) error { _, err := st.DueOutbox(ctx, 1); return err })
+	dropAndExpect(t, "settings", func(st *Store) error { _, err := st.Status(ctx); return err })
+	dropAndExpect(t, "event_batches", func(st *Store) error { _, err := st.ListHistory(ctx, HistoryFilter{}); return err })
+}
+
 func TestSetupAndWebhookConfigurationErrors(t *testing.T) {
 	ctx := context.Background()
 	st := testStore(t)

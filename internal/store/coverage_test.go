@@ -284,6 +284,76 @@ func TestHistoryFormattingHelpers(t *testing.T) {
 	}
 }
 
+func TestClosedStoreReturnsOperationalErrors(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	expectErr := func(name string, call func() error) {
+		t.Helper()
+		if err := call(); err == nil {
+			t.Fatalf("%s unexpectedly succeeded on a closed store", name)
+		}
+	}
+	expectErr("Ping", func() error { return st.Ping(ctx) })
+	expectErr("AdminExists", func() error { _, err := st.AdminExists(ctx); return err })
+	expectErr("NewSetupToken", func() error { _, err := st.NewSetupToken(ctx); return err })
+	expectErr("Claim", func() error { return st.Claim(ctx, "token", "a secure password") })
+	if st.Authenticate(ctx, "password") {
+		t.Fatal("Authenticate succeeded on a closed store")
+	}
+	expectErr("ResetPassword", func() error { return st.ResetPassword(ctx, "a secure password") })
+	expectErr("NewResetToken", func() error { _, err := st.NewResetToken(ctx); return err })
+	expectErr("ResetWithToken", func() error { return st.ResetWithToken(ctx, "token", "a secure password") })
+	if _, _, err := st.CreateSession(ctx); err == nil {
+		t.Fatal("CreateSession unexpectedly succeeded on a closed store")
+	}
+	if st.ValidateSession(ctx, "token", "csrf", true) {
+		t.Fatal("ValidateSession succeeded on a closed store")
+	}
+	validSettings := settings()
+	expectErr("SaveSettings", func() error { _, err := st.SaveSettings(ctx, validSettings); return err })
+	expectErr("Settings", func() error { _, err := st.Settings(ctx); return err })
+	expectErr("WebhookSecret", func() error { _, err := st.WebhookSecret(ctx); return err })
+	expectErr("RecordWebhookTrigger", func() error { _, _, err := st.RecordWebhookTrigger(ctx, strings.Repeat("a", 64), nil, nil); return err })
+	expectErr("ClaimWebhookTriggers", func() error { _, err := st.ClaimWebhookTriggers(ctx, 1, time.Minute); return err })
+	expectErr("CompleteWebhookTriggers", func() error { return st.CompleteWebhookTriggers(ctx, []int64{1}) })
+	expectErr("RetryWebhookTriggers", func() error { return st.RetryWebhookTriggers(ctx, []int64{1}, time.Now(), "error") })
+	expectErr("MarkWebhookTriggerProcessed", func() error { return st.MarkWebhookTriggerProcessed(ctx, 1) })
+	expectErr("ListDestinations", func() error { _, err := st.ListDestinations(ctx); return err })
+	expectErr("SaveDestination", func() error {
+		_, err := st.SaveDestination(ctx, NotificationDestination{Name: "test", ServiceURL: "generic://example.invalid"})
+		return err
+	})
+	expectErr("SetDestinationEnabled", func() error { return st.SetDestinationEnabled(ctx, 1, true) })
+	expectErr("DeleteDestination", func() error { return st.DeleteDestination(ctx, 1) })
+	expectErr("TrackAppVersion", func() error {
+		_, err := st.TrackAppVersion(ctx, "1.0.0", func(string, string) string { return "update" })
+		return err
+	})
+	expectErr("ApplyBatch", func() error {
+		_, err := st.ApplyBatch(ctx, 1, nil, func([]model.Change) string { return "" })
+		return err
+	})
+	expectErr("ApplyBatchWithBatch", func() error {
+		_, err := st.ApplyBatchWithBatch(ctx, 1, nil, func([]model.Change) string { return "" })
+		return err
+	})
+	expectErr("RecordCollectorFailure", func() error { _, _, err := st.RecordCollectorFailure(ctx, 1, "devices", "error"); return err })
+	if st.CollectorWasUnhealthy(ctx, 1, "devices") {
+		t.Fatal("CollectorWasUnhealthy succeeded on a closed store")
+	}
+	expectErr("EnqueueSystem", func() error { return st.EnqueueSystem(ctx, "payload") })
+	expectErr("DueOutbox", func() error { _, err := st.DueOutbox(ctx, 1); return err })
+	expectErr("Delivered", func() error { return st.Delivered(ctx, 1) })
+	expectErr("Retry", func() error { return st.Retry(ctx, 1, time.Now(), "error", false) })
+	expectErr("Status", func() error { _, err := st.Status(ctx); return err })
+	expectErr("Cleanup", func() error { return st.Cleanup(ctx, time.Hour) })
+	expectErr("ListHistory", func() error { _, err := st.ListHistory(ctx, HistoryFilter{}); return err })
+	expectErr("ExportEvidencePack", func() error { _, err := st.ExportEvidencePack(ctx, HistoryFilter{}); return err })
+}
+
 func TestSetupAndWebhookConfigurationErrors(t *testing.T) {
 	ctx := context.Background()
 	st := testStore(t)

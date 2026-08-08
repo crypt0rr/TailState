@@ -457,3 +457,25 @@ func TestResetRejectsInvalidToken(t *testing.T) {
 		t.Fatalf("invalid reset response status=%d body=%s", response.Code, response.Body.String())
 	}
 }
+
+func TestServeShutdownAndConfiguredHome(t *testing.T) {
+	server, st, setupToken := testServer(t)
+	cookies := claimCoverageAdmin(t, server, setupToken)
+	if _, err := st.SaveSettings(context.Background(), store.Settings{Tailnet: "-", OAuthClientID: "client", OAuthClientSecret: "secret", MattermostURL: "https://mattermost.example/hooks/token", DeviceInterval: time.Minute, InventoryInterval: 5 * time.Minute}); err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodGet, "/", nil)
+	for _, cookie := range cookies {
+		request.AddCookie(cookie)
+	}
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusSeeOther || response.Header().Get("Location") != "/status" {
+		t.Fatalf("configured home status=%d location=%q", response.Code, response.Header().Get("Location"))
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := server.Serve(ctx); err != nil {
+		t.Fatalf("pre-canceled server shutdown error=%v", err)
+	}
+}

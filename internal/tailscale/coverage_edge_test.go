@@ -200,3 +200,104 @@ func TestPaginationHelpersAndGetRetryBranches(t *testing.T) {
 		t.Fatalf("429 retry value=%#v err=%v attempts=%d", value, err, rateAttempts)
 	}
 }
+
+func TestCollectorHTTPErrorBranches(t *testing.T) {
+	mode := "details-unsupported"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/devices") {
+			if mode == "details-unsupported" || mode == "details-error" {
+				_, _ = w.Write([]byte(`{"devices":[{"id":"device-1","hostname":"server"}]}`))
+				return
+			}
+		}
+		switch mode {
+		case "details-unsupported":
+			if strings.Contains(r.URL.Path, "/device/device-1/") {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+		case "details-error":
+			if strings.Contains(r.URL.Path, "/device/device-1/") {
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+		case "dns-error":
+			if strings.Contains(r.URL.Path, "/dns/") {
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+		case "policy-error":
+			if strings.HasSuffix(r.URL.Path, "/acl") {
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+		case "log-error":
+			if strings.Contains(r.URL.Path, "/logging/") {
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+		}
+		http.NotFound(w, r)
+	}))
+	defer server.Close()
+	newClient := func() *Client {
+		client := New(server.URL+"/api/v2", server.URL+"/oauth/token", "test", Credentials{Tailnet: "-"})
+		client.token = "cached"
+		client.expires = time.Now().Add(time.Hour)
+		return client
+	}
+	if resources, err := newClient().Collect(context.Background(), "device_details"); err != nil || len(resources) != 1 {
+		t.Fatalf("unsupported device details resources=%#v err=%v", resources, err)
+	}
+	mode = "details-error"
+	if _, err := newClient().Collect(context.Background(), "device_details"); err == nil {
+		t.Fatal("device details server error was ignored")
+	}
+	mode = "dns-error"
+	if _, err := newClient().Collect(context.Background(), "dns"); err == nil {
+		t.Fatal("DNS server error was ignored")
+	}
+	mode = "policy-error"
+	if _, err := newClient().Collect(context.Background(), "policy"); err == nil {
+		t.Fatal("policy server error was ignored")
+	}
+	mode = "log-error"
+	if _, err := newClient().Collect(context.Background(), "log_streaming"); err == nil {
+		t.Fatal("log streaming server error was ignored")
+	}
+}
+
+type failingBody struct{}
+
+func (failingBody) Read([]byte) (int, error) { return 0, fmt.Errorf("body read failed") }
+func (failingBody) Close() error             { return nil }
+
+func TestClientTransportAndOAuthErrorBranches(t *testing.T) {
+	client := New("https://api.example.test/api/v2", "https://oauth.example.test/token", "test", Credentials{})
+	client.token, client.expires = "cached", time.Now().Add(time.Hour)
+	client.http = &http.Client{Transport: coverageRoundTripper(func(*http.Request) (*http.Response, error) { return nil, fmt.Errorf("transport failed") })}
+	ctx, cancel := context.WithCancel(context.Background())
+	client.http.Transport = coverageRoundTripper(func(*http.Request) (*http.Response, error) {
+		cancel()
+		return nil, fmt.Errorf("transport failed")
+	})
+	if _, err := client.get(ctx, "https://api.example.test/api/v2/devices"); err == nil {
+		t.Fatal("transport failure was ignored")
+	}
+	badURL := New("https://api.example.test/api/v2", "://invalid", "test", Credentials{})
+	if _, err := badURL.accessToken(context.Background()); err == nil {
+		t.Fatal("invalid OAuth URL succeeded")
+	}
+	readError := New("https://api.example.test/api/v2", "https://oauth.example.test/token", "test", Credentials{})
+	readError.token, readError.expires = "cached", time.Now().Add(time.Hour)
+	readError.http = &http.Client{Transport: coverageRoundTripper(func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusOK, Status: "200", Body: failingBody{}}, nil
+	})}
+	if _, err := readError.get(context.Background(), "https://api.example.test/api/v2/devices"); err == nil || !strings.Contains(err.Error(), "body read failed") {
+		t.Fatalf("API body read error=%v", err)
+	}
+	readError.token = ""
+	if _, err := readError.accessToken(context.Background()); err == nil || !strings.Contains(err.Error(), "body read failed") {
+		t.Fatalf("OAuth body read error=%v", err)
+	}
+}

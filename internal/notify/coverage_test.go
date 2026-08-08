@@ -147,3 +147,19 @@ func TestSendReturnsRedactedDeliveryError(t *testing.T) {
 		t.Fatalf("delivery error leaked destination: %v", err)
 	}
 }
+
+func TestSendValidationAndPostDeliveryCancellation(t *testing.T) {
+	if err := New().Send(context.Background(), "not-a-shoutrrr-url", "message"); err == nil {
+		t.Fatal("invalid notification URL was sent")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cancel()
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	serviceURL := strings.Replace(server.URL, "http://", "generic://", 1) + "?disabletls=true"
+	if err := New().Send(ctx, serviceURL, "message"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("post-delivery cancellation error=%v", err)
+	}
+}

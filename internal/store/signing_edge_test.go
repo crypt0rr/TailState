@@ -4,11 +4,14 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"database/sql"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"strings"
 	"testing"
+
+	"github.com/crypt0rr/tailstate/internal/secret"
 )
 
 func TestParseEvidencePublicKeyAcceptsSupportedEncodings(t *testing.T) {
@@ -221,4 +224,71 @@ func TestVerifyLedgerLinksRejectsInvalidChains(t *testing.T) {
 	if err := verifyLedgerLinks(EvidencePack{SigningKeyID: keyID, Batches: []EvidenceBatch{{ID: 1, LedgerSequence: 0}, {ID: 2, LedgerSequence: 1, LedgerHash: strings.Repeat("a", 64)}}}); err != nil {
 		t.Fatalf("sequence-zero/last batch was rejected: %v", err)
 	}
+}
+
+func TestEvidenceSigningMetadataValidation(t *testing.T) {
+	box, err := secret.NewBox(make([]byte, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	public, private, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newDB := func(t *testing.T) *sql.DB {
+		t.Helper()
+		db, err := sql.Open("sqlite", ":memory:")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.Exec("CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT NOT NULL)"); err != nil {
+			db.Close()
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { db.Close() })
+		return db
+	}
+	put := func(t *testing.T, db *sql.DB, values map[string]string) {
+		t.Helper()
+		for key, value := range values {
+			if _, err := db.Exec("INSERT INTO meta(key,value) VALUES(?,?)", key, value); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	privateEncoded := base64.RawStdEncoding.EncodeToString(private)
+	publicEncoded := base64.RawStdEncoding.EncodeToString(public)
+	privateEnvelope, err := box.Encrypt(privateEncoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyID := evidenceKeyID(public)
+	tests := []struct {
+		name   string
+		values map[string]string
+		want   string
+	}{
+		{"incomplete", map[string]string{evidenceSigningPrivateKeyMeta: privateEnvelope}, "metadata is incomplete"},
+		{"bad private envelope", map[string]string{evidenceSigningPrivateKeyMeta: "bad", evidenceSigningPublicKeyMeta: publicEncoded, evidenceSigningKeyIDMeta: keyID}, "decrypt evidence signing key"},
+		{"bad private length", map[string]string{evidenceSigningPrivateKeyMeta: mustEncryptForTest(t, box, base64.RawStdEncoding.EncodeToString(make([]byte, 31))), evidenceSigningPublicKeyMeta: publicEncoded, evidenceSigningKeyIDMeta: keyID}, "decode evidence signing key"},
+		{"fingerprint mismatch", map[string]string{evidenceSigningPrivateKeyMeta: privateEnvelope, evidenceSigningPublicKeyMeta: publicEncoded, evidenceSigningKeyIDMeta: "ed25519:bad"}, "fingerprint does not match"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			db := newDB(t)
+			put(t, db, tc.values)
+			if _, err := loadOrCreateEvidenceSigningKey(context.Background(), db, box); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error=%v, want %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func mustEncryptForTest(t *testing.T, box *secret.Box, value string) string {
+	t.Helper()
+	encrypted, err := box.Encrypt(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return encrypted
 }

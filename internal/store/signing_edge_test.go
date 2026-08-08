@@ -263,6 +263,10 @@ func TestEvidenceSigningMetadataValidation(t *testing.T) {
 		t.Fatal(err)
 	}
 	keyID := evidenceKeyID(public)
+	otherPublic, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
 	tests := []struct {
 		name   string
 		values map[string]string
@@ -271,6 +275,8 @@ func TestEvidenceSigningMetadataValidation(t *testing.T) {
 		{"incomplete", map[string]string{evidenceSigningPrivateKeyMeta: privateEnvelope}, "metadata is incomplete"},
 		{"bad private envelope", map[string]string{evidenceSigningPrivateKeyMeta: "bad", evidenceSigningPublicKeyMeta: publicEncoded, evidenceSigningKeyIDMeta: keyID}, "decrypt evidence signing key"},
 		{"bad private length", map[string]string{evidenceSigningPrivateKeyMeta: mustEncryptForTest(t, box, base64.RawStdEncoding.EncodeToString(make([]byte, 31))), evidenceSigningPublicKeyMeta: publicEncoded, evidenceSigningKeyIDMeta: keyID}, "decode evidence signing key"},
+		{"bad public length", map[string]string{evidenceSigningPrivateKeyMeta: privateEnvelope, evidenceSigningPublicKeyMeta: "bad", evidenceSigningKeyIDMeta: keyID}, "decode evidence signing public key"},
+		{"key pair mismatch", map[string]string{evidenceSigningPrivateKeyMeta: privateEnvelope, evidenceSigningPublicKeyMeta: base64.RawStdEncoding.EncodeToString(otherPublic), evidenceSigningKeyIDMeta: evidenceKeyID(otherPublic)}, "key pair does not match"},
 		{"fingerprint mismatch", map[string]string{evidenceSigningPrivateKeyMeta: privateEnvelope, evidenceSigningPublicKeyMeta: publicEncoded, evidenceSigningKeyIDMeta: "ed25519:bad"}, "fingerprint does not match"},
 	}
 	for _, tc := range tests {

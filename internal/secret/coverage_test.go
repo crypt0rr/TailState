@@ -1,6 +1,7 @@
 package secret
 
 import (
+	"encoding/base64"
 	"strings"
 	"testing"
 )
@@ -51,5 +52,16 @@ func TestNewBoxAndDecryptRejectMalformedCiphertexts(t *testing.T) {
 	tampered := encrypted[:3] + string(replacement) + encrypted[4:]
 	if _, err := box.Decrypt(tampered); err == nil {
 		t.Fatal("tampered ciphertext decrypted")
+	}
+}
+
+func TestBoxRejectsInvalidInternalKey(t *testing.T) {
+	box := &Box{key: make([]byte, 31)}
+	if _, err := box.Encrypt("secret"); err == nil {
+		t.Fatal("Encrypt accepted an invalid internal key")
+	}
+	encoded := base64.RawURLEncoding.EncodeToString(make([]byte, 16))
+	if _, err := box.Decrypt(envelopeVersion + ":" + encoded); err == nil {
+		t.Fatal("Decrypt accepted an invalid internal key")
 	}
 }

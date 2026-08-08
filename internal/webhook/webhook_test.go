@@ -1,6 +1,7 @@
 package webhook
 
 import (
+	"fmt"
 	"net/http"
 	"strings"
 	"testing"
@@ -87,5 +88,33 @@ func TestCollectorsForCoversDocumentedEventFamilies(t *testing.T) {
 	}
 	if got := CollectorsFor(nil); len(got) != 0 {
 		t.Fatalf("empty event list collectors=%v, want empty", got)
+	}
+}
+
+func TestVerifyRejectsMalformedHeadersAndEvents(t *testing.T) {
+	now := time.Unix(1_786_000_000, 0)
+	body := []byte(`[{"type":"nodeCreated"}]`)
+	cases := []struct {
+		name, signature, secret, want string
+	}{
+		{"empty body", "", "secret", "body is empty"},
+		{"missing secret", SignatureForTest(body, "secret", now.Unix()), "", "secret is not configured"},
+		{"missing timestamp", "v1=deadbeef", "secret", "signature is missing"},
+		{"duplicate timestamp", "t=1,t=2,v1=deadbeef", "secret", "duplicate timestamp"},
+		{"bad timestamp", "t=bad,v1=deadbeef", "secret", "timestamp is invalid"},
+		{"future timestamp", SignatureForTest(body, "secret", now.Add(6*time.Minute).Unix()), "secret", "outside the accepted window"},
+		{"bad encoding", "t=" + fmt.Sprint(now.Unix()) + ",v1=not-hex", "secret", "signature is invalid"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := Verify(func() []byte {
+				if tc.name == "empty body" {
+					return nil
+				}
+				return body
+			}(), tc.signature, tc.secret, now); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error=%v, want %q", err, tc.want)
+			}
+		})
 	}
 }

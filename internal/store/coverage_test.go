@@ -262,6 +262,28 @@ func TestCleanupRemovesExpiredOperationalData(t *testing.T) {
 	}
 }
 
+func TestHistoryFormattingHelpers(t *testing.T) {
+	if got := prettyJSON(nil); got != "" {
+		t.Fatalf("prettyJSON(nil)=%q", got)
+	}
+	if got := prettyJSON([]byte(`{"name":"server"}`)); !strings.Contains(got, "\n  \"name\"") {
+		t.Fatalf("prettyJSON valid=%q", got)
+	}
+	if got := prettyJSON([]byte("not-json")); got != "not-json" {
+		t.Fatalf("prettyJSON invalid=%q", got)
+	}
+	fields := formatHistoryFields([]model.FieldChange{{Field: "name", Old: "old", New: nil}, {Field: "count", Old: nil, New: 2}})
+	if len(fields) != 2 || !fields[0].HasOld || fields[0].HasNew || fields[1].HasOld || !fields[1].HasNew {
+		t.Fatalf("formatted fields=%#v", fields)
+	}
+	if parseOptionalTime("") != nil || parseOptionalTime("bad") != nil || parseOptionalTime(time.Now().UTC().Format(time.RFC3339Nano)) == nil {
+		t.Fatal("parseOptionalTime branches incorrect")
+	}
+	if truncate("short", 10) != "short" || !strings.HasSuffix(truncate(strings.Repeat("x", 11), 10), "…") {
+		t.Fatal("truncate branches incorrect")
+	}
+}
+
 func TestSetupAndWebhookConfigurationErrors(t *testing.T) {
 	ctx := context.Background()
 	st := testStore(t)

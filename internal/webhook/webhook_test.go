@@ -118,3 +118,18 @@ func TestVerifyRejectsMalformedHeadersAndEvents(t *testing.T) {
 		})
 	}
 }
+
+func TestVerifyRejectsEmptyAndUntypedEvents(t *testing.T) {
+	now := time.Unix(1_786_000_000, 0)
+	for _, body := range [][]byte{[]byte(`[]`), []byte(`[{"type":"   "}]`)} {
+		signature := SignatureForTest(body, "secret", now.Unix())
+		if _, err := Verify(body, signature, "secret", now); err == nil {
+			t.Fatalf("invalid event body %s was accepted", body)
+		}
+	}
+	valid := []byte(`[{"type":"nodeCreated"}]`)
+	signature := "garbage," + SignatureForTest(valid, "secret", now.Unix())
+	if _, _, err := parseSignature(signature); err != nil {
+		t.Fatalf("signature parser rejected an ignorable segment: %v", err)
+	}
+}

@@ -59,3 +59,12 @@ func TestMattermostDigestOmissionBranches(t *testing.T) {
 		t.Fatalf("field-bounded digest too large: %d", len(got))
 	}
 }
+
+func TestMattermostTransportFailure(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	url := server.URL
+	server.Close()
+	if err := New().Send(context.Background(), url, "message"); err == nil {
+		t.Fatal("closed Mattermost endpoint unexpectedly succeeded")
+	}
+}

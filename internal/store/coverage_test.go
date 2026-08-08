@@ -471,3 +471,518 @@ func TestDestinationUpdatesAndTriggerLeaseBranches(t *testing.T) {
 		t.Fatalf("invalid trigger metadata error=%v", err)
 	}
 }
+
+func TestStatusQueryErrorBranches(t *testing.T) {
+	ctx := context.Background()
+	for _, table := range []string{"snapshots", "collector_state", "outbox", "notification_destinations", "webhook_triggers"} {
+		t.Run(table, func(t *testing.T) {
+			st := testStore(t)
+			if _, err := st.SaveSettings(ctx, settings()); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := st.db.ExecContext(ctx, "DROP TABLE "+table); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := st.Status(ctx); err == nil {
+				t.Fatalf("Status succeeded after dropping %s", table)
+			}
+		})
+	}
+}
+
+func TestCleanupQueryErrorBranches(t *testing.T) {
+	ctx := context.Background()
+	for _, table := range []string{"sessions", "events", "event_batches", "event_batch_triggers", "evidence_ledger", "webhook_triggers", "outbox"} {
+		t.Run(table, func(t *testing.T) {
+			st := testStore(t)
+			if _, err := st.db.ExecContext(ctx, "DROP TABLE "+table); err != nil {
+				t.Fatal(err)
+			}
+			if err := st.Cleanup(ctx, time.Hour); err == nil {
+				t.Fatalf("Cleanup succeeded after dropping %s", table)
+			}
+		})
+	}
+}
+
+func TestDestinationMutationQueryErrorBranches(t *testing.T) {
+	ctx := context.Background()
+	newDestination := func(t *testing.T, st *Store) int64 {
+		t.Helper()
+		id, err := st.SaveDestination(ctx, NotificationDestination{Name: "test", ServiceURL: "generic://example.invalid/path", Enabled: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+
+	t.Run("save destination table", func(t *testing.T) {
+		st := testStore(t)
+		if _, err := st.db.ExecContext(ctx, "DROP TABLE notification_destinations"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.SaveDestination(ctx, NotificationDestination{Name: "test", ServiceURL: "generic://example.invalid/path", Enabled: true}); err == nil {
+			t.Fatal("SaveDestination succeeded without its table")
+		}
+	})
+
+	t.Run("save disabled outbox", func(t *testing.T) {
+		st := testStore(t)
+		if _, err := st.db.ExecContext(ctx, "DROP TABLE outbox"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.SaveDestination(ctx, NotificationDestination{Name: "test", ServiceURL: "generic://example.invalid/path"}); err == nil {
+			t.Fatal("SaveDestination succeeded without outbox")
+		}
+	})
+
+	t.Run("enable destination table", func(t *testing.T) {
+		st := testStore(t)
+		if _, err := st.db.ExecContext(ctx, "DROP TABLE notification_destinations"); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.SetDestinationEnabled(ctx, 1, true); err == nil {
+			t.Fatal("SetDestinationEnabled succeeded without its table")
+		}
+	})
+
+	t.Run("disable destination outbox", func(t *testing.T) {
+		st := testStore(t)
+		id := newDestination(t, st)
+		if _, err := st.db.ExecContext(ctx, "DROP TABLE outbox"); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.SetDestinationEnabled(ctx, id, false); err == nil {
+			t.Fatal("SetDestinationEnabled succeeded without outbox")
+		}
+	})
+
+	t.Run("delete destination table", func(t *testing.T) {
+		st := testStore(t)
+		if _, err := st.db.ExecContext(ctx, "DROP TABLE notification_destinations"); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.DeleteDestination(ctx, 1); err == nil {
+			t.Fatal("DeleteDestination succeeded without its table")
+		}
+	})
+
+	t.Run("delete destination outbox", func(t *testing.T) {
+		st := testStore(t)
+		id := newDestination(t, st)
+		if _, err := st.db.ExecContext(ctx, "DROP TABLE outbox"); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.DeleteDestination(ctx, id); err == nil {
+			t.Fatal("DeleteDestination succeeded without outbox")
+		}
+	})
+}
+
+func TestTrackAppVersionQueryErrorBranches(t *testing.T) {
+	ctx := context.Background()
+	t.Run("meta table", func(t *testing.T) {
+		st := testStore(t)
+		if _, err := st.db.ExecContext(ctx, "DROP TABLE meta"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.TrackAppVersion(ctx, "1.0.0", nil); err == nil {
+			t.Fatal("TrackAppVersion succeeded without meta")
+		}
+	})
+
+	newVersionStore := func(t *testing.T) *Store {
+		t.Helper()
+		st := testStore(t)
+		if _, err := st.SaveSettings(ctx, settings()); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.TrackAppVersion(ctx, "1.0.0", nil); err != nil {
+			t.Fatal(err)
+		}
+		return st
+	}
+	t.Run("settings query", func(t *testing.T) {
+		st := newVersionStore(t)
+		if _, err := st.db.ExecContext(ctx, "DROP TABLE settings"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.TrackAppVersion(ctx, "1.1.0", nil); err == nil {
+			t.Fatal("TrackAppVersion succeeded without settings")
+		}
+	})
+	t.Run("destination query", func(t *testing.T) {
+		st := newVersionStore(t)
+		if _, err := st.db.ExecContext(ctx, "DROP TABLE notification_destinations"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.TrackAppVersion(ctx, "1.1.0", nil); err == nil {
+			t.Fatal("TrackAppVersion succeeded without destinations")
+		}
+	})
+	t.Run("outbox query", func(t *testing.T) {
+		st := newVersionStore(t)
+		if _, err := st.db.ExecContext(ctx, "DROP TABLE outbox"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.TrackAppVersion(ctx, "1.1.0", func(string, string) string { return "version changed" }); err == nil {
+			t.Fatal("TrackAppVersion succeeded without outbox")
+		}
+	})
+}
+
+func TestWebhookTriggerCollectorMetadataError(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	bodyHash := strings.Repeat("a", 64)
+	if _, _, err := st.RecordWebhookTrigger(ctx, bodyHash, []string{"policyUpdate"}, []string{"policy"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.db.ExecContext(ctx, "UPDATE webhook_triggers SET collectors_json='invalid-json' WHERE body_hash=?", bodyHash); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := st.RecordWebhookTrigger(ctx, bodyHash, nil, nil); err == nil || !strings.Contains(err.Error(), "decode webhook collector metadata") {
+		t.Fatalf("collector metadata error=%v", err)
+	}
+}
+
+func storeWithHistoryBatch(t *testing.T) (*Store, int64) {
+	t.Helper()
+	ctx := context.Background()
+	st := testStore(t)
+	generation, err := st.SaveSettings(ctx, settings())
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseline := []model.Collected{{Collector: "devices", Resources: []model.Resource{{
+		ID: "device-1", Type: "device", Name: "server", Data: map[string]any{"hostname": "server"},
+	}}}}
+	if _, err := st.ApplyBatch(ctx, generation, baseline, func([]model.Change) string { return "baseline" }); err != nil {
+		t.Fatal(err)
+	}
+	changed := []model.Collected{{Collector: "devices", Resources: []model.Resource{{
+		ID: "device-1", Type: "device", Name: "server-new", Data: map[string]any{"hostname": "server-new"},
+	}}}}
+	batch, err := st.ApplyBatchWithBatch(ctx, generation, changed, func([]model.Change) string { return "changed" })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if batch.ID == 0 {
+		t.Fatal("changed batch did not create history")
+	}
+	return st, batch.ID
+}
+
+func TestHistoryLoaderQueryErrorBranches(t *testing.T) {
+	ctx := context.Background()
+	for _, table := range []string{"event_batch_triggers", "evidence_ledger", "events", "outbox"} {
+		t.Run(table, func(t *testing.T) {
+			st, _ := storeWithHistoryBatch(t)
+			if _, err := st.db.ExecContext(ctx, "DROP TABLE "+table); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := st.ListHistory(ctx, HistoryFilter{}); err == nil {
+				t.Fatalf("ListHistory succeeded after dropping %s", table)
+			}
+		})
+	}
+
+	t.Run("malformed fields", func(t *testing.T) {
+		st, batchID := storeWithHistoryBatch(t)
+		if _, err := st.db.ExecContext(ctx, "UPDATE events SET changes_json='invalid-json' WHERE batch_id=?", batchID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.ListHistory(ctx, HistoryFilter{}); err == nil || !strings.Contains(err.Error(), "decode history fields") {
+			t.Fatalf("malformed history fields error=%v", err)
+		}
+	})
+}
+
+func TestSettingsEncryptionErrorBranches(t *testing.T) {
+	ctx := context.Background()
+	tests := []struct {
+		name  string
+		field string
+		value string
+	}{
+		{name: "oauth secret", field: "oauth_secret_enc", value: "invalid-envelope"},
+		{name: "mattermost URL", field: "mattermost_url_enc", value: "invalid-envelope"},
+		{name: "webhook secret", field: "webhook_secret_enc", value: "invalid-envelope"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			st := testStore(t)
+			input := settings()
+			input.WebhookSecret = "webhook-secret"
+			if _, err := st.SaveSettings(ctx, input); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := st.db.ExecContext(ctx, "UPDATE settings SET "+tt.field+"=?", tt.value); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := st.Settings(ctx); err == nil {
+				t.Fatalf("Settings accepted a corrupt %s", tt.name)
+			}
+		})
+	}
+
+	t.Run("save existing secret", func(t *testing.T) {
+		st := testStore(t)
+		if _, err := st.SaveSettings(ctx, settings()); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.db.ExecContext(ctx, "UPDATE settings SET oauth_secret_enc='invalid-envelope'"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.SaveSettings(ctx, settings()); err == nil {
+			t.Fatal("SaveSettings accepted a corrupt existing secret")
+		}
+	})
+
+	t.Run("missing settings table", func(t *testing.T) {
+		st := testStore(t)
+		if _, err := st.db.ExecContext(ctx, "DROP TABLE settings"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.SaveSettings(ctx, settings()); err == nil {
+			t.Fatal("SaveSettings succeeded without settings table")
+		}
+	})
+
+	for _, table := range []string{"snapshots", "collector_state"} {
+		t.Run("generation cleanup "+table, func(t *testing.T) {
+			st := testStore(t)
+			if _, err := st.SaveSettings(ctx, settings()); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := st.db.ExecContext(ctx, "DROP TABLE "+table); err != nil {
+				t.Fatal(err)
+			}
+			changed := settings()
+			changed.OAuthClientID = "changed-client"
+			if _, err := st.SaveSettings(ctx, changed); err == nil {
+				t.Fatalf("SaveSettings succeeded after dropping %s", table)
+			}
+		})
+	}
+}
+
+func setupCoverageAdmin(t *testing.T, st *Store) {
+	t.Helper()
+	ctx := context.Background()
+	token, err := st.NewSetupToken(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Claim(ctx, token, "a secure password"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAuthenticationTransactionErrorBranches(t *testing.T) {
+	ctx := context.Background()
+	t.Run("new setup token meta table", func(t *testing.T) {
+		st := testStore(t)
+		if _, err := st.db.ExecContext(ctx, "DROP TABLE meta"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.NewSetupToken(ctx); err == nil {
+			t.Fatal("NewSetupToken succeeded without meta")
+		}
+	})
+
+	t.Run("reset password admin table", func(t *testing.T) {
+		st := testStore(t)
+		if _, err := st.db.ExecContext(ctx, "DROP TABLE admin"); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.ResetPassword(ctx, "a secure password"); err == nil {
+			t.Fatal("ResetPassword succeeded without admin")
+		}
+	})
+
+	t.Run("reset password sessions table", func(t *testing.T) {
+		st := testStore(t)
+		setupCoverageAdmin(t, st)
+		if _, err := st.db.ExecContext(ctx, "DROP TABLE sessions"); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.ResetPassword(ctx, "new secure password"); err == nil {
+			t.Fatal("ResetPassword succeeded without sessions")
+		}
+	})
+
+	t.Run("reset with token admin table", func(t *testing.T) {
+		st := testStore(t)
+		setupCoverageAdmin(t, st)
+		token, err := st.NewResetToken(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.db.ExecContext(ctx, "DROP TABLE admin"); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.ResetWithToken(ctx, token, "new secure password"); err == nil {
+			t.Fatal("ResetWithToken succeeded without admin")
+		}
+	})
+
+	t.Run("reset with token sessions table", func(t *testing.T) {
+		st := testStore(t)
+		setupCoverageAdmin(t, st)
+		token, err := st.NewResetToken(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.db.ExecContext(ctx, "DROP TABLE sessions"); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.ResetWithToken(ctx, token, "new secure password"); err == nil {
+			t.Fatal("ResetWithToken succeeded without sessions")
+		}
+	})
+
+	t.Run("reset token delete trigger", func(t *testing.T) {
+		st := testStore(t)
+		setupCoverageAdmin(t, st)
+		token, err := st.NewResetToken(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.db.ExecContext(ctx, `CREATE TRIGGER fail_reset_token_delete BEFORE DELETE ON meta WHEN OLD.key='reset_token_hash' BEGIN SELECT RAISE(ABORT,'reset token delete failed'); END`); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.ResetWithToken(ctx, token, "new secure password"); err == nil {
+			t.Fatal("ResetWithToken ignored the meta delete failure")
+		}
+	})
+
+	t.Run("create session table", func(t *testing.T) {
+		st := testStore(t)
+		if _, err := st.db.ExecContext(ctx, "DROP TABLE sessions"); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := st.CreateSession(ctx); err == nil {
+			t.Fatal("CreateSession succeeded without sessions")
+		}
+	})
+
+	t.Run("invalid csrf", func(t *testing.T) {
+		st := testStore(t)
+		token, csrf, err := st.CreateSession(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if st.ValidateSession(ctx, token, "wrong", true) {
+			t.Fatal("ValidateSession accepted an invalid CSRF token")
+		}
+		if !st.ValidateSession(ctx, token, csrf, false) {
+			t.Fatal("ValidateSession rejected a session without CSRF enforcement")
+		}
+	})
+}
+
+func configuredCoverageStore(t *testing.T) (*Store, int64) {
+	t.Helper()
+	st := testStore(t)
+	generation, err := st.SaveSettings(context.Background(), settings())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return st, generation
+}
+
+func TestApplyBatchTransactionErrorBranches(t *testing.T) {
+	ctx := context.Background()
+	t.Run("settings query", func(t *testing.T) {
+		st := testStore(t)
+		if _, err := st.db.ExecContext(ctx, "DROP TABLE settings"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.ApplyBatchWithBatch(ctx, 1, nil, func([]model.Change) string { return "digest" }); err == nil {
+			t.Fatal("ApplyBatchWithBatch succeeded without settings")
+		}
+	})
+
+	t.Run("unsupported collector state", func(t *testing.T) {
+		st, generation := configuredCoverageStore(t)
+		if _, err := st.db.ExecContext(ctx, `CREATE TRIGGER fail_unsupported_collector BEFORE INSERT ON collector_state WHEN NEW.supported=0 BEGIN SELECT RAISE(ABORT,'unsupported collector state failed'); END`); err != nil {
+			t.Fatal(err)
+		}
+		unsupported := []model.Collected{{Collector: "log_streaming", Unsupported: true}}
+		if _, err := st.ApplyBatchWithBatch(ctx, generation, unsupported, func([]model.Change) string { return "digest" }); err == nil {
+			t.Fatal("unsupported collector state write unexpectedly succeeded")
+		}
+	})
+
+	t.Run("canonicalization error", func(t *testing.T) {
+		st, generation := configuredCoverageStore(t)
+		bad := []model.Collected{{Collector: "devices", Resources: []model.Resource{{ID: "bad", Type: "device", Name: "bad", Data: map[string]any{"hostname": make(chan int)}}}}}
+		if _, err := st.ApplyBatchWithBatch(ctx, generation, bad, func([]model.Change) string { return "digest" }); err == nil {
+			t.Fatal("unsupported resource data was accepted")
+		}
+	})
+
+	t.Run("snapshots query", func(t *testing.T) {
+		st, generation := configuredCoverageStore(t)
+		if _, err := st.db.ExecContext(ctx, "DROP TABLE snapshots"); err != nil {
+			t.Fatal(err)
+		}
+		empty := []model.Collected{{Collector: "devices"}}
+		if _, err := st.ApplyBatchWithBatch(ctx, generation, empty, func([]model.Change) string { return "digest" }); err == nil {
+			t.Fatal("ApplyBatchWithBatch succeeded without snapshots")
+		}
+	})
+
+	tests := []struct {
+		name  string
+		table string
+		want  string
+	}{
+		{name: "event batch insert", table: "event_batches", want: "event batch insert failed"},
+		{name: "outbox insert", table: "outbox", want: "outbox insert failed"},
+		{name: "evidence ledger", table: "evidence_ledger", want: "evidence ledger"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			st, generation := configuredCoverageStore(t)
+			if tt.table == "event_batches" {
+				if _, err := st.db.ExecContext(ctx, `CREATE TRIGGER fail_event_batch BEFORE INSERT ON event_batches BEGIN SELECT RAISE(ABORT,'event batch insert failed'); END`); err != nil {
+					t.Fatal(err)
+				}
+			} else if _, err := st.db.ExecContext(ctx, "DROP TABLE "+tt.table); err != nil {
+				t.Fatal(err)
+			}
+			baseline := []model.Collected{{Collector: "devices", Resources: []model.Resource{{ID: "device-1", Type: "device", Name: "server", Data: map[string]any{"hostname": "server"}}}}}
+			if _, err := st.ApplyBatch(ctx, generation, baseline, func([]model.Change) string { return "baseline" }); err != nil && tt.table != "evidence_ledger" {
+				// The event batch and outbox cases should fail only on the changed write;
+				// the evidence-ledger case also fails during the baseline backfill.
+				t.Fatal(err)
+			}
+			changed := []model.Collected{{Collector: "devices", Resources: []model.Resource{{ID: "device-1", Type: "device", Name: "changed", Data: map[string]any{"hostname": "changed"}}}}}
+			if _, err := st.ApplyBatchWithBatch(ctx, generation, changed, func([]model.Change) string { return "changed" }); err == nil {
+				t.Fatalf("ApplyBatchWithBatch succeeded with broken %s", tt.table)
+			}
+		})
+	}
+}
+
+func TestDestinationDecryptionErrorBranches(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	if _, err := st.SaveSettings(ctx, settings()); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.EnqueueSystem(ctx, "payload"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.db.ExecContext(ctx, "UPDATE notification_destinations SET service_url_enc='invalid-envelope'"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.ListDestinations(ctx); err == nil {
+		t.Fatal("ListDestinations accepted a corrupt encrypted URL")
+	}
+	if _, err := st.DueOutbox(ctx, 10); err == nil {
+		t.Fatal("DueOutbox accepted a corrupt encrypted URL")
+	}
+}

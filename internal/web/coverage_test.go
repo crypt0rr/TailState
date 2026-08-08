@@ -3,6 +3,7 @@ package web
 import (
 	"context"
 	"errors"
+	"html/template"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -534,4 +535,11 @@ func TestWebAdditionalErrorAndMetricsBranches(t *testing.T) {
 	if unavailable.Code != http.StatusNotFound {
 		t.Fatalf("closed-store webhook status=%d body=%s", unavailable.Code, unavailable.Body.String())
 	}
+}
+
+func TestRenderTemplateError(t *testing.T) {
+	server, _, _ := testServer(t)
+	server.templates["status"] = template.Must(template.New("status").Option("missingkey=error").Parse("{{.MissingField}}"))
+	rendered := httptest.NewRecorder()
+	server.render(rendered, "status", pageData{})
 }

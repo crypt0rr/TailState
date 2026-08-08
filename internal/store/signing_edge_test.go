@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 
@@ -312,6 +313,37 @@ func TestEvidenceLedgerOperationalErrors(t *testing.T) {
 	}
 	if _, _, err := evidenceLedgerPayload(context.Background(), db, 1); err == nil {
 		t.Fatal("evidenceLedgerPayload succeeded without event batch storage")
+	}
+}
+
+func TestEvidenceLedgerHeadOperationalErrors(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	if _, err := st.db.ExecContext(ctx, "DROP TABLE evidence_ledger"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.evidenceLedgerHead(ctx); err == nil {
+		t.Fatal("evidenceLedgerHead succeeded without its table")
+	}
+	tx, err := st.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	if _, err := ledgerHeadTx(ctx, tx); err == nil {
+		t.Fatal("ledgerHeadTx succeeded without its table")
+	}
+}
+
+type failingWebhookTriggerScanner struct{}
+
+func (failingWebhookTriggerScanner) Scan(...any) error {
+	return errors.New("scan failed")
+}
+
+func TestWebhookTriggerScannerErrors(t *testing.T) {
+	if _, err := readWebhookTrigger(failingWebhookTriggerScanner{}); err == nil {
+		t.Fatal("readWebhookTrigger accepted a failing scanner")
 	}
 }
 

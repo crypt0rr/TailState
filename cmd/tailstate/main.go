@@ -82,6 +82,12 @@ func load() (boot.Config, *store.Store, error) {
 }
 
 func serve() error {
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	return serveContext(ctx)
+}
+
+func serveContext(ctx context.Context) error {
 	config, st, err := load()
 	if err != nil {
 		return err
@@ -92,8 +98,6 @@ func serve() error {
 		level = slog.LevelDebug
 	}
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: level})))
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	exists, err := st.AdminExists(ctx)

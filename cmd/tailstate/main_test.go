@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/crypt0rr/tailstate/internal/store"
 )
@@ -81,6 +82,17 @@ func TestMainAndServeRejectInvalidConfiguration(t *testing.T) {
 	}
 	if err := serve(); err == nil || !strings.Contains(err.Error(), "master key") {
 		t.Fatalf("direct serve with invalid configuration error=%v", err)
+	}
+}
+
+func TestServeContextCompletesWhenCanceled(t *testing.T) {
+	configureCommandEnvironment(t, t.TempDir())
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	timer := time.AfterFunc(500*time.Millisecond, cancel)
+	t.Cleanup(func() { timer.Stop() })
+	if err := serveContext(ctx); err != nil {
+		t.Fatalf("serveContext returned error: %v", err)
 	}
 }
 

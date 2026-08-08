@@ -2,6 +2,7 @@ package web
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -14,6 +15,11 @@ import (
 	"github.com/crypt0rr/tailstate/internal/store"
 	"github.com/crypt0rr/tailstate/internal/webhook"
 )
+
+type webFailingBody struct{}
+
+func (webFailingBody) Read([]byte) (int, error) { return 0, errors.New("body read failed") }
+func (webFailingBody) Close() error             { return nil }
 
 func claimCoverageAdmin(t *testing.T, server *Server, token string) []*http.Cookie {
 	t.Helper()
@@ -477,5 +483,53 @@ func TestServeShutdownAndConfiguredHome(t *testing.T) {
 	cancel()
 	if err := server.Serve(ctx); err != nil {
 		t.Fatalf("pre-canceled server shutdown error=%v", err)
+	}
+}
+
+func TestWebAdditionalErrorAndMetricsBranches(t *testing.T) {
+	server, st, setupToken := testServer(t)
+	claimCoverageAdmin(t, server, setupToken)
+	unauthHome := httptest.NewRecorder()
+	server.Handler().ServeHTTP(unauthHome, httptest.NewRequest(http.MethodGet, "/", nil))
+	if unauthHome.Code != http.StatusSeeOther || unauthHome.Header().Get("Location") != "/login" {
+		t.Fatalf("unauthenticated home status=%d location=%q", unauthHome.Code, unauthHome.Header().Get("Location"))
+	}
+	loginPage := httptest.NewRecorder()
+	server.Handler().ServeHTTP(loginPage, httptest.NewRequest(http.MethodGet, "/login", nil))
+	if loginPage.Code != http.StatusOK || !strings.Contains(loginPage.Body.String(), "Sign in") {
+		t.Fatalf("login page status=%d body=%s", loginPage.Code, loginPage.Body.String())
+	}
+	if _, err := st.SaveSettings(context.Background(), store.Settings{Tailnet: "-", OAuthClientID: "client", OAuthClientSecret: "secret", WebhookSecret: "webhook-secret", MattermostURL: "https://mattermost.example/hooks/token", DeviceInterval: time.Minute, InventoryInterval: 5 * time.Minute}); err != nil {
+		t.Fatal(err)
+	}
+	settings, err := st.Settings(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.SetNextPoll(context.Background(), settings.Generation, []string{"devices"}, time.Now().Add(time.Minute))
+	metrics := httptest.NewRecorder()
+	server.Handler().ServeHTTP(metrics, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	if !strings.Contains(metrics.Body.String(), "tailstate_collector_next_poll_timestamp_seconds") {
+		t.Fatal("next-poll metric missing")
+	}
+	invalidServer := *server
+	invalidServer.config.ListenAddr = "bad"
+	if err := invalidServer.Serve(context.Background()); err == nil {
+		t.Fatal("invalid listen address unexpectedly succeeded")
+	}
+	webhookBody := httptest.NewRequest(http.MethodPost, "/webhooks/tailscale", nil)
+	webhookBody.Body = webFailingBody{}
+	webhookResponse := httptest.NewRecorder()
+	server.tailscaleWebhook(webhookResponse, webhookBody)
+	if webhookResponse.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("failing webhook body status=%d body=%s", webhookResponse.Code, webhookResponse.Body.String())
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	unavailable := httptest.NewRecorder()
+	server.tailscaleWebhook(unavailable, httptest.NewRequest(http.MethodPost, "/webhooks/tailscale", strings.NewReader("[]")))
+	if unavailable.Code != http.StatusNotFound {
+		t.Fatalf("closed-store webhook status=%d body=%s", unavailable.Code, unavailable.Body.String())
 	}
 }

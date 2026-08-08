@@ -46,6 +46,9 @@ func TestConfigDatabasePathAndMasterKeyFormats(t *testing.T) {
 }
 
 func TestLoadRejectsCookieAndEndpointEdgeCases(t *testing.T) {
+	if err := validateEndpoint("test", "ftp://example.com"); err == nil || !strings.Contains(err.Error(), "http or https") {
+		t.Fatalf("non-http endpoint error=%v", err)
+	}
 	t.Setenv("TAILSTATE_COOKIE_SECURE", "maybe")
 	if _, err := Load("test"); err == nil || !strings.Contains(err.Error(), "COOKIE_SECURE") {
 		t.Fatalf("invalid cookie secure setting error=%v", err)

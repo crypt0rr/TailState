@@ -728,3 +728,134 @@ func TestWebCSRFAndFormBoundaryBranches(t *testing.T) {
 		t.Fatal("stale login attempts were not pruned")
 	}
 }
+
+func TestWebOperationalFailureBranches(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("history export database error", func(t *testing.T) {
+		server, _, db, cookies := webServerWithDatabase(t)
+		if _, err := db.ExecContext(ctx, "DROP TABLE event_batches"); err != nil {
+			t.Fatal(err)
+		}
+		request := httptest.NewRequest(http.MethodGet, "/history/export", nil)
+		for _, cookie := range cookies {
+			request.AddCookie(cookie)
+		}
+		response := httptest.NewRecorder()
+		server.Handler().ServeHTTP(response, request)
+		if response.Code != http.StatusInternalServerError || !strings.Contains(response.Body.String(), "export history") {
+			t.Fatalf("history export failure status=%d body=%s", response.Code, response.Body.String())
+		}
+	})
+
+	t.Run("history export size limit", func(t *testing.T) {
+		server, st, db, cookies := webServerWithDatabase(t)
+		defer st.Close()
+		now := time.Now().UTC().Format(time.RFC3339Nano)
+		result, err := db.ExecContext(ctx, "INSERT INTO event_batches(generation,observed_at,change_count,created_at) VALUES(1,?,?,?)", now, 1, now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		batchID, err := result.LastInsertId()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.ExecContext(ctx, "INSERT INTO events(batch_id,generation,observed_at,collector,event_type,resource_id,name,changes_json,after_json) VALUES(?,1,?,'devices','changed','device-large','server','[]',?)", batchID, now, strings.Repeat("x", 6<<20)); err != nil {
+			t.Fatal(err)
+		}
+		request := httptest.NewRequest(http.MethodGet, "/history/export", nil)
+		for _, cookie := range cookies {
+			request.AddCookie(cookie)
+		}
+		response := httptest.NewRecorder()
+		server.Handler().ServeHTTP(response, request)
+		if response.Code != http.StatusRequestEntityTooLarge || !strings.Contains(response.Body.String(), "history export is too large") {
+			t.Fatalf("history export size status=%d body=%s", response.Code, response.Body.String())
+		}
+	})
+
+	t.Run("history pagination", func(t *testing.T) {
+		server, st, db, cookies := webServerWithDatabase(t)
+		defer st.Close()
+		now := time.Now().UTC().Format(time.RFC3339Nano)
+		for i := 0; i < 21; i++ {
+			result, err := db.ExecContext(ctx, "INSERT INTO event_batches(generation,observed_at,change_count,created_at) VALUES(1,?,?,?)", now, 1, now)
+			if err != nil {
+				t.Fatal(err)
+			}
+			batchID, err := result.LastInsertId()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.ExecContext(ctx, "INSERT INTO events(batch_id,generation,observed_at,collector,event_type,resource_id,name,changes_json) VALUES(?,1,?,'devices','changed',?,?,?)", batchID, now, "device-"+strconv.Itoa(i), "server", "[]"); err != nil {
+				t.Fatal(err)
+			}
+		}
+		request := httptest.NewRequest(http.MethodGet, "/history", nil)
+		for _, cookie := range cookies {
+			request.AddCookie(cookie)
+		}
+		response := httptest.NewRecorder()
+		server.Handler().ServeHTTP(response, request)
+		if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "Load older changes") {
+			t.Fatalf("history pagination status=%d body=%s", response.Code, response.Body.String())
+		}
+	})
+
+	t.Run("login session creation failure", func(t *testing.T) {
+		server, st, db, _ := webServerWithDatabase(t)
+		defer st.Close()
+		if _, err := db.ExecContext(ctx, "DROP TABLE sessions"); err != nil {
+			t.Fatal(err)
+		}
+		response := coveragePost(t, server, "/login", url.Values{"password": {"a secure password"}}, nil)
+		if response.Code != http.StatusInternalServerError || !strings.Contains(response.Body.String(), "create session") {
+			t.Fatalf("login session failure status=%d body=%s", response.Code, response.Body.String())
+		}
+	})
+
+	t.Run("claim session creation failure", func(t *testing.T) {
+		box, err := secret.NewBox(make([]byte, 32))
+		if err != nil {
+			t.Fatal(err)
+		}
+		path := filepath.Join(t.TempDir(), "tailstate.db")
+		st, err := store.Open(path, box)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer st.Close()
+		config := boot.Config{ListenAddr: "127.0.0.1:0", TailscaleBase: "http://example.invalid", OAuthTokenURL: "http://example.invalid/oauth", Version: "test"}
+		server, err := New(config, st, monitor.New(st, config.TailscaleBase, config.OAuthTokenURL, config.Version))
+		if err != nil {
+			t.Fatal(err)
+		}
+		db, err := sql.Open("sqlite", "file:"+path+"?_pragma=busy_timeout(5000)")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer db.Close()
+		if _, err := db.ExecContext(ctx, `CREATE TRIGGER fail_claim_session BEFORE INSERT ON sessions
+			BEGIN SELECT RAISE(ABORT,'claim session insert failed'); END`); err != nil {
+			t.Fatal(err)
+		}
+		token, err := st.NewSetupToken(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		response := coveragePost(t, server, "/setup/claim", url.Values{"token": {token}, "password": {"a secure password"}, "confirm": {"a secure password"}}, nil)
+		if response.Code != http.StatusInternalServerError || !strings.Contains(response.Body.String(), "create session") {
+			t.Fatalf("claim session failure status=%d body=%s", response.Code, response.Body.String())
+		}
+	})
+
+	server, st, _, _ := webServerWithDatabase(t)
+	defer st.Close()
+	server.loginAttempts["recent"] = []time.Time{time.Now()}
+	if server.rateLimited("recent") {
+		t.Fatal("a single recent login attempt was rate limited")
+	}
+	if len(server.loginAttempts["recent"]) != 1 {
+		t.Fatal("recent login attempt was pruned")
+	}
+}

@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"database/sql"
 	"encoding/base64"
 	"net/http"
 	"net/http/httptest"
@@ -13,6 +15,16 @@ import (
 
 	"github.com/crypt0rr/tailstate/internal/store"
 )
+
+func commandDB(t *testing.T, dataDir string) *sql.DB {
+	t.Helper()
+	db, err := sql.Open("sqlite", "file:"+filepath.Join(dataDir, "tailstate.db")+"?_pragma=busy_timeout(5000)")
+	if err != nil {
+		t.Fatalf("open command database: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	return db
+}
 
 func configureCommandEnvironment(t *testing.T, dataDir string) string {
 	t.Helper()
@@ -168,6 +180,117 @@ func TestLoadRejectsMissingMasterKey(t *testing.T) {
 	t.Setenv("TAILSTATE_COOKIE_SECURE", "false")
 	if _, _, err := load(); err == nil || !strings.Contains(err.Error(), "master key") {
 		t.Fatalf("missing master key error=%v", err)
+	}
+}
+
+func TestLoadRejectsMalformedMasterKeyAndStorePath(t *testing.T) {
+	dataDir := t.TempDir()
+	keyPath := configureCommandEnvironment(t, dataDir)
+	if err := os.WriteFile(keyPath, []byte("short"), 0o600); err != nil {
+		t.Fatalf("write malformed key: %v", err)
+	}
+	if _, _, err := load(); err == nil || !strings.Contains(err.Error(), "master key must be exactly 32 bytes") {
+		t.Fatalf("load with malformed key error = %v", err)
+	}
+
+	dataFile := filepath.Join(t.TempDir(), "not-a-directory")
+	if err := os.WriteFile(dataFile, []byte("not a directory"), 0o600); err != nil {
+		t.Fatalf("write data path: %v", err)
+	}
+	validKeyPath := filepath.Join(t.TempDir(), "master.key")
+	validKey := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0x42}, 32))
+	if err := os.WriteFile(validKeyPath, []byte(validKey), 0o600); err != nil {
+		t.Fatalf("write valid key: %v", err)
+	}
+	t.Setenv("TAILSTATE_DATA_DIR", dataFile)
+	t.Setenv("TAILSTATE_MASTER_KEY_FILE", validKeyPath)
+	if _, _, err := load(); err == nil {
+		t.Fatal("load with a file as data directory succeeded")
+	}
+}
+
+func TestAdminResetReportsStoreError(t *testing.T) {
+	dataDir := t.TempDir()
+	configureCommandEnvironment(t, dataDir)
+	_, st, err := load()
+	if err != nil {
+		t.Fatalf("initialize store: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+	db := commandDB(t, dataDir)
+	if _, err := db.Exec(`CREATE TRIGGER fail_reset_token BEFORE INSERT ON meta
+		WHEN NEW.key = 'reset_token_hash'
+		BEGIN SELECT RAISE(ABORT, 'reset token insert failed'); END`); err != nil {
+		t.Fatalf("create reset trigger: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close trigger database: %v", err)
+	}
+	if err := adminReset(); err == nil || !strings.Contains(err.Error(), "reset token insert failed") {
+		t.Fatalf("adminReset error = %v", err)
+	}
+}
+
+func TestServeContextReportsSetupTokenError(t *testing.T) {
+	dataDir := t.TempDir()
+	configureCommandEnvironment(t, dataDir)
+	_, st, err := load()
+	if err != nil {
+		t.Fatalf("initialize store: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+	db := commandDB(t, dataDir)
+	if _, err := db.Exec(`DROP TABLE admin`); err != nil {
+		t.Fatalf("drop admin table: %v", err)
+	}
+	if _, err := db.Exec(`CREATE TRIGGER fail_setup_token BEFORE INSERT ON meta
+		WHEN NEW.key = 'setup_token_hash'
+		BEGIN SELECT RAISE(ABORT, 'setup token insert failed'); END`); err != nil {
+		t.Fatalf("create setup trigger: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close trigger database: %v", err)
+	}
+	if err := serveContext(context.Background()); err == nil || !strings.Contains(err.Error(), "setup token insert failed") {
+		t.Fatalf("serveContext error = %v", err)
+	}
+}
+
+func TestServeContextReportsVersionTrackingError(t *testing.T) {
+	previousVersion := version
+	version = "test"
+	t.Cleanup(func() { version = previousVersion })
+	dataDir := t.TempDir()
+	configureCommandEnvironment(t, dataDir)
+	_, st, err := load()
+	if err != nil {
+		t.Fatalf("initialize store: %v", err)
+	}
+	setupToken, err := st.NewSetupToken(context.Background())
+	if err != nil {
+		t.Fatalf("create setup token: %v", err)
+	}
+	if err := st.Claim(context.Background(), setupToken, "a sufficiently strong test password"); err != nil {
+		t.Fatalf("claim setup token: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+	db := commandDB(t, dataDir)
+	if _, err := db.Exec(`CREATE TRIGGER fail_app_version BEFORE INSERT ON meta
+		WHEN NEW.key = 'app_version'
+		BEGIN SELECT RAISE(ABORT, 'app version insert failed'); END`); err != nil {
+		t.Fatalf("create version trigger: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close trigger database: %v", err)
+	}
+	if err := serveContext(context.Background()); err == nil || !strings.Contains(err.Error(), "app version insert failed") {
+		t.Fatalf("serveContext error = %v", err)
 	}
 }
 

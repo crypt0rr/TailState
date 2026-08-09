@@ -277,6 +277,9 @@ func TestHistoryFormattingHelpers(t *testing.T) {
 	if len(fields) != 2 || !fields[0].HasOld || fields[0].HasNew || fields[1].HasOld || !fields[1].HasNew {
 		t.Fatalf("formatted fields=%#v", fields)
 	}
+	if got := prettyValue(func() {}); got == "" {
+		t.Fatal("prettyValue fallback returned an empty string")
+	}
 	if parseOptionalTime("") != nil || parseOptionalTime("bad") != nil || parseOptionalTime(time.Now().UTC().Format(time.RFC3339Nano)) == nil {
 		t.Fatal("parseOptionalTime branches incorrect")
 	}

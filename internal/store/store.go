@@ -200,6 +200,13 @@ func Open(path string, box *secret.Box) (*Store, error) {
 		db.Close()
 		return nil, err
 	}
+	// The due index depends on columns introduced by the v4-to-v5 migration.
+	// Keep it out of the bootstrap DDL so historical v4 databases can reach
+	// that migration before the index is created.
+	if _, err := db.Exec("CREATE INDEX IF NOT EXISTS webhook_triggers_due ON webhook_triggers(status, next_attempt_at, id)"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("create webhook trigger due index: %w", err)
+	}
 	if _, err := db.Exec("CREATE INDEX IF NOT EXISTS events_batch_id ON events(batch_id, id)"); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("create event history index: %w", err)

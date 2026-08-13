@@ -97,7 +97,6 @@ CREATE TABLE IF NOT EXISTS webhook_triggers (
   processed_at TEXT
 );
 CREATE INDEX IF NOT EXISTS webhook_triggers_received_at ON webhook_triggers(received_at DESC, id DESC);
-CREATE INDEX IF NOT EXISTS webhook_triggers_due ON webhook_triggers(status, next_attempt_at, id);
 CREATE TABLE IF NOT EXISTS events (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   batch_id INTEGER,

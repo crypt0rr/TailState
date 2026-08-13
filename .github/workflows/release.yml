@@ -48,33 +48,75 @@ jobs:
             org.opencontainers.image.title=TailState
             org.opencontainers.image.description=Read-only Tailscale inventory drift monitoring with signed evidence
             org.opencontainers.image.licenses=MIT
-      - name: Build release candidate
+      - name: Build and push immutable release candidate
+        id: candidate
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
-        with:
-          context: .
-          load: true
-          tags: tailstate:release-candidate
-          build-args: VERSION=${{ steps.meta.outputs.version }}
-          provenance: false
-          sbom: false
-      - name: Scan release candidate
-        uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7.4.0
-        with:
-          image: tailstate:release-candidate
-          fail-build: true
-          severity-cutoff: high
-      - name: Runtime smoke test
-        run: bash scripts/container-smoke.sh tailstate:release-candidate 18081
-      - uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
           push: true
           platforms: linux/amd64,linux/arm64
-          tags: ${{ steps.meta.outputs.tags }}
+          tags: ghcr.io/${{ github.repository }}:release-candidate-${{ github.sha }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: VERSION=${{ steps.meta.outputs.version }}
           provenance: mode=max
           sbom: true
+      - name: Verify release candidate manifest
+        env:
+          CANDIDATE_IMAGE: ghcr.io/${{ github.repository }}:release-candidate-${{ github.sha }}
+          CANDIDATE_DIGEST: ${{ steps.candidate.outputs.digest }}
+        run: |
+          set -euo pipefail
+          test -n "$CANDIDATE_DIGEST"
+          docker buildx imagetools inspect "$CANDIDATE_IMAGE@$CANDIDATE_DIGEST" | tee /tmp/tailstate-release-candidate.txt
+          grep -q 'linux/amd64' /tmp/tailstate-release-candidate.txt
+          grep -q 'linux/arm64' /tmp/tailstate-release-candidate.txt
+      - name: Pull immutable release candidate platforms
+        env:
+          CANDIDATE_IMAGE: ghcr.io/${{ github.repository }}:release-candidate-${{ github.sha }}
+          CANDIDATE_DIGEST: ${{ steps.candidate.outputs.digest }}
+        run: |
+          set -euo pipefail
+          docker pull --platform linux/amd64 "$CANDIDATE_IMAGE@$CANDIDATE_DIGEST"
+          docker tag "$CANDIDATE_IMAGE@$CANDIDATE_DIGEST" tailstate:release-candidate-amd64
+          docker pull --platform linux/arm64 "$CANDIDATE_IMAGE@$CANDIDATE_DIGEST"
+          docker tag "$CANDIDATE_IMAGE@$CANDIDATE_DIGEST" tailstate:release-candidate-arm64
+      - name: Scan amd64 release candidate
+        uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7.4.0
+        with:
+          image: tailstate:release-candidate-amd64
+          fail-build: true
+          severity-cutoff: high
+      - name: Scan arm64 release candidate
+        uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7.4.0
+        with:
+          image: tailstate:release-candidate-arm64
+          fail-build: true
+          severity-cutoff: high
+      - name: Runtime smoke test (amd64)
+        run: bash scripts/container-smoke.sh tailstate:release-candidate-amd64 18081
+      - name: Runtime smoke test (arm64)
+        env:
+          DOCKER_DEFAULT_PLATFORM: linux/arm64
+        run: bash scripts/container-smoke.sh tailstate:release-candidate-arm64 18082
+      - name: Promote verified release candidate
+        env:
+          CANDIDATE_IMAGE: ghcr.io/${{ github.repository }}:release-candidate-${{ github.sha }}
+          CANDIDATE_DIGEST: ${{ steps.candidate.outputs.digest }}
+          RELEASE_TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          set -euo pipefail
+          tag_args=()
+          while IFS= read -r tag; do
+            [[ -n "$tag" ]] || continue
+            tag_args+=(--tag "$tag")
+          done <<< "$RELEASE_TAGS"
+          ((${#tag_args[@]} > 0))
+          docker buildx imagetools create "${tag_args[@]}" "$CANDIDATE_IMAGE@$CANDIDATE_DIGEST"
+          while IFS= read -r tag; do
+            [[ -n "$tag" ]] || continue
+            promoted_digest="$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$tag")"
+            test "$promoted_digest" = "$CANDIDATE_DIGEST"
+          done <<< "$RELEASE_TAGS"
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}

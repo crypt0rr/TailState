@@ -135,16 +135,36 @@ Then open `/reset`. Resetting the password invalidates existing sessions.
 
 ### Backup
 
-Stop the service before a simple volume backup so the SQLite files are consistent:
+Use the repository helper to stop TailState, archive the exact data volume, and
+write a SHA-256 checksum. The helper discovers the Compose-managed volume from
+the service container, so it does not depend on a project name or a hardcoded
+volume name:
 
 ```console
-docker compose stop tailstate
-docker run --rm -v tailstate_tailstate-data:/data -v "$PWD:/backup" alpine:3.24 \
-  tar czf /backup/tailstate-data.tar.gz -C /data .
-docker compose start tailstate
+./scripts/backup.sh ./backups
 ```
 
-Back up `secrets/tailstate_master_key` separately and securely.
+Back up `secrets/tailstate_master_key` separately and securely. A backup is
+only useful with the matching master key: TailState intentionally refuses to
+open encrypted state with a different key.
+
+Restore into the same Compose project only after confirming the archive and
+key are from the same point in time. The command requires an explicit
+`--yes`, verifies the checksum when present, rejects unsafe archive paths, and
+creates a pre-restore archive beside the source archive before replacing the
+data volume:
+
+```console
+./scripts/restore.sh ./backups/tailstate-data-20260813T120000Z.tar.gz --yes
+docker compose ps
+curl -fsS http://127.0.0.1:8080/healthz
+curl -fsS http://127.0.0.1:8080/readyz
+```
+
+After a restore, sign in and verify that the expected History, evidence,
+notification destinations, and monitoring settings are present. Keep the
+pre-restore archive until that verification is complete. Run a restore drill
+in a disposable project before relying on the procedure for an outage.
 
 ## Change and delivery behavior
 
@@ -216,7 +236,7 @@ go run ./cmd/tailstate serve
 
 ## Releases
 
-Pushing a semantic tag such as `v1.0.0` starts the verified release promotion workflow. The exact tagged commit must pass the reusable CI gate, including tests, coverage, Staticcheck, Govulncheck, an Anchore high-severity scan, a runtime healthcheck, and a multi-architecture build. The workflow then publishes signed-build metadata, an SBOM, and `linux/amd64` plus `linux/arm64` images to:
+Pushing a semantic tag such as `v1.0.0` starts the verified release promotion workflow. The exact tagged commit must pass the reusable CI gate, including tests, coverage, Staticcheck, Govulncheck, an Anchore high-severity scan, runtime healthchecks, backup/restore validation, and a multi-architecture build. Release promotion first pushes one immutable candidate manifest, scans and smoke-tests both platform images by digest, and only then assigns the version, minor, and `latest` tags to that same verified digest. The workflow publishes signed-build metadata, an SBOM, and `linux/amd64` plus `linux/arm64` images to:
 
 ```text
 ghcr.io/crypt0rr/tailstate

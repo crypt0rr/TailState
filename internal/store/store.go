@@ -174,12 +174,15 @@ type HistoryPage struct {
 	HasNext    bool
 }
 
-const currentSchemaVersion = 6
+const currentSchemaVersion = 7
 
 const (
 	webhookTriggerRetryWindow = 24 * time.Hour
 	webhookTriggerLease       = 2 * time.Minute
 	webhookTriggerBatchSize   = 8
+	setupTokenLifetime        = 30 * time.Minute
+	resetTokenLifetime        = 30 * time.Minute
+	outboxRetryWindow         = 24 * time.Hour
 )
 
 func Open(path string, box *secret.Box) (*Store, error) {
@@ -284,6 +287,12 @@ func migrateSchema(db *sql.DB, box *secret.Box) error {
 	}
 	if version == 5 {
 		if err := migrateSchemaV5ToV6(db); err != nil {
+			return err
+		}
+		return migrateSchema(db, box)
+	}
+	if version == 6 {
+		if err := migrateSchemaV6ToV7(db); err != nil {
 			return err
 		}
 		return migrateSchema(db, box)
@@ -545,6 +554,53 @@ func migrateSchemaV5ToV6(db *sql.DB) error {
 	return nil
 }
 
+func migrateSchemaV6ToV7(db *sql.DB) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin authentication token migration: %w", err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`CREATE TABLE IF NOT EXISTS auth_tokens (
+		token_hash TEXT PRIMARY KEY,
+		kind TEXT NOT NULL CHECK(kind IN ('setup','reset')),
+		created_at TEXT NOT NULL,
+		expires_at TEXT NOT NULL
+	)`); err != nil {
+		return fmt.Errorf("create authentication tokens: %w", err)
+	}
+	if _, err := tx.Exec("CREATE INDEX IF NOT EXISTS auth_tokens_expires_at ON auth_tokens(expires_at)"); err != nil {
+		return fmt.Errorf("create authentication token index: %w", err)
+	}
+	now := time.Now().UTC()
+	for _, token := range []struct {
+		key       string
+		kind      string
+		expiresAt time.Time
+	}{
+		{key: "setup_token_hash", kind: "setup", expiresAt: now.Add(setupTokenLifetime)},
+		{key: "reset_token_hash", kind: "reset", expiresAt: now.Add(resetTokenLifetime)},
+	} {
+		var hash string
+		err := tx.QueryRow("SELECT value FROM meta WHERE key=?", token.key).Scan(&hash)
+		if errors.Is(err, sql.ErrNoRows) {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("read legacy %s token: %w", token.kind, err)
+		}
+		if _, err := tx.Exec(`INSERT OR IGNORE INTO auth_tokens(token_hash,kind,created_at,expires_at) VALUES(?,?,?,?)`, hash, token.kind, now.Format(time.RFC3339Nano), token.expiresAt.Format(time.RFC3339Nano)); err != nil {
+			return fmt.Errorf("migrate %s token: %w", token.kind, err)
+		}
+	}
+	if _, err := tx.Exec("UPDATE schema_version SET version=7"); err != nil {
+		return fmt.Errorf("record authentication token migration: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit authentication token migration: %w", err)
+	}
+	return nil
+}
+
 func addColumnIfMissing(tx *sql.Tx, table, column, definition string) error {
 	rows, err := tx.Query("PRAGMA table_info(" + table + ")")
 	if err != nil {
@@ -593,16 +649,11 @@ func (s *Store) NewSetupToken(ctx context.Context) (string, error) {
 	if err != nil || exists {
 		return "", err
 	}
-	token, err := secret.Token(24)
-	if err != nil {
-		return "", err
-	}
-	_, err = s.db.ExecContext(ctx, `INSERT INTO meta(key,value) VALUES('setup_token_hash',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`, secret.HashToken(token))
-	return token, err
+	return s.issueAuthToken(ctx, "setup", "setup_token_hash", setupTokenLifetime)
 }
 
 func (s *Store) Claim(ctx context.Context, token, password string) error {
-	if err := s.validateSetupToken(ctx, token); err != nil {
+	if err := s.validateAuthToken(ctx, "setup", token, "setup token"); err != nil {
 		return err
 	}
 	hash, err := secret.PasswordHash(password)
@@ -614,16 +665,22 @@ func (s *Store) Claim(ctx context.Context, token, password string) error {
 		return err
 	}
 	defer tx.Rollback()
-	var want string
-	if err := tx.QueryRowContext(ctx, "SELECT value FROM meta WHERE key='setup_token_hash'").Scan(&want); err != nil {
+	var want, expires string
+	if err := tx.QueryRowContext(ctx, "SELECT token_hash,expires_at FROM auth_tokens WHERE kind='setup' ORDER BY created_at DESC LIMIT 1").Scan(&want, &expires); err != nil {
 		return errors.New("setup token is unavailable")
 	}
 	got := secret.HashToken(token)
 	if subtle.ConstantTimeCompare([]byte(got), []byte(want)) != 1 {
 		return errors.New("invalid setup token")
 	}
+	if expiry, err := time.Parse(time.RFC3339Nano, expires); err != nil || !expiry.After(time.Now().UTC()) {
+		return errors.New("setup token has expired")
+	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	if _, err := tx.ExecContext(ctx, "INSERT INTO admin(id,password_hash,created_at,updated_at) VALUES(1,?,?,?)", hash, now, now); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, "DELETE FROM auth_tokens WHERE token_hash=? AND kind='setup'", want); err != nil {
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, "DELETE FROM meta WHERE key='setup_token_hash'"); err != nil {
@@ -632,13 +689,42 @@ func (s *Store) Claim(ctx context.Context, token, password string) error {
 	return tx.Commit()
 }
 
-func (s *Store) validateSetupToken(ctx context.Context, token string) error {
-	var want string
-	if err := s.db.QueryRowContext(ctx, "SELECT value FROM meta WHERE key='setup_token_hash'").Scan(&want); err != nil {
-		return errors.New("setup token is unavailable")
+func (s *Store) issueAuthToken(ctx context.Context, kind, legacyKey string, lifetime time.Duration) (string, error) {
+	token, err := secret.Token(24)
+	if err != nil {
+		return "", err
+	}
+	now := time.Now().UTC()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return "", err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, "DELETE FROM auth_tokens WHERE kind=?", kind); err != nil {
+		return "", err
+	}
+	if _, err := tx.ExecContext(ctx, "INSERT INTO auth_tokens(token_hash,kind,created_at,expires_at) VALUES(?,?,?,?)", secret.HashToken(token), kind, now.Format(time.RFC3339Nano), now.Add(lifetime).Format(time.RFC3339Nano)); err != nil {
+		return "", err
+	}
+	if _, err := tx.ExecContext(ctx, "INSERT INTO meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", legacyKey, secret.HashToken(token)); err != nil {
+		return "", err
+	}
+	if err := tx.Commit(); err != nil {
+		return "", err
+	}
+	return token, nil
+}
+
+func (s *Store) validateAuthToken(ctx context.Context, kind, token, label string) error {
+	var want, expires string
+	if err := s.db.QueryRowContext(ctx, "SELECT token_hash,expires_at FROM auth_tokens WHERE kind=? ORDER BY created_at DESC LIMIT 1", kind).Scan(&want, &expires); err != nil {
+		return errors.New(label + " is unavailable")
 	}
 	if subtle.ConstantTimeCompare([]byte(secret.HashToken(token)), []byte(want)) != 1 {
-		return errors.New("invalid setup token")
+		return errors.New("invalid " + label)
+	}
+	if expiry, err := time.Parse(time.RFC3339Nano, expires); err != nil || !expiry.After(time.Now().UTC()) {
+		return errors.New(label + " has expired")
 	}
 	return nil
 }
@@ -676,19 +762,20 @@ func (s *Store) ResetPassword(ctx context.Context, password string) error {
 	if _, err := tx.ExecContext(ctx, "DELETE FROM sessions"); err != nil {
 		return err
 	}
+	if _, err := tx.ExecContext(ctx, "DELETE FROM auth_tokens WHERE kind='reset'"); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, "DELETE FROM meta WHERE key='reset_token_hash'"); err != nil {
+		return err
+	}
 	return tx.Commit()
 }
 
 func (s *Store) NewResetToken(ctx context.Context) (string, error) {
-	token, err := secret.Token(24)
-	if err != nil {
-		return "", err
-	}
-	_, err = s.db.ExecContext(ctx, `INSERT INTO meta(key,value) VALUES('reset_token_hash',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`, secret.HashToken(token))
-	return token, err
+	return s.issueAuthToken(ctx, "reset", "reset_token_hash", resetTokenLifetime)
 }
 func (s *Store) ResetWithToken(ctx context.Context, token, password string) error {
-	if err := s.validateResetToken(ctx, token); err != nil {
+	if err := s.validateAuthToken(ctx, "reset", token, "reset token"); err != nil {
 		return err
 	}
 	hash, err := secret.PasswordHash(password)
@@ -700,12 +787,15 @@ func (s *Store) ResetWithToken(ctx context.Context, token, password string) erro
 		return err
 	}
 	defer tx.Rollback()
-	var want string
-	if err := tx.QueryRowContext(ctx, "SELECT value FROM meta WHERE key='reset_token_hash'").Scan(&want); err != nil {
+	var want, expires string
+	if err := tx.QueryRowContext(ctx, "SELECT token_hash,expires_at FROM auth_tokens WHERE kind='reset' ORDER BY created_at DESC LIMIT 1").Scan(&want, &expires); err != nil {
 		return errors.New("reset token is unavailable")
 	}
 	if subtle.ConstantTimeCompare([]byte(secret.HashToken(token)), []byte(want)) != 1 {
 		return errors.New("invalid reset token")
+	}
+	if expiry, err := time.Parse(time.RFC3339Nano, expires); err != nil || !expiry.After(time.Now().UTC()) {
+		return errors.New("reset token has expired")
 	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	result, err := tx.ExecContext(ctx, "UPDATE admin SET password_hash=?,updated_at=? WHERE id=1", hash, now)
@@ -722,21 +812,13 @@ func (s *Store) ResetWithToken(ctx context.Context, token, password string) erro
 	if _, err := tx.ExecContext(ctx, "DELETE FROM sessions"); err != nil {
 		return err
 	}
+	if _, err := tx.ExecContext(ctx, "DELETE FROM auth_tokens WHERE token_hash=? AND kind='reset'", want); err != nil {
+		return err
+	}
 	if _, err := tx.ExecContext(ctx, "DELETE FROM meta WHERE key='reset_token_hash'"); err != nil {
 		return err
 	}
 	return tx.Commit()
-}
-
-func (s *Store) validateResetToken(ctx context.Context, token string) error {
-	var want string
-	if err := s.db.QueryRowContext(ctx, "SELECT value FROM meta WHERE key='reset_token_hash'").Scan(&want); err != nil {
-		return errors.New("reset token is unavailable")
-	}
-	if subtle.ConstantTimeCompare([]byte(secret.HashToken(token)), []byte(want)) != 1 {
-		return errors.New("invalid reset token")
-	}
-	return nil
 }
 
 func (s *Store) CreateSession(ctx context.Context) (token, csrf string, err error) {
@@ -1803,9 +1885,26 @@ func (s *Store) CollectorDue(ctx context.Context, generation int64, collector st
 	when, err := time.Parse(time.RFC3339Nano, next)
 	return err != nil || !when.After(time.Now())
 }
+
+// Cleanup expires short-lived authentication/session state, bounds pending
+// notification retries, and applies the configured retention window.
 func (s *Store) Cleanup(ctx context.Context, retention time.Duration) error {
 	now := time.Now().UTC()
 	if _, err := s.db.ExecContext(ctx, "DELETE FROM sessions WHERE expires_at<=?", now.Format(time.RFC3339Nano)); err != nil {
+		return err
+	}
+	if _, err := s.db.ExecContext(ctx, "DELETE FROM auth_tokens WHERE expires_at<=?", now.Format(time.RFC3339Nano)); err != nil {
+		return err
+	}
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM meta
+		WHERE (key='setup_token_hash' AND NOT EXISTS (SELECT 1 FROM auth_tokens WHERE kind='setup'))
+		   OR (key='reset_token_hash' AND NOT EXISTS (SELECT 1 FROM auth_tokens WHERE kind='reset'))`); err != nil {
+		return err
+	}
+	retryCutoff := now.Add(-outboxRetryWindow).Format(time.RFC3339Nano)
+	if _, err := s.db.ExecContext(ctx, `UPDATE outbox
+		SET status='dead',next_attempt=?,last_error=CASE WHEN TRIM(last_error)='' THEN 'delivery retry window expired' ELSE last_error END
+		WHERE status='pending' AND first_attempt<=?`, now.Format(time.RFC3339Nano), retryCutoff); err != nil {
 		return err
 	}
 	cutoff := now.Add(-retention).Format(time.RFC3339Nano)
@@ -1825,7 +1924,10 @@ func (s *Store) Cleanup(ctx context.Context, retention time.Duration) error {
 	if _, err := s.db.ExecContext(ctx, "DELETE FROM webhook_triggers WHERE received_at<?", cutoff); err != nil {
 		return err
 	}
-	_, err = s.db.ExecContext(ctx, "DELETE FROM outbox WHERE status='delivered' AND delivered_at<?", cutoff)
+	if _, err := s.db.ExecContext(ctx, "DELETE FROM outbox WHERE status='delivered' AND delivered_at<?", cutoff); err != nil {
+		return err
+	}
+	_, err = s.db.ExecContext(ctx, "DELETE FROM outbox WHERE status='dead' AND created_at<?", cutoff)
 	return err
 }
 

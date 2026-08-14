@@ -254,6 +254,66 @@ CREATE TABLE outbox(id INTEGER PRIMARY KEY AUTOINCREMENT,batch_id INTEGER,destin
 	assertVersionAndState(t, reopened)
 }
 
+func TestVersionSixMigrationThroughOpenMigratesLegacyAuthenticationTokens(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "tailstate.db")
+	box, err := secret.NewBox(make([]byte, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	initial, err := Open(path, box)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := initial.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	setupToken := "legacy-setup-token"
+	resetToken := "legacy-reset-token"
+	db, err := sqlOpen(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec("DELETE FROM auth_tokens; DELETE FROM meta WHERE key IN ('setup_token_hash','reset_token_hash'); UPDATE schema_version SET version=6"); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if _, err := db.Exec("INSERT INTO meta(key,value) VALUES('setup_token_hash',?),('reset_token_hash',?)", secret.HashToken(setupToken), secret.HashToken(resetToken)); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	st, err := Open(path, box)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	var migrated int
+	if err := st.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM auth_tokens").Scan(&migrated); err != nil {
+		t.Fatal(err)
+	}
+	if migrated != 2 {
+		t.Fatalf("migrated authentication token count=%d, want 2", migrated)
+	}
+	if err := st.Claim(ctx, setupToken, "a secure password"); err != nil {
+		t.Fatalf("migrated setup token was not usable: %v", err)
+	}
+	if err := st.ResetWithToken(ctx, resetToken, "another secure password"); err != nil {
+		t.Fatalf("migrated reset token was not usable: %v", err)
+	}
+	var remaining int
+	if err := st.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM auth_tokens").Scan(&remaining); err != nil {
+		t.Fatal(err)
+	}
+	if remaining != 0 {
+		t.Fatalf("consumed migrated authentication tokens=%d, want 0", remaining)
+	}
+}
+
 func TestMigrateSchemaRejectsUnknownAndMissingVersions(t *testing.T) {
 	box, err := secret.NewBox(make([]byte, 32))
 	if err != nil {

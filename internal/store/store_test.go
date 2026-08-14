@@ -97,6 +97,125 @@ func TestResetTokenIsSingleUseAndInvalidatesSessions(t *testing.T) {
 	}
 }
 
+func TestAuthTokensExpireAndPasswordResetRevokesOutstandingToken(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	setup, err := st.NewSetupToken(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.db.ExecContext(ctx, "UPDATE auth_tokens SET expires_at=? WHERE kind='setup'", time.Now().UTC().Add(-time.Minute).Format(time.RFC3339Nano)); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Claim(ctx, setup, "a secure password"); err == nil || !strings.Contains(err.Error(), "expired") {
+		t.Fatalf("expired setup token error=%v", err)
+	}
+	if err := st.Cleanup(ctx, 30*24*time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	var count int
+	if err := st.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM auth_tokens WHERE kind='setup'").Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("expired setup token remained: %d", count)
+	}
+	if err := st.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM meta WHERE key='setup_token_hash'").Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("expired legacy setup token remained: %d", count)
+	}
+
+	setup, err = st.NewSetupToken(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Claim(ctx, setup, "a secure password"); err != nil {
+		t.Fatal(err)
+	}
+	reset, err := st.NewResetToken(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.ResetPassword(ctx, "another secure password"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.ResetWithToken(ctx, reset, "third secure password"); err == nil || !strings.Contains(err.Error(), "unavailable") {
+		t.Fatalf("revoked reset token error=%v", err)
+	}
+	if err := st.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM meta WHERE key='reset_token_hash'").Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("revoked legacy reset token remained: %d", count)
+	}
+}
+
+func TestCleanupDeadLettersExpiredOutboxAndPurgesOldDeadLetters(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	if _, err := st.SaveSettings(ctx, settings()); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.EnqueueSystem(ctx, "retry payload"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.EnqueueSystem(ctx, "fresh retry"); err != nil {
+		t.Fatal(err)
+	}
+	items, err := st.DueOutbox(ctx, 10)
+	if err != nil || len(items) != 2 {
+		t.Fatalf("outbox=%#v err=%v", items, err)
+	}
+	var expiredID, freshID int64
+	for _, item := range items {
+		switch item.Payload {
+		case "retry payload":
+			expiredID = item.ID
+		case "fresh retry":
+			freshID = item.ID
+		}
+	}
+	if expiredID == 0 || freshID == 0 {
+		t.Fatalf("outbox IDs were not found: %#v", items)
+	}
+	oldAttempt := time.Now().UTC().Add(-outboxRetryWindow - time.Hour).Format(time.RFC3339Nano)
+	if _, err := st.db.ExecContext(ctx, "UPDATE outbox SET first_attempt=?,last_error='' WHERE id=?", oldAttempt, expiredID); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Cleanup(ctx, 30*24*time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	var status, lastError string
+	if err := st.db.QueryRowContext(ctx, "SELECT status,last_error FROM outbox WHERE id=?", expiredID).Scan(&status, &lastError); err != nil {
+		t.Fatal(err)
+	}
+	if status != "dead" || lastError != "delivery retry window expired" {
+		t.Fatalf("expired outbox status=%q error=%q", status, lastError)
+	}
+	if err := st.db.QueryRowContext(ctx, "SELECT status FROM outbox WHERE id=?", freshID).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != "pending" {
+		t.Fatalf("recent outbox status=%q, want pending", status)
+	}
+	oldCreated := time.Now().UTC().Add(-31 * 24 * time.Hour).Format(time.RFC3339Nano)
+	if _, err := st.db.ExecContext(ctx, "UPDATE outbox SET created_at=? WHERE id=?", oldCreated, expiredID); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Cleanup(ctx, 30*24*time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	var count int
+	if err := st.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM outbox WHERE id=?", expiredID).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("old dead-letter row remained: %d", count)
+	}
+}
+
 func TestWrongMasterKeyFailsOpen(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "tailstate.db")
 	firstKey := make([]byte, 32)

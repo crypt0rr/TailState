@@ -55,14 +55,16 @@ jobs:
           context: .
           push: true
           platforms: linux/amd64,linux/arm64
-          tags: ghcr.io/${{ github.repository }}:release-candidate-${{ github.sha }}
+          # GHCR repository paths are case-sensitive and must be lowercase;
+          # github.repository preserves the mixed-case GitHub repository name.
+          tags: ghcr.io/crypt0rr/tailstate:release-candidate-${{ github.sha }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: VERSION=${{ steps.meta.outputs.version }}
           provenance: mode=max
           sbom: true
       - name: Verify release candidate manifest
         env:
-          CANDIDATE_IMAGE: ghcr.io/${{ github.repository }}:release-candidate-${{ github.sha }}
+          CANDIDATE_IMAGE: ghcr.io/crypt0rr/tailstate:release-candidate-${{ github.sha }}
           CANDIDATE_DIGEST: ${{ steps.candidate.outputs.digest }}
         run: |
           set -euo pipefail
@@ -72,7 +74,7 @@ jobs:
           grep -q 'linux/arm64' /tmp/tailstate-release-candidate.txt
       - name: Pull immutable release candidate platforms
         env:
-          CANDIDATE_IMAGE: ghcr.io/${{ github.repository }}:release-candidate-${{ github.sha }}
+          CANDIDATE_IMAGE: ghcr.io/crypt0rr/tailstate:release-candidate-${{ github.sha }}
           CANDIDATE_DIGEST: ${{ steps.candidate.outputs.digest }}
         run: |
           set -euo pipefail
@@ -100,7 +102,7 @@ jobs:
         run: bash scripts/container-smoke.sh tailstate:release-candidate-arm64 18082
       - name: Promote verified release candidate
         env:
-          CANDIDATE_IMAGE: ghcr.io/${{ github.repository }}:release-candidate-${{ github.sha }}
+          CANDIDATE_IMAGE: ghcr.io/crypt0rr/tailstate:release-candidate-${{ github.sha }}
           CANDIDATE_DIGEST: ${{ steps.candidate.outputs.digest }}
           RELEASE_TAGS: ${{ steps.meta.outputs.tags }}
         run: |

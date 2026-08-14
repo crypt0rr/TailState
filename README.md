@@ -215,7 +215,7 @@ The test-only `TAILSTATE_TS_API_URL` and `TAILSTATE_TS_OAUTH_URL` variables allo
 
 ## Local development
 
-TailState uses Go 1.26.5.
+TailState uses Go 1.26.6.
 
 ```console
 gofmt -w cmd internal

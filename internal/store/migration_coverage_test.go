@@ -5,6 +5,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 func migrationV2WriteFixture(t *testing.T) *sql.DB {
@@ -109,6 +110,7 @@ func TestVersionedMigrationsReportSchemaWriteErrors(t *testing.T) {
 		{version: 3, call: migrateSchemaV3ToV4, trigger: "fail_webhook_schema_version", want: "record webhook migration"},
 		{version: 4, call: migrateSchemaV4ToV5, trigger: "fail_durable_webhook_schema_version", want: "record durable webhook migration"},
 		{version: 5, call: migrateSchemaV5ToV6, trigger: "fail_evidence_schema_version", want: "record evidence ledger migration"},
+		{version: 6, call: migrateSchemaV6ToV7, trigger: "fail_auth_schema_version", want: "record authentication token migration"},
 	}
 	for _, tt := range tests {
 		t.Run("version "+strconv.Itoa(tt.version), func(t *testing.T) {
@@ -120,5 +122,63 @@ func TestVersionedMigrationsReportSchemaWriteErrors(t *testing.T) {
 				t.Fatalf("migration error=%v, want substring %q", err, tt.want)
 			}
 		})
+	}
+}
+
+func TestMigrateSchemaV6ToV7MigratesLegacyAuthenticationTokens(t *testing.T) {
+	db := migrationErrorDB(t)
+	if _, err := db.Exec(`CREATE TABLE schema_version(version INTEGER NOT NULL);
+INSERT INTO schema_version VALUES(6);
+CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+INSERT INTO meta(key,value) VALUES('setup_token_hash','setup-hash'),('reset_token_hash','reset-hash');`); err != nil {
+		t.Fatal(err)
+	}
+	started := time.Now().UTC()
+	if err := migrateSchemaV6ToV7(db); err != nil {
+		t.Fatal(err)
+	}
+	var version int
+	if err := db.QueryRow("SELECT version FROM schema_version").Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if version != 7 {
+		t.Fatalf("schema version=%d, want 7", version)
+	}
+	rows, err := db.Query("SELECT kind,token_hash,created_at,expires_at FROM auth_tokens ORDER BY kind")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var got int
+	for rows.Next() {
+		var kind, hash, created, expires string
+		if err := rows.Scan(&kind, &hash, &created, &expires); err != nil {
+			t.Fatal(err)
+		}
+		if hash == "" || (kind != "reset" && kind != "setup") {
+			t.Fatalf("migrated token=%q hash=%q", kind, hash)
+		}
+		createdAt, err := time.Parse(time.RFC3339Nano, created)
+		if err != nil || createdAt.Before(started) {
+			t.Fatalf("created_at=%q err=%v", created, err)
+		}
+		expiresAt, err := time.Parse(time.RFC3339Nano, expires)
+		if err != nil || !expiresAt.After(createdAt) {
+			t.Fatalf("expires_at=%q err=%v", expires, err)
+		}
+		got++
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if got != 2 {
+		t.Fatalf("migrated token count=%d, want 2", got)
+	}
+	var legacy int
+	if err := db.QueryRow("SELECT COUNT(*) FROM meta WHERE key IN ('setup_token_hash','reset_token_hash')").Scan(&legacy); err != nil {
+		t.Fatal(err)
+	}
+	if legacy != 2 {
+		t.Fatalf("legacy token count=%d, want 2", legacy)
 	}
 }

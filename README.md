@@ -58,7 +58,7 @@ After either installation method, inspect the startup log:
 docker compose logs tailstate
 ```
 
-The logs contain a one-time setup token. Open [http://127.0.0.1:8080/setup](http://127.0.0.1:8080/setup), enter that token, and create the administrator password.
+The logs contain a one-time setup token. Open [http://127.0.0.1:8080/setup](http://127.0.0.1:8080/setup), enter that token, and create the administrator password. Setup tokens expire after 30 minutes; restart the service to issue a fresh token if needed.
 
 The setup interface then asks for:
 
@@ -131,7 +131,9 @@ Generate a one-time reset token:
 docker compose exec tailstate /tailstate admin reset
 ```
 
-Then open `/reset`. Resetting the password invalidates existing sessions.
+Then open `/reset`. Resetting the password invalidates existing sessions and any
+outstanding reset token. Reset tokens expire after 30 minutes; generate another
+token if one expires.
 
 ### Backup
 
@@ -176,7 +178,7 @@ in a disposable project before relying on the procedure for an outage.
 - Every change batch is also recorded in the authenticated History page with field-level diffs and redacted normalized before/after snapshots. Filters support collector, change type, and resource name or ID; history is retained for 30 days.
 - The History page can download a filtered, redacted JSON evidence pack for incident reports and offline review. Packs include normalized snapshots, field diffs, destination delivery outcomes, a SHA-256 content hash, and an Ed25519 signature over a hash-linked event ledger; exports are limited to 100 batches, 2,000 events, and 5 MiB. A changed export fails verification.
 - Verify an export offline with `tailstate evidence verify --file tailstate-drift-evidence.json`. Verification checks the content hash, embedded public key fingerprint, signature, and included ledger links. For independent trust, print the instance public key with `tailstate evidence public-key`, save it as a base64 file, and pass it with `--public-key public.key`.
-- Shoutrrr deliveries retry independently for up to 24 hours across restarts, then remain visible as dead letters. Disabling or removing a destination dead-letters its pending items; newly added destinations receive only future notifications.
+- Shoutrrr deliveries retry independently for up to 24 hours across restarts, then remain visible as dead letters until the 30-day operational retention window expires. Disabling or removing a destination dead-letters its pending items; newly added destinations receive only future notifications.
 - If every destination is disabled, monitoring continues and notifications are reported as paused.
 - API collector failures alert after three consecutive failures and once on recovery.
 - Plan-specific unavailable endpoints appear as unsupported and retry every six hours.
@@ -197,6 +199,10 @@ Schema v6 adds the encrypted Ed25519 evidence key and the hash-linked evidence
 ledger. Existing event batches are signed automatically on
 the first startup after the upgrade; the public-key fingerprint is shown on the
 History page and new exports use signed evidence format version 2.
+Schema v7 adds expiring, revocable setup and password-reset token records. It
+also bounds notification retries to 24 hours and removes dead-letter rows after
+the normal 30-day retention period. Legacy token hashes remain only as a
+rollback aid and are removed by cleanup once their active token record expires.
 
 ## Runtime configuration
 

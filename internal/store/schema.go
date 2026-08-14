@@ -3,12 +3,19 @@ package store
 const schema = `
 PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);
-INSERT INTO schema_version(version) SELECT 6 WHERE NOT EXISTS (SELECT 1 FROM schema_version);
+INSERT INTO schema_version(version) SELECT 7 WHERE NOT EXISTS (SELECT 1 FROM schema_version);
 
 CREATE TABLE IF NOT EXISTS meta (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS auth_tokens (
+  token_hash TEXT PRIMARY KEY,
+  kind TEXT NOT NULL CHECK(kind IN ('setup','reset')),
+  created_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS auth_tokens_expires_at ON auth_tokens(expires_at);
 CREATE TABLE IF NOT EXISTS admin (
   id INTEGER PRIMARY KEY CHECK(id = 1),
   password_hash TEXT NOT NULL,

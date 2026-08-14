@@ -78,10 +78,24 @@ jobs:
           CANDIDATE_DIGEST: ${{ steps.candidate.outputs.digest }}
         run: |
           set -euo pipefail
-          docker pull --platform linux/amd64 "$CANDIDATE_IMAGE@$CANDIDATE_DIGEST"
-          docker tag "$CANDIDATE_IMAGE@$CANDIDATE_DIGEST" tailstate:release-candidate-amd64
-          docker pull --platform linux/arm64 "$CANDIDATE_IMAGE@$CANDIDATE_DIGEST"
-          docker tag "$CANDIDATE_IMAGE@$CANDIDATE_DIGEST" tailstate:release-candidate-arm64
+          manifest_json="$(docker buildx imagetools inspect --raw "$CANDIDATE_IMAGE@$CANDIDATE_DIGEST")"
+          amd64_digest="$(jq -er '
+            .manifests[]
+            | select(.platform.os == "linux" and .platform.architecture == "amd64")
+            | .digest
+          ' <<< "$manifest_json")"
+          arm64_digest="$(jq -er '
+            .manifests[]
+            | select(.platform.os == "linux" and .platform.architecture == "arm64")
+            | .digest
+          ' <<< "$manifest_json")"
+
+          amd64_image="$CANDIDATE_IMAGE@$amd64_digest"
+          arm64_image="$CANDIDATE_IMAGE@$arm64_digest"
+          docker pull "$amd64_image"
+          docker tag "$amd64_image" tailstate:release-candidate-amd64
+          docker pull "$arm64_image"
+          docker tag "$arm64_image" tailstate:release-candidate-arm64
       - name: Scan amd64 release candidate
         uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7.4.0
         with:

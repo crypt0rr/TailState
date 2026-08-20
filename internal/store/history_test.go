@@ -22,6 +22,61 @@ func historyResource(hostname, address string) model.Collected {
 	}}}
 }
 
+func TestHistoryFieldFormattingPreservesExplicitNull(t *testing.T) {
+	fields := formatHistoryFields([]model.FieldChange{{Field: "optional", OldPresent: true, NewPresent: false}})
+	if len(fields) != 1 || !fields[0].HasOld || fields[0].Old != "null" || fields[0].HasNew {
+		t.Fatalf("explicit null field formatting=%#v", fields)
+	}
+}
+
+func TestEvidenceExportPreservesExplicitNullPresence(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	generation, err := st.SaveSettings(ctx, settings())
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseline := model.Collected{Collector: "devices", Resources: []model.Resource{{
+		ID: "device-1", Type: "device", Name: "server", Data: map[string]any{"authorized": nil},
+	}}}
+	recovered := model.Collected{Collector: "devices", Resources: []model.Resource{{
+		ID: "device-1", Type: "device", Name: "server", Data: map[string]any{},
+	}}}
+	if _, err := st.applyBatch(ctx, generation, []model.Collected{baseline}, func([]model.Change) string { return "baseline" }); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.applyBatch(ctx, generation, []model.Collected{recovered}, func([]model.Change) string { return "changed" }); err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := st.ExportEvidencePack(ctx, HistoryFilter{Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := VerifyEvidencePack(encoded); err != nil {
+		t.Fatalf("evidence export did not verify: %v", err)
+	}
+	var pack EvidencePack
+	if err := json.Unmarshal(encoded, &pack); err != nil {
+		t.Fatal(err)
+	}
+	if len(pack.Batches) != 1 || len(pack.Batches[0].Events) != 1 {
+		t.Fatalf("unexpected evidence batches: %#v", pack.Batches)
+	}
+	var found bool
+	for _, field := range pack.Batches[0].Events[0].Fields {
+		if field.Field != "authorized" {
+			continue
+		}
+		found = true
+		if !field.OldPresent || field.NewPresent || string(field.Old) != "null" || field.New != nil {
+			t.Fatalf("evidence field lost null/missing presence: %#v", field)
+		}
+	}
+	if !found {
+		t.Fatalf("authorized field missing from evidence: %#v", pack.Batches[0].Events[0].Fields)
+	}
+}
+
 func TestHistoryPersistsExplainableChangesAndDeliveryState(t *testing.T) {
 	ctx := context.Background()
 	st := testStore(t)
@@ -106,6 +161,97 @@ func TestHistoryPersistsExplainableChangesAndDeliveryState(t *testing.T) {
 	}
 }
 
+func TestDestinationURLNeverReachesPersistedError(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	generation, err := st.SaveSettings(ctx, settings())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.applyBatch(ctx, generation, []model.Collected{historyResource("server", "100.64.0.1")}, func([]model.Change) string { return "baseline" }); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.applyBatch(ctx, generation, []model.Collected{historyResource("server-new", "100.64.0.2")}, func([]model.Change) string { return "changed" }); err != nil {
+		t.Fatal(err)
+	}
+	items, err := st.DueOutbox(ctx, 10)
+	if err != nil || len(items) != 1 {
+		t.Fatalf("expected one due notification: %#v err=%v", items, err)
+	}
+	secretURL := items[0].Destination.ServiceURL
+	if err := st.Retry(ctx, items[0].ID, time.Now().UTC().Add(time.Minute), "request failed for "+secretURL, false); err != nil {
+		t.Fatal(err)
+	}
+	page, err := st.ListHistory(ctx, HistoryFilter{Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Batches) != 1 || len(page.Batches[0].Deliveries) != 1 {
+		t.Fatalf("unexpected delivery history: %#v", page)
+	}
+	if strings.Contains(page.Batches[0].Deliveries[0].LastError, secretURL) || strings.Contains(page.Batches[0].Deliveries[0].LastError, "hooks/token") {
+		t.Fatalf("destination URL reached persisted error: %#v", page.Batches[0].Deliveries[0])
+	}
+}
+
+func TestDestinationQueryCredentialsStayOutOfOutbox(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	generation, err := st.SaveSettings(ctx, settings())
+	if err != nil {
+		t.Fatal(err)
+	}
+	destinationURL := "generic://notify.example/hooks/super-secret?template=json&messagekey=text&token=query-secret"
+	destinationID, err := st.SaveDestination(ctx, NotificationDestination{Name: "Query webhook", ServiceURL: destinationURL, Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.applyBatch(ctx, generation, []model.Collected{historyResource("server", "100.64.0.1")}, func([]model.Change) string { return "baseline" }); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.applyBatch(ctx, generation, []model.Collected{historyResource("server-new", "100.64.0.2")}, func([]model.Change) string { return "changed" }); err != nil {
+		t.Fatal(err)
+	}
+	items, err := st.DueOutbox(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var item OutboxItem
+	for _, candidate := range items {
+		if candidate.DestinationID == destinationID {
+			item = candidate
+			break
+		}
+	}
+	if item.ID == 0 {
+		t.Fatalf("query destination outbox row missing: %#v", items)
+	}
+	if err := st.Retry(ctx, item.ID, time.Now().UTC().Add(time.Minute), "provider rejected "+item.Destination.ServiceURL, false); err != nil {
+		t.Fatal(err)
+	}
+	var persisted string
+	if err := st.db.QueryRowContext(ctx, "SELECT last_error FROM outbox WHERE id=?", item.ID).Scan(&persisted); err != nil {
+		t.Fatal(err)
+	}
+	for _, secret := range []string{"notify.example", "/hooks/super-secret", "query-secret"} {
+		if strings.Contains(persisted, secret) {
+			t.Fatalf("destination credential %q reached outbox.last_error: %q", secret, persisted)
+		}
+	}
+	if _, err := st.db.ExecContext(ctx, "UPDATE outbox SET last_error=? WHERE id=?", "provider response contained an unrelated credential=should-not-render", item.ID); err != nil {
+		t.Fatal(err)
+	}
+	page, err := st.ListHistory(ctx, HistoryFilter{Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, delivery := range page.Batches[0].Deliveries {
+		if delivery.ID == item.ID && strings.Contains(delivery.LastError, "should-not-render") {
+			t.Fatalf("legacy arbitrary delivery text reached history: %q", delivery.LastError)
+		}
+	}
+}
+
 func TestHistoryResourceFilterTreatsWildcardsLiterally(t *testing.T) {
 	ctx := context.Background()
 	st := testStore(t)
@@ -117,14 +263,14 @@ func TestHistoryResourceFilterTreatsWildcardsLiterally(t *testing.T) {
 		{ID: "device%1", Type: "device", Name: "percent", Data: map[string]any{"hostname": "percent"}},
 		{ID: "device-2", Type: "device", Name: "plain", Data: map[string]any{"hostname": "plain"}},
 	}}
-	if _, err := st.ApplyBatch(ctx, generation, []model.Collected{baseline}, func([]model.Change) string { return "baseline" }); err != nil {
+	if _, err := st.applyBatch(ctx, generation, []model.Collected{baseline}, func([]model.Change) string { return "baseline" }); err != nil {
 		t.Fatal(err)
 	}
 	changed := model.Collected{Collector: "devices", Resources: []model.Resource{
 		{ID: "device%1", Type: "device", Name: "percent", Data: map[string]any{"hostname": "percent-new"}},
 		{ID: "device-2", Type: "device", Name: "plain", Data: map[string]any{"hostname": "plain-new"}},
 	}}
-	if _, err := st.ApplyBatch(ctx, generation, []model.Collected{changed}, func([]model.Change) string { return "changed" }); err != nil {
+	if _, err := st.applyBatch(ctx, generation, []model.Collected{changed}, func([]model.Change) string { return "changed" }); err != nil {
 		t.Fatal(err)
 	}
 	page, err := st.ListHistory(ctx, HistoryFilter{ResourceID: "%", Limit: 10})
@@ -143,7 +289,7 @@ func TestHistoryCorrelatesCoalescedWebhookTriggers(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.ApplyBatch(ctx, generation, []model.Collected{historyResource("server", "100.64.0.1")}, func([]model.Change) string { return "baseline" }); err != nil {
+	if _, err := st.applyBatch(ctx, generation, []model.Collected{historyResource("server", "100.64.0.1")}, func([]model.Change) string { return "baseline" }); err != nil {
 		t.Fatal(err)
 	}
 	first, _, err := st.RecordWebhookTrigger(ctx, strings.Repeat("d", 64), []string{"policyUpdate"}, []string{"devices"})
@@ -170,14 +316,14 @@ func TestHistoryCorrelatesCoalescedWebhookTriggers(t *testing.T) {
 	}
 }
 
-func TestEvidencePackExportIsRedactedAndVerifiable(t *testing.T) {
+func TestTamperedExportFailsVerification(t *testing.T) {
 	ctx := context.Background()
 	st := testStore(t)
 	generation, err := st.SaveSettings(ctx, settings())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.ApplyBatch(ctx, generation, []model.Collected{historyResource("server", "100.64.0.1")}, func([]model.Change) string { return "baseline" }); err != nil {
+	if _, err := st.applyBatch(ctx, generation, []model.Collected{historyResource("server", "100.64.0.1")}, func([]model.Change) string { return "baseline" }); err != nil {
 		t.Fatal(err)
 	}
 	batch, err := st.ApplyBatchWithBatch(ctx, generation, []model.Collected{historyResource("server-new", "100.64.0.2")}, func([]model.Change) string { return "changed" })
@@ -225,7 +371,7 @@ func TestHistoryPaginationAndRemovalSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.ApplyBatch(ctx, generation, []model.Collected{historyResource("server", "100.64.0.1")}, func([]model.Change) string { return "baseline" }); err != nil {
+	if _, err := st.applyBatch(ctx, generation, []model.Collected{historyResource("server", "100.64.0.1")}, func([]model.Change) string { return "baseline" }); err != nil {
 		t.Fatal(err)
 	}
 	first, err := st.ApplyBatchWithBatch(ctx, generation, []model.Collected{historyResource("server-one", "100.64.0.1")}, func([]model.Change) string { return "first" })
@@ -393,10 +539,10 @@ func TestCleanupRemovesExpiredHistoryBatches(t *testing.T) {
 	}
 	baseline := historyResource("server", "100.64.0.1")
 	changed := historyResource("server-new", "100.64.0.2")
-	if _, err := st.ApplyBatch(ctx, generation, []model.Collected{baseline}, func([]model.Change) string { return "baseline" }); err != nil {
+	if _, err := st.applyBatch(ctx, generation, []model.Collected{baseline}, func([]model.Change) string { return "baseline" }); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.ApplyBatch(ctx, generation, []model.Collected{changed}, func([]model.Change) string { return "changed" }); err != nil {
+	if _, err := st.applyBatch(ctx, generation, []model.Collected{changed}, func([]model.Change) string { return "changed" }); err != nil {
 		t.Fatal(err)
 	}
 	old := time.Now().UTC().Add(-48 * time.Hour).Format(time.RFC3339Nano)

@@ -77,8 +77,37 @@ func TestPolicyAdditionalCollectorsAndClientTest(t *testing.T) {
 }
 
 func TestTailscaleHelpersAndHTTPError(t *testing.T) {
+	var nilHTTPError *HTTPError
+	if got := nilHTTPError.SafeMessage(); got != "Tailscale request failed" {
+		t.Fatalf("nil HTTPError safe message=%q", got)
+	}
+	if got := SafeError(nil); got != "" {
+		t.Fatalf("nil SafeError=%q", got)
+	}
+	if got := SafeError(errors.New("transport unavailable")); got != "transport unavailable" {
+		t.Fatalf("generic SafeError=%q", got)
+	}
 	if got := (&HTTPError{Status: 418}).Error(); got != "Tailscale GET endpoint returned 418" {
 		t.Fatalf("HTTPError=%q", got)
+	}
+	if got := (&HTTPError{Status: http.StatusBadGateway, URL: "https://api.example/devices?token=secret", Body: "upstream\nmessage"}).Error(); got != "Tailscale GET /devices returned 502: upstream message" {
+		t.Fatalf("HTTPError with body=%q", got)
+	}
+	if got := (&HTTPError{Status: http.StatusBadGateway, URL: "https://api.example/devices?token=secret", Body: "upstream secret"}).SafeMessage(); got != "Tailscale request to /devices returned HTTP 502" || strings.Contains(got, "upstream secret") || strings.Contains(got, "secret") {
+		t.Fatalf("HTTPError safe message=%q", got)
+	}
+	if got := SafeError(&PartialError{Err: &HTTPError{Status: http.StatusServiceUnavailable, URL: "/devices", Body: "provider secret"}}); got != "Tailscale request to /devices returned HTTP 503" {
+		t.Fatalf("SafeError=%q", got)
+	}
+	if got := (&HTTPError{Status: http.StatusBadGateway, URL: "http://[::1"}).SafeMessage(); got != "Tailscale request to endpoint returned HTTP 502" {
+		t.Fatalf("malformed HTTPError safe message=%q", got)
+	}
+	var nilPartial *PartialError
+	if got := nilPartial.Error(); got != "partial collector response" || nilPartial.Unwrap() != nil {
+		t.Fatalf("nil PartialError behavior: error=%q unwrap=%v", got, nilPartial.Unwrap())
+	}
+	if got := (&PartialError{}).Error(); got != "partial collector response" {
+		t.Fatalf("empty PartialError=%q", got)
 	}
 	if err := noRedirect(nil, nil); err != http.ErrUseLastResponse {
 		t.Fatalf("noRedirect error=%v", err)

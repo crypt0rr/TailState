@@ -1,0 +1,47 @@
+# HTTPS reverse-proxy override. Copy Caddyfile.example to Caddyfile, replace
+# the hostname, and keep the TailState listener on the private network.
+services:
+  tailstate:
+    # Compose's !reset tag removes the loopback host publish inherited from
+    # compose.yaml; only the Caddy service is externally reachable.
+    ports: !reset []
+    expose:
+      - "8080"
+    environment:
+      TAILSTATE_COOKIE_SECURE: "true"
+      # Caddy has a fixed address on the private network below, so forwarded
+      # headers are trusted only from this proxy container.
+      TAILSTATE_TRUSTED_PROXIES: "172.30.0.2/32"
+    networks:
+      - tailstate-private
+
+  caddy:
+    image: caddy:2.10-alpine@sha256:4c6e91c6ed0e2fa03efd5b44747b625fec79bc9cd06ac5235a779726618e530d
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      - tailstate
+    networks:
+      tailstate-private:
+        ipv4_address: 172.30.0.2
+      caddy-public:
+
+volumes:
+  caddy-data:
+  caddy-config:
+
+networks:
+  # Keep TailState off the public bridge. Caddy joins both networks so it can
+  # reach TailState and obtain/renew certificates from the ACME service.
+  tailstate-private:
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
+  caddy-public:

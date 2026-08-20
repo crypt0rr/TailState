@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -219,6 +220,65 @@ func TestVerifyEvidencePackRejectsUnknownFields(t *testing.T) {
 	}
 }
 
+func TestVerifyEvidencePackRejectsAmbiguousPagination(t *testing.T) {
+	data, _ := signedEvidencePackFixture(t)
+	tests := []struct {
+		name string
+		edit func(*EvidencePack)
+		want string
+	}{
+		{
+			name: "truncated without cursor",
+			edit: func(pack *EvidencePack) {
+				pack.Truncated = true
+				pack.NextCursor = 0
+			},
+			want: "truncated evidence pack is missing next cursor",
+		},
+		{
+			name: "truncated without batches",
+			edit: func(pack *EvidencePack) {
+				pack.Truncated = true
+				pack.NextCursor = 1
+			},
+			want: "truncated evidence pack has no batches",
+		},
+		{
+			name: "cursor does not identify last batch",
+			edit: func(pack *EvidencePack) {
+				pack.Truncated = true
+				pack.Batches = []EvidenceBatch{{ID: 10}}
+				pack.NextCursor = 42
+			},
+			want: "truncated evidence pack cursor does not match last batch",
+		},
+		{
+			name: "complete with cursor",
+			edit: func(pack *EvidencePack) {
+				pack.Truncated = false
+				pack.NextCursor = 42
+			},
+			want: "complete evidence pack has an unexpected next cursor",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var pack EvidencePack
+			if err := json.Unmarshal(data, &pack); err != nil {
+				t.Fatal(err)
+			}
+			tt.edit(&pack)
+			mutated, err := json.Marshal(pack)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := VerifyEvidencePack(mutated); err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("error = %v, want substring %q", err, tt.want)
+			}
+		})
+	}
+}
+
 func TestVerifyEvidencePackRejectsVersionDowngrade(t *testing.T) {
 	data, public := signedEvidencePackFixture(t)
 	var forged EvidencePack
@@ -358,7 +418,45 @@ func TestEvidenceLedgerOperationalErrors(t *testing.T) {
 func TestEvidenceLedgerBackfillIsStartupOnly(t *testing.T) {
 	ctx := context.Background()
 	st := testStore(t)
-	batchID := insertSigningBatch(t, st)
+	if _, err := st.db.ExecContext(ctx, "DELETE FROM meta WHERE key IN (?,?)", evidenceLedgerBackfilledMeta, evidenceLedgerBackfillCutoff); err != nil {
+		t.Fatal(err)
+	}
+	firstBatchID := insertCompleteSigningBatch(t, st)
+	if _, err := st.db.ExecContext(ctx, "INSERT INTO meta(key,value) VALUES(?,?)", evidenceLedgerBackfillCutoff, strconv.FormatInt(firstBatchID, 10)); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.backfillEvidenceLedgerOnStartup(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var count int
+	if err := st.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM evidence_ledger WHERE batch_id=?", firstBatchID).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("initial historical batch was not backfilled: %d ledger rows", count)
+	}
+	if _, err := st.db.ExecContext(ctx, "DELETE FROM meta WHERE key=?", evidenceLedgerBackfilledMeta); err != nil {
+		t.Fatal(err)
+	}
+	secondBatchID := insertCompleteSigningBatch(t, st)
+	if err := st.backfillEvidenceLedgerOnStartup(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM evidence_ledger WHERE batch_id=?", secondBatchID).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("post-cutoff batch acquired a historical ledger row: %d", count)
+	}
+}
+
+func TestEvidenceLedgerStartupDoesNotInferMissingCutoffFromRows(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	if _, err := st.db.ExecContext(ctx, "DELETE FROM meta WHERE key IN (?,?)", evidenceLedgerBackfilledMeta, evidenceLedgerBackfillCutoff); err != nil {
+		t.Fatal(err)
+	}
+	batchID := insertCompleteSigningBatch(t, st)
 	if err := st.backfillEvidenceLedgerOnStartup(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -367,7 +465,7 @@ func TestEvidenceLedgerBackfillIsStartupOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 	if count != 0 {
-		t.Fatalf("startup marker allowed a fabricated batch to be signed: %d ledger rows", count)
+		t.Fatalf("startup inferred a historical cutoff and signed batch %d", batchID)
 	}
 }
 
@@ -410,6 +508,24 @@ func insertSigningBatch(t *testing.T, st *Store) int64 {
 	}
 	id, err := result.LastInsertId()
 	if err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
+func insertCompleteSigningBatch(t *testing.T, st *Store) int64 {
+	t.Helper()
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	result, err := st.db.ExecContext(context.Background(), "INSERT INTO event_batches(generation,observed_at,change_count,created_at) VALUES(1,?,?,?)", now, 1, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := result.LastInsertId()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.db.ExecContext(context.Background(), `INSERT INTO events(batch_id,generation,observed_at,collector,event_type,resource_id,name,changes_json)
+		VALUES(?,?,?,?,?,?,?,?)`, id, 1, now, "devices", "changed", "device-"+strconv.FormatInt(id, 10), "server", `[]`); err != nil {
 		t.Fatal(err)
 	}
 	return id

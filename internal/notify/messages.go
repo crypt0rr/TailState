@@ -58,6 +58,9 @@ func Update(previous, current string) string {
 
 func escape(value string) string {
 	value = strings.NewReplacer("\n", " ", "\r", " ").Replace(value)
+	// Escape Markdown syntax that can change links, emphasis, headings, HTML,
+	// or block structure. Backticks are rendered as apostrophes because these
+	// values are placed in code/bold spans by the message builders.
 	value = strings.NewReplacer(
 		"\\", "\\\\",
 		"`", "'",
@@ -68,6 +71,12 @@ func escape(value string) string {
 		"(", "\\(",
 		")", "\\)",
 		"#", "\\#",
+		"+", "\\+",
+		"-", "\\-",
+		"!", "\\!",
+		"{", "\\{",
+		"}", "\\}",
+		"<", "\\<",
 		"|", "\\|",
 		"~", "\\~",
 		">", "\\>",

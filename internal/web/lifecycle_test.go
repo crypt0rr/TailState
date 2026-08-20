@@ -70,7 +70,9 @@ func TestMetricsReportsStoreFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	response := httptest.NewRecorder()
-	server.metrics(response, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	request := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	request.RemoteAddr = "127.0.0.1:1234"
+	server.metrics(response, request)
 	if response.Code != http.StatusInternalServerError || !strings.Contains(response.Body.String(), "metrics unavailable") {
 		t.Fatalf("metrics failure response %d: %s", response.Code, response.Body.String())
 	}
@@ -84,6 +86,19 @@ func TestCurrentSettingsDataFallsBackWhenStoreIsUnavailable(t *testing.T) {
 	data := server.currentSettingsData(context.Background(), "csrf-token")
 	if data.Configured || data.Settings.Tailnet != "-" || data.DeviceSeconds != 60 || data.InventorySeconds != 300 {
 		t.Fatalf("fallback settings data=%#v", data)
+	}
+}
+
+func TestAdminExistsFailsClosedWhenStoreIsUnavailable(t *testing.T) {
+	server, st, _ := testServer(t)
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	response := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/login", nil)
+	exists, ok := server.adminExists(response, request)
+	if exists || ok || response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("closed-store admin check exists=%v ok=%v status=%d", exists, ok, response.Code)
 	}
 }
 

@@ -1,6 +1,7 @@
 package model
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 )
@@ -74,6 +75,27 @@ func TestDiffAndCanonicalErrorBranches(t *testing.T) {
 	}
 	if got := compact(long); !strings.HasSuffix(got.(string), "…") {
 		t.Fatalf("compact output=%q", got)
+	}
+}
+
+func TestDiffPreservesMissingVersusExplicitNull(t *testing.T) {
+	changes := Diff([]byte(`{"value":null}`), []byte(`{}`))
+	if len(changes) != 1 || changes[0].Field != "value" || !changes[0].OldPresent || changes[0].NewPresent {
+		t.Fatalf("null-to-missing diff=%#v", changes)
+	}
+	if got, ok := changes[0].Old.(json.RawMessage); !ok || string(got) != "null" {
+		t.Fatalf("explicit null was not preserved: %#v", changes[0].Old)
+	}
+	encoded, err := json.Marshal(changes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var roundTrip []FieldChange
+	if err := json.Unmarshal(encoded, &roundTrip); err != nil {
+		t.Fatal(err)
+	}
+	if len(roundTrip) != 1 || !roundTrip[0].OldPresent || roundTrip[0].NewPresent || roundTrip[0].Old != nil {
+		t.Fatalf("presence metadata did not survive persistence: %s -> %#v", encoded, roundTrip)
 	}
 }
 

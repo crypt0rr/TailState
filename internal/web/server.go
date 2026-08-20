@@ -68,6 +68,16 @@ type destinationPage struct {
 	Enabled    bool
 }
 
+type readinessCollector struct {
+	Name              string `json:"name"`
+	Supported         bool   `json:"supported"`
+	Baseline          bool   `json:"baseline"`
+	Partial           bool   `json:"partial"`
+	PartialErrorCount int    `json:"partial_error_count"`
+	PollDuration      int64  `json:"poll_duration_ms"`
+	FailureCount      int    `json:"failure_count"`
+}
+
 func New(config boot.Config, st *store.Store, engine *monitor.Engine) (*Server, error) {
 	templates := map[string]*template.Template{}
 	for _, name := range []string{"setup", "login", "reset", "settings", "status", "history"} {
@@ -169,7 +179,12 @@ func (s *Server) home(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/login", http.StatusSeeOther)
 		return
 	}
-	status, _ := s.store.Status(r.Context())
+	status, err := s.store.Status(r.Context())
+	if err != nil {
+		slog.Error("load status for home redirect", "error", err)
+		http.Error(w, "service temporarily unavailable", http.StatusServiceUnavailable)
+		return
+	}
 	if !status.Configured {
 		http.Redirect(w, r, "/settings", http.StatusSeeOther)
 		return
@@ -188,7 +203,7 @@ func (s *Server) setup(w http.ResponseWriter, r *http.Request) {
 	s.render(w, "setup", pageData{})
 }
 func (s *Server) claim(w http.ResponseWriter, r *http.Request) {
-	if !sameOriginRequest(r) {
+	if !s.sameOriginRequest(r) {
 		http.Error(w, "cross-origin setup rejected", http.StatusForbidden)
 		return
 	}
@@ -222,7 +237,10 @@ func (s *Server) claim(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := s.store.Claim(r.Context(), r.FormValue("token"), r.FormValue("password")); err != nil {
 		s.recordFailure(ip)
-		s.render(w, "setup", pageData{Error: err.Error()})
+		// Setup is unauthenticated. Keep storage, token, and migration details
+		// out of the response so this endpoint cannot become an oracle.
+		slog.Debug("setup claim rejected", "error", err)
+		s.render(w, "setup", pageData{Error: "Setup could not be completed. Check the setup token and try again."})
 		return
 	}
 	s.clearFailures(ip)
@@ -258,7 +276,7 @@ func (s *Server) adminExists(w http.ResponseWriter, r *http.Request) (bool, bool
 }
 
 func (s *Server) loginPost(w http.ResponseWriter, r *http.Request) {
-	if !sameOriginRequest(r) {
+	if !s.sameOriginRequest(r) {
 		http.Error(w, "cross-origin login rejected", http.StatusForbidden)
 		return
 	}
@@ -287,7 +305,7 @@ func (s *Server) loginPost(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 
-func sameOriginRequest(r *http.Request) bool {
+func (s *Server) sameOriginRequest(r *http.Request) bool {
 	origin := strings.TrimSpace(r.Header.Get("Origin"))
 	if origin == "" {
 		return !strings.EqualFold(strings.TrimSpace(r.Header.Get("Sec-Fetch-Site")), "cross-site")
@@ -304,7 +322,7 @@ func sameOriginRequest(r *http.Request) bool {
 		return false
 	}
 	scheme := "http"
-	if r.TLS != nil || strings.EqualFold(strings.TrimSpace(strings.Split(r.Header.Get("X-Forwarded-Proto"), ",")[0]), "https") {
+	if r.TLS != nil || (s.isTrustedProxy(remoteIP(r)) && strings.EqualFold(strings.TrimSpace(strings.Split(r.Header.Get("X-Forwarded-Proto"), ",")[0]), "https")) {
 		scheme = "https"
 	}
 	if scheme == "https" {
@@ -325,7 +343,7 @@ func (s *Server) logout(w http.ResponseWriter, r *http.Request) {
 }
 func (s *Server) reset(w http.ResponseWriter, r *http.Request) { s.render(w, "reset", pageData{}) }
 func (s *Server) resetPost(w http.ResponseWriter, r *http.Request) {
-	if !sameOriginRequest(r) {
+	if !s.sameOriginRequest(r) {
 		http.Error(w, "cross-origin reset rejected", http.StatusForbidden)
 		return
 	}
@@ -369,6 +387,16 @@ func (s *Server) status(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		http.Error(w, "load status", 500)
 		return
+	}
+	for i := range status.Collectors {
+		collector := &status.Collectors[i]
+		if collector.Partial && collector.PartialErrorCount > 0 {
+			if collector.LastError == "" {
+				collector.LastError = fmt.Sprintf("%d related requests failed", collector.PartialErrorCount)
+			} else {
+				collector.LastError = fmt.Sprintf("%s (%d related requests failed)", collector.LastError, collector.PartialErrorCount)
+			}
+		}
 	}
 	s.render(w, "status", pageData{CSRF: csrf, Status: status})
 }
@@ -475,9 +503,22 @@ func (s *Server) settings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	current, err := s.store.Settings(r.Context())
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		// An unreadable settings row is a backend failure, not an
+		// unconfigured installation. Rendering the setup form here invites an
+		// operator to overwrite a database they cannot currently read.
+		slog.Error("load settings", "error", err)
+		http.Error(w, "settings temporarily unavailable", http.StatusServiceUnavailable)
+		return
+	}
 	configured := err == nil
 	if !configured {
 		current = store.Settings{Tailnet: "-", DeviceInterval: 60 * time.Second, InventoryInterval: 5 * time.Minute}
+	}
+	if _, err := s.store.ListDestinations(r.Context()); err != nil {
+		slog.Error("load notification destinations", "error", err)
+		http.Error(w, "settings temporarily unavailable", http.StatusServiceUnavailable)
+		return
 	}
 	data := s.settingsData(r.Context(), csrf, configured, current)
 	s.render(w, "settings", data)
@@ -494,6 +535,11 @@ func (s *Server) settingsPost(w http.ResponseWriter, r *http.Request) {
 	device, err1 := strconv.ParseInt(r.FormValue("device_interval"), 10, 64)
 	inventory, err2 := strconv.ParseInt(r.FormValue("inventory_interval"), 10, 64)
 	current, currentErr := s.store.Settings(r.Context())
+	if currentErr != nil && !errors.Is(currentErr, sql.ErrNoRows) {
+		slog.Error("load settings for update", "error", currentErr)
+		http.Error(w, "settings temporarily unavailable", http.StatusServiceUnavailable)
+		return
+	}
 	configured := currentErr == nil
 	clearWebhookSecret := r.FormValue("clear_webhook_secret") == "on" || r.FormValue("clear_webhook_secret") == "true"
 	input := store.Settings{Tailnet: strings.TrimSpace(r.FormValue("tailnet")), OAuthClientID: strings.TrimSpace(r.FormValue("client_id")), OAuthClientSecret: r.FormValue("client_secret"), WebhookSecret: strings.TrimSpace(r.FormValue("webhook_secret")), ClearWebhookSecret: clearWebhookSecret, DeviceInterval: time.Duration(device) * time.Second, InventoryInterval: time.Duration(inventory) * time.Second}
@@ -516,7 +562,7 @@ func (s *Server) settingsPost(w http.ResponseWriter, r *http.Request) {
 	testCtx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 	defer cancel()
 	if err := client.Test(testCtx); err != nil {
-		data.Error = "Tailscale test failed: " + err.Error()
+		data.Error = "Tailscale test failed: " + tailscale.SafeError(err)
 		s.render(w, "settings", data)
 		return
 	}
@@ -636,7 +682,7 @@ func (s *Server) destinationPost(w http.ResponseWriter, r *http.Request) {
 		defer cancel()
 		data := s.currentSettingsData(ctx, csrf)
 		if err := notify.New().Test(testCtx, serviceURL); err != nil {
-			data.Error = "Notification test failed: " + err.Error()
+			data.Error = "Notification test failed: " + notify.SafeTestError(err, serviceURL)
 		} else {
 			data.Message = "Notification test sent."
 		}
@@ -721,11 +767,43 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 }
 func (s *Server) ready(w http.ResponseWriter, r *http.Request) {
 	status, err := s.store.Status(r.Context())
-	if err != nil || !status.Configured || !status.BaselineReady {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"status": "not_ready", "configured": status.Configured, "baseline": status.BaselineReady})
+	if err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"status": "not_ready", "configured": false, "baseline": false})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"status": "ready"})
+	collectors := make([]readinessCollector, 0, len(status.Collectors))
+	for _, collector := range status.Collectors {
+		collectors = append(collectors, readinessCollector{
+			Name:              collector.Name,
+			Supported:         collector.Supported,
+			Baseline:          collector.Baseline,
+			Partial:           collector.Partial,
+			PartialErrorCount: collector.PartialErrorCount,
+			PollDuration:      collector.PollDurationMS,
+			FailureCount:      collector.FailureCount,
+		})
+	}
+	state := "not_ready"
+	code := http.StatusServiceUnavailable
+	if status.Configured && status.BaselineReady {
+		state = "ready"
+		code = http.StatusOK
+		if status.BaselineDegraded {
+			state = "degraded"
+		}
+	}
+	response := map[string]any{
+		"status":          state,
+		"configured":      status.Configured,
+		"baseline":        status.BaselineReady,
+		"degraded":        status.BaselineDegraded,
+		"collectors":      collectors,
+		"baseline_reason": status.BaselineReason,
+	}
+	if status.BaselineGraceUntil != nil {
+		response["baseline_grace_until"] = status.BaselineGraceUntil.UTC().Format(time.RFC3339Nano)
+	}
+	writeJSON(w, code, response)
 }
 func (s *Server) metrics(w http.ResponseWriter, r *http.Request) {
 	if !s.metricsAuthorized(r) {
@@ -744,9 +822,24 @@ func (s *Server) metrics(w http.ResponseWriter, r *http.Request) {
 		ready = 1
 	}
 	fmt.Fprintf(w, "# HELP tailstate_ready Whether setup and baseline are complete.\n# TYPE tailstate_ready gauge\ntailstate_ready %d\n", ready)
+	degraded := 0
+	if status.BaselineDegraded {
+		degraded = 1
+	}
+	fmt.Fprintf(w, "# TYPE tailstate_baseline_degraded gauge\ntailstate_baseline_degraded %d\n", degraded)
+	dueErrors := uint64(0)
+	if s.engine != nil {
+		dueErrors = s.engine.CollectorDueErrors()
+	}
+	fmt.Fprintf(w, "# TYPE tailstate_collector_due_errors_total counter\ntailstate_collector_due_errors_total %d\n", dueErrors)
 	fmt.Fprintf(w, "# TYPE tailstate_outbox_pending gauge\ntailstate_outbox_pending %d\n# TYPE tailstate_outbox_dead gauge\ntailstate_outbox_dead %d\n", status.Pending, status.Dead)
 	fmt.Fprintf(w, "# TYPE tailstate_webhook_triggers_pending gauge\ntailstate_webhook_triggers_pending %d\n# TYPE tailstate_webhook_triggers_processing gauge\ntailstate_webhook_triggers_processing %d\n# TYPE tailstate_webhook_triggers_dead gauge\ntailstate_webhook_triggers_dead %d\n", status.WebhookPending, status.WebhookProcessing, status.WebhookDead)
-	fmt.Fprint(w, "# TYPE tailstate_collector_supported gauge\n# TYPE tailstate_collector_baseline gauge\n# TYPE tailstate_collector_failures gauge\n# TYPE tailstate_collector_last_success_timestamp_seconds gauge\n# TYPE tailstate_collector_next_poll_timestamp_seconds gauge\n")
+	paused := 0
+	if status.Configured && status.EnabledDestinations == 0 {
+		paused = 1
+	}
+	fmt.Fprintf(w, "# TYPE tailstate_notification_destinations gauge\ntailstate_notification_destinations %d\n# TYPE tailstate_notification_destinations_enabled gauge\ntailstate_notification_destinations_enabled %d\n# TYPE tailstate_notifications_paused gauge\ntailstate_notifications_paused %d\n", status.Destinations, status.EnabledDestinations, paused)
+	fmt.Fprint(w, "# TYPE tailstate_collector_supported gauge\n# TYPE tailstate_collector_baseline gauge\n# TYPE tailstate_collector_partial gauge\n# TYPE tailstate_collector_partial_errors gauge\n# TYPE tailstate_collector_failures gauge\n# TYPE tailstate_collector_poll_duration_seconds gauge\n# TYPE tailstate_collector_last_success_timestamp_seconds gauge\n# TYPE tailstate_collector_next_poll_timestamp_seconds gauge\n")
 	for _, collector := range status.Collectors {
 		supported, baseline := 0, 0
 		if collector.Supported {
@@ -755,7 +848,11 @@ func (s *Server) metrics(w http.ResponseWriter, r *http.Request) {
 		if collector.Baseline {
 			baseline = 1
 		}
-		fmt.Fprintf(w, "tailstate_collector_supported{collector=%q} %d\ntailstate_collector_baseline{collector=%q} %d\ntailstate_collector_failures{collector=%q} %d\n", collector.Name, supported, collector.Name, baseline, collector.Name, collector.FailureCount)
+		partial := 0
+		if collector.Partial {
+			partial = 1
+		}
+		fmt.Fprintf(w, "tailstate_collector_supported{collector=%q} %d\ntailstate_collector_baseline{collector=%q} %d\ntailstate_collector_partial{collector=%q} %d\ntailstate_collector_partial_errors{collector=%q} %d\ntailstate_collector_failures{collector=%q} %d\ntailstate_collector_poll_duration_seconds{collector=%q} %.3f\n", collector.Name, supported, collector.Name, baseline, collector.Name, partial, collector.Name, collector.PartialErrorCount, collector.Name, collector.FailureCount, collector.Name, float64(collector.PollDurationMS)/1000)
 		if collector.LastSuccess != nil {
 			fmt.Fprintf(w, "tailstate_collector_last_success_timestamp_seconds{collector=%q} %d\n", collector.Name, collector.LastSuccess.Unix())
 		}
@@ -769,19 +866,22 @@ func (s *Server) metrics(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) metricsAuthorized(r *http.Request) bool {
-	if s.config.MetricsToken == "" {
-		return true
+	if s.config.MetricsToken != "" {
+		const prefix = "Bearer "
+		authorization := r.Header.Get("Authorization")
+		if !strings.HasPrefix(authorization, prefix) {
+			return false
+		}
+		provided := strings.TrimSpace(strings.TrimPrefix(authorization, prefix))
+		if provided == "" {
+			return false
+		}
+		return subtle.ConstantTimeCompare([]byte(provided), []byte(s.config.MetricsToken)) == 1
 	}
-	const prefix = "Bearer "
-	authorization := r.Header.Get("Authorization")
-	if !strings.HasPrefix(authorization, prefix) {
-		return false
-	}
-	provided := strings.TrimSpace(strings.TrimPrefix(authorization, prefix))
-	if provided == "" {
-		return false
-	}
-	return subtle.ConstantTimeCompare([]byte(provided), []byte(s.config.MetricsToken)) == 1
+	// A blank token is useful for local Compose development, but must not turn
+	// an accidentally public listener into an unauthenticated inventory API.
+	addr, err := netip.ParseAddr(strings.TrimSpace(s.clientIP(r)))
+	return err == nil && addr.IsLoopback()
 }
 
 func (s *Server) startSession(w http.ResponseWriter, r *http.Request) bool {

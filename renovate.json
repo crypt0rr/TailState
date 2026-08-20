@@ -6,7 +6,7 @@
   "customManagers": [
     {
       "customType": "regex",
-      "managerFilePatterns": ["/(^|\\/)scripts\\/.*\\.sh$/"],
+      "managerFilePatterns": ["/(^|\\/)scripts\\/backup-image\\.sh$/"],
       "matchStrings": [
         "# renovate: datasource=(?<datasource>docker) depName=(?<depName>[^\\s]+)\\nbackup_image=\"\\$\\{TAILSTATE_BACKUP_IMAGE:-(?<currentValue>[^@\"]+)(?:@(?<currentDigest>sha256:[a-f0-9]+))?\\}\""
       ],

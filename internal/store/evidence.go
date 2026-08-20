@@ -60,20 +60,24 @@ type EvidenceFilter struct {
 // EvidenceBatch contains one atomic polling result and its related events and
 // notification outcomes.
 type EvidenceBatch struct {
-	ID              int64              `json:"id"`
-	Generation      int64              `json:"generation"`
-	ObservedAt      time.Time          `json:"observed_at"`
-	ChangeCount     int                `json:"change_count"`
-	TriggerID       int64              `json:"trigger_id,omitempty"`
-	TriggerIDs      []int64            `json:"trigger_ids,omitempty"`
-	LedgerSequence  int64              `json:"ledger_sequence,omitempty"`
-	LedgerPrevHash  string             `json:"ledger_prev_hash,omitempty"`
-	LedgerHash      string             `json:"ledger_hash,omitempty"`
-	LedgerSignature string             `json:"ledger_signature,omitempty"`
-	LedgerKeyID     string             `json:"ledger_key_id,omitempty"`
-	LedgerPayload   string             `json:"ledger_payload,omitempty"`
-	Events          []EvidenceEvent    `json:"events"`
-	Deliveries      []EvidenceDelivery `json:"deliveries"`
+	ID          int64     `json:"id"`
+	Generation  int64     `json:"generation"`
+	ObservedAt  time.Time `json:"observed_at"`
+	ChangeCount int       `json:"change_count"`
+	// LedgerChangeCount preserves the unfiltered event count used by the
+	// signed ledger payload. A history filter may include only some events from
+	// a batch, while the ledger must still verify the original batch metadata.
+	LedgerChangeCount int                `json:"ledger_change_count,omitempty"`
+	TriggerID         int64              `json:"trigger_id,omitempty"`
+	TriggerIDs        []int64            `json:"trigger_ids,omitempty"`
+	LedgerSequence    int64              `json:"ledger_sequence,omitempty"`
+	LedgerPrevHash    string             `json:"ledger_prev_hash,omitempty"`
+	LedgerHash        string             `json:"ledger_hash,omitempty"`
+	LedgerSignature   string             `json:"ledger_signature,omitempty"`
+	LedgerKeyID       string             `json:"ledger_key_id,omitempty"`
+	LedgerPayload     string             `json:"ledger_payload,omitempty"`
+	Events            []EvidenceEvent    `json:"events"`
+	Deliveries        []EvidenceDelivery `json:"deliveries"`
 }
 
 // EvidenceLedgerLink carries the signed chain links between exported batches.
@@ -110,9 +114,11 @@ type EvidenceEvent struct {
 // EvidenceField is a machine-readable field-level diff. Missing old or new
 // values are omitted, while an explicit JSON null remains distinguishable.
 type EvidenceField struct {
-	Field string          `json:"field"`
-	Old   json.RawMessage `json:"old,omitempty"`
-	New   json.RawMessage `json:"new,omitempty"`
+	Field      string          `json:"field"`
+	Old        json.RawMessage `json:"old,omitempty"`
+	New        json.RawMessage `json:"new,omitempty"`
+	OldPresent bool            `json:"old_present,omitempty"`
+	NewPresent bool            `json:"new_present,omitempty"`
 }
 
 // EvidenceDelivery records destination-specific delivery state without
@@ -233,6 +239,19 @@ func verifyEvidencePack(data, trustedPublic []byte) error {
 	if pack.Version != evidencePackVersion {
 		return fmt.Errorf("unsupported evidence pack format %q version %d", pack.Format, pack.Version)
 	}
+	if pack.Truncated {
+		if pack.NextCursor <= 0 {
+			return errors.New("truncated evidence pack is missing next cursor")
+		}
+		if len(pack.Batches) == 0 {
+			return errors.New("truncated evidence pack has no batches")
+		}
+		if pack.Batches[len(pack.Batches)-1].ID != pack.NextCursor {
+			return errors.New("truncated evidence pack cursor does not match last batch")
+		}
+	} else if pack.NextCursor != 0 {
+		return errors.New("complete evidence pack has an unexpected next cursor")
+	}
 	content, err := evidencePayload(pack)
 	if err != nil {
 		return fmt.Errorf("encode evidence pack content: %w", err)
@@ -315,6 +334,29 @@ func verifyLedgerLinks(pack EvidencePack) error {
 	}
 	links := append([]EvidenceLedgerLink(nil), pack.LedgerLinks...)
 	sort.Slice(links, func(i, j int) bool { return links[i].Sequence < links[j].Sequence })
+	minBatchSequence, maxBatchSequence := int64(0), int64(0)
+	for sequence := range batchesBySequence {
+		if minBatchSequence == 0 || sequence < minBatchSequence {
+			minBatchSequence = sequence
+		}
+		if sequence > maxBatchSequence {
+			maxBatchSequence = sequence
+		}
+	}
+	// ExportEvidencePack includes exactly one predecessor as a checkpoint for
+	// ranges that begin in the middle of the append-only ledger. Requiring that
+	// boundary here makes a missing ledger row distinguishable from a normal
+	// filtered/retained range instead of silently accepting a truncated chain.
+	expectedFirstSequence := minBatchSequence
+	if expectedFirstSequence > 1 {
+		expectedFirstSequence--
+	}
+	if links[0].Sequence != expectedFirstSequence {
+		return fmt.Errorf("evidence ledger checkpoint is missing before sequence %d", minBatchSequence)
+	}
+	if links[len(links)-1].Sequence != maxBatchSequence {
+		return fmt.Errorf("evidence ledger links extend beyond exported sequence %d", maxBatchSequence)
+	}
 	public, err := decodeKeyMaterial(pack.SigningPublicKey, ed25519.PublicKeySize)
 	if err != nil {
 		return fmt.Errorf("decode evidence ledger public key: %w", err)
@@ -376,7 +418,11 @@ func verifyLedgerLinks(pack EvidencePack) error {
 		if err := json.Unmarshal(payload, &ledgerBatch); err != nil {
 			return fmt.Errorf("decode ledger payload for batch %d: %w", batch.ID, err)
 		}
-		if ledgerBatch.BatchID != batch.ID || ledgerBatch.Generation != batch.Generation || ledgerBatch.ChangeCount != batch.ChangeCount {
+		changeCount := batch.LedgerChangeCount
+		if changeCount == 0 {
+			changeCount = batch.ChangeCount
+		}
+		if ledgerBatch.BatchID != batch.ID || ledgerBatch.Generation != batch.Generation || ledgerBatch.ChangeCount != changeCount {
 			return fmt.Errorf("ledger payload metadata mismatch for batch %d", batch.ID)
 		}
 		digest := ledgerDigest(batch.LedgerPrevHash, payload)
@@ -401,21 +447,29 @@ func evidencePayload(pack EvidencePack) ([]byte, error) {
 }
 
 func evidenceBatch(batch HistoryBatch) EvidenceBatch {
+	ledgerChangeCount := batch.ChangeCount
+	if len(batch.ledgerPayload) > 0 {
+		var ledgerBatch evidenceLedgerBatch
+		if err := json.Unmarshal(batch.ledgerPayload, &ledgerBatch); err == nil && ledgerBatch.ChangeCount > 0 {
+			ledgerChangeCount = ledgerBatch.ChangeCount
+		}
+	}
 	out := EvidenceBatch{
-		ID:              batch.ID,
-		Generation:      batch.Generation,
-		ObservedAt:      batch.ObservedAt,
-		ChangeCount:     batch.ChangeCount,
-		TriggerID:       batch.TriggerID,
-		TriggerIDs:      append([]int64(nil), batch.TriggerIDs...),
-		LedgerSequence:  batch.LedgerSequence,
-		LedgerPrevHash:  batch.LedgerPrevHash,
-		LedgerHash:      batch.LedgerHash,
-		LedgerSignature: batch.LedgerSignature,
-		LedgerKeyID:     batch.LedgerKeyID,
-		LedgerPayload:   base64.RawStdEncoding.EncodeToString(batch.ledgerPayload),
-		Events:          make([]EvidenceEvent, 0, len(batch.Events)),
-		Deliveries:      make([]EvidenceDelivery, 0, len(batch.Deliveries)),
+		ID:                batch.ID,
+		Generation:        batch.Generation,
+		ObservedAt:        batch.ObservedAt,
+		ChangeCount:       batch.ChangeCount,
+		LedgerChangeCount: ledgerChangeCount,
+		TriggerID:         batch.TriggerID,
+		TriggerIDs:        append([]int64(nil), batch.TriggerIDs...),
+		LedgerSequence:    batch.LedgerSequence,
+		LedgerPrevHash:    batch.LedgerPrevHash,
+		LedgerHash:        batch.LedgerHash,
+		LedgerSignature:   batch.LedgerSignature,
+		LedgerKeyID:       batch.LedgerKeyID,
+		LedgerPayload:     base64.RawStdEncoding.EncodeToString(batch.ledgerPayload),
+		Events:            make([]EvidenceEvent, 0, len(batch.Events)),
+		Deliveries:        make([]EvidenceDelivery, 0, len(batch.Deliveries)),
 	}
 	for _, event := range batch.Events {
 		converted := EvidenceEvent{
@@ -435,9 +489,11 @@ func evidenceBatch(batch HistoryBatch) EvidenceBatch {
 		}
 		for _, field := range event.Fields {
 			converted.Fields = append(converted.Fields, EvidenceField{
-				Field: field.Field,
-				Old:   evidenceJSON(field.Old),
-				New:   evidenceJSON(field.New),
+				Field:      field.Field,
+				Old:        evidenceJSON(field.Old),
+				New:        evidenceJSON(field.New),
+				OldPresent: field.HasOld,
+				NewPresent: field.HasNew,
 			})
 		}
 		out.Events = append(out.Events, converted)

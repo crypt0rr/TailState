@@ -19,6 +19,10 @@ COPY --from=builder /out/tailstate /tailstate
 USER 10001:10001
 VOLUME ["/data"]
 EXPOSE 8080
+# Containers receive their network boundary from Compose/Docker port
+# publishing; keep the application reachable on the container bridge while
+# standalone binaries default to loopback in boot.Config.
+ENV TAILSTATE_LISTEN_ADDR=0.0.0.0:8080
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 CMD ["/tailstate", "healthcheck"]
 ENTRYPOINT ["/tailstate"]
 CMD ["serve"]

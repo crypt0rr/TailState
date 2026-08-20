@@ -57,9 +57,17 @@ func TestPasswordMatchesUsesEncodedParameters(t *testing.T) {
 		strings.Replace(encoded, "m=8192,t=1,p=1", "m=8192,t=1,p=1,x=1", 1),
 		strings.Replace(encoded, "m=8192,t=1,p=1", "m=8192,t=1", 1),
 		strings.Replace(encoded, "m=8192,t=1,p=1", "m=8192,t=1,p=0", 1),
+		strings.Replace(encoded, "m=8192,t=1,p=1", "m=65537,t=1,p=1", 1),
+		strings.Replace(encoded, "m=8192,t=1,p=1", "m=8192,t=4,p=1", 1),
+		strings.Replace(encoded, "m=8192,t=1,p=1", "m=8192,t=1,p=3", 1),
+		strings.Replace(encoded, "m=8192,t=1,p=1", "m=8192,t=1,p=1,m=8192", 1),
 	} {
 		if PasswordMatches(malformed, "a secure password") {
 			t.Fatalf("malformed Argon2 parameters were accepted: %q", malformed)
 		}
+	}
+	shortSalt := fmt.Sprintf("argon2id$v=19$m=8192,t=1,p=1$%s$%s", base64.RawStdEncoding.EncodeToString([]byte("short")), base64.RawStdEncoding.EncodeToString(hash))
+	if PasswordMatches(shortSalt, "a secure password") {
+		t.Fatal("short Argon2 salt was accepted")
 	}
 }

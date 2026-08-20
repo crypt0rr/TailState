@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/crypt0rr/tailstate/internal/model"
 	"github.com/crypt0rr/tailstate/internal/secret"
 )
 
@@ -38,6 +39,34 @@ func TestRekeyPreservesEncryptedStateAndEvidenceIdentity(t *testing.T) {
 	if generation != 1 {
 		st.Close()
 		t.Fatalf("generation=%d", generation)
+	}
+	baseline := model.Collected{Collector: "devices", Resources: []model.Resource{{
+		ID: "device-1", Type: "device", Name: "server", Data: map[string]any{"hostname": "server"},
+	}}}
+	changed := model.Collected{Collector: "devices", Resources: []model.Resource{{
+		ID: "device-1", Type: "device", Name: "server", Data: map[string]any{"hostname": "server-new"},
+	}}}
+	if _, err := st.applyBatch(ctx, generation, []model.Collected{baseline}, func([]model.Change) string { return "baseline" }); err != nil {
+		st.Close()
+		t.Fatal(err)
+	}
+	if _, err := st.applyBatch(ctx, generation, []model.Collected{changed}, func([]model.Change) string { return "changed" }); err != nil {
+		st.Close()
+		t.Fatal(err)
+	}
+	evidence, err := st.ExportEvidencePack(ctx, HistoryFilter{Limit: 10})
+	if err != nil {
+		st.Close()
+		t.Fatal(err)
+	}
+	public, err := st.EvidenceSigningPublicKey(ctx)
+	if err != nil {
+		st.Close()
+		t.Fatal(err)
+	}
+	if err := VerifyEvidencePackWithKey(evidence, public); err != nil {
+		st.Close()
+		t.Fatalf("evidence did not verify before rekey: %v", err)
 	}
 	newBox, err := secret.NewBox([]byte(strings.Repeat("b", 32)))
 	if err != nil {
@@ -72,6 +101,9 @@ func TestRekeyPreservesEncryptedStateAndEvidenceIdentity(t *testing.T) {
 	defer reopened.Close()
 	if got, err := reopened.EvidenceSigningKeyID(ctx); err != nil || got != keyID {
 		t.Fatalf("reopened evidence key=%q err=%v", got, err)
+	}
+	if err := VerifyEvidencePackWithKey(evidence, public); err != nil {
+		t.Fatalf("evidence signed before rekey no longer verifies: %v", err)
 	}
 }
 

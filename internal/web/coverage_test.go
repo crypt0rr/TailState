@@ -129,7 +129,7 @@ func TestHealthReadyMetricsAndSecurityHeaders(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.ApplyBatch(context.Background(), generation, []model.Collected{{Collector: "devices", Resources: []model.Resource{{ID: "device-1", Type: "device", Name: "server", Data: map[string]any{"hostname": "server"}}}}}, func([]model.Change) string { return "baseline" }); err != nil {
+	if _, err := st.ApplyBatchWithBatch(context.Background(), generation, []model.Collected{{Collector: "devices", Resources: []model.Resource{{ID: "device-1", Type: "device", Name: "server", Data: map[string]any{"hostname": "server"}}}}}, func([]model.Change) string { return "baseline" }); err != nil {
 		t.Fatal(err)
 	}
 	ready = httptest.NewRecorder()
@@ -138,9 +138,21 @@ func TestHealthReadyMetricsAndSecurityHeaders(t *testing.T) {
 		t.Fatalf("configured ready response %d: %s", ready.Code, ready.Body.String())
 	}
 	metrics := httptest.NewRecorder()
-	handler.ServeHTTP(metrics, httptest.NewRequest(http.MethodGet, "/metrics", nil))
-	if metrics.Code != http.StatusOK || !strings.Contains(metrics.Body.String(), "tailstate_ready 1") || !strings.Contains(metrics.Header().Get("Content-Type"), "0.0.4") {
+	metricsRequest := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	metricsRequest.RemoteAddr = "127.0.0.1:1234"
+	handler.ServeHTTP(metrics, metricsRequest)
+	metricsBody := metrics.Body.String()
+	if metrics.Code != http.StatusOK || !strings.Contains(metricsBody, "tailstate_ready 1") || !strings.Contains(metrics.Header().Get("Content-Type"), "0.0.4") {
 		t.Fatalf("ready metrics response %d headers=%v body=%s", metrics.Code, metrics.Header(), metrics.Body.String())
+	}
+	for _, want := range []string{
+		"tailstate_notification_destinations 1",
+		"tailstate_notification_destinations_enabled 1",
+		"tailstate_notifications_paused 0",
+	} {
+		if !strings.Contains(metricsBody, want) {
+			t.Fatalf("notification metric %q missing from metrics body: %s", want, metricsBody)
+		}
 	}
 
 	if err := st.Close(); err != nil {
@@ -150,6 +162,22 @@ func TestHealthReadyMetricsAndSecurityHeaders(t *testing.T) {
 	server.health(unhealthy, httptest.NewRequest(http.MethodGet, "/healthz", nil))
 	if unhealthy.Code != http.StatusServiceUnavailable || !strings.Contains(unhealthy.Body.String(), "unhealthy") {
 		t.Fatalf("closed-store health response %d: %s", unhealthy.Code, unhealthy.Body.String())
+	}
+}
+
+func TestHomeReportsStorageErrors(t *testing.T) {
+	server, _, db, cookies := webServerWithDatabase(t)
+	if _, err := db.ExecContext(context.Background(), "DROP TABLE settings"); err != nil {
+		t.Fatal(err)
+	}
+	homeRequest := httptest.NewRequest(http.MethodGet, "/", nil)
+	for _, cookie := range cookies {
+		homeRequest.AddCookie(cookie)
+	}
+	homeResponse := httptest.NewRecorder()
+	server.Handler().ServeHTTP(homeResponse, homeRequest)
+	if homeResponse.Code != http.StatusServiceUnavailable {
+		t.Fatalf("home redirected through a storage failure: status=%d body=%s", homeResponse.Code, homeResponse.Body.String())
 	}
 }
 
@@ -176,7 +204,7 @@ func TestNavigationAndClaimValidationBranches(t *testing.T) {
 	}
 	invalid := url.Values{"token": {"wrong-token"}, "password": {"a secure password"}, "confirm": {"a secure password"}}
 	invalidResponse := coveragePost(t, server, "/setup/claim", invalid, nil)
-	if invalidResponse.Code != http.StatusOK || !strings.Contains(invalidResponse.Body.String(), "invalid") {
+	if invalidResponse.Code != http.StatusOK || !strings.Contains(invalidResponse.Body.String(), "Setup could not be completed") || strings.Contains(invalidResponse.Body.String(), "wrong-token") {
 		t.Fatalf("invalid token response %d: %s", invalidResponse.Code, invalidResponse.Body.String())
 	}
 
@@ -198,6 +226,40 @@ func TestNavigationAndClaimValidationBranches(t *testing.T) {
 	}
 	if exists, err := st.AdminExists(context.Background()); err != nil || !exists {
 		t.Fatalf("admin state after claim exists=%v err=%v", exists, err)
+	}
+}
+
+func TestSetupDoesNotExposeStorageErrors(t *testing.T) {
+	box, err := secret.NewBox(make([]byte, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "tailstate.db")
+	st, err := store.Open(path, box)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	config := boot.Config{ListenAddr: "127.0.0.1:0", TailscaleBase: "http://example.invalid", OAuthTokenURL: "http://example.invalid/oauth", Version: "test"}
+	server, err := New(config, st, monitor.New(st, config.TailscaleBase, config.OAuthTokenURL, config.Version))
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", "file:"+path+"?_pragma=busy_timeout(5000)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	token, err := st.NewSetupToken(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(context.Background(), "DROP TABLE auth_tokens"); err != nil {
+		t.Fatal(err)
+	}
+	response := coveragePost(t, server, "/setup/claim", url.Values{"token": {token}, "password": {"a secure password"}, "confirm": {"a secure password"}}, nil)
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "Setup could not be completed") || strings.Contains(response.Body.String(), "no such table") {
+		t.Fatalf("storage error leaked through setup response status=%d body=%s", response.Code, response.Body.String())
 	}
 }
 
@@ -426,13 +488,30 @@ func TestDestinationTestAndUnknownMutationErrors(t *testing.T) {
 	server, st, setupToken := testServer(t)
 	cookies := claimCoverageAdmin(t, server, setupToken)
 	csrf := coverageCSRF(t, cookies)
-	server.config.TailscaleBase = "http://127.0.0.1:1/api/v2"
-	server.config.OAuthTokenURL = "http://127.0.0.1:1/oauth/token"
+	tailscaleAPI := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/oauth/token" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"access_token":"access","expires_in":3600}`))
+			return
+		}
+		if r.URL.Path == "/api/v2/tailnet/-/devices" {
+			w.WriteHeader(http.StatusBadGateway)
+			_, _ = w.Write([]byte("UPSTREAM-SECRET-RESPONSE"))
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer tailscaleAPI.Close()
+	server.config.TailscaleBase = tailscaleAPI.URL + "/api/v2"
+	server.config.OAuthTokenURL = tailscaleAPI.URL + "/oauth/token"
 	failedSettings := coveragePost(t, server, "/settings", url.Values{
 		"_csrf": {csrf}, "tailnet": {"-"}, "client_id": {"client"}, "client_secret": {"secret"}, "device_interval": {"60"}, "inventory_interval": {"300"},
 	}, cookies)
 	if failedSettings.Code != http.StatusOK || !strings.Contains(failedSettings.Body.String(), "Tailscale test failed") {
 		t.Fatalf("failed Tailscale settings status=%d body=%s", failedSettings.Code, failedSettings.Body.String())
+	}
+	if strings.Contains(failedSettings.Body.String(), "UPSTREAM-SECRET-RESPONSE") {
+		t.Fatalf("Tailscale provider response leaked into settings HTML: %s", failedSettings.Body.String())
 	}
 
 	invalid := coveragePost(t, server, "/settings/destinations", url.Values{
@@ -440,6 +519,16 @@ func TestDestinationTestAndUnknownMutationErrors(t *testing.T) {
 	}, cookies)
 	if invalid.Code != http.StatusOK || !strings.Contains(invalid.Body.String(), "Notification destination was not saved") {
 		t.Fatalf("invalid destination save status=%d body=%s", invalid.Code, invalid.Body.String())
+	}
+	secretURL := "not-a-shoutrrr-url?token=notification-secret"
+	secretTest := coveragePost(t, server, "/settings/destinations/test", url.Values{
+		"_csrf": {csrf}, "service_url": {secretURL},
+	}, cookies)
+	if secretTest.Code != http.StatusOK || !strings.Contains(secretTest.Body.String(), "Notification test failed") {
+		t.Fatalf("secret-bearing notification test status=%d body=%s", secretTest.Code, secretTest.Body.String())
+	}
+	if strings.Contains(secretTest.Body.String(), "notification-secret") {
+		t.Fatalf("destination credential leaked into notification test HTML: %s", secretTest.Body.String())
 	}
 
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -461,6 +550,19 @@ func TestDestinationTestAndUnknownMutationErrors(t *testing.T) {
 		t.Fatalf("saved destinations=%#v err=%v", destinations, err)
 	}
 	id := strconv.FormatInt(destinations[0].ID, 10)
+	failingNotification := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = w.Write([]byte("UPSTREAM-NOTIFICATION-SECRET"))
+	}))
+	defer failingNotification.Close()
+	failingURL := strings.Replace(failingNotification.URL, "http://", "generic://", 1) + "?disabletls=true"
+	failedTest := coveragePost(t, server, "/settings/destinations/test", url.Values{"_csrf": {csrf}, "id": {id}, "service_url": {failingURL}}, cookies)
+	if failedTest.Code != http.StatusOK || !strings.Contains(failedTest.Body.String(), "Notification test failed") {
+		t.Fatalf("failed notification test status=%d body=%s", failedTest.Code, failedTest.Body.String())
+	}
+	if strings.Contains(failedTest.Body.String(), "UPSTREAM-NOTIFICATION-SECRET") {
+		t.Fatalf("provider response leaked into notification test HTML: %s", failedTest.Body.String())
+	}
 
 	tested := coveragePost(t, server, "/settings/destinations/test", url.Values{"_csrf": {csrf}, "id": {id}}, cookies)
 	if tested.Code != http.StatusOK || !strings.Contains(tested.Body.String(), "Notification test sent") {
@@ -553,9 +655,13 @@ func TestWebAdditionalErrorAndMetricsBranches(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	st.SetNextPoll(context.Background(), settings.Generation, []string{"devices"}, time.Now().Add(time.Minute))
+	if err := st.SetNextPollErr(context.Background(), settings.Generation, []string{"devices"}, time.Now().Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
 	metrics := httptest.NewRecorder()
-	server.Handler().ServeHTTP(metrics, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	metricsRequest := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	metricsRequest.RemoteAddr = "127.0.0.1:1234"
+	server.Handler().ServeHTTP(metrics, metricsRequest)
 	if !strings.Contains(metrics.Body.String(), "tailstate_collector_next_poll_timestamp_seconds") {
 		t.Fatal("next-poll metric missing")
 	}
@@ -628,6 +734,25 @@ func TestSettingsAndWebhookDatabaseErrorResponses(t *testing.T) {
 		}
 	})
 
+	t.Run("settings page destination failure", func(t *testing.T) {
+		server, st, db, cookies := webServerWithDatabase(t)
+		if _, err := st.SaveSettings(ctx, store.Settings{Tailnet: "-", OAuthClientID: "client", OAuthClientSecret: "secret", MattermostURL: "https://mattermost.example/hooks/token", DeviceInterval: time.Minute, InventoryInterval: 5 * time.Minute}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.ExecContext(ctx, "DROP TABLE notification_destinations"); err != nil {
+			t.Fatal(err)
+		}
+		request := httptest.NewRequest(http.MethodGet, "/settings", nil)
+		for _, cookie := range cookies {
+			request.AddCookie(cookie)
+		}
+		response := httptest.NewRecorder()
+		server.Handler().ServeHTTP(response, request)
+		if response.Code != http.StatusServiceUnavailable || strings.Contains(response.Body.String(), "no such table") {
+			t.Fatalf("settings destination failure response=%d body=%s", response.Code, response.Body.String())
+		}
+	})
+
 	t.Run("settings save failure", func(t *testing.T) {
 		server, st, db, cookies := webServerWithDatabase(t)
 		if _, err := st.SaveSettings(ctx, store.Settings{Tailnet: "-", OAuthClientID: "client", OAuthClientSecret: "secret", MattermostURL: "https://mattermost.example/hooks/token", DeviceInterval: time.Minute, InventoryInterval: 5 * time.Minute}); err != nil {
@@ -641,7 +766,7 @@ func TestSettingsAndWebhookDatabaseErrorResponses(t *testing.T) {
 			t.Fatal(err)
 		}
 		response := coveragePost(t, server, "/settings", settingsForm(coverageCSRF(t, cookies)), cookies)
-		if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "no such table") {
+		if response.Code != http.StatusServiceUnavailable || strings.Contains(response.Body.String(), "no such table") {
 			t.Fatalf("settings save failure response=%d body=%s", response.Code, response.Body.String())
 		}
 	})
@@ -660,7 +785,7 @@ func TestSettingsAndWebhookDatabaseErrorResponses(t *testing.T) {
 		}
 		response := httptest.NewRecorder()
 		server.Handler().ServeHTTP(response, request)
-		if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "Monitoring settings") {
+		if response.Code != http.StatusServiceUnavailable || strings.Contains(response.Body.String(), "decrypt encrypted value") {
 			t.Fatalf("settings fallback response=%d body=%s", response.Code, response.Body.String())
 		}
 	})
@@ -705,7 +830,7 @@ func TestSettingsAndWebhookDatabaseErrorResponses(t *testing.T) {
 }
 
 func TestWebCSRFAndFormBoundaryBranches(t *testing.T) {
-	server, _, _, cookies := webServerWithDatabase(t)
+	server, _, db, cookies := webServerWithDatabase(t)
 	unauthSettings := httptest.NewRecorder()
 	server.Handler().ServeHTTP(unauthSettings, httptest.NewRequest(http.MethodGet, "/settings", nil))
 	if unauthSettings.Code != http.StatusSeeOther || unauthSettings.Header().Get("Location") != "/login" {
@@ -731,6 +856,21 @@ func TestWebCSRFAndFormBoundaryBranches(t *testing.T) {
 	defaultSave := coveragePost(t, server, "/settings/destinations", url.Values{"_csrf": {coverageCSRF(t, cookies)}, "name": {"Default action"}, "service_url": {"generic://example.invalid/path"}, "enabled": {"on"}}, cookies)
 	if defaultSave.Code != http.StatusSeeOther {
 		t.Fatalf("default destination action status=%d body=%s", defaultSave.Code, defaultSave.Body.String())
+	}
+	if _, err := db.ExecContext(context.Background(), `INSERT INTO settings(id,tailnet,oauth_client_id,oauth_secret_enc,mattermost_url_enc,webhook_secret_enc,device_interval_seconds,inventory_interval_seconds,generation,configured_at) VALUES(1,'-','client','','','',60,300,1,?)`, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(context.Background(), `INSERT INTO collector_state(generation,collector,supported,baseline,last_success,last_error,failure_count,partial,partial_error_count) VALUES(1,'device_details',1,1,?,'detail endpoint unavailable',1,1,2)`, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		t.Fatal(err)
+	}
+	authStatus := httptest.NewRecorder()
+	authStatusRequest := httptest.NewRequest(http.MethodGet, "/status", nil)
+	for _, cookie := range cookies {
+		authStatusRequest.AddCookie(cookie)
+	}
+	server.Handler().ServeHTTP(authStatus, authStatusRequest)
+	if authStatus.Code != http.StatusOK || !strings.Contains(authStatus.Body.String(), "2 related requests failed") {
+		t.Fatalf("authenticated status did not explain partial collector errors: status=%d body=%s", authStatus.Code, authStatus.Body.String())
 	}
 	server.loginAttempts["stale"] = []time.Time{time.Now().Add(-16 * time.Minute)}
 	if server.rateLimited("stale") {

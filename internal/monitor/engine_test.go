@@ -3,6 +3,7 @@ package monitor
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -18,6 +19,14 @@ type scriptedSender struct {
 	mu    sync.Mutex
 	calls []string
 }
+
+type leakingSender struct{}
+
+func (leakingSender) Send(_ context.Context, serviceURL, _ string) error {
+	return fmt.Errorf("provider rejected %s", serviceURL)
+}
+
+func (leakingSender) Test(context.Context, string) error { return nil }
 
 func (s *scriptedSender) Send(_ context.Context, serviceURL, _ string) error {
 	s.mu.Lock()
@@ -58,10 +67,10 @@ func TestDeliveryKeepsDestinationFailuresIndependent(t *testing.T) {
 	}
 	baseline := []model.Collected{{Collector: "devices", Resources: []model.Resource{{ID: "device-1", Type: "device", Name: "server", Data: map[string]any{"hostname": "server"}}}}}
 	changed := []model.Collected{{Collector: "devices", Resources: []model.Resource{{ID: "device-1", Type: "device", Name: "server", Data: map[string]any{"hostname": "server-new"}}}}}
-	if _, err := st.ApplyBatch(ctx, generation, baseline, notify.Digest); err != nil {
+	if _, err := st.ApplyBatchWithBatch(ctx, generation, baseline, notify.Digest); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.ApplyBatch(ctx, generation, changed, notify.Digest); err != nil {
+	if _, err := st.ApplyBatchWithBatch(ctx, generation, changed, notify.Digest); err != nil {
 		t.Fatal(err)
 	}
 	sender := &scriptedSender{}
@@ -93,6 +102,139 @@ func TestDeliveryKeepsDestinationFailuresIndependent(t *testing.T) {
 	t.Fatalf("destinations did not settle independently; sender calls=%d", sender.callCount())
 }
 
+func TestDeliveryRedactsInjectedSenderErrors(t *testing.T) {
+	ctx := context.Background()
+	st, _, db := monitorTestStoreWithDB(t)
+	if err := st.EnqueueSystem(ctx, "delivery redaction"); err != nil {
+		t.Fatal(err)
+	}
+	previous := deliveryPollInterval
+	deliveryPollInterval = time.Millisecond
+	t.Cleanup(func() { deliveryPollInterval = previous })
+	engine := New(st, "", "", "test", leakingSender{})
+	deliveryCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		engine.delivery(deliveryCtx)
+		close(done)
+	}()
+
+	deadline := time.Now().Add(time.Second)
+	var lastError string
+	for time.Now().Before(deadline) {
+		if err := db.QueryRowContext(ctx, "SELECT last_error FROM outbox ORDER BY id LIMIT 1").Scan(&lastError); err == nil && lastError != "" {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("delivery worker did not stop")
+	}
+	if lastError == "" {
+		t.Fatal("delivery error was not persisted")
+	}
+	if strings.Contains(lastError, "mattermost://TailState@mattermost.example/token") || strings.Contains(lastError, "mattermost.example") || strings.Contains(lastError, "/token") {
+		t.Fatalf("injected sender URL reached persisted error: %q", lastError)
+	}
+}
+
+type cancellationAwareSender struct {
+	started chan struct{}
+	once    sync.Once
+}
+
+func (s *cancellationAwareSender) Send(ctx context.Context, _, _ string) error {
+	s.once.Do(func() { close(s.started) })
+	<-ctx.Done()
+	return nil
+}
+
+func (s *cancellationAwareSender) Test(context.Context, string) error { return nil }
+
+func TestRestartMidDeliveryRecordsOutcome(t *testing.T) {
+	ctx := context.Background()
+	st, _ := monitorTestStore(t)
+	if err := st.EnqueueSystem(ctx, "delivery before restart"); err != nil {
+		t.Fatal(err)
+	}
+	previous := deliveryPollInterval
+	deliveryPollInterval = time.Millisecond
+	t.Cleanup(func() { deliveryPollInterval = previous })
+	sender := &cancellationAwareSender{started: make(chan struct{})}
+	engine := New(st, "", "", "test", sender)
+	deliveryCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() {
+		engine.delivery(deliveryCtx)
+		close(done)
+	}()
+	select {
+	case <-sender.started:
+		cancel()
+	case <-time.After(time.Second):
+		cancel()
+		t.Fatal("delivery did not start before restart")
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("delivery worker did not stop after restart")
+	}
+	status, err := st.Status(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.Pending != 0 {
+		t.Fatalf("delivered notification remained pending after restart: %#v", status)
+	}
+}
+
+func TestFinishTriggersOutlivesShutdownCancellation(t *testing.T) {
+	ctx := context.Background()
+	st, _ := monitorTestStore(t)
+	trigger, created, err := st.RecordWebhookTrigger(ctx, strings.Repeat("b", 64), []string{"nodeCreated"}, []string{"devices"})
+	if err != nil || !created {
+		t.Fatalf("record trigger: %#v created=%v err=%v", trigger, created, err)
+	}
+	canceled, cancel := context.WithCancel(ctx)
+	cancel()
+	New(st, "", "", "test", &scriptedSender{}).finishTriggers(canceled, []int64{trigger.ID}, true, 1)
+	updated, _, err := st.RecordWebhookTrigger(ctx, strings.Repeat("b", 64), nil, nil)
+	if err != nil || updated.Status != "processed" {
+		t.Fatalf("canceled shutdown left trigger unfinished: %#v err=%v", updated, err)
+	}
+}
+
+func TestFastTriggerClaimOnlyOwnsPendingDurableRows(t *testing.T) {
+	ctx := context.Background()
+	st, _ := monitorTestStore(t)
+	trigger, created, err := st.RecordWebhookTrigger(ctx, strings.Repeat("e", 64), nil, []string{"devices"})
+	if err != nil || !created {
+		t.Fatalf("record trigger: %#v created=%v err=%v", trigger, created, err)
+	}
+	engine := New(st, "", "", "test", &scriptedSender{})
+	claimed := engine.claimFastTriggers(ctx, []int64{trigger.ID, trigger.ID, 0, -1, 99999})
+	if len(claimed) != 1 || claimed[0] != trigger.ID {
+		t.Fatalf("claimed fast trigger IDs=%v, want [%d]", claimed, trigger.ID)
+	}
+	if claimed = engine.claimFastTriggers(ctx, []int64{trigger.ID}); len(claimed) != 0 {
+		t.Fatalf("processing trigger was claimed a second time: %v", claimed)
+	}
+	if err := st.CompleteWebhookTriggers(ctx, []int64{trigger.ID}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if claimed = engine.claimFastTriggers(ctx, []int64{trigger.ID}); len(claimed) != 0 {
+		t.Fatalf("closed-store fast claim returned IDs: %v", claimed)
+	}
+}
+
 func TestRetryDelayIsBounded(t *testing.T) {
 	for attempt := 0; attempt < 32; attempt++ {
 		delay := retryDelay(attempt)
@@ -102,7 +244,7 @@ func TestRetryDelayIsBounded(t *testing.T) {
 	}
 }
 
-func TestTriggerQueuesTargetedCollectorsAndCoalescesOverflow(t *testing.T) {
+func TestTriggerQueuesTargetedCollectorsAndRetainsOverflowScopes(t *testing.T) {
 	engine := New(nil, "", "", "test", &scriptedSender{})
 	engine.Trigger(ReconcileRequest{TriggerID: 7, Collectors: []string{"policy", "devices", "policy"}})
 	request := <-engine.trigger
@@ -110,21 +252,18 @@ func TestTriggerQueuesTargetedCollectorsAndCoalescesOverflow(t *testing.T) {
 		t.Fatalf("unexpected targeted trigger: %#v", request)
 	}
 	for i := 0; i < cap(engine.trigger)+1; i++ {
-		engine.Trigger(ReconcileRequest{TriggerID: int64(i + 1), Collectors: []string{"policy"}})
-	}
-	seenBroad := false
-	for {
-		select {
-		case request := <-engine.trigger:
-			if request.TriggerID == 0 && len(request.Collectors) == 0 && len(request.TriggerIDs) == cap(engine.trigger)+1 {
-				seenBroad = true
-			}
-		default:
-			if !seenBroad {
-				t.Fatal("overflow did not retain a broad reconciliation")
-			}
-			return
+		collector := "policy"
+		if i%2 == 0 {
+			collector = "devices"
 		}
+		engine.Trigger(ReconcileRequest{TriggerID: int64(i + 1), Collectors: []string{collector}})
+	}
+	overflow := engine.takeTriggerOverflow()
+	if len(overflow) != 1 || overflow[0].TriggerID != int64(cap(engine.trigger)+1) {
+		t.Fatalf("overflow requests = %#v, want the final request preserved", overflow)
+	}
+	if len(overflow[0].Collectors) != 1 || overflow[0].Collectors[0] != "devices" {
+		t.Fatalf("overflow collector scope = %#v, want devices", overflow[0].Collectors)
 	}
 }
 

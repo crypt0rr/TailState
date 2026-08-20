@@ -57,6 +57,10 @@ func TestHealthAndUpdateMessagesEscapeInput(t *testing.T) {
 	if strings.Contains(got, "[URGENT](https://evil.example)") || !strings.Contains(got, `\[URGENT\]`) {
 		t.Fatalf("device name retained active Markdown: %s", got)
 	}
+	got = Digest([]model.Change{{Kind: "created", Collector: "devices", Name: "!<img src=x> a+b-c"}})
+	if strings.Contains(got, "!<img src=x>") || !strings.Contains(got, `\!\<img src=x\>`) {
+		t.Fatalf("device name retained HTML or image syntax: %s", got)
+	}
 }
 
 func TestDigestStopsAddingFieldsNearBound(t *testing.T) {

@@ -1,0 +1,5 @@
+# Copy this file to Caddyfile and replace the hostname before starting the
+# compose.remote.yaml override. Caddy obtains and renews the HTTPS certificate.
+tailstate.example.com {
+    reverse_proxy tailstate:8080
+}

@@ -4,6 +4,9 @@ services:
     build: .
     image: ${TAILSTATE_IMAGE:-ghcr.io/crypt0rr/tailstate:latest}
     restart: unless-stopped
+    # Keep authentication work and an unexpected upstream response bounded to
+    # the container instead of allowing an OOM to affect the host.
+    mem_limit: ${TAILSTATE_MEMORY_LIMIT:-512m}
     read_only: true
     environment:
       TAILSTATE_LISTEN_ADDR: 0.0.0.0:8080

@@ -90,7 +90,7 @@ func TestCollectorEdgeResponsesAndFallbackIDs(t *testing.T) {
 	newClient := func() *Client {
 		return New(server.URL+"/api/v2", server.URL+"/oauth/token", "test", Credentials{ClientID: "id", ClientSecret: "secret"})
 	}
-	if resources, err := newClient().Collect(context.Background(), "device_details"); err != nil || len(resources) != 0 {
+	if resources, err := newClient().Collect(context.Background(), "device_details"); err == nil || len(resources) != 0 || !strings.Contains(err.Error(), "partial collector response") {
 		t.Fatalf("device without an ID = %#v, %v", resources, err)
 	}
 	resources, err := newClient().Collect(context.Background(), "users")

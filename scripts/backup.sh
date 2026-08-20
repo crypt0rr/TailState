@@ -17,8 +17,8 @@ fi
 
 output_dir="${1:-./backups}"
 service="${2:-tailstate}"
-# renovate: datasource=docker depName=alpine
-backup_image="${TAILSTATE_BACKUP_IMAGE:-alpine:3.24@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b}"
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+backup_image="$(bash "$script_dir/backup-image.sh")"
 host_uid="$(id -u)"
 host_gid="$(id -g)"
 

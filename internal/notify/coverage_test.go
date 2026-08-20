@@ -46,9 +46,6 @@ func TestNotifyTestAndErrorHelpers(t *testing.T) {
 	if got := (&DeliveryError{Message: "delivery failed"}).Error(); got != "delivery failed" {
 		t.Fatalf("delivery error=%q", got)
 	}
-	if (&DeliveryError{}).Permanent() {
-		t.Fatal("Shoutrrr delivery error was marked permanent")
-	}
 	if err := Validate(""); err == nil {
 		t.Fatal("empty notification URL was accepted")
 	}
@@ -75,6 +72,29 @@ func TestNotifyTestAndErrorHelpers(t *testing.T) {
 	}
 	if got := RedactError("provider rejected mattermost://TailState@host/token?secret=hidden", "mattermost://TailState@host/token?secret=hidden"); strings.Contains(got, "hidden") {
 		t.Fatalf("RedactError leaked destination credential: %q", got)
+	}
+	if got := SafeDeliveryError(&DeliveryError{Status: http.StatusBadGateway, Message: "provider body contains secret"}); got != "notification delivery failed with HTTP 502" {
+		t.Fatalf("safe HTTP delivery reason=%q", got)
+	}
+	if got := SafeDeliveryMessage("upstream response contains an unrelated credential"); got != "notification delivery failed" {
+		t.Fatalf("safe generic delivery reason=%q", got)
+	}
+	if got := SafeDeliveryMessage("request timeout after 15s"); got != "notification delivery timed out" {
+		t.Fatalf("safe timeout delivery reason=%q", got)
+	}
+	if got := SafeTestError(&DeliveryError{Status: http.StatusBadGateway, Message: "provider body contains secret"}); got != "notification delivery failed with HTTP 502" {
+		t.Fatalf("safe notification test reason=%q", got)
+	}
+	if got := SafeTestError(errors.New("invalid notification URL (generic://host)"), "generic://host"); got != "invalid notification URL (generic://<redacted>)" {
+		t.Fatalf("validation notification test reason=%q", got)
+	}
+	secretURL := "mattermost://TailState:password@chat.example/hooks/secret-token?icon=:satellite:"
+	got := SafeTestError(errors.New("provider rejected request for "+secretURL), secretURL)
+	if strings.Contains(got, "password") || strings.Contains(got, "secret-token") || strings.Contains(got, ":satellite:") {
+		t.Fatalf("notification test error leaked destination credentials: %q", got)
+	}
+	if got := SafeTestError(errors.New("provider response contained a secret")); got != "notification delivery failed" {
+		t.Fatalf("unscoped notification test error=%q", got)
 	}
 }
 
@@ -151,7 +171,7 @@ func TestSendReturnsRedactedDeliveryError(t *testing.T) {
 	}
 }
 
-func TestSendValidationAndPostDeliveryCancellation(t *testing.T) {
+func TestSendValidationAndPostDeliveryCancellationIsSuccess(t *testing.T) {
 	if err := New().Send(context.Background(), "not-a-shoutrrr-url", "message"); err == nil {
 		t.Fatal("invalid notification URL was sent")
 	}
@@ -162,7 +182,7 @@ func TestSendValidationAndPostDeliveryCancellation(t *testing.T) {
 	}))
 	defer server.Close()
 	serviceURL := strings.Replace(server.URL, "http://", "generic://", 1) + "?disabletls=true"
-	if err := New().Send(ctx, serviceURL, "message"); !errors.Is(err, context.Canceled) {
-		t.Fatalf("post-delivery cancellation error=%v", err)
+	if err := New().Send(ctx, serviceURL, "message"); err != nil {
+		t.Fatalf("post-delivery cancellation was treated as a send failure: %v", err)
 	}
 }

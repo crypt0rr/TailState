@@ -18,6 +18,20 @@ import (
 
 const envelopeVersion = "v1"
 
+// Password hashes are stored in the database and therefore are not an
+// appropriate place to accept unbounded Argon2 resource requests. These
+// bounds include the parameters emitted by PasswordHash and the lower-cost
+// parameters used by older hashes, while preventing a tampered row from
+// turning one login into a multi-gigabyte allocation.
+const (
+	minArgon2MemoryKiB = 8 * 1024
+	maxArgon2MemoryKiB = 64 * 1024
+	maxArgon2Time      = 3
+	maxArgon2Parallel  = 2
+	minArgon2SaltBytes = 8
+	maxArgon2SaltBytes = 64
+)
+
 type Box struct{ key []byte }
 
 func NewBox(key []byte) (*Box, error) {
@@ -98,14 +112,19 @@ func PasswordMatches(encoded, password string) bool {
 		if err != nil || parsed == 0 {
 			return false
 		}
+		if _, exists := params[key]; exists {
+			return false
+		}
 		params[key] = parsed
 	}
-	if len(params) != 3 || params["p"] > 255 {
+	if len(params) != 3 ||
+		params["m"] < minArgon2MemoryKiB || params["m"] > maxArgon2MemoryKiB ||
+		params["t"] > maxArgon2Time || params["p"] > maxArgon2Parallel {
 		return false
 	}
 	salt, err1 := base64.RawStdEncoding.DecodeString(parts[3])
 	want, err2 := base64.RawStdEncoding.DecodeString(parts[4])
-	if err1 != nil || err2 != nil || len(want) != 32 {
+	if err1 != nil || err2 != nil || len(salt) < minArgon2SaltBytes || len(salt) > maxArgon2SaltBytes || len(want) != 32 {
 		return false
 	}
 	got := argon2.IDKey([]byte(password), salt, uint32(params["t"]), uint32(params["m"]), uint8(params["p"]), uint32(len(want)))

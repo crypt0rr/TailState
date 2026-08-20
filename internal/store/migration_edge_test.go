@@ -107,8 +107,17 @@ CREATE TABLE outbox(id INTEGER PRIMARY KEY AUTOINCREMENT,payload TEXT NOT NULL,s
 				if destinationID != outboxDestinationID {
 					t.Fatalf("outbox destination = %d, migrated destination = %d", outboxDestinationID, destinationID)
 				}
-			} else if destinationCount != 0 {
-				t.Fatalf("destination created without a legacy URL: %d", destinationCount)
+			} else {
+				if destinationCount != 0 {
+					t.Fatalf("destination created without a legacy URL: %d", destinationCount)
+				}
+				var status, lastError string
+				if err := st.db.QueryRowContext(context.Background(), "SELECT status,last_error FROM outbox LIMIT 1").Scan(&status, &lastError); err != nil {
+					t.Fatal(err)
+				}
+				if status != "dead" || lastError != "no notification destination configured" {
+					t.Fatalf("orphaned outbox status = %q/%q, want dead-letter reason", status, lastError)
+				}
 			}
 		})
 	}

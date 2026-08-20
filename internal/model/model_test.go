@@ -19,7 +19,17 @@ func TestCanonicalIgnoresVolatileAndOrder(t *testing.T) {
 	}
 }
 
-func TestPolicyCanonicalizationRetainsTenantControlledSecretNamedKeys(t *testing.T) {
+func TestRedactionAndCanonicalizationHandleUnserializableValues(t *testing.T) {
+	redacted := redactedValue(func() {})
+	if len(redacted) != 1 || redacted["redacted_sha256"] == nil {
+		t.Fatalf("unserializable value was not fingerprinted: %#v", redacted)
+	}
+	if _, _, err := CanonicalFor("", func() {}); err == nil {
+		t.Fatal("canonicalization unexpectedly accepted an unserializable value")
+	}
+}
+
+func TestTenantControlledSecretNamedKeysRemainVisible(t *testing.T) {
 	before := map[string]any{
 		"group:eng":          []any{"alice@corp"},
 		"group:secrets-team": []any{"alice@corp"},
@@ -45,6 +55,47 @@ func TestPolicyCanonicalizationRetainsTenantControlledSecretNamedKeys(t *testing
 	nested := map[string]any{"groups": map[string]any{"secret": []any{"alice@corp"}}}
 	if raw, _, err := CanonicalFor("policy", nested); err != nil || !strings.Contains(string(raw), `"secret"`) {
 		t.Fatalf("nested tenant key was removed: %s (%v)", raw, err)
+	}
+}
+
+func TestAllTenantKeyedPolicyAndDNSMapsRetainSecretNamedKeys(t *testing.T) {
+	policyCases := []struct {
+		section string
+		key     string
+	}{
+		{section: "tagOwners", key: "tag:secrets-team"},
+		{section: "hosts", key: "secrets.internal"},
+	}
+	for _, testCase := range policyCases {
+		t.Run("policy/"+testCase.section, func(t *testing.T) {
+			before := map[string]any{testCase.section: map[string]any{testCase.key: []any{"alice@corp"}}}
+			after := map[string]any{testCase.section: map[string]any{testCase.key: []any{"alice@corp", "mallory@corp"}}}
+			raw, beforeHash, err := CanonicalFor("policy", before)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, afterHash, err := CanonicalFor("policy", after)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(string(raw), testCase.key) || beforeHash == afterHash {
+				t.Fatalf("tenant key %q was dropped or its membership change was invisible: %s", testCase.key, raw)
+			}
+		})
+	}
+
+	beforeDNS := map[string]any{"split-dns": map[string]any{"secrets.internal": []any{"100.64.0.1"}}}
+	afterDNS := map[string]any{"split-dns": map[string]any{"secrets.internal": []any{"100.64.0.1", "100.64.0.2"}}}
+	raw, beforeHash, err := CanonicalFor("dns", beforeDNS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, afterHash, err := CanonicalFor("dns", afterDNS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), "secrets.internal") || beforeHash == afterHash {
+		t.Fatalf("split DNS tenant key was dropped or its value change was invisible: %s", raw)
 	}
 }
 
@@ -95,6 +146,48 @@ func TestSensitiveURLIsHashed(t *testing.T) {
 	}
 	if firstHash == secondHash {
 		t.Fatal("configuration URL changes must remain detectable")
+	}
+}
+
+func TestKnownSecretFieldsAreRedactedWithoutLosingPresence(t *testing.T) {
+	before := map[string]any{
+		"clientSecret": "first-secret",
+		"token":        "first-token",
+	}
+	after := map[string]any{
+		"clientSecret": "rotated-secret",
+		"token":        "first-token",
+	}
+	beforeRaw, beforeHash, err := Canonical(before)
+	if err != nil {
+		t.Fatal(err)
+	}
+	afterRaw, afterHash, err := Canonical(after)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, raw := range [][]byte{beforeRaw, afterRaw} {
+		text := string(raw)
+		if strings.Contains(text, "first-secret") || strings.Contains(text, "rotated-secret") || strings.Contains(text, "first-token") {
+			t.Fatalf("secret value leaked into canonical snapshot: %s", raw)
+		}
+		if !strings.Contains(text, "redacted_sha256") {
+			t.Fatalf("redacted secret fingerprint missing: %s", raw)
+		}
+	}
+	if beforeHash == afterHash {
+		t.Fatal("secret rotation was invisible to drift detection")
+	}
+	var normalized any
+	if err := json.Unmarshal(beforeRaw, &normalized); err != nil {
+		t.Fatal(err)
+	}
+	roundTrip, roundTripHash, err := Canonical(normalized)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if roundTripHash != beforeHash || string(roundTrip) != string(beforeRaw) {
+		t.Fatalf("redacted secret normalization was not idempotent: %s -> %s", beforeRaw, roundTrip)
 	}
 }
 

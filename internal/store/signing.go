@@ -23,6 +23,7 @@ const (
 	evidenceSigningPublicKeyMeta  = "evidence_signing_public_key"
 	evidenceSigningKeyIDMeta      = "evidence_signing_key_id"
 	evidenceLedgerHeadMeta        = "evidence_ledger_head"
+	evidenceLedgerBackfilledMeta  = "evidence_ledger_backfilled_at"
 	evidenceLedgerDomain          = "tailstate-evidence-ledger-v1\n"
 )
 
@@ -30,6 +31,48 @@ type evidenceSigningKey struct {
 	private ed25519.PrivateKey
 	public  ed25519.PublicKey
 	keyID   string
+}
+
+// evidenceLedgerLinks returns the complete chain segment spanning the
+// selected batches. Filtered exports can therefore verify links for batches
+// that are not included in the event payload itself.
+func (s *Store) evidenceLedgerLinks(ctx context.Context, batches []HistoryBatch) ([]EvidenceLedgerLink, error) {
+	var minSequence, maxSequence int64
+	for _, batch := range batches {
+		if batch.LedgerSequence == 0 {
+			continue
+		}
+		if minSequence == 0 || batch.LedgerSequence < minSequence {
+			minSequence = batch.LedgerSequence
+		}
+		if batch.LedgerSequence > maxSequence {
+			maxSequence = batch.LedgerSequence
+		}
+	}
+	if minSequence == 0 {
+		return nil, nil
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT sequence,batch_id,prev_hash,entry_hash,signature,key_id
+		FROM evidence_ledger WHERE sequence BETWEEN ? AND ? ORDER BY sequence`, minSequence, maxSequence)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	links := make([]EvidenceLedgerLink, 0, min(maxEvidenceLedgerLinks, int(maxSequence-minSequence+1)))
+	for rows.Next() {
+		if len(links) >= maxEvidenceLedgerLinks {
+			return nil, ErrEvidencePackTooLarge
+		}
+		var link EvidenceLedgerLink
+		if err := rows.Scan(&link.Sequence, &link.BatchID, &link.PrevHash, &link.EntryHash, &link.Signature, &link.KeyID); err != nil {
+			return nil, err
+		}
+		links = append(links, link)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return links, nil
 }
 
 type ledgerQueryer interface {
@@ -209,6 +252,22 @@ func (s *Store) backfillEvidenceLedger(ctx context.Context) error {
 		}
 	}
 	return tx.Commit()
+}
+
+func (s *Store) backfillEvidenceLedgerOnStartup(ctx context.Context) error {
+	var marker string
+	err := s.db.QueryRowContext(ctx, "SELECT value FROM meta WHERE key=?", evidenceLedgerBackfilledMeta).Scan(&marker)
+	if err == nil && strings.TrimSpace(marker) != "" {
+		return nil
+	}
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	if err := s.backfillEvidenceLedger(ctx); err != nil {
+		return err
+	}
+	_, err = s.db.ExecContext(ctx, "INSERT INTO meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", evidenceLedgerBackfilledMeta, time.Now().UTC().Format(time.RFC3339Nano))
+	return err
 }
 
 func (s *Store) appendEvidenceLedgerTx(ctx context.Context, tx *sql.Tx, batchID int64) error {

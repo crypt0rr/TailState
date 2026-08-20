@@ -259,8 +259,8 @@ func TestCollectorHTTPErrorBranches(t *testing.T) {
 		client.expires = time.Now().Add(time.Hour)
 		return client
 	}
-	if resources, err := newClient().Collect(context.Background(), "device_details"); err != nil || len(resources) != 1 {
-		t.Fatalf("unsupported device details resources=%#v err=%v", resources, err)
+	if resources, err := newClient().Collect(context.Background(), "device_details"); err == nil || !strings.Contains(err.Error(), "partial collector response") || len(resources) != 0 {
+		t.Fatalf("missing device detail should be partial resources=%#v err=%v", resources, err)
 	}
 	mode = "details-error"
 	if _, err := newClient().Collect(context.Background(), "device_details"); err == nil {

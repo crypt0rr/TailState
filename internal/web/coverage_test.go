@@ -300,6 +300,18 @@ func TestWebhookConfigurationAndEngineNilBranches(t *testing.T) {
 	}
 }
 
+func TestWebhookStorageErrorsReturnUnavailable(t *testing.T) {
+	server, st, _ := testServer(t)
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	response := httptest.NewRecorder()
+	server.tailscaleWebhook(response, httptest.NewRequest(http.MethodPost, "/webhooks/tailscale", strings.NewReader(`[]`)))
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("closed-store webhook status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
 func TestSettingsAndDestinationMutationBranches(t *testing.T) {
 	server, st, setupToken := testServer(t)
 	cookies := claimCoverageAdmin(t, server, setupToken)
@@ -494,7 +506,7 @@ func TestResetRejectsInvalidToken(t *testing.T) {
 	response := coveragePost(t, server, "/reset", url.Values{
 		"token": {"invalid-reset-token"}, "password": {"new secure password"}, "confirm": {"new secure password"},
 	}, nil)
-	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "invalid reset token") {
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "reset token is invalid or expired") {
 		t.Fatalf("invalid reset response status=%d body=%s", response.Code, response.Body.String())
 	}
 }
@@ -566,7 +578,7 @@ func TestWebAdditionalErrorAndMetricsBranches(t *testing.T) {
 	}
 	unavailable := httptest.NewRecorder()
 	server.tailscaleWebhook(unavailable, httptest.NewRequest(http.MethodPost, "/webhooks/tailscale", strings.NewReader("[]")))
-	if unavailable.Code != http.StatusNotFound {
+	if unavailable.Code != http.StatusServiceUnavailable {
 		t.Fatalf("closed-store webhook status=%d body=%s", unavailable.Code, unavailable.Body.String())
 	}
 }

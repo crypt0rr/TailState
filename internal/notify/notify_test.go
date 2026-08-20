@@ -41,6 +41,10 @@ func TestValidateAndRedact(t *testing.T) {
 	if strings.Contains(message, "super-secret-token") {
 		t.Fatalf("token leaked from transformed service URL: %s", message)
 	}
+	queryMessage := sanitize("upstream rejected token=SUPERSECRET123 for hooks.example.com", "generic://hooks.example.com/post?token=SUPERSECRET123&template=json")
+	if strings.Contains(queryMessage, "SUPERSECRET123") {
+		t.Fatalf("query credential leaked through sanitization: %s", queryMessage)
+	}
 }
 
 func TestSendGenericWebhook(t *testing.T) {

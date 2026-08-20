@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -42,10 +43,15 @@ func run() error {
 	case "healthcheck":
 		return healthcheck(os.Args[2:])
 	case "admin":
-		if len(os.Args) > 2 && os.Args[2] == "reset" {
-			return adminReset()
+		if len(os.Args) > 2 {
+			switch os.Args[2] {
+			case "reset":
+				return adminReset()
+			case "rekey":
+				return adminRekey(os.Args[3:])
+			}
 		}
-		return errors.New("usage: tailstate admin reset")
+		return errors.New("usage: tailstate admin reset or tailstate admin rekey -new-key-file PATH")
 	case "evidence":
 		if len(os.Args) > 2 {
 			switch os.Args[2] {
@@ -60,7 +66,7 @@ func run() error {
 		fmt.Printf("tailstate %s\n", version)
 		return nil
 	default:
-		return fmt.Errorf("unknown command %q (use serve, healthcheck, admin reset, evidence verify, evidence public-key, or version)", command)
+		return fmt.Errorf("unknown command %q (use serve, healthcheck, admin reset, admin rekey, evidence verify, evidence public-key, or version)", command)
 	}
 }
 
@@ -102,17 +108,26 @@ func serveContext(ctx context.Context) error {
 	defer cancel()
 	exists, err := st.AdminExists(ctx)
 	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			return nil
+		}
 		return err
 	}
 	if !exists {
 		token, err := st.NewSetupToken(ctx)
 		if err != nil {
+			if errors.Is(err, context.Canceled) {
+				return nil
+			}
 			return err
 		}
 		slog.Warn("installation is unclaimed; open /setup and use the one-time setup token", "setup_token", token)
 	}
 	notified, err := st.TrackAppVersion(ctx, version, notify.Update)
 	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			return nil
+		}
 		return fmt.Errorf("track TailState version: %w", err)
 	}
 	if notified {
@@ -120,11 +135,19 @@ func serveContext(ctx context.Context) error {
 	}
 	engine := monitor.New(st, config.TailscaleBase, config.OAuthTokenURL, version)
 	engine.Run(ctx)
+	defer func() {
+		cancel()
+		engine.Wait()
+	}()
 	server, err := webui.New(config, st, engine)
 	if err != nil {
 		return err
 	}
-	return server.Serve(ctx)
+	if err := server.Serve(ctx); errors.Is(err, context.Canceled) {
+		return nil
+	} else {
+		return err
+	}
 }
 
 func healthcheck(args []string) error {
@@ -156,6 +179,35 @@ func adminReset() error {
 		return err
 	}
 	fmt.Printf("Password reset token: %s\nOpen /reset to choose a new administrator password.\n", token)
+	return nil
+}
+
+func adminRekey(args []string) error {
+	flags := flag.NewFlagSet("admin rekey", flag.ContinueOnError)
+	newKeyFile := flags.String("new-key-file", "", "path to the replacement raw or base64 master-key file")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if strings.TrimSpace(*newKeyFile) == "" {
+		return errors.New("-new-key-file is required")
+	}
+	_, st, err := load()
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+	key, err := boot.ReadMasterKeyFile(*newKeyFile)
+	if err != nil {
+		return err
+	}
+	newBox, err := secret.NewBox(key)
+	if err != nil {
+		return err
+	}
+	if err := st.Rekey(context.Background(), newBox); err != nil {
+		return err
+	}
+	fmt.Printf("TailState master key rotated successfully. Replace the configured key file with %s before restarting the service.\n", *newKeyFile)
 	return nil
 }
 

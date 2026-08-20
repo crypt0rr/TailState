@@ -57,9 +57,10 @@ func TestEmptyCollectionResponses(t *testing.T) {
 		body      string
 		wantErr   bool
 	}{
-		{name: "user invites empty object", collector: "user_invites", path: "/api/v2/tailnet/-/user-invites", body: `{}`},
+		{name: "user invites missing array", collector: "user_invites", path: "/api/v2/tailnet/-/user-invites", body: `{}`, wantErr: true},
 		{name: "user invites top-level array", collector: "user_invites", path: "/api/v2/tailnet/-/user-invites", body: `[]`},
-		{name: "webhooks empty object", collector: "webhooks", path: "/api/v2/tailnet/-/webhooks", body: `{}`},
+		{name: "webhooks missing array", collector: "webhooks", path: "/api/v2/tailnet/-/webhooks", body: `{}`, wantErr: true},
+		{name: "webhooks null array", collector: "webhooks", path: "/api/v2/tailnet/-/webhooks", body: `{"webhooks":null}`},
 		{name: "webhooks empty array", collector: "webhooks", path: "/api/v2/tailnet/-/webhooks", body: `{"webhooks":[]}`},
 		{name: "strict collection still rejects missing array", collector: "users", path: "/api/v2/tailnet/-/users", body: `{}`, wantErr: true},
 	}
@@ -109,7 +110,7 @@ func TestCollectionRejectsWrongArrayType(t *testing.T) {
 	defer server.Close()
 
 	client := New(server.URL+"/api/v2", server.URL+"/oauth/token", "test", Credentials{ClientID: "id", ClientSecret: "secret"})
-	if _, err := client.Collect(context.Background(), "webhooks"); err == nil || !strings.Contains(err.Error(), "webhooks response has no webhooks array") {
+	if _, err := client.Collect(context.Background(), "webhooks"); err == nil || !strings.Contains(err.Error(), "webhooks response webhooks is not an array") {
 		t.Fatalf("expected wrong-array-type error, got %v", err)
 	}
 }
@@ -127,6 +128,16 @@ func TestUnsupportedCollector(t *testing.T) {
 	_, err := client.Collect(context.Background(), "contacts")
 	if err == nil || !IsUnsupported(err) {
 		t.Fatalf("expected unsupported error, got %v", err)
+	}
+}
+
+func TestCoreCollectorNotFoundIsNotUnsupported(t *testing.T) {
+	err := &HTTPError{Status: http.StatusNotFound, URL: "devices"}
+	if IsUnsupportedCollector("devices", err) || IsUnsupportedCollector("device_details", err) {
+		t.Fatal("core collector 404 was treated as a plan limitation")
+	}
+	if !IsUnsupportedCollector("users", err) {
+		t.Fatal("optional collector 404 was not treated as unsupported")
 	}
 }
 
@@ -152,11 +163,13 @@ func TestDNSKeepsSupportedSubresources(t *testing.T) {
 
 func TestDeviceDetailsDoNotRefetchCoreDevice(t *testing.T) {
 	coreDetailCalls := 0
+	deviceListCalls := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.URL.Path == "/oauth/token":
 			_, _ = w.Write([]byte(`{"access_token":"access","expires_in":3600}`))
 		case r.URL.Path == "/api/v2/tailnet/-/devices":
+			deviceListCalls++
 			_, _ = w.Write([]byte(`{"devices":[{"id":"1","hostname":"server","addresses":["100.64.0.1"]}]}`))
 		case r.URL.Path == "/api/v2/device/1":
 			coreDetailCalls++
@@ -174,6 +187,9 @@ func TestDeviceDetailsDoNotRefetchCoreDevice(t *testing.T) {
 	defer server.Close()
 
 	client := New(server.URL+"/api/v2", server.URL+"/oauth/token", "test", Credentials{ClientID: "id", ClientSecret: "secret"})
+	if _, err := client.Collect(context.Background(), "devices"); err != nil {
+		t.Fatal(err)
+	}
 	resources, err := client.Collect(context.Background(), "device_details")
 	if err != nil {
 		t.Fatal(err)
@@ -181,12 +197,56 @@ func TestDeviceDetailsDoNotRefetchCoreDevice(t *testing.T) {
 	if coreDetailCalls != 0 {
 		t.Fatalf("core device was fetched %d additional time(s)", coreDetailCalls)
 	}
+	if deviceListCalls != 1 {
+		t.Fatalf("device list was fetched %d time(s), want one shared response", deviceListCalls)
+	}
 	if len(resources) != 1 {
 		t.Fatalf("unexpected device details: %#v", resources)
 	}
 	data, ok := resources[0].Data.(map[string]any)
 	if !ok || data["routes"] == nil || data["postureAttributes"] == nil || data["deviceInvites"] == nil {
 		t.Fatalf("secondary details missing: %#v", resources[0].Data)
+	}
+}
+
+func TestDeviceDetailNotFoundIsPartialNotUnsupported(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/oauth/token":
+			_, _ = w.Write([]byte(`{"access_token":"access","expires_in":3600}`))
+		case "/api/v2/tailnet/-/devices":
+			_, _ = w.Write([]byte(`{"devices":[{"id":"missing","hostname":"missing"},{"id":"healthy","hostname":"healthy"}]}`))
+		case "/api/v2/device/missing/routes":
+			http.NotFound(w, r)
+		case "/api/v2/device/healthy/routes":
+			_, _ = w.Write([]byte(`{"enabledRoutes":[]}`))
+		case "/api/v2/device/missing/attributes", "/api/v2/device/missing/device-invites",
+			"/api/v2/device/healthy/attributes", "/api/v2/device/healthy/device-invites":
+			_, _ = w.Write([]byte(`{}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	client := New(server.URL+"/api/v2", server.URL+"/oauth/token", "test", Credentials{ClientID: "id", ClientSecret: "secret"})
+	resources, err := client.Collect(context.Background(), "device_details")
+	if err == nil || !strings.Contains(err.Error(), "partial collector response") {
+		t.Fatalf("expected partial detail error, got resources=%#v err=%v", resources, err)
+	}
+	if len(resources) != 1 || resources[0].ID != "healthy" {
+		t.Fatalf("expected only the healthy device detail, got %#v", resources)
+	}
+	data, ok := resources[0].Data.(map[string]any)
+	if !ok {
+		t.Fatalf("unexpected resource data %#v", resources[0].Data)
+	}
+	routes, ok := data["routes"].(map[string]any)
+	if !ok {
+		t.Fatalf("unexpected routes data: %#v", data["routes"])
+	}
+	if _, unsupported := routes["unsupported"]; unsupported {
+		t.Fatalf("404 detail endpoint was marked unsupported: %#v", data)
 	}
 }
 

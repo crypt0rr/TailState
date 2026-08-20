@@ -203,6 +203,44 @@ func TestVerifyEvidencePackRejectsMalformedSignedPacks(t *testing.T) {
 	}
 }
 
+func TestVerifyEvidencePackRejectsUnknownFields(t *testing.T) {
+	data, _ := signedEvidencePackFixture(t)
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatal(err)
+	}
+	raw["untrusted_annotation"] = json.RawMessage(`"not covered by the signature"`)
+	mutated, err := json.Marshal(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := VerifyEvidencePack(mutated); err == nil || !strings.Contains(err.Error(), "unknown field") {
+		t.Fatalf("unknown evidence field was accepted: %v", err)
+	}
+}
+
+func TestVerifyEvidencePackRejectsVersionDowngrade(t *testing.T) {
+	data, public := signedEvidencePackFixture(t)
+	var forged EvidencePack
+	if err := json.Unmarshal(data, &forged); err != nil {
+		t.Fatal(err)
+	}
+	forged.Version = 1
+	forged.Batches = nil
+	content, err := evidencePayload(forged)
+	if err != nil {
+		t.Fatal(err)
+	}
+	forged.ContentSHA256 = sha256Sum(content)
+	encoded, err := json.Marshal(forged)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := VerifyEvidencePackWithKey(encoded, public); err == nil {
+		t.Fatal("trusted-key verification accepted a forged version-downgraded pack")
+	}
+}
+
 func TestVerifyLedgerLinksRejectsInvalidChains(t *testing.T) {
 	_, public := signedEvidencePackFixture(t)
 	keyID := evidenceKeyID(public)
@@ -223,7 +261,7 @@ func TestVerifyLedgerLinksRejectsInvalidChains(t *testing.T) {
 			}
 		})
 	}
-	if err := verifyLedgerLinks(EvidencePack{SigningKeyID: keyID, Batches: []EvidenceBatch{{ID: 1, LedgerSequence: 0}, {ID: 2, LedgerSequence: 1, LedgerHash: strings.Repeat("a", 64)}}}); err != nil {
+	if err := verifyLedgerLinks(EvidencePack{SigningKeyID: keyID, Batches: []EvidenceBatch{{ID: 1, LedgerSequence: 0}, {ID: 2, LedgerSequence: 0, LedgerHash: strings.Repeat("a", 64)}}}); err != nil {
 		t.Fatalf("sequence-zero/last batch was rejected: %v", err)
 	}
 }
@@ -314,6 +352,22 @@ func TestEvidenceLedgerOperationalErrors(t *testing.T) {
 	}
 	if _, _, err := evidenceLedgerPayload(context.Background(), db, 1); err == nil {
 		t.Fatal("evidenceLedgerPayload succeeded without event batch storage")
+	}
+}
+
+func TestEvidenceLedgerBackfillIsStartupOnly(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	batchID := insertSigningBatch(t, st)
+	if err := st.backfillEvidenceLedgerOnStartup(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var count int
+	if err := st.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM evidence_ledger WHERE batch_id=?", batchID).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("startup marker allowed a fabricated batch to be signed: %d ledger rows", count)
 	}
 }
 

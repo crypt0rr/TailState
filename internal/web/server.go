@@ -2,6 +2,7 @@ package web
 
 import (
 	"context"
+	"crypto/subtle"
 	"database/sql"
 	"embed"
 	"encoding/json"
@@ -13,6 +14,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"strconv"
 	"strings"
@@ -37,6 +39,7 @@ type Server struct {
 	templates     map[string]*template.Template
 	loginMu       sync.Mutex
 	loginAttempts map[string][]time.Time
+	authWork      chan struct{}
 }
 
 const maxTrackedLoginIPs = 4096
@@ -74,7 +77,7 @@ func New(config boot.Config, st *store.Store, engine *monitor.Engine) (*Server, 
 		}
 		templates[name] = parsed
 	}
-	return &Server{config: config, store: st, engine: engine, templates: templates, loginAttempts: map[string][]time.Time{}}, nil
+	return &Server{config: config, store: st, engine: engine, templates: templates, loginAttempts: map[string][]time.Time{}, authWork: make(chan struct{}, 2)}, nil
 }
 
 func (s *Server) Handler() http.Handler {
@@ -138,6 +141,9 @@ func (s *Server) security(next http.Handler) http.Handler {
 		w.Header().Set("X-Frame-Options", "DENY")
 		w.Header().Set("Referrer-Policy", "no-referrer")
 		w.Header().Set("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+		if !strings.HasPrefix(r.URL.Path, "/static/") {
+			w.Header().Set("Cache-Control", "no-store")
+		}
 		if r.Method == http.MethodPost {
 			r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 		}
@@ -151,7 +157,10 @@ func (s *Server) render(w http.ResponseWriter, name string, data pageData) {
 	}
 }
 func (s *Server) home(w http.ResponseWriter, r *http.Request) {
-	exists, _ := s.store.AdminExists(r.Context())
+	exists, ok := s.adminExists(w, r)
+	if !ok {
+		return
+	}
 	if !exists {
 		http.Redirect(w, r, "/setup", http.StatusSeeOther)
 		return
@@ -168,7 +177,10 @@ func (s *Server) home(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/status", http.StatusSeeOther)
 }
 func (s *Server) setup(w http.ResponseWriter, r *http.Request) {
-	exists, _ := s.store.AdminExists(r.Context())
+	exists, ok := s.adminExists(w, r)
+	if !ok {
+		return
+	}
 	if exists {
 		http.Redirect(w, r, "/settings", http.StatusSeeOther)
 		return
@@ -176,9 +188,28 @@ func (s *Server) setup(w http.ResponseWriter, r *http.Request) {
 	s.render(w, "setup", pageData{})
 }
 func (s *Server) claim(w http.ResponseWriter, r *http.Request) {
-	exists, _ := s.store.AdminExists(r.Context())
+	if !sameOriginRequest(r) {
+		http.Error(w, "cross-origin setup rejected", http.StatusForbidden)
+		return
+	}
+	exists, ok := s.adminExists(w, r)
+	if !ok {
+		return
+	}
 	if exists {
 		http.Error(w, "installation already claimed", http.StatusConflict)
+		return
+	}
+	ip := "setup:" + s.clientIP(r)
+	if s.rateLimited(ip) {
+		s.render(w, "setup", pageData{Error: "Too many setup attempts. Try again later."})
+		return
+	}
+	select {
+	case s.authWork <- struct{}{}:
+		defer func() { <-s.authWork }()
+	default:
+		http.Error(w, "authentication busy", http.StatusServiceUnavailable)
 		return
 	}
 	if err := r.ParseForm(); err != nil {
@@ -190,16 +221,21 @@ func (s *Server) claim(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.store.Claim(r.Context(), r.FormValue("token"), r.FormValue("password")); err != nil {
+		s.recordFailure(ip)
 		s.render(w, "setup", pageData{Error: err.Error()})
 		return
 	}
+	s.clearFailures(ip)
 	if !s.startSession(w, r) {
 		return
 	}
 	http.Redirect(w, r, "/settings", http.StatusSeeOther)
 }
 func (s *Server) login(w http.ResponseWriter, r *http.Request) {
-	exists, _ := s.store.AdminExists(r.Context())
+	exists, ok := s.adminExists(w, r)
+	if !ok {
+		return
+	}
 	if !exists {
 		http.Redirect(w, r, "/setup", http.StatusSeeOther)
 		return
@@ -210,10 +246,32 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 	}
 	s.render(w, "login", pageData{})
 }
+
+func (s *Server) adminExists(w http.ResponseWriter, r *http.Request) (bool, bool) {
+	exists, err := s.store.AdminExists(r.Context())
+	if err != nil {
+		slog.Error("check administrator state", "error", err)
+		http.Error(w, "service temporarily unavailable", http.StatusServiceUnavailable)
+		return false, false
+	}
+	return exists, true
+}
+
 func (s *Server) loginPost(w http.ResponseWriter, r *http.Request) {
-	ip := remoteIP(r)
+	if !sameOriginRequest(r) {
+		http.Error(w, "cross-origin login rejected", http.StatusForbidden)
+		return
+	}
+	ip := s.clientIP(r)
 	if s.rateLimited(ip) {
 		s.render(w, "login", pageData{Error: "Too many login attempts. Try again later."})
+		return
+	}
+	select {
+	case s.authWork <- struct{}{}:
+		defer func() { <-s.authWork }()
+	default:
+		http.Error(w, "authentication busy", http.StatusServiceUnavailable)
 		return
 	}
 	_ = r.ParseForm()
@@ -228,6 +286,32 @@ func (s *Server) loginPost(w http.ResponseWriter, r *http.Request) {
 	}
 	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
+
+func sameOriginRequest(r *http.Request) bool {
+	origin := strings.TrimSpace(r.Header.Get("Origin"))
+	if origin == "" {
+		return !strings.EqualFold(strings.TrimSpace(r.Header.Get("Sec-Fetch-Site")), "cross-site")
+	}
+	parsed, err := url.Parse(origin)
+	if err != nil || parsed.Host == "" {
+		return false
+	}
+	host := r.Host
+	if host == "" {
+		host = r.URL.Host
+	}
+	if !strings.EqualFold(parsed.Host, host) {
+		return false
+	}
+	scheme := "http"
+	if r.TLS != nil || strings.EqualFold(strings.TrimSpace(strings.Split(r.Header.Get("X-Forwarded-Proto"), ",")[0]), "https") {
+		scheme = "https"
+	}
+	if scheme == "https" {
+		return strings.EqualFold(parsed.Scheme, "https")
+	}
+	return strings.EqualFold(parsed.Scheme, "http")
+}
 func (s *Server) logout(w http.ResponseWriter, r *http.Request) {
 	if !s.authenticated(r, true) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
@@ -241,15 +325,38 @@ func (s *Server) logout(w http.ResponseWriter, r *http.Request) {
 }
 func (s *Server) reset(w http.ResponseWriter, r *http.Request) { s.render(w, "reset", pageData{}) }
 func (s *Server) resetPost(w http.ResponseWriter, r *http.Request) {
+	if !sameOriginRequest(r) {
+		http.Error(w, "cross-origin reset rejected", http.StatusForbidden)
+		return
+	}
+	ip := "reset:" + s.clientIP(r)
+	if s.rateLimited(ip) {
+		s.render(w, "reset", pageData{Error: "Too many reset attempts. Try again later."})
+		return
+	}
+	select {
+	case s.authWork <- struct{}{}:
+		defer func() { <-s.authWork }()
+	default:
+		http.Error(w, "authentication busy", http.StatusServiceUnavailable)
+		return
+	}
 	_ = r.ParseForm()
 	if r.FormValue("password") != r.FormValue("confirm") {
+		s.recordFailure(ip)
 		s.render(w, "reset", pageData{Error: "Passwords do not match."})
 		return
 	}
 	if err := s.store.ResetWithToken(r.Context(), r.FormValue("token"), r.FormValue("password")); err != nil {
-		s.render(w, "reset", pageData{Error: err.Error()})
+		s.recordFailure(ip)
+		// Do not disclose whether a reset token is missing, invalid, expired,
+		// or temporarily unreadable. The token is deliberately a single
+		// generic oracle to unauthenticated callers.
+		slog.Debug("password reset rejected", "error", err)
+		s.render(w, "reset", pageData{Error: "The reset token is invalid or expired."})
 		return
 	}
+	s.clearFailures(ip)
 	s.clearCookies(w)
 	http.Redirect(w, r, "/login", http.StatusSeeOther)
 }
@@ -353,6 +460,9 @@ func historyExportURL(filter store.HistoryFilter) string {
 	if filter.ResourceID != "" {
 		values.Set("resource", filter.ResourceID)
 	}
+	if filter.Cursor > 0 {
+		values.Set("cursor", strconv.FormatInt(filter.Cursor, 10))
+	}
 	if encoded := values.Encode(); encoded != "" {
 		return "/history/export?" + encoded
 	}
@@ -385,12 +495,13 @@ func (s *Server) settingsPost(w http.ResponseWriter, r *http.Request) {
 	inventory, err2 := strconv.ParseInt(r.FormValue("inventory_interval"), 10, 64)
 	current, currentErr := s.store.Settings(r.Context())
 	configured := currentErr == nil
-	input := store.Settings{Tailnet: strings.TrimSpace(r.FormValue("tailnet")), OAuthClientID: strings.TrimSpace(r.FormValue("client_id")), OAuthClientSecret: r.FormValue("client_secret"), WebhookSecret: strings.TrimSpace(r.FormValue("webhook_secret")), DeviceInterval: time.Duration(device) * time.Second, InventoryInterval: time.Duration(inventory) * time.Second}
+	clearWebhookSecret := r.FormValue("clear_webhook_secret") == "on" || r.FormValue("clear_webhook_secret") == "true"
+	input := store.Settings{Tailnet: strings.TrimSpace(r.FormValue("tailnet")), OAuthClientID: strings.TrimSpace(r.FormValue("client_id")), OAuthClientSecret: r.FormValue("client_secret"), WebhookSecret: strings.TrimSpace(r.FormValue("webhook_secret")), ClearWebhookSecret: clearWebhookSecret, DeviceInterval: time.Duration(device) * time.Second, InventoryInterval: time.Duration(inventory) * time.Second}
 	if configured {
 		if input.OAuthClientSecret == "" {
 			input.OAuthClientSecret = current.OAuthClientSecret
 		}
-		if input.WebhookSecret == "" {
+		if input.WebhookSecret == "" && !input.ClearWebhookSecret {
 			input.WebhookSecret = current.WebhookSecret
 		}
 	}
@@ -561,12 +672,16 @@ func (s *Server) tailscaleWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	secret, err := s.store.WebhookSecret(r.Context())
-	if errors.Is(err, sql.ErrNoRows) || secret == "" {
-		http.Error(w, "webhook not configured", http.StatusNotFound)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			http.Error(w, "webhook not configured", http.StatusNotFound)
+			return
+		}
+		http.Error(w, "webhook unavailable", http.StatusServiceUnavailable)
 		return
 	}
-	if err != nil {
-		http.Error(w, "webhook unavailable", http.StatusServiceUnavailable)
+	if secret == "" {
+		http.Error(w, "webhook not configured", http.StatusNotFound)
 		return
 	}
 	body, err := io.ReadAll(r.Body)
@@ -606,13 +721,18 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 }
 func (s *Server) ready(w http.ResponseWriter, r *http.Request) {
 	status, err := s.store.Status(r.Context())
-	if err != nil || !status.Configured || status.BaselineAt == nil {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"status": "not_ready", "configured": status.Configured, "baseline": status.BaselineAt != nil})
+	if err != nil || !status.Configured || !status.BaselineReady {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"status": "not_ready", "configured": status.Configured, "baseline": status.BaselineReady})
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"status": "ready"})
 }
 func (s *Server) metrics(w http.ResponseWriter, r *http.Request) {
+	if !s.metricsAuthorized(r) {
+		w.Header().Set("WWW-Authenticate", `Bearer realm="tailstate-metrics"`)
+		http.Error(w, "metrics authorization required", http.StatusUnauthorized)
+		return
+	}
 	status, err := s.store.Status(r.Context())
 	if err != nil {
 		http.Error(w, "metrics unavailable", http.StatusInternalServerError)
@@ -620,7 +740,7 @@ func (s *Server) metrics(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
 	ready := 0
-	if status.Configured && status.BaselineAt != nil {
+	if status.Configured && status.BaselineReady {
 		ready = 1
 	}
 	fmt.Fprintf(w, "# HELP tailstate_ready Whether setup and baseline are complete.\n# TYPE tailstate_ready gauge\ntailstate_ready %d\n", ready)
@@ -646,6 +766,22 @@ func (s *Server) metrics(w http.ResponseWriter, r *http.Request) {
 	for collector, count := range status.ResourceCounts {
 		fmt.Fprintf(w, "tailstate_resources{collector=%q} %d\n", collector, count)
 	}
+}
+
+func (s *Server) metricsAuthorized(r *http.Request) bool {
+	if s.config.MetricsToken == "" {
+		return true
+	}
+	const prefix = "Bearer "
+	authorization := r.Header.Get("Authorization")
+	if !strings.HasPrefix(authorization, prefix) {
+		return false
+	}
+	provided := strings.TrimSpace(strings.TrimPrefix(authorization, prefix))
+	if provided == "" {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(provided), []byte(s.config.MetricsToken)) == 1
 }
 
 func (s *Server) startSession(w http.ResponseWriter, r *http.Request) bool {
@@ -764,6 +900,42 @@ func remoteIP(r *http.Request) string {
 		return r.RemoteAddr
 	}
 	return host
+}
+
+func (s *Server) clientIP(r *http.Request) string {
+	remote := remoteIP(r)
+	if !s.isTrustedProxy(remote) {
+		return remote
+	}
+	forwarded := strings.Split(r.Header.Get("X-Forwarded-For"), ",")
+	for index := len(forwarded) - 1; index >= 0; index-- {
+		candidate, err := netip.ParseAddr(strings.TrimSpace(forwarded[index]))
+		if err != nil {
+			continue
+		}
+		if !s.isTrustedProxy(candidate.String()) {
+			return candidate.String()
+		}
+	}
+	for _, value := range forwarded {
+		if candidate, err := netip.ParseAddr(strings.TrimSpace(value)); err == nil {
+			return candidate.String()
+		}
+	}
+	return remote
+}
+
+func (s *Server) isTrustedProxy(value string) bool {
+	addr, err := netip.ParseAddr(strings.TrimSpace(value))
+	if err != nil {
+		return false
+	}
+	for _, prefix := range s.config.TrustedProxies {
+		if prefix.Contains(addr) {
+			return true
+		}
+	}
+	return false
 }
 func writeJSON(w http.ResponseWriter, status int, value any) {
 	w.Header().Set("Content-Type", "application/json")

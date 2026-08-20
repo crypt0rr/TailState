@@ -5,4 +5,9 @@ secrets
 tailstate-data
 target
 *.db
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+backups/
 README.md

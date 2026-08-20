@@ -136,7 +136,42 @@ func TestEvidenceLedgerChainAndEncryptedKeyMetadata(t *testing.T) {
 	}
 }
 
-func TestEvidencePackV1RemainsVerifiable(t *testing.T) {
+func TestEvidenceLedgerEntrySignaturesVerifyIndependently(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	generation, err := st.SaveSettings(ctx, settings())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.ApplyBatch(ctx, generation, []model.Collected{historyResource("server", "100.64.0.1")}, func([]model.Change) string { return "baseline" }); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.ApplyBatch(ctx, generation, []model.Collected{historyResource("server-new", "100.64.0.2")}, func([]model.Change) string { return "changed" }); err != nil {
+		t.Fatal(err)
+	}
+	data, err := st.ExportEvidencePack(ctx, HistoryFilter{Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var pack EvidencePack
+	if err := json.Unmarshal(data, &pack); err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyLedgerLinks(pack); err != nil {
+		t.Fatalf("valid ledger signatures rejected: %v", err)
+	}
+	pack.Batches[0].LedgerSignature = base64.RawStdEncoding.EncodeToString(make([]byte, ed25519.SignatureSize))
+	for index := range pack.LedgerLinks {
+		if pack.LedgerLinks[index].BatchID == pack.Batches[0].ID {
+			pack.LedgerLinks[index].Signature = pack.Batches[0].LedgerSignature
+		}
+	}
+	if err := verifyLedgerLinks(pack); err == nil || !strings.Contains(err.Error(), "ledger signature verification failed") {
+		t.Fatalf("tampered ledger signature accepted: %v", err)
+	}
+}
+
+func TestEvidencePackV1IsRejected(t *testing.T) {
 	pack := EvidencePack{Format: evidencePackFormat, Version: 1, Filter: EvidenceFilter{Limit: 1}, Batches: []EvidenceBatch{}}
 	// The payload does not include the content hash, so compute it after the
 	// stable v1 fields have been assembled.
@@ -150,8 +185,8 @@ func TestEvidencePackV1RemainsVerifiable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := VerifyEvidencePack(encoded); err != nil {
-		t.Fatalf("legacy evidence pack no longer verifies: %v", err)
+	if err := VerifyEvidencePack(encoded); err == nil || !strings.Contains(err.Error(), "unsupported evidence pack format") {
+		t.Fatalf("legacy evidence pack was accepted: %v", err)
 	}
 }
 

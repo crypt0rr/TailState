@@ -18,6 +18,52 @@ func TestCanonicalIgnoresVolatileAndOrder(t *testing.T) {
 		t.Fatalf("volatile/order differences changed hash: %s != %s", ha, hb)
 	}
 }
+
+func TestPolicyCanonicalizationRetainsTenantControlledSecretNamedKeys(t *testing.T) {
+	before := map[string]any{
+		"group:eng":          []any{"alice@corp"},
+		"group:secrets-team": []any{"alice@corp"},
+	}
+	after := map[string]any{
+		"group:eng":          []any{"alice@corp"},
+		"group:secrets-team": []any{"alice@corp", "mallory@corp"},
+	}
+	raw, beforeHash, err := CanonicalFor("policy", before)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, afterHash, err := CanonicalFor("policy", after)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), "group:secrets-team") {
+		t.Fatalf("tenant-controlled key was removed from policy canonical form: %s", raw)
+	}
+	if beforeHash == afterHash {
+		t.Fatal("membership change in a secret-named policy group was invisible")
+	}
+	nested := map[string]any{"groups": map[string]any{"secret": []any{"alice@corp"}}}
+	if raw, _, err := CanonicalFor("policy", nested); err != nil || !strings.Contains(string(raw), `"secret"`) {
+		t.Fatalf("nested tenant key was removed: %s (%v)", raw, err)
+	}
+}
+
+func TestDNSCanonicalizationPreservesResolverOrder(t *testing.T) {
+	first := map[string]any{"nameservers": map[string]any{"dns": []any{"1.1.1.1", "9.9.9.9"}}, "searchpaths": map[string]any{"dns": []any{"corp.example", "lab.example"}}}
+	second := map[string]any{"nameservers": map[string]any{"dns": []any{"9.9.9.9", "1.1.1.1"}}, "searchpaths": map[string]any{"dns": []any{"lab.example", "corp.example"}}}
+	_, firstHash, err := CanonicalFor("dns", first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, secondHash, err := CanonicalFor("dns", second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstHash == secondHash {
+		t.Fatal("order-significant DNS configuration was normalized as unordered")
+	}
+}
+
 func TestTailnetAddressChangeDetected(t *testing.T) {
 	a, _, _ := Canonical(map[string]any{"addresses": []any{"100.64.0.1"}})
 	b, _, _ := Canonical(map[string]any{"addresses": []any{"100.64.0.2"}})

@@ -53,6 +53,10 @@ func TestHealthAndUpdateMessagesEscapeInput(t *testing.T) {
 	if got := Update("v1`", "v2\n"); strings.Contains(got, "v1`") || strings.Contains(got, "v2\n") {
 		t.Fatalf("update message did not escape input: %s", got)
 	}
+	got := Digest([]model.Change{{Kind: "created", Collector: "devices", Name: "[URGENT](https://evil.example)"}})
+	if strings.Contains(got, "[URGENT](https://evil.example)") || !strings.Contains(got, `\[URGENT\]`) {
+		t.Fatalf("device name retained active Markdown: %s", got)
+	}
 }
 
 func TestDigestStopsAddingFieldsNearBound(t *testing.T) {
@@ -63,5 +67,12 @@ func TestDigestStopsAddingFieldsNearBound(t *testing.T) {
 	message := Digest([]model.Change{{Kind: "changed", Collector: "devices", Name: "server", Fields: fields}})
 	if len(message) > 12000 {
 		t.Fatalf("bounded digest length=%d", len(message))
+	}
+}
+
+func TestDigestMarksTruncatedFieldDiffs(t *testing.T) {
+	message := Digest([]model.Change{{Kind: "changed", Collector: "devices", Name: "server", Fields: make([]model.FieldChange, 24), FieldsTruncated: true, TotalFields: 40}})
+	if !strings.Contains(message, "Additional field changes omitted; total: 40") {
+		t.Fatalf("truncated field metadata was not surfaced: %s", message)
 	}
 }

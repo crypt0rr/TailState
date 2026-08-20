@@ -18,6 +18,7 @@ import (
 const (
 	MaxBodyBytes    = 1 << 20
 	maxEvents       = 100
+	maxEventTypeLen = 128
 	maxSignatureAge = 24 * time.Hour
 	maxFutureSkew   = 5 * time.Minute
 )
@@ -93,6 +94,9 @@ func Verify(body []byte, signature, secret string, now time.Time) (Delivery, err
 		events[i].Type = strings.TrimSpace(events[i].Type)
 		if events[i].Type == "" {
 			return Delivery{}, errors.New("webhook event type is missing")
+		}
+		if len(events[i].Type) > maxEventTypeLen {
+			return Delivery{}, fmt.Errorf("webhook event type exceeds %d bytes", maxEventTypeLen)
 		}
 		eventTypes = append(eventTypes, events[i].Type)
 	}

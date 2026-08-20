@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"net/url"
 	"path/filepath"
 	"strconv"
@@ -158,6 +159,94 @@ func TestLoginAttemptTrackingIsBoundedAndPruned(t *testing.T) {
 	}
 }
 
+func TestLoginRejectsCrossOriginRequests(t *testing.T) {
+	server, _, token := testServer(t)
+	claim := url.Values{"token": {token}, "password": {"a secure password"}, "confirm": {"a secure password"}}
+	claimRequest := httptest.NewRequest(http.MethodPost, "/setup/claim", strings.NewReader(claim.Encode()))
+	claimRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	claimResponse := httptest.NewRecorder()
+	server.Handler().ServeHTTP(claimResponse, claimRequest)
+	if claimResponse.Code != http.StatusSeeOther {
+		t.Fatalf("claim status %d: %s", claimResponse.Code, claimResponse.Body.String())
+	}
+
+	login := url.Values{"password": {"a secure password"}}
+	request := httptest.NewRequest(http.MethodPost, "/login", strings.NewReader(login.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.Header.Set("Origin", "https://attacker.example")
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusForbidden {
+		t.Fatalf("cross-origin login status %d: %s", response.Code, response.Body.String())
+	}
+}
+
+func TestLoginAllowsSameOriginBehindTLSProxy(t *testing.T) {
+	server, _, token := testServer(t)
+	claim := url.Values{"token": {token}, "password": {"a secure password"}, "confirm": {"a secure password"}}
+	claimRequest := httptest.NewRequest(http.MethodPost, "/setup/claim", strings.NewReader(claim.Encode()))
+	claimRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	claimResponse := httptest.NewRecorder()
+	server.Handler().ServeHTTP(claimResponse, claimRequest)
+	if claimResponse.Code != http.StatusSeeOther {
+		t.Fatalf("claim status %d: %s", claimResponse.Code, claimResponse.Body.String())
+	}
+
+	login := url.Values{"password": {"a secure password"}}
+	request := httptest.NewRequest(http.MethodPost, "http://example.com/login", strings.NewReader(login.Encode()))
+	request.Host = "example.com"
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.Header.Set("Origin", "https://example.com")
+	request.Header.Set("X-Forwarded-Proto", "https")
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusSeeOther {
+		t.Fatalf("proxied same-origin login status %d: %s", response.Code, response.Body.String())
+	}
+}
+
+func TestForwardedClientAddressRequiresTrustedProxy(t *testing.T) {
+	server, _, _ := testServer(t)
+	server.config.TrustedProxies = []netip.Prefix{netip.MustParsePrefix("192.0.2.0/24")}
+	request := httptest.NewRequest(http.MethodPost, "/login", nil)
+	request.RemoteAddr = "192.0.2.10:1234"
+	request.Header.Set("X-Forwarded-For", "198.51.100.8, 192.0.2.9")
+	if got := server.clientIP(request); got != "198.51.100.8" {
+		t.Fatalf("trusted proxy client address=%q", got)
+	}
+	request.RemoteAddr = "203.0.113.10:1234"
+	if got := server.clientIP(request); got != "203.0.113.10" {
+		t.Fatalf("untrusted proxy client address=%q", got)
+	}
+}
+
+func TestLoginRejectsWhenAuthenticationCapacityIsExhausted(t *testing.T) {
+	server, _, token := testServer(t)
+	claim := url.Values{"token": {token}, "password": {"a secure password"}, "confirm": {"a secure password"}}
+	claimRequest := httptest.NewRequest(http.MethodPost, "/setup/claim", strings.NewReader(claim.Encode()))
+	claimRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	claimResponse := httptest.NewRecorder()
+	server.Handler().ServeHTTP(claimResponse, claimRequest)
+	if claimResponse.Code != http.StatusSeeOther {
+		t.Fatalf("claim status %d: %s", claimResponse.Code, claimResponse.Body.String())
+	}
+
+	server.authWork <- struct{}{}
+	server.authWork <- struct{}{}
+	defer func() {
+		<-server.authWork
+		<-server.authWork
+	}()
+	login := url.Values{"password": {"a secure password"}}
+	request := httptest.NewRequest(http.MethodPost, "/login", strings.NewReader(login.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("busy login status %d: %s", response.Code, response.Body.String())
+	}
+}
+
 func TestMetricsExposeCollectorHealthWithoutErrorDetails(t *testing.T) {
 	server, st, _ := testServer(t)
 	generation, err := st.SaveSettings(context.Background(), store.Settings{Tailnet: "-", OAuthClientID: "client", OAuthClientSecret: "secret", MattermostURL: "https://mattermost.example/hooks/x", DeviceInterval: time.Minute, InventoryInterval: 5 * time.Minute})
@@ -176,6 +265,26 @@ func TestMetricsExposeCollectorHealthWithoutErrorDetails(t *testing.T) {
 	}
 	if strings.Contains(body, "secret response") {
 		t.Fatal("collector error details leaked into metrics")
+	}
+}
+
+func TestMetricsTokenProtectsMetricsWhenConfigured(t *testing.T) {
+	server, st, _ := testServer(t)
+	server.config.MetricsToken = "metrics-secret"
+	if _, err := st.SaveSettings(context.Background(), store.Settings{Tailnet: "-", OAuthClientID: "client", OAuthClientSecret: "secret", MattermostURL: "https://mattermost.example/hooks/x", DeviceInterval: time.Minute, InventoryInterval: 5 * time.Minute}); err != nil {
+		t.Fatal(err)
+	}
+	unauthorized := httptest.NewRecorder()
+	server.Handler().ServeHTTP(unauthorized, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	if unauthorized.Code != http.StatusUnauthorized {
+		t.Fatalf("missing metrics token status=%d body=%s", unauthorized.Code, unauthorized.Body.String())
+	}
+	authorizedRequest := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	authorizedRequest.Header.Set("Authorization", "Bearer metrics-secret")
+	authorized := httptest.NewRecorder()
+	server.Handler().ServeHTTP(authorized, authorizedRequest)
+	if authorized.Code != http.StatusOK || !strings.Contains(authorized.Body.String(), "tailstate_ready") {
+		t.Fatalf("authorized metrics status=%d body=%s", authorized.Code, authorized.Body.String())
 	}
 }
 

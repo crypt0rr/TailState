@@ -35,6 +35,9 @@ wait_health() {
 }
 trap cleanup EXIT
 
+# The temporary file remains owned by the invoking host user while it is
+# bind-mounted into the fixed UID 10001 container. The production quick start
+# chowns the persistent key to 10001 and uses mode 0400 instead.
 chmod 644 "$key_file"
 openssl rand -base64 32 >"$key_file"
 export TAILSTATE_IMAGE="$image"

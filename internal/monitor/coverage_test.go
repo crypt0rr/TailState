@@ -90,6 +90,8 @@ func monitorTestAPI(t *testing.T, status *atomic.Int32) *httptest.Server {
 			_, _ = w.Write([]byte(`{"devices":[{"id":"device-1","hostname":"server"}]}`))
 		case "/api/v2/tailnet/-/users":
 			_, _ = w.Write([]byte(`{"users":[]}`))
+		case "/api/v2/device/device-1/routes", "/api/v2/device/device-1/attributes", "/api/v2/device/device-1/device-invites":
+			_, _ = w.Write([]byte(`{}`))
 		default:
 			http.NotFound(w, r)
 		}

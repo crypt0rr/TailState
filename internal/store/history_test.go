@@ -106,6 +106,36 @@ func TestHistoryPersistsExplainableChangesAndDeliveryState(t *testing.T) {
 	}
 }
 
+func TestHistoryResourceFilterTreatsWildcardsLiterally(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	generation, err := st.SaveSettings(ctx, settings())
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseline := model.Collected{Collector: "devices", Resources: []model.Resource{
+		{ID: "device%1", Type: "device", Name: "percent", Data: map[string]any{"hostname": "percent"}},
+		{ID: "device-2", Type: "device", Name: "plain", Data: map[string]any{"hostname": "plain"}},
+	}}
+	if _, err := st.ApplyBatch(ctx, generation, []model.Collected{baseline}, func([]model.Change) string { return "baseline" }); err != nil {
+		t.Fatal(err)
+	}
+	changed := model.Collected{Collector: "devices", Resources: []model.Resource{
+		{ID: "device%1", Type: "device", Name: "percent", Data: map[string]any{"hostname": "percent-new"}},
+		{ID: "device-2", Type: "device", Name: "plain", Data: map[string]any{"hostname": "plain-new"}},
+	}}
+	if _, err := st.ApplyBatch(ctx, generation, []model.Collected{changed}, func([]model.Change) string { return "changed" }); err != nil {
+		t.Fatal(err)
+	}
+	page, err := st.ListHistory(ctx, HistoryFilter{ResourceID: "%", Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Batches) != 1 || len(page.Batches[0].Events) != 1 || page.Batches[0].Events[0].ResourceID != "device%1" {
+		t.Fatalf("wildcard filter was not literal: %#v", page)
+	}
+}
+
 func TestHistoryCorrelatesCoalescedWebhookTriggers(t *testing.T) {
 	ctx := context.Background()
 	st := testStore(t)

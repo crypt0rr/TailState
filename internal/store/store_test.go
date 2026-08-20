@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -57,8 +58,8 @@ func TestSetupSessionAndSettingsEncryption(t *testing.T) {
 	changed := settings()
 	changed.OAuthClientSecret = "new-secret"
 	generation, err = st.SaveSettings(ctx, changed)
-	if err != nil || generation != 2 {
-		t.Fatalf("credential change did not rebaseline: %d %v", generation, err)
+	if err != nil || generation != 1 {
+		t.Fatalf("credential rotation unexpectedly changed generation: %d %v", generation, err)
 	}
 }
 
@@ -414,7 +415,60 @@ func TestUnsupportedCollectorSilentlyBaselinesWhenItReturns(t *testing.T) {
 	}
 }
 
-func TestCredentialRotationPrunesOldInventoryAndRejectsStalePolls(t *testing.T) {
+func TestUnsupportedWindowReportsDriftAfterRecovery(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	generation, err := st.SaveSettings(ctx, settings())
+	if err != nil {
+		t.Fatal(err)
+	}
+	resource := func(authorized bool) []model.Resource {
+		return []model.Resource{{Collector: "devices", ID: "device-1", Type: "device", Name: "server", Data: map[string]any{
+			"id": "device-1", "hostname": "server", "authorized": authorized,
+		}}}
+	}
+	if _, err := st.ApplyBatch(ctx, generation, []model.Collected{{Collector: "devices", Resources: resource(false)}}, func([]model.Change) string { return "baseline" }); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.ApplyBatch(ctx, generation, []model.Collected{{Collector: "devices", Unsupported: true}}, func([]model.Change) string { return "unsupported" }); err != nil {
+		t.Fatal(err)
+	}
+	changes, err := st.ApplyBatch(ctx, generation, []model.Collected{{Collector: "devices", Resources: resource(true)}}, func([]model.Change) string { return "recovered" })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(changes) != 1 || changes[0].Kind != "changed" {
+		t.Fatalf("drift across unsupported window was absorbed: %#v", changes)
+	}
+}
+
+func TestUnsupportedWindowPreservesRemovalDetection(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	generation, err := st.SaveSettings(ctx, settings())
+	if err != nil {
+		t.Fatal(err)
+	}
+	resource := []model.Resource{{Collector: "devices", ID: "device-1", Type: "device", Name: "server", Data: map[string]any{"hostname": "server"}}}
+	if _, err := st.ApplyBatch(ctx, generation, []model.Collected{{Collector: "devices", Resources: resource}}, func([]model.Change) string { return "baseline" }); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.ApplyBatch(ctx, generation, []model.Collected{{Collector: "devices", Unsupported: true}}, func([]model.Change) string { return "unsupported" }); err != nil {
+		t.Fatal(err)
+	}
+	if changes, err := st.ApplyBatch(ctx, generation, []model.Collected{{Collector: "devices"}}, func([]model.Change) string { return "first recovery" }); err != nil || len(changes) != 0 {
+		t.Fatalf("first recovery unexpectedly changed state: %#v err=%v", changes, err)
+	}
+	changes, err := st.ApplyBatch(ctx, generation, []model.Collected{{Collector: "devices"}}, func([]model.Change) string { return "second recovery" })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(changes) != 1 || changes[0].Kind != "removed" {
+		t.Fatalf("removal across unsupported window was lost: %#v", changes)
+	}
+}
+
+func TestCredentialRotationPreservesInventory(t *testing.T) {
 	ctx := context.Background()
 	st := testStore(t)
 	firstGeneration, err := st.SaveSettings(ctx, settings())
@@ -431,41 +485,44 @@ func TestCredentialRotationPrunesOldInventoryAndRejectsStalePolls(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if secondGeneration == firstGeneration {
-		t.Fatal("credential rotation did not create a new generation")
+	if secondGeneration != firstGeneration {
+		t.Fatal("credential rotation unexpectedly created a new generation")
 	}
 	var count int
 	if err := st.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM snapshots").Scan(&count); err != nil {
 		t.Fatal(err)
 	}
-	if count != 0 {
-		t.Fatalf("old snapshots were retained after rotation: %d", count)
+	if count != 1 {
+		t.Fatalf("baseline snapshot was lost after credential rotation: %d", count)
 	}
-	st.SetNextPoll(ctx, firstGeneration, []string{"devices"}, time.Now().UTC().Add(time.Minute))
-	if notify, _, err := st.RecordCollectorFailure(ctx, firstGeneration, "devices", "stale failure"); err != nil || notify {
-		t.Fatalf("stale collector failure was not ignored: notify=%v err=%v", notify, err)
-	}
-	var oldStateCount int
-	if err := st.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM collector_state WHERE generation=?", firstGeneration).Scan(&oldStateCount); err != nil {
-		t.Fatal(err)
-	}
-	if oldStateCount != 0 {
-		t.Fatalf("stale poll recreated old collector state: %d", oldStateCount)
-	}
-	stale := []model.Collected{{Collector: "devices", Resources: []model.Resource{{ID: "stale", Type: "device", Name: "stale", Data: map[string]any{"hostname": "stale"}}}}}
-	changes, err := st.ApplyBatch(ctx, firstGeneration, stale, func([]model.Change) string { return "digest" })
-	if err != nil || len(changes) != 0 {
-		t.Fatalf("stale poll was not ignored: %#v %v", changes, err)
-	}
-	if err := st.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM snapshots").Scan(&count); err != nil {
-		t.Fatal(err)
-	}
-	if count != 0 {
-		t.Fatalf("stale poll repopulated old snapshots: %d", count)
+	changed := []model.Collected{{Collector: "devices", Resources: []model.Resource{{ID: "1", Type: "device", Name: "server", Data: map[string]any{"hostname": "server-new"}}}}}
+	changes, err := st.ApplyBatch(ctx, secondGeneration, changed, func([]model.Change) string { return "digest" })
+	if err != nil || len(changes) != 1 || changes[0].Kind != "changed" {
+		t.Fatalf("change after credential rotation was not detected: %#v %v", changes, err)
 	}
 }
 
-func TestStatusFailsWhenConfiguredSecretsCannotBeDecrypted(t *testing.T) {
+func TestWebhookSecretCanBeCleared(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	configured := settings()
+	configured.WebhookSecret = "webhook-secret"
+	if _, err := st.SaveSettings(ctx, configured); err != nil {
+		t.Fatal(err)
+	}
+	cleared := configured
+	cleared.WebhookSecret = ""
+	cleared.ClearWebhookSecret = true
+	if _, err := st.SaveSettings(ctx, cleared); err != nil {
+		t.Fatal(err)
+	}
+	value, err := st.WebhookSecret(ctx)
+	if err != nil || value != "" {
+		t.Fatalf("webhook secret was not cleared: %q err=%v", value, err)
+	}
+}
+
+func TestStatusDoesNotDecryptConfiguredSecrets(t *testing.T) {
 	ctx := context.Background()
 	st := testStore(t)
 	if _, err := st.SaveSettings(ctx, settings()); err != nil {
@@ -474,8 +531,8 @@ func TestStatusFailsWhenConfiguredSecretsCannotBeDecrypted(t *testing.T) {
 	if _, err := st.db.ExecContext(ctx, "UPDATE settings SET oauth_secret_enc='invalid-envelope'"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.Status(ctx); err == nil {
-		t.Fatal("status hid a settings decryption failure")
+	if status, err := st.Status(ctx); err != nil || !status.Configured {
+		t.Fatalf("status should remain available without decrypting secrets: %#v %v", status, err)
 	}
 }
 
@@ -567,6 +624,44 @@ func TestSilentBaselineDiffAndTwoPollRemoval(t *testing.T) {
 	}
 }
 
+func TestMassRemovalGuardPreservesSnapshots(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	generation, err := st.SaveSettings(ctx, settings())
+	if err != nil {
+		t.Fatal(err)
+	}
+	resources := make([]model.Resource, 4)
+	for i := range resources {
+		id := fmt.Sprintf("device-%d", i)
+		resources[i] = model.Resource{ID: id, Type: "device", Name: id, Collector: "devices", Data: map[string]any{"hostname": id}}
+	}
+	if _, err := st.ApplyBatch(ctx, generation, []model.Collected{{Collector: "devices", Resources: resources}}, func([]model.Change) string { return "baseline" }); err != nil {
+		t.Fatal(err)
+	}
+	changes, err := st.ApplyBatch(ctx, generation, []model.Collected{{Collector: "devices"}}, func([]model.Change) string { return "degraded" })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(changes) != 0 {
+		t.Fatalf("mass removal guard emitted changes: %#v", changes)
+	}
+	var count int
+	if err := st.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM snapshots WHERE generation=? AND collector='devices'", generation).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != len(resources) {
+		t.Fatalf("mass removal guard deleted snapshots: %d", count)
+	}
+	var lastError string
+	if err := st.db.QueryRowContext(ctx, "SELECT last_error FROM collector_state WHERE generation=? AND collector='devices'", generation).Scan(&lastError); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(lastError, "possible mass removal guarded") {
+		t.Fatalf("mass removal guard did not record collector health: %q", lastError)
+	}
+}
+
 func TestFailedCollectorCannotRemoveSnapshots(t *testing.T) {
 	ctx := context.Background()
 	st := testStore(t)
@@ -582,6 +677,40 @@ func TestFailedCollectorCannotRemoveSnapshots(t *testing.T) {
 	_ = st.db.QueryRow("SELECT COUNT(*) FROM snapshots").Scan(&count)
 	if count != 1 {
 		t.Fatalf("snapshot lost after failure: %d", count)
+	}
+}
+
+func TestPartialCollectorCannotRemoveSnapshots(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	generation, _ := st.SaveSettings(ctx, settings())
+	baseline := []model.Collected{{Collector: "devices", Resources: []model.Resource{
+		{ID: "1", Type: "device", Name: "server", Data: map[string]any{"hostname": "server"}},
+		{ID: "2", Type: "device", Name: "router", Data: map[string]any{"hostname": "router"}},
+	}}}
+	if _, err := st.ApplyBatch(ctx, generation, baseline, func([]model.Change) string { return "" }); err != nil {
+		t.Fatal(err)
+	}
+	partial := []model.Collected{{Collector: "devices", Partial: true, PartialError: "detail request failed", Resources: []model.Resource{
+		{ID: "1", Type: "device", Name: "server", Data: map[string]any{"hostname": "server-new"}},
+	}}}
+	changes, err := st.ApplyBatch(ctx, generation, partial, func([]model.Change) string { return "" })
+	if err != nil || len(changes) != 1 || changes[0].Kind != "changed" {
+		t.Fatalf("partial change not recorded: %#v %v", changes, err)
+	}
+	var count int
+	if err := st.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM snapshots WHERE generation=? AND collector='devices'", generation).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 2 {
+		t.Fatalf("partial poll removed snapshots: %d", count)
+	}
+	var lastError string
+	if err := st.db.QueryRowContext(ctx, "SELECT last_error FROM collector_state WHERE generation=? AND collector='devices'", generation).Scan(&lastError); err != nil {
+		t.Fatal(err)
+	}
+	if lastError != "detail request failed" {
+		t.Fatalf("partial collector error not persisted: %q", lastError)
 	}
 }
 

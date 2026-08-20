@@ -11,12 +11,14 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/crypt0rr/tailstate/internal/model"
+	"github.com/crypt0rr/tailstate/internal/textutil"
 )
 
 var CoreCollectors = []string{"devices"}
@@ -29,6 +31,8 @@ type Client struct {
 	credentials             Credentials
 	http                    *http.Client
 	mu                      sync.Mutex
+	deviceCacheMu           sync.RWMutex
+	deviceCache             []map[string]any
 	token                   string
 	expires                 time.Time
 }
@@ -39,15 +43,59 @@ type HTTPError struct {
 	Body   string
 }
 
+// PartialError reports a collector response that contained usable resources
+// but could not complete every related request. Callers may apply the
+// returned resources while preserving existing snapshots for missing items.
+type PartialError struct{ Err error }
+
+func (e *PartialError) Error() string {
+	if e == nil || e.Err == nil {
+		return "partial collector response"
+	}
+	return "partial collector response: " + e.Err.Error()
+}
+
+func (e *PartialError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
+}
+
 const (
 	maxAPIResponseBytes   = 16 << 20
 	maxOAuthResponseBytes = 1 << 20
+	maxRetryAfterDelay    = 5 * time.Minute
 )
 
-func (e *HTTPError) Error() string { return fmt.Sprintf("Tailscale GET returned %d", e.Status) }
+func (e *HTTPError) Error() string {
+	endpoint := strings.TrimSpace(e.URL)
+	if parsed, err := url.Parse(endpoint); err == nil {
+		endpoint = parsed.Path
+		if endpoint == "" {
+			endpoint = parsed.Host
+		}
+	}
+	if endpoint == "" {
+		endpoint = "endpoint"
+	}
+	return fmt.Sprintf("Tailscale GET %s returned %d", endpoint, e.Status)
+}
 func IsUnsupported(err error) bool {
 	var e *HTTPError
 	return errors.As(err, &e) && (e.Status == http.StatusForbidden || e.Status == http.StatusNotFound)
+}
+
+// IsUnsupportedCollector applies plan-capability semantics only to optional
+// collectors. Core device inventory and its dependent details must surface a
+// 404 as an upstream failure; otherwise a transient endpoint disappearance
+// would be treated as a six-hour unsupported window and silently reset drift
+// detection.
+func IsUnsupportedCollector(collector string, err error) bool {
+	if collector == "devices" || collector == "device_details" {
+		return false
+	}
+	return IsUnsupported(err)
 }
 
 func New(base, tokenURL, version string, credentials Credentials) *Client {
@@ -61,17 +109,23 @@ func (c *Client) Test(ctx context.Context) error { _, err := c.Collect(ctx, "dev
 func (c *Client) Collect(ctx context.Context, collector string) ([]model.Resource, error) {
 	switch collector {
 	case "devices":
-		return c.collection(ctx, c.tailnet("devices?fields=all"), "devices", collector, "device", []string{"id", "nodeId", "nodeID"})
+		resources, err := c.collection(ctx, c.tailnet("devices?fields=all"), "devices", collector, "device", []string{"id", "nodeId", "nodeID"})
+		if err != nil {
+			c.clearDeviceCache()
+			return nil, err
+		}
+		c.cacheDeviceResources(resources)
+		return resources, nil
 	case "device_details":
 		return c.deviceDetails(ctx)
 	case "users":
 		return c.collection(ctx, c.tailnet("users"), "users", collector, "user", []string{"id", "userId", "userID", "loginName"})
 	case "user_invites":
-		return c.collectionAllowEmptyResponse(ctx, c.tailnet("user-invites"), "userInvites", collector, "user_invite", []string{"id", "inviteId", "inviteID"})
+		return c.collection(ctx, c.tailnet("user-invites"), "userInvites", collector, "user_invite", []string{"id", "inviteId", "inviteID"})
 	case "keys":
 		return c.collection(ctx, c.tailnet("keys?all=true"), "keys", collector, "credential", []string{"id", "keyId", "keyID"})
 	case "webhooks":
-		return c.collectionAllowEmptyResponse(ctx, c.tailnet("webhooks"), "webhooks", collector, "webhook_configuration", []string{"id", "endpointId", "endpointID"})
+		return c.collection(ctx, c.tailnet("webhooks"), "webhooks", collector, "webhook_configuration", []string{"id", "endpointId", "endpointID"})
 	case "dns":
 		return c.dns(ctx)
 	case "policy":
@@ -90,31 +144,142 @@ func (c *Client) Collect(ctx context.Context, collector string) ([]model.Resourc
 }
 
 func (c *Client) deviceDetails(ctx context.Context) ([]model.Resource, error) {
-	devices, err := c.allPages(ctx, c.tailnet("devices?fields=all"), "devices")
-	if err != nil {
-		return nil, err
-	}
-	out := make([]model.Resource, 0, len(devices))
-	for _, device := range devices {
-		id := idFor(device, []string{"id", "nodeId", "nodeID"})
-		if id == "" {
-			continue
+	devices, ok := c.cachedDevices()
+	if !ok {
+		var err error
+		devices, err = c.allPages(ctx, c.tailnet("devices?fields=all"), "devices")
+		if err != nil {
+			return nil, err
 		}
-		combined := map[string]any{}
-		for key, path := range map[string]string{"routes": "routes", "postureAttributes": "attributes", "deviceInvites": "device-invites"} {
-			value, e := c.get(ctx, c.global("device/"+url.PathEscape(id)+"/"+path))
-			if e != nil {
-				if IsUnsupported(e) {
-					combined[key] = map[string]any{"unsupported": true}
+		c.cacheDeviceMaps(devices)
+	}
+	return c.deviceDetailsFromDevices(ctx, devices)
+}
+
+func (c *Client) deviceDetailsFromDevices(ctx context.Context, devices []map[string]any) ([]model.Resource, error) {
+	type detailJob struct {
+		index  int
+		device map[string]any
+	}
+	type detailResult struct {
+		index    int
+		resource model.Resource
+		err      error
+		hasValue bool
+	}
+	jobs := make(chan detailJob, len(devices))
+	results := make(chan detailResult, len(devices))
+	workers := min(8, len(devices))
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for job := range jobs {
+				id := idFor(job.device, []string{"id", "nodeId", "nodeID"})
+				if id == "" {
 					continue
 				}
-				return nil, e
+				combined := map[string]any{}
+				var detailErr error
+				for _, detail := range []struct {
+					key  string
+					path string
+				}{
+					{key: "routes", path: "routes"},
+					{key: "postureAttributes", path: "attributes"},
+					{key: "deviceInvites", path: "device-invites"},
+				} {
+					key, path := detail.key, detail.path
+					value, err := c.get(ctx, c.global("device/"+url.PathEscape(id)+"/"+path))
+					if err != nil {
+						// A missing per-device detail endpoint is an incomplete
+						// response, not proof that the whole subresource is
+						// unsupported. Preserve that distinction so the monitor does
+						// not persist a synthetic "unsupported" value or clear a
+						// previously known detail snapshot.
+						var httpErr *HTTPError
+						if errors.As(err, &httpErr) && httpErr.Status == http.StatusNotFound {
+							detailErr = err
+							break
+						}
+						if IsUnsupported(err) {
+							combined[key] = map[string]any{"unsupported": true}
+							continue
+						}
+						detailErr = err
+						break
+					}
+					combined[key] = value
+				}
+				if detailErr != nil {
+					results <- detailResult{index: job.index, err: detailErr}
+					continue
+				}
+				results <- detailResult{index: job.index, hasValue: true, resource: model.Resource{ID: id, Type: "device_details", Name: nameFor(job.device, id), Collector: "device_details", Data: combined}}
 			}
-			combined[key] = value
+		}()
+	}
+	for index, device := range devices {
+		jobs <- detailJob{index: index, device: device}
+	}
+	close(jobs)
+	wg.Wait()
+	close(results)
+	ordered := make([]detailResult, 0, len(devices))
+	var partialErr error
+	for result := range results {
+		if result.err != nil {
+			if partialErr == nil {
+				partialErr = result.err
+			}
+			continue
 		}
-		out = append(out, model.Resource{ID: id, Type: "device_details", Name: nameFor(device, id), Collector: "device_details", Data: combined})
+		if result.hasValue {
+			ordered = append(ordered, result)
+		}
+	}
+	sort.SliceStable(ordered, func(i, j int) bool { return ordered[i].index < ordered[j].index })
+	out := make([]model.Resource, 0, len(ordered))
+	for _, result := range ordered {
+		out = append(out, result.resource)
+	}
+	if partialErr != nil {
+		return out, &PartialError{Err: partialErr}
 	}
 	return out, nil
+}
+
+func (c *Client) cacheDeviceResources(resources []model.Resource) {
+	devices := make([]map[string]any, 0, len(resources))
+	for _, resource := range resources {
+		if data, ok := resource.Data.(map[string]any); ok {
+			devices = append(devices, data)
+		}
+	}
+	c.cacheDeviceMaps(devices)
+}
+
+func (c *Client) cacheDeviceMaps(devices []map[string]any) {
+	copyOf := append([]map[string]any(nil), devices...)
+	c.deviceCacheMu.Lock()
+	c.deviceCache = copyOf
+	c.deviceCacheMu.Unlock()
+}
+
+func (c *Client) cachedDevices() ([]map[string]any, bool) {
+	c.deviceCacheMu.RLock()
+	defer c.deviceCacheMu.RUnlock()
+	if c.deviceCache == nil {
+		return nil, false
+	}
+	return append([]map[string]any(nil), c.deviceCache...), true
+}
+
+func (c *Client) clearDeviceCache() {
+	c.deviceCacheMu.Lock()
+	c.deviceCache = nil
+	c.deviceCacheMu.Unlock()
 }
 
 func (c *Client) dns(ctx context.Context) ([]model.Resource, error) {
@@ -146,7 +311,7 @@ func (c *Client) policy(ctx context.Context) ([]model.Resource, error) {
 	sections := map[string]any{}
 	if object, ok := value.(map[string]any); ok {
 		for key, section := range object {
-			raw, _, _ := model.Canonical(section)
+			raw, _, _ := model.CanonicalFor("policy", section)
 			sum := sha256.Sum256(raw)
 			sections[key] = hex.EncodeToString(sum[:])
 		}
@@ -199,12 +364,8 @@ func (c *Client) collection(ctx context.Context, endpoint, arrayKey, collector, 
 	return c.collectionWithOptions(ctx, endpoint, arrayKey, collector, typ, ids, false)
 }
 
-func (c *Client) collectionAllowEmptyResponse(ctx context.Context, endpoint, arrayKey, collector, typ string, ids []string) ([]model.Resource, error) {
-	return c.collectionWithOptions(ctx, endpoint, arrayKey, collector, typ, ids, true)
-}
-
-func (c *Client) collectionWithOptions(ctx context.Context, endpoint, arrayKey, collector, typ string, ids []string, allowEmptyResponse bool) ([]model.Resource, error) {
-	values, err := c.allPagesWithOptions(ctx, endpoint, arrayKey, allowEmptyResponse)
+func (c *Client) collectionWithOptions(ctx context.Context, endpoint, arrayKey, collector, typ string, ids []string, _ bool) ([]model.Resource, error) {
+	values, err := c.allPagesWithOptions(ctx, endpoint, arrayKey)
 	if err != nil {
 		return nil, err
 	}
@@ -221,10 +382,10 @@ func (c *Client) collectionWithOptions(ctx context.Context, endpoint, arrayKey, 
 }
 
 func (c *Client) allPages(ctx context.Context, endpoint, arrayKey string) ([]map[string]any, error) {
-	return c.allPagesWithOptions(ctx, endpoint, arrayKey, false)
+	return c.allPagesWithOptions(ctx, endpoint, arrayKey)
 }
 
-func (c *Client) allPagesWithOptions(ctx context.Context, endpoint, arrayKey string, allowEmptyResponse bool) ([]map[string]any, error) {
+func (c *Client) allPagesWithOptions(ctx context.Context, endpoint, arrayKey string) ([]map[string]any, error) {
 	next := endpoint
 	var out []map[string]any
 	for page := 0; page < 100; page++ {
@@ -236,14 +397,24 @@ func (c *Client) allPagesWithOptions(ctx context.Context, endpoint, arrayKey str
 		var items []any
 		if objectOK {
 			raw, present := object[arrayKey]
-			if present && raw != nil {
-				items, _ = raw.([]any)
-			} else if allowEmptyResponse {
-				// Some Tailscale deployments omit or null the collection field when it is empty.
+			if !present {
+				return nil, fmt.Errorf("%s response has no %s array", arrayKey, arrayKey)
+			}
+			if raw == nil {
 				items = []any{}
+			} else {
+				var ok bool
+				items, ok = raw.([]any)
+				if !ok {
+					return nil, fmt.Errorf("%s response %s is not an array", arrayKey, arrayKey)
+				}
 			}
 		} else {
-			items, _ = value.([]any)
+			var ok bool
+			items, ok = value.([]any)
+			if !ok {
+				return nil, fmt.Errorf("%s response has no %s array", arrayKey, arrayKey)
+			}
 		}
 		if items == nil {
 			return nil, fmt.Errorf("%s response has no %s array", arrayKey, arrayKey)
@@ -444,10 +615,10 @@ func nameFor(value map[string]any, fallback string) string {
 }
 func retryAfter(value string, fallback time.Duration) time.Duration {
 	if seconds, err := strconv.Atoi(value); err == nil && seconds >= 0 {
-		return time.Duration(seconds) * time.Second
+		return min(time.Duration(seconds)*time.Second, maxRetryAfterDelay)
 	}
 	if when, err := http.ParseTime(value); err == nil {
-		return max(time.Until(when), 0)
+		return min(max(time.Until(when), 0), maxRetryAfterDelay)
 	}
 	return fallback
 }
@@ -466,8 +637,5 @@ var waitForRetry = sleep
 
 func safeBody(body []byte) string {
 	value := strings.TrimSpace(string(body))
-	if len(value) > 200 {
-		value = value[:200] + "…"
-	}
-	return value
+	return textutil.Truncate(value, 200)
 }

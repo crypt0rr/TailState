@@ -107,6 +107,9 @@ func TestOpenReportsEvidenceLedgerBackfillError(t *testing.T) {
 		t.Fatalf("close initial store: %v", err)
 	}
 	db := openCoverageDB(t, path)
+	if _, err := db.ExecContext(context.Background(), "DELETE FROM meta WHERE key=?", evidenceLedgerBackfilledMeta); err != nil {
+		t.Fatalf("clear ledger backfill marker: %v", err)
+	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	if _, err := db.ExecContext(context.Background(), "INSERT INTO event_batches(generation,observed_at,change_count,created_at) VALUES(1,?,?,?)", now, 0, now); err != nil {
 		t.Fatalf("insert event batch: %v", err)

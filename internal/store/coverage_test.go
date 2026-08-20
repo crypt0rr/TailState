@@ -23,6 +23,9 @@ func TestStoreLifecycleAndCollectorStateBranches(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if got, err := st.SettingsGeneration(ctx); err != nil || got != generation {
+		t.Fatalf("SettingsGeneration=%d err=%v, want %d", got, err, generation)
+	}
 	if !st.CollectorDue(ctx, generation, "devices") {
 		t.Fatal("collector without state should be due")
 	}
@@ -212,6 +215,12 @@ func TestStoreValidationBranches(t *testing.T) {
 	}
 	if _, _, err := st.RecordWebhookTrigger(ctx, strings.Repeat("d", 64), events, nil); err == nil {
 		t.Fatal("oversized webhook metadata was accepted")
+	}
+	if _, _, err := st.RecordWebhookTrigger(ctx, strings.Repeat("e", 64), []string{strings.Repeat("x", 129)}, nil); err == nil {
+		t.Fatal("oversized webhook metadata value was accepted")
+	}
+	if _, _, err := st.RecordWebhookTrigger(ctx, strings.Repeat("f", 64), []string{"policy\nupdate"}, nil); err == nil {
+		t.Fatal("control character in webhook metadata was accepted")
 	}
 }
 
@@ -496,7 +505,7 @@ func TestStatusQueryErrorBranches(t *testing.T) {
 
 func TestCleanupQueryErrorBranches(t *testing.T) {
 	ctx := context.Background()
-	for _, table := range []string{"sessions", "events", "event_batches", "event_batch_triggers", "evidence_ledger", "webhook_triggers", "outbox"} {
+	for _, table := range []string{"sessions", "events", "event_batches", "event_batch_triggers", "webhook_triggers", "outbox"} {
 		t.Run(table, func(t *testing.T) {
 			st := testStore(t)
 			if _, err := st.db.ExecContext(ctx, "DROP TABLE "+table); err != nil {
@@ -731,16 +740,24 @@ func TestWebhookTriggerDurabilityErrorBranches(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		pending, _, err := st.RecordWebhookTrigger(ctx, strings.Repeat("f", 64), nil, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
 		old := time.Now().UTC().Add(-48 * time.Hour).Format(time.RFC3339Nano)
 		if _, err := st.db.ExecContext(ctx, "UPDATE webhook_triggers SET received_at=? WHERE id=?", old, trigger.ID); err != nil {
 			t.Fatal(err)
 		}
-		if err := st.RetryWebhookTriggers(ctx, []int64{trigger.ID}, time.Now(), ""); err != nil {
+		if err := st.RetryWebhookTriggers(ctx, []int64{trigger.ID, pending.ID}, time.Now(), ""); err != nil {
 			t.Fatal(err)
 		}
 		dead, _, err := st.RecordWebhookTrigger(ctx, bodyHash, nil, nil)
 		if err != nil || dead.Status != "dead" || dead.LastError == "" {
 			t.Fatalf("dead trigger=%#v err=%v", dead, err)
+		}
+		queued, _, err := st.RecordWebhookTrigger(ctx, strings.Repeat("f", 64), nil, nil)
+		if err != nil || queued.Status != "pending" || queued.LastError != "" {
+			t.Fatalf("fresh trigger inherited dead-letter message: %#v err=%v", queued, err)
 		}
 	})
 
@@ -1121,7 +1138,7 @@ func TestDestinationAndVersionWriteErrorBranches(t *testing.T) {
 		if _, err := st.db.ExecContext(ctx, `CREATE TRIGGER fail_destination_update BEFORE UPDATE OF service_url_enc ON notification_destinations BEGIN SELECT RAISE(ABORT,'destination update failed'); END`); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := st.SaveDestination(ctx, NotificationDestination{Name: "renamed", ServiceURL: "generic://example.invalid/updated", Enabled: true}); err == nil {
+		if _, err := st.SaveDestination(ctx, NotificationDestination{ID: 1, Name: "renamed", ServiceURL: "generic://example.invalid/updated", Enabled: true}); err == nil {
 			t.Fatal("SaveDestination ignored destination update failure")
 		}
 	})

@@ -133,3 +133,11 @@ func TestVerifyRejectsEmptyAndUntypedEvents(t *testing.T) {
 		t.Fatalf("signature parser rejected an ignorable segment: %v", err)
 	}
 }
+
+func TestVerifyRejectsOversizedEventType(t *testing.T) {
+	now := time.Unix(1_786_000_000, 0)
+	body := []byte(`[{"type":"` + strings.Repeat("x", maxEventTypeLen+1) + `"}]`)
+	if _, err := Verify(body, SignatureForTest(body, "secret", now.Unix()), "secret", now); err == nil || !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("oversized event type was accepted: %v", err)
+	}
+}

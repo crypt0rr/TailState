@@ -2,6 +2,7 @@ name: CI
 
 on:
   push:
+    branches: [main]
   pull_request:
   workflow_call:
     inputs:
@@ -13,6 +14,10 @@ on:
 
 permissions:
   contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   go:
@@ -30,7 +35,7 @@ jobs:
       - name: Enforce coverage baseline
         run: |
           total=$(go tool cover -func=coverage.out | awk '/^total:/ {gsub("%", "", $3); print $3}')
-          awk -v total="$total" 'BEGIN { if (total < 55.0) { printf "coverage %.1f%% is below the 55.0%% baseline\n", total; exit 1 } }'
+          awk -v total="$total" 'BEGIN { if (total < 90.0) { printf "coverage %.1f%% is below the 90.0%% baseline\n", total; exit 1 } }'
       - run: go install honnef.co/go/tools/cmd/staticcheck@v0.7.0
       - run: staticcheck ./...
       - run: go install golang.org/x/vuln/cmd/govulncheck@v1.6.0

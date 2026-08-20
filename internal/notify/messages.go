@@ -31,9 +31,16 @@ func Digest(changes []model.Change) string {
 			}
 			b.WriteString(detail)
 		}
+		if c.FieldsTruncated {
+			total := c.TotalFields
+			if total <= len(c.Fields) {
+				total = len(c.Fields) + 1
+			}
+			fmt.Fprintf(&b, "  _Additional field changes omitted; total: %d._\n", total)
+		}
 	}
 	if b.Len() > 12000 {
-		return b.String()[:11999] + "…"
+		return truncate(b.String(), 11999)
 	}
 	return b.String()
 }
@@ -50,14 +57,29 @@ func Update(previous, current string) string {
 }
 
 func escape(value string) string {
-	return strings.NewReplacer("`", "'", "\n", " ", "\r", " ").Replace(value)
+	value = strings.NewReplacer("\n", " ", "\r", " ").Replace(value)
+	value = strings.NewReplacer(
+		"\\", "\\\\",
+		"`", "'",
+		"*", "\\*",
+		"_", "\\_",
+		"[", "\\[",
+		"]", "\\]",
+		"(", "\\(",
+		")", "\\)",
+		"#", "\\#",
+		"|", "\\|",
+		"~", "\\~",
+		">", "\\>",
+	).Replace(value)
+	return truncate(value, 256)
 }
 
 func short(value any) string {
 	raw, _ := json.Marshal(value)
 	text := string(raw)
 	if len(text) > 180 {
-		text = text[:179] + "…"
+		text = truncate(text, 179)
 	}
 	return escape(text)
 }

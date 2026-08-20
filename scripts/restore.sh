@@ -18,6 +18,7 @@ fi
 
 archive="$(cd "$(dirname "$1")" && pwd -P)/$(basename "$1")"
 service="${3:-tailstate}"
+# renovate: datasource=docker depName=alpine
 backup_image="${TAILSTATE_BACKUP_IMAGE:-alpine:3.24@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b}"
 host_uid="$(id -u)"
 host_gid="$(id -g)"
@@ -56,11 +57,13 @@ pre_restore_path="$archive_dir/$pre_restore_name"
 restart() {
     local status=$?
     trap - EXIT
-    if [[ "$running" == "true" ]]; then
+    if [[ "$status" -eq 0 && "$running" == "true" ]]; then
         if ! docker compose start "$service" >/dev/null; then
             echo "restore failed, and $service could not be restarted" >&2
             status=1
         fi
+    elif [[ "$status" -ne 0 ]]; then
+        echo "restore failed; $service was left stopped so the data volume can be inspected or recovered from the pre-restore archive" >&2
     fi
     exit "$status"
 }
@@ -86,13 +89,30 @@ docker run --rm \
     "$backup_image" \
     sh -ec '
         restore_dir="$(mktemp -d /tmp/tailstate-restore.XXXXXX)"
-        trap "rm -rf \"$restore_dir\"" EXIT
+        previous_dir="$(mktemp -d /tmp/tailstate-previous.XXXXXX)"
+        backup_ready=0
+        restore_failed() {
+            status=$?
+            trap - EXIT
+            if [ "$status" -ne 0 ] && [ "$backup_ready" -eq 1 ]; then
+                rm -rf /data/* /data/.[!.]* /data/..?* 2>/dev/null || true
+                cp -a "$previous_dir"/. /data/ || {
+                    echo "restore rollback failed; recover from the pre-restore archive" >&2
+                    status=1
+                }
+            fi
+            rm -rf "$restore_dir" "$previous_dir"
+            exit "$status"
+        }
+        trap restore_failed EXIT
         tar xzf "/backup/$1" -C "$restore_dir"
         unsafe="$(find "$restore_dir" \( -type l -o -type b -o -type c -o -type p \) -print -quit)"
         if [ -n "$unsafe" ]; then
             echo "archive contains an unsafe special file: $unsafe" >&2
             exit 1
         fi
+        cp -a /data/. "$previous_dir"/
+        backup_ready=1
         find /data -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
         cp -a "$restore_dir"/. /data/
     ' -- "$archive_name"

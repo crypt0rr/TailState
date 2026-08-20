@@ -86,6 +86,15 @@ func TestRunAndCleanupCancellation(t *testing.T) {
 	time.Sleep(25 * time.Millisecond)
 }
 
+func TestEngineWaitAfterRun(t *testing.T) {
+	st, _ := monitorTestStore(t)
+	engine := New(st, "", "", "test", &scriptedSender{})
+	ctx, cancel := context.WithCancel(context.Background())
+	engine.Run(ctx)
+	cancel()
+	engine.Wait()
+}
+
 func TestJitterBounds(t *testing.T) {
 	if got := jitter(0); got != time.Minute {
 		t.Fatalf("zero jitter=%s", got)
@@ -120,7 +129,7 @@ func TestPollRejectsResultsFromStaleGeneration(t *testing.T) {
 	defer api.Close()
 	client := tailscale.New(api.URL+"/api/v2", api.URL+"/oauth/token", "test", tailscale.Credentials{Tailnet: "-", ClientID: "client", ClientSecret: "secret"})
 	newSettings := oldSettings
-	newSettings.OAuthClientSecret = "rotated-secret"
+	newSettings.OAuthClientID = "rotated-client"
 	if generation, err := st.SaveSettings(ctx, newSettings); err != nil || generation == oldSettings.Generation {
 		t.Fatalf("rotate settings generation=%d err=%v", generation, err)
 	}

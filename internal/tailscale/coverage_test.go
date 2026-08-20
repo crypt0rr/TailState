@@ -2,6 +2,7 @@ package tailscale
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -76,7 +77,7 @@ func TestPolicyAdditionalCollectorsAndClientTest(t *testing.T) {
 }
 
 func TestTailscaleHelpersAndHTTPError(t *testing.T) {
-	if got := (&HTTPError{Status: 418}).Error(); got != "Tailscale GET returned 418" {
+	if got := (&HTTPError{Status: 418}).Error(); got != "Tailscale GET endpoint returned 418" {
 		t.Fatalf("HTTPError=%q", got)
 	}
 	if err := noRedirect(nil, nil); err != http.ErrUseLastResponse {
@@ -84,6 +85,9 @@ func TestTailscaleHelpersAndHTTPError(t *testing.T) {
 	}
 	if got := retryAfter("3", time.Minute); got != 3*time.Second {
 		t.Fatalf("seconds Retry-After=%s", got)
+	}
+	if got := retryAfter("86400", time.Minute); got != 5*time.Minute {
+		t.Fatalf("large seconds Retry-After=%s, want five-minute cap", got)
 	}
 	future := time.Now().Add(2 * time.Second).UTC().Format(http.TimeFormat)
 	if got := retryAfter(future, time.Minute); got <= 0 || got > 3*time.Second {
@@ -109,7 +113,7 @@ func TestTailscaleHelpersAndHTTPError(t *testing.T) {
 	if got := nextURL(map[string]any{"pagination": map[string]any{"nextCursor": "abc"}}); got != "?cursor=abc" {
 		t.Fatalf("next cursor=%q", got)
 	}
-	if got := safeBody([]byte(strings.Repeat("x", 201))); !strings.HasPrefix(got, strings.Repeat("x", 200)) || !strings.HasSuffix(got, "…") {
+	if got := safeBody([]byte(strings.Repeat("x", 201))); len(got) > 200 || !strings.HasSuffix(got, "…") {
 		t.Fatalf("safe body=%q", got)
 	}
 	if got := idFor(map[string]any{"id": float64(42)}, []string{"id"}); got != "42" {
@@ -208,5 +212,16 @@ func TestDeviceDetailsPropagatesSecondaryEndpointFailure(t *testing.T) {
 	client := New(server.URL+"/api/v2", server.URL+"/oauth/token", "test", Credentials{ClientID: "id", ClientSecret: "secret"})
 	if _, err := client.Collect(context.Background(), "device_details"); err == nil || !strings.Contains(err.Error(), "returned 500") {
 		t.Fatalf("secondary endpoint failure was not propagated: %v", err)
+	}
+}
+
+func TestPartialErrorUnwrapsCause(t *testing.T) {
+	cause := &HTTPError{Status: http.StatusNotFound, URL: "device/routes"}
+	partial := &PartialError{Err: cause}
+	if !errors.Is(partial, cause) {
+		t.Fatal("PartialError did not unwrap its cause")
+	}
+	if partial.Error() == "" {
+		t.Fatal("PartialError returned an empty message")
 	}
 }

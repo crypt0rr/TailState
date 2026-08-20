@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strconv"
 	"strings"
 
 	"golang.org/x/crypto/argon2"
@@ -84,7 +85,22 @@ func PasswordHash(password string) (string, error) {
 
 func PasswordMatches(encoded, password string) bool {
 	parts := strings.Split(encoded, "$")
-	if len(parts) != 5 || parts[0] != "argon2id" {
+	if len(parts) != 5 || parts[0] != "argon2id" || parts[1] != "v=19" {
+		return false
+	}
+	params := map[string]uint64{}
+	for _, part := range strings.Split(parts[2], ",") {
+		key, value, ok := strings.Cut(part, "=")
+		if !ok || (key != "m" && key != "t" && key != "p") {
+			return false
+		}
+		parsed, err := strconv.ParseUint(value, 10, 32)
+		if err != nil || parsed == 0 {
+			return false
+		}
+		params[key] = parsed
+	}
+	if len(params) != 3 || params["p"] > 255 {
 		return false
 	}
 	salt, err1 := base64.RawStdEncoding.DecodeString(parts[3])
@@ -92,7 +108,7 @@ func PasswordMatches(encoded, password string) bool {
 	if err1 != nil || err2 != nil || len(want) != 32 {
 		return false
 	}
-	got := argon2.IDKey([]byte(password), salt, 3, 64*1024, 2, 32)
+	got := argon2.IDKey([]byte(password), salt, uint32(params["t"]), uint32(params["m"]), uint8(params["p"]), uint32(len(want)))
 	return subtle.ConstantTimeCompare(got, want) == 1
 }
 

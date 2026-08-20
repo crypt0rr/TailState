@@ -54,6 +54,48 @@ func TestNotificationDestinationFanoutAndDisable(t *testing.T) {
 	}
 }
 
+func TestSecondMattermostDestinationDoesNotOverwriteTheFirst(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	first, err := st.SaveDestination(ctx, NotificationDestination{Name: "Mattermost", ServiceURL: "mattermost://TailState@chat.example/first", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := st.SaveDestination(ctx, NotificationDestination{Name: "Mattermost", ServiceURL: "mattermost://TailState@soc.example/second", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	destinations, err := st.ListDestinations(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first == second || len(destinations) != 2 {
+		t.Fatalf("second destination overwrote the first: ids=%d/%d destinations=%#v", first, second, destinations)
+	}
+}
+
+func TestEditingDeletedDestinationDoesNotResurrectIt(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	id, err := st.SaveDestination(ctx, NotificationDestination{Name: "primary", ServiceURL: "generic://example.invalid/hook", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.DeleteDestination(ctx, id); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.SaveDestination(ctx, NotificationDestination{ID: id, Name: "renamed", ServiceURL: "generic://example.invalid/new-hook", Enabled: true}); err == nil {
+		t.Fatal("editing a deleted destination unexpectedly resurrected it")
+	}
+	active, err := st.ListDestinations(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(active) != 0 {
+		t.Fatalf("deleted destination returned to active list: %#v", active)
+	}
+}
+
 func TestLegacyMattermostMigration(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "tailstate.db")

@@ -70,8 +70,11 @@ func TestNotifyTestAndErrorHelpers(t *testing.T) {
 	if err != nil || !strings.HasPrefix(native, "mattermost://TailState@mattermost.example/token") || !strings.Contains(native, "disabletls=true") {
 		t.Fatalf("native HTTP conversion=%q err=%v", native, err)
 	}
-	if got := truncate(strings.Repeat("x", 501), 500); len(got) <= 500 || !strings.HasSuffix(got, "…") {
+	if got := truncate(strings.Repeat("x", 501), 500); len(got) > 500 || !strings.HasSuffix(got, "…") {
 		t.Fatalf("truncate output length=%d", len(got))
+	}
+	if got := RedactError("provider rejected mattermost://TailState@host/token?secret=hidden", "mattermost://TailState@host/token?secret=hidden"); strings.Contains(got, "hidden") {
+		t.Fatalf("RedactError leaked destination credential: %q", got)
 	}
 }
 

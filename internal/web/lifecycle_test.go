@@ -128,8 +128,8 @@ func TestStatusReportsSettingsLoadFailure(t *testing.T) {
 	}
 	response := httptest.NewRecorder()
 	server.Handler().ServeHTTP(response, request)
-	if response.Code != http.StatusInternalServerError || !strings.Contains(response.Body.String(), "load status") {
-		t.Fatalf("status failure response %d: %s", response.Code, response.Body.String())
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "Baseline") {
+		t.Fatalf("status response %d: %s", response.Code, response.Body.String())
 	}
 }
 

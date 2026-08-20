@@ -13,12 +13,14 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode"
 
 	_ "modernc.org/sqlite"
 
 	"github.com/crypt0rr/tailstate/internal/model"
 	"github.com/crypt0rr/tailstate/internal/notify"
 	"github.com/crypt0rr/tailstate/internal/secret"
+	"github.com/crypt0rr/tailstate/internal/textutil"
 )
 
 type Store struct {
@@ -28,10 +30,11 @@ type Store struct {
 }
 
 type Settings struct {
-	Tailnet           string
-	OAuthClientID     string
-	OAuthClientSecret string
-	WebhookSecret     string
+	Tailnet            string
+	OAuthClientID      string
+	OAuthClientSecret  string
+	WebhookSecret      string
+	ClearWebhookSecret bool
 	// MattermostURL is retained for source compatibility with older callers.
 	// New configuration is stored through NotificationDestination APIs.
 	MattermostURL     string
@@ -65,6 +68,7 @@ type CollectorState struct {
 type Status struct {
 	Configured          bool
 	BaselineAt          *time.Time
+	BaselineReady       bool
 	ResourceCounts      map[string]int
 	Collectors          []CollectorState
 	Pending             int
@@ -125,17 +129,19 @@ type HistoryFieldChange struct {
 }
 
 type HistoryEvent struct {
-	ID         int64
-	BatchID    int64
-	Generation int64
-	ObservedAt time.Time
-	Collector  string
-	EventType  string
-	ResourceID string
-	Name       string
-	Fields     []HistoryFieldChange
-	BeforeJSON string
-	AfterJSON  string
+	ID              int64
+	BatchID         int64
+	Generation      int64
+	ObservedAt      time.Time
+	Collector       string
+	EventType       string
+	ResourceID      string
+	Name            string
+	Fields          []HistoryFieldChange
+	FieldsTruncated bool
+	TotalFields     int
+	BeforeJSON      string
+	AfterJSON       string
 }
 
 type HistoryDelivery struct {
@@ -158,6 +164,7 @@ type HistoryBatch struct {
 	LedgerHash      string
 	LedgerSignature string
 	LedgerKeyID     string
+	ledgerPayload   []byte
 }
 
 type HistoryFilter struct {
@@ -189,12 +196,16 @@ func Open(path string, box *secret.Box) (*Store, error) {
 	if err := os.MkdirAll(filepathDir(path), 0o700); err != nil {
 		return nil, err
 	}
-	dsn := "file:" + path + "?_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)"
+	dsn := "file:" + path + "?_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)&_pragma=synchronous(FULL)"
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err
 	}
 	db.SetMaxOpenConns(1)
+	if _, err := verifyExistingMasterKey(db, box); err != nil {
+		db.Close()
+		return nil, err
+	}
 	if _, err := db.Exec(schema); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("migrate database: %w", err)
@@ -214,10 +225,17 @@ func Open(path string, box *secret.Box) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("create event history index: %w", err)
 	}
+	if _, err := db.Exec("CREATE INDEX IF NOT EXISTS outbox_batch_id ON outbox(batch_id, id)"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("create outbox batch index: %w", err)
+	}
 	st := &Store{db: db, box: box}
-	var keyCheck string
-	err = db.QueryRow("SELECT value FROM meta WHERE key='master_key_check'").Scan(&keyCheck)
-	if errors.Is(err, sql.ErrNoRows) {
+	present, err := verifyExistingMasterKey(db, box)
+	if err != nil {
+		db.Close()
+		return nil, err
+	}
+	if !present {
 		encrypted, encryptErr := box.Encrypt("tailstate-master-key-check")
 		if encryptErr != nil {
 			db.Close()
@@ -227,22 +245,13 @@ func Open(path string, box *secret.Box) (*Store, error) {
 			db.Close()
 			return nil, err
 		}
-	} else if err != nil {
-		db.Close()
-		return nil, err
-	} else {
-		plain, decryptErr := box.Decrypt(keyCheck)
-		if decryptErr != nil || plain != "tailstate-master-key-check" {
-			db.Close()
-			return nil, errors.New("master key does not match this TailState database")
-		}
 	}
 	st.evidenceKey, err = loadOrCreateEvidenceSigningKey(context.Background(), db, box)
 	if err != nil {
 		db.Close()
 		return nil, fmt.Errorf("load evidence signing key: %w", err)
 	}
-	if err := st.backfillEvidenceLedger(context.Background()); err != nil {
+	if err := st.backfillEvidenceLedgerOnStartup(context.Background()); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("backfill evidence ledger: %w", err)
 	}
@@ -251,6 +260,25 @@ func Open(path string, box *secret.Box) (*Store, error) {
 		return nil, err
 	}
 	return st, nil
+}
+
+func verifyExistingMasterKey(db *sql.DB, box *secret.Box) (bool, error) {
+	var keyCheck string
+	err := db.QueryRow("SELECT value FROM meta WHERE key='master_key_check'").Scan(&keyCheck)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil && strings.Contains(strings.ToLower(err.Error()), "no such table") {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	plain, decryptErr := box.Decrypt(keyCheck)
+	if decryptErr != nil || plain != "tailstate-master-key-check" {
+		return true, errors.New("master key does not match this TailState database")
+	}
+	return true, nil
 }
 
 // migrateSchema keeps startup safe as the on-disk schema evolves. The schema
@@ -888,17 +916,18 @@ func (s *Store) SaveSettings(ctx context.Context, in Settings) (int64, error) {
 	} else if err != nil {
 		return 0, err
 	} else {
-		oldSecret, decryptErr := s.box.Decrypt(oldSecretEnc)
-		if decryptErr != nil {
+		if _, decryptErr := s.box.Decrypt(oldSecretEnc); decryptErr != nil {
 			return 0, decryptErr
 		}
-		if oldTailnet != in.Tailnet || oldClient != in.OAuthClientID || oldSecret != in.OAuthClientSecret {
+		if oldTailnet != in.Tailnet || oldClient != in.OAuthClientID {
 			generation++
 			generationChanged = true
 		}
 	}
 	webhookSecretEnc := oldWebhookSecretEnc
-	if in.WebhookSecret != "" {
+	if in.ClearWebhookSecret {
+		webhookSecretEnc = ""
+	} else if in.WebhookSecret != "" {
 		webhookSecretEnc, err = s.box.Encrypt(in.WebhookSecret)
 		if err != nil {
 			return 0, err
@@ -917,7 +946,9 @@ func (s *Store) SaveSettings(ctx context.Context, in Settings) (int64, error) {
 		if err != nil {
 			return 0, err
 		}
-		if _, err := upsertDestinationTx(ctx, tx, s.box, 0, "Mattermost", converted, true); err != nil {
+		var destinationID int64
+		_ = tx.QueryRowContext(ctx, "SELECT id FROM notification_destinations WHERE name=? AND deleted_at IS NULL ORDER BY id LIMIT 1", "Mattermost").Scan(&destinationID)
+		if _, err := upsertDestinationTx(ctx, tx, s.box, destinationID, "Mattermost", converted, true); err != nil {
 			return 0, err
 		}
 	}
@@ -935,6 +966,11 @@ func (s *Store) SaveSettings(ctx context.Context, in Settings) (int64, error) {
 	VALUES(1,?,?,?,?,?,?,?,?,?,NULL) ON CONFLICT(id) DO UPDATE SET tailnet=excluded.tailnet,oauth_client_id=excluded.oauth_client_id,oauth_secret_enc=excluded.oauth_secret_enc,mattermost_url_enc=CASE WHEN excluded.mattermost_url_enc='' THEN settings.mattermost_url_enc ELSE excluded.mattermost_url_enc END,webhook_secret_enc=CASE WHEN excluded.webhook_secret_enc='' THEN settings.webhook_secret_enc ELSE excluded.webhook_secret_enc END,device_interval_seconds=excluded.device_interval_seconds,inventory_interval_seconds=excluded.inventory_interval_seconds,generation=excluded.generation,configured_at=excluded.configured_at,baseline_at=CASE WHEN settings.generation=excluded.generation THEN settings.baseline_at ELSE NULL END`, in.Tailnet, in.OAuthClientID, secretEnc, legacyURLEnc, webhookSecretEnc, int64(in.DeviceInterval.Seconds()), int64(in.InventoryInterval.Seconds()), generation, now)
 	if err != nil {
 		return 0, err
+	}
+	if in.ClearWebhookSecret {
+		if _, err := tx.ExecContext(ctx, "UPDATE settings SET webhook_secret_enc='' WHERE id=1"); err != nil {
+			return 0, err
+		}
 	}
 	if generationChanged {
 		if _, err := tx.ExecContext(ctx, "DELETE FROM snapshots WHERE generation<>?", generation); err != nil {
@@ -1012,6 +1048,11 @@ func (s *Store) RecordWebhookTrigger(ctx context.Context, bodyHash string, event
 	collectors = sortedUnique(collectors)
 	if len(eventTypes) > 100 || len(collectors) > 32 {
 		return WebhookTrigger{}, false, errors.New("webhook metadata is too large")
+	}
+	for _, value := range append(append([]string(nil), eventTypes...), collectors...) {
+		if len(value) > 128 || strings.IndexFunc(value, unicode.IsControl) >= 0 {
+			return WebhookTrigger{}, false, errors.New("webhook metadata contains an invalid value")
+		}
 	}
 	eventJSON, err := json.Marshal(eventTypes)
 	if err != nil {
@@ -1194,14 +1235,15 @@ func (s *Store) RetryWebhookTriggers(ctx context.Context, ids []int64, next time
 		dead := now.Sub(parseTime(received)) >= webhookTriggerRetryWindow
 		status := "pending"
 		attempt := next.UTC()
+		lastError := message
 		if dead {
 			status = "dead"
 			attempt = now
-			if message == "" {
-				message = "reconciliation retry window expired"
+			if lastError == "" {
+				lastError = "reconciliation retry window expired"
 			}
 		}
-		if _, err := tx.ExecContext(ctx, "UPDATE webhook_triggers SET status=?,next_attempt_at=?,lease_until=NULL,last_error=? WHERE id=? AND status IN ('pending','processing')", status, attempt.Format(time.RFC3339Nano), message, id); err != nil {
+		if _, err := tx.ExecContext(ctx, "UPDATE webhook_triggers SET status=?,next_attempt_at=?,lease_until=NULL,last_error=? WHERE id=? AND status IN ('pending','processing')", status, attempt.Format(time.RFC3339Nano), lastError, id); err != nil {
 			return err
 		}
 	}
@@ -1295,10 +1337,6 @@ func (s *Store) SaveDestination(ctx context.Context, destination NotificationDes
 	if err := notify.Validate(destination.ServiceURL); err != nil {
 		return 0, err
 	}
-	encrypted, err := s.box.Encrypt(destination.ServiceURL)
-	if err != nil {
-		return 0, err
-	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, err
@@ -1306,9 +1344,6 @@ func (s *Store) SaveDestination(ctx context.Context, destination NotificationDes
 	defer tx.Rollback()
 	id, err := upsertDestinationTx(ctx, tx, s.box, destination.ID, destination.Name, destination.ServiceURL, destination.Enabled)
 	if err != nil {
-		return 0, err
-	}
-	if _, err := tx.ExecContext(ctx, "UPDATE notification_destinations SET service_url_enc=? WHERE id=?", encrypted, id); err != nil {
 		return 0, err
 	}
 	if !destination.Enabled {
@@ -1375,12 +1410,11 @@ func upsertDestinationTx(ctx context.Context, tx *sql.Tx, box *secret.Box, id in
 	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	if id == 0 {
-		if name == "Mattermost" {
-			_ = tx.QueryRowContext(ctx, "SELECT id FROM notification_destinations WHERE name=? AND deleted_at IS NULL ORDER BY id LIMIT 1", name).Scan(&id)
-		}
+		// An id of zero always means insert. Legacy Mattermost idempotency is
+		// resolved by SaveSettings, never by the user-facing destination API.
 	}
 	if id > 0 {
-		result, err := tx.ExecContext(ctx, "UPDATE notification_destinations SET name=?,service_url_enc=?,enabled=?,updated_at=?,deleted_at=NULL WHERE id=?", name, encoded, boolInt(enabled), now, id)
+		result, err := tx.ExecContext(ctx, "UPDATE notification_destinations SET name=?,service_url_enc=?,enabled=?,updated_at=? WHERE id=? AND deleted_at IS NULL", name, encoded, boolInt(enabled), now, id)
 		if err != nil {
 			return 0, err
 		}
@@ -1458,6 +1492,12 @@ type recordedChange struct {
 	After  []byte
 }
 
+type persistedFields struct {
+	Fields          []model.FieldChange `json:"fields"`
+	FieldsTruncated bool                `json:"fields_truncated,omitempty"`
+	TotalFields     int                 `json:"total_fields,omitempty"`
+}
+
 func (s *Store) ApplyBatch(ctx context.Context, generation int64, results []model.Collected, digest func([]model.Change) string) ([]model.Change, error) {
 	batch, err := s.ApplyBatchWithBatch(ctx, generation, results, digest)
 	return batch.Changes, err
@@ -1491,7 +1531,7 @@ func (s *Store) ApplyBatchWithBatch(ctx context.Context, generation int64, resul
 		}
 		if result.Unsupported {
 			next := now.Add(6 * time.Hour).Format(time.RFC3339Nano)
-			_, err = tx.ExecContext(ctx, `INSERT INTO collector_state(generation,collector,supported,baseline,last_error,next_poll) VALUES(?,?,0,0,'unsupported',?) ON CONFLICT(generation,collector) DO UPDATE SET supported=0,baseline=0,last_error='unsupported',next_poll=excluded.next_poll`, generation, result.Collector, next)
+			_, err = tx.ExecContext(ctx, `INSERT INTO collector_state(generation,collector,supported,baseline,last_error,next_poll) VALUES(?,?,0,0,'unsupported',?) ON CONFLICT(generation,collector) DO UPDATE SET supported=0,last_error='unsupported',next_poll=excluded.next_poll`, generation, result.Collector, next)
 			if err != nil {
 				return ChangeBatchResult{}, err
 			}
@@ -1531,7 +1571,8 @@ func (s *Store) ApplyBatchWithBatch(ctx context.Context, generation int64, resul
 				return ChangeBatchResult{}, err
 			case oldHash != hash:
 				if baseline == 1 {
-					record(model.Change{Kind: "changed", Collector: result.Collector, ResourceID: resource.ID, Type: resource.Type, Name: resource.Name, Fields: model.Diff(oldRaw, raw)}, oldRaw, raw)
+					diff := model.DiffDetailed(oldRaw, raw)
+					record(model.Change{Kind: "changed", Collector: result.Collector, ResourceID: resource.ID, Type: resource.Type, Name: resource.Name, Fields: diff.Fields, FieldsTruncated: diff.FieldsTruncated, TotalFields: diff.TotalFields}, oldRaw, raw)
 				}
 				_, err = tx.ExecContext(ctx, "UPDATE snapshots SET resource_type=?,name=?,canonical_json=?,content_hash=?,missing_count=0,updated_at=? WHERE generation=? AND collector=? AND resource_id=?", resource.Type, resource.Name, raw, hash, now.Format(time.RFC3339Nano), generation, result.Collector, resource.ID)
 			default:
@@ -1541,47 +1582,81 @@ func (s *Store) ApplyBatchWithBatch(ctx context.Context, generation int64, resul
 				return ChangeBatchResult{}, err
 			}
 		}
-		rows, err := tx.QueryContext(ctx, "SELECT resource_id,resource_type,name,canonical_json,missing_count FROM snapshots WHERE generation=? AND collector=?", generation, result.Collector)
-		if err != nil {
-			return ChangeBatchResult{}, err
-		}
 		type absent struct {
 			id, typ, name string
 			raw           []byte
 			missing       int
 		}
 		var missingRows []absent
-		for rows.Next() {
-			var a absent
-			if err := rows.Scan(&a.id, &a.typ, &a.name, &a.raw, &a.missing); err != nil {
+		massRemovalGuarded := result.Partial
+		if !result.Partial {
+			rows, queryErr := tx.QueryContext(ctx, "SELECT resource_id,resource_type,name,canonical_json,missing_count FROM snapshots WHERE generation=? AND collector=?", generation, result.Collector)
+			if queryErr != nil {
+				return ChangeBatchResult{}, queryErr
+			}
+			for rows.Next() {
+				var a absent
+				if scanErr := rows.Scan(&a.id, &a.typ, &a.name, &a.raw, &a.missing); scanErr != nil {
+					rows.Close()
+					return ChangeBatchResult{}, scanErr
+				}
+				if _, ok := seen[a.id]; !ok {
+					missingRows = append(missingRows, a)
+				}
+			}
+			if rowsErr := rows.Err(); rowsErr != nil {
 				rows.Close()
+				return ChangeBatchResult{}, rowsErr
+			}
+			if closeErr := rows.Close(); closeErr != nil {
+				return ChangeBatchResult{}, closeErr
+			}
+		}
+		if !result.Partial {
+			massRemovalGuarded = len(missingRows) >= 3 && len(missingRows) >= len(seen)
+		}
+		if !massRemovalGuarded {
+			for _, a := range missingRows {
+				if a.missing+1 >= 2 {
+					if baseline == 1 {
+						record(model.Change{Kind: "removed", Collector: result.Collector, ResourceID: a.id, Type: a.typ, Name: a.name}, a.raw, nil)
+					}
+					_, err = tx.ExecContext(ctx, "DELETE FROM snapshots WHERE generation=? AND collector=? AND resource_id=?", generation, result.Collector, a.id)
+				} else {
+					_, err = tx.ExecContext(ctx, "UPDATE snapshots SET missing_count=missing_count+1 WHERE generation=? AND collector=? AND resource_id=?", generation, result.Collector, a.id)
+				}
+				if err != nil {
+					return ChangeBatchResult{}, err
+				}
+			}
+		} else if result.Partial {
+			partialMessage := strings.TrimSpace(result.PartialError)
+			if partialMessage == "" {
+				partialMessage = "collector response was partial"
+			}
+			// Partial responses are still a usable baseline for the resources
+			// returned. Preserve existing snapshots for omitted resources, but do
+			// not let one incomplete optional collector hold the whole installation
+			// in an un-baselined state forever.
+			_, err = tx.ExecContext(ctx, `INSERT INTO collector_state(generation,collector,supported,baseline,last_success,last_error,failure_count,unhealthy_notified) VALUES(?,?,1,1,?,?,1,0) ON CONFLICT(generation,collector) DO UPDATE SET supported=1,baseline=MAX(collector_state.baseline,1),last_success=excluded.last_success,last_error=excluded.last_error`, generation, result.Collector, observedAt, partialMessage)
+			if err != nil {
 				return ChangeBatchResult{}, err
 			}
-			if _, ok := seen[a.id]; !ok {
-				missingRows = append(missingRows, a)
-			}
-		}
-		if err := rows.Err(); err != nil {
-			rows.Close()
-			return ChangeBatchResult{}, err
-		}
-		rows.Close()
-		for _, a := range missingRows {
-			if a.missing+1 >= 2 {
-				if baseline == 1 {
-					record(model.Change{Kind: "removed", Collector: result.Collector, ResourceID: a.id, Type: a.typ, Name: a.name}, a.raw, nil)
-				}
-				_, err = tx.ExecContext(ctx, "DELETE FROM snapshots WHERE generation=? AND collector=? AND resource_id=?", generation, result.Collector, a.id)
-			} else {
-				_, err = tx.ExecContext(ctx, "UPDATE snapshots SET missing_count=missing_count+1 WHERE generation=? AND collector=? AND resource_id=?", generation, result.Collector, a.id)
-			}
+		} else {
+			// A successful-looking empty or near-empty response is more likely an
+			// upstream degradation than a real mass removal. Keep the snapshots
+			// intact and surface the guard in collector health instead of creating
+			// a removal storm.
+			_, err = tx.ExecContext(ctx, `INSERT INTO collector_state(generation,collector,supported,baseline,last_success,last_error,failure_count,unhealthy_notified) VALUES(?,?,1,?,?,?,1,0) ON CONFLICT(generation,collector) DO UPDATE SET supported=1,last_success=excluded.last_success,last_error=excluded.last_error,failure_count=collector_state.failure_count+1,unhealthy_notified=0`, generation, result.Collector, baseline, observedAt, fmt.Sprintf("possible mass removal guarded (%d missing, %d present)", len(missingRows), len(seen)))
 			if err != nil {
 				return ChangeBatchResult{}, err
 			}
 		}
-		_, err = tx.ExecContext(ctx, `INSERT INTO collector_state(generation,collector,supported,baseline,last_success,last_error,failure_count,unhealthy_notified) VALUES(?,?,1,1,?,'',0,0) ON CONFLICT(generation,collector) DO UPDATE SET supported=1,baseline=1,last_success=excluded.last_success,last_error='',failure_count=0,unhealthy_notified=0`, generation, result.Collector, observedAt)
-		if err != nil {
-			return ChangeBatchResult{}, err
+		if !massRemovalGuarded {
+			_, err = tx.ExecContext(ctx, `INSERT INTO collector_state(generation,collector,supported,baseline,last_success,last_error,failure_count,unhealthy_notified) VALUES(?,?,1,1,?,'',0,0) ON CONFLICT(generation,collector) DO UPDATE SET supported=1,baseline=1,last_success=excluded.last_success,last_error='',failure_count=0,unhealthy_notified=0`, generation, result.Collector, observedAt)
+			if err != nil {
+				return ChangeBatchResult{}, err
+			}
 		}
 	}
 	var triggerID int64
@@ -1609,7 +1684,7 @@ func (s *Store) ApplyBatchWithBatch(ctx context.Context, generation int64, resul
 			}
 		}
 		for _, entry := range recorded {
-			fields, marshalErr := json.Marshal(entry.Change.Fields)
+			fields, marshalErr := json.Marshal(persistedFields{Fields: entry.Change.Fields, FieldsTruncated: entry.Change.FieldsTruncated, TotalFields: entry.Change.TotalFields})
 			if marshalErr != nil {
 				return ChangeBatchResult{}, marshalErr
 			}
@@ -1767,7 +1842,7 @@ func (s *Store) Retry(ctx context.Context, id int64, next time.Time, message str
 	var encrypted string
 	if err := s.db.QueryRowContext(ctx, "SELECT d.service_url_enc FROM outbox o JOIN notification_destinations d ON d.id=o.destination_id WHERE o.id=?", id).Scan(&encrypted); err == nil {
 		if destinationURL, decryptErr := s.box.Decrypt(encrypted); decryptErr == nil {
-			message = strings.ReplaceAll(message, destinationURL, notify.RedactURL(destinationURL))
+			message = notify.RedactError(message, destinationURL)
 		}
 	}
 	status := "pending"
@@ -1792,11 +1867,11 @@ func (s *Store) Status(ctx context.Context) (Status, error) {
 		return out, err
 	}
 	if out.Configured {
-		settings, err := s.Settings(ctx)
+		generation, err := s.currentGeneration(ctx)
 		if err != nil {
-			return out, fmt.Errorf("load settings for status: %w", err)
+			return out, fmt.Errorf("load settings generation for status: %w", err)
 		}
-		rows, err := s.db.QueryContext(ctx, "SELECT collector,COUNT(*) FROM snapshots WHERE generation=? GROUP BY collector", settings.Generation)
+		rows, err := s.db.QueryContext(ctx, "SELECT collector,COUNT(*) FROM snapshots WHERE generation=? GROUP BY collector", generation)
 		if err != nil {
 			return out, err
 		}
@@ -1814,7 +1889,7 @@ func (s *Store) Status(ctx context.Context) (Status, error) {
 			return out, err
 		}
 		rows.Close()
-		rows, err = s.db.QueryContext(ctx, "SELECT collector,supported,baseline,COALESCE(last_success,''),last_error,failure_count,COALESCE(next_poll,'') FROM collector_state WHERE generation=? ORDER BY collector", settings.Generation)
+		rows, err = s.db.QueryContext(ctx, "SELECT collector,supported,baseline,COALESCE(last_success,''),last_error,failure_count,COALESCE(next_poll,'') FROM collector_state WHERE generation=? ORDER BY collector", generation)
 		if err != nil {
 			return out, err
 		}
@@ -1822,6 +1897,7 @@ func (s *Store) Status(ctx context.Context) (Status, error) {
 			var c CollectorState
 			var last, next string
 			if err := rows.Scan(&c.Name, &c.Supported, &c.Baseline, &last, &c.LastError, &c.FailureCount, &next); err != nil {
+				rows.Close()
 				return out, err
 			}
 			if last != "" {
@@ -1839,6 +1915,15 @@ func (s *Store) Status(ctx context.Context) (Status, error) {
 			return out, err
 		}
 		rows.Close()
+		for _, collector := range out.Collectors {
+			if collector.Supported && collector.Baseline {
+				out.BaselineReady = true
+				break
+			}
+		}
+	}
+	if out.BaselineAt != nil {
+		out.BaselineReady = true
 	}
 	if err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM outbox WHERE status='pending'").Scan(&out.Pending); err != nil {
 		return out, err
@@ -1864,26 +1949,83 @@ func (s *Store) Status(ctx context.Context) (Status, error) {
 	return out, nil
 }
 
-func (s *Store) SetNextPoll(ctx context.Context, generation int64, collectors []string, next time.Time) {
-	sort.Strings(collectors)
-	for _, collector := range collectors {
-		_, _ = s.db.ExecContext(ctx, `INSERT INTO collector_state(generation,collector,next_poll)
-		SELECT ?,?,? WHERE EXISTS (SELECT 1 FROM settings WHERE id=1 AND generation=?)
-		ON CONFLICT(generation,collector) DO UPDATE SET next_poll=excluded.next_poll`, generation, collector, next.UTC().Format(time.RFC3339Nano), generation)
+func (s *Store) currentGeneration(ctx context.Context) (int64, error) {
+	var generation int64
+	if err := s.db.QueryRowContext(ctx, "SELECT generation FROM settings WHERE id=1").Scan(&generation); err != nil {
+		return 0, err
 	}
+	return generation, nil
+}
+
+// SettingsGeneration reads only the non-secret generation marker. The
+// monitor uses it for its idle loop so ordinary timer wakeups do not decrypt
+// OAuth and webhook credentials repeatedly.
+func (s *Store) SettingsGeneration(ctx context.Context) (int64, error) {
+	return s.currentGeneration(ctx)
+}
+
+func (s *Store) SetNextPoll(ctx context.Context, generation int64, collectors []string, next time.Time) {
+	_ = s.SetNextPollErr(ctx, generation, collectors, next)
+}
+
+// SetNextPollErr schedules collectors without mutating the caller's slice and
+// returns persistence failures to the monitor so they can be surfaced.
+func (s *Store) SetNextPollErr(ctx context.Context, generation int64, collectors []string, next time.Time) error {
+	ordered := sortedUnique(collectors)
+	if len(ordered) == 0 {
+		return nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var activeGeneration int64
+	if err := tx.QueryRowContext(ctx, "SELECT generation FROM settings WHERE id=1").Scan(&activeGeneration); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		return err
+	}
+	if activeGeneration != generation {
+		return nil
+	}
+	value := next.UTC().Format(time.RFC3339Nano)
+	args := make([]any, 0, len(ordered)*3)
+	placeholders := make([]string, 0, len(ordered))
+	for _, collector := range ordered {
+		placeholders = append(placeholders, "(?,?,?)")
+		args = append(args, generation, collector, value)
+	}
+	query := `INSERT INTO collector_state(generation,collector,next_poll) VALUES ` + strings.Join(placeholders, ",") + `
+		ON CONFLICT(generation,collector) DO UPDATE SET next_poll=excluded.next_poll`
+	if _, err := tx.ExecContext(ctx, query, args...); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (s *Store) CollectorDue(ctx context.Context, generation int64, collector string) bool {
+	due, _ := s.CollectorDueWithError(ctx, generation, collector)
+	return due
+}
+
+// CollectorDueWithError reports whether a collector is due and preserves
+// database errors for callers that need to surface a degraded scheduler.
+func (s *Store) CollectorDueWithError(ctx context.Context, generation int64, collector string) (bool, error) {
 	var next string
 	err := s.db.QueryRowContext(ctx, "SELECT COALESCE(next_poll,'') FROM collector_state WHERE generation=? AND collector=?", generation, collector).Scan(&next)
 	if errors.Is(err, sql.ErrNoRows) || next == "" {
-		return true
+		return true, nil
 	}
 	if err != nil {
-		return true
+		return true, err
 	}
 	when, err := time.Parse(time.RFC3339Nano, next)
-	return err != nil || !when.After(time.Now())
+	if err != nil {
+		return true, err
+	}
+	return !when.After(time.Now()), nil
 }
 
 // Cleanup expires short-lived authentication/session state, bounds pending
@@ -1918,9 +2060,8 @@ func (s *Store) Cleanup(ctx context.Context, retention time.Duration) error {
 	if _, err := s.db.ExecContext(ctx, "DELETE FROM event_batch_triggers WHERE NOT EXISTS (SELECT 1 FROM event_batches WHERE event_batches.id=event_batch_triggers.batch_id)"); err != nil {
 		return err
 	}
-	if _, err := s.db.ExecContext(ctx, "DELETE FROM evidence_ledger WHERE NOT EXISTS (SELECT 1 FROM event_batches WHERE event_batches.id=evidence_ledger.batch_id)"); err != nil {
-		return err
-	}
+	// Ledger entries are retained beyond event snapshots so the hash chain
+	// remains a durable audit trail after the 30-day history retention sweep.
 	if _, err := s.db.ExecContext(ctx, "DELETE FROM webhook_triggers WHERE received_at<?", cutoff); err != nil {
 		return err
 	}
@@ -1954,8 +2095,8 @@ func (s *Store) ListHistory(ctx context.Context, filter HistoryFilter) (HistoryP
 		args = append(args, filter.EventType)
 	}
 	if filter.ResourceID != "" {
-		where = append(where, "EXISTS (SELECT 1 FROM events e WHERE e.batch_id=b.id AND (e.resource_id LIKE ? OR e.name LIKE ?))")
-		term := "%" + filter.ResourceID + "%"
+		where = append(where, "EXISTS (SELECT 1 FROM events e WHERE e.batch_id=b.id AND (e.resource_id LIKE ? ESCAPE '\\' OR e.name LIKE ? ESCAPE '\\'))")
+		term := "%" + escapeLike(filter.ResourceID) + "%"
 		args = append(args, term, term)
 	}
 	args = append(args, limit+1)
@@ -2028,6 +2169,13 @@ func (s *Store) loadHistoryBatch(ctx context.Context, batch HistoryBatch, filter
 	if err := s.db.QueryRowContext(ctx, "SELECT sequence,prev_hash,entry_hash,signature,key_id FROM evidence_ledger WHERE batch_id=?", batch.ID).Scan(&batch.LedgerSequence, &batch.LedgerPrevHash, &batch.LedgerHash, &batch.LedgerSignature, &batch.LedgerKeyID); err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return HistoryBatch{}, err
 	}
+	if batch.LedgerSequence > 0 {
+		payload, _, payloadErr := evidenceLedgerPayload(ctx, s.db, batch.ID)
+		if payloadErr != nil {
+			return HistoryBatch{}, fmt.Errorf("load evidence ledger payload: %w", payloadErr)
+		}
+		batch.ledgerPayload = payload
+	}
 	eventWhere := []string{"batch_id=?"}
 	eventArgs := []any{batch.ID}
 	if filter.Collector != "" {
@@ -2039,8 +2187,8 @@ func (s *Store) loadHistoryBatch(ctx context.Context, batch HistoryBatch, filter
 		eventArgs = append(eventArgs, filter.EventType)
 	}
 	if filter.ResourceID != "" {
-		eventWhere = append(eventWhere, "(resource_id LIKE ? OR name LIKE ?)")
-		term := "%" + filter.ResourceID + "%"
+		eventWhere = append(eventWhere, "(resource_id LIKE ? ESCAPE '\\' OR name LIKE ? ESCAPE '\\')")
+		term := "%" + escapeLike(filter.ResourceID) + "%"
 		eventArgs = append(eventArgs, term, term)
 	}
 	rows, err := s.db.QueryContext(ctx, `SELECT id,batch_id,generation,observed_at,collector,event_type,resource_id,name,changes_json,before_json,after_json
@@ -2060,7 +2208,16 @@ func (s *Store) loadHistoryBatch(ctx context.Context, batch HistoryBatch, filter
 		event.ObservedAt, _ = time.Parse(time.RFC3339Nano, observed)
 		var fields []model.FieldChange
 		if err := json.Unmarshal(fieldsRaw, &fields); err != nil && len(fieldsRaw) > 0 {
-			return HistoryBatch{}, fmt.Errorf("decode history fields: %w", err)
+			var persisted persistedFields
+			if envelopeErr := json.Unmarshal(fieldsRaw, &persisted); envelopeErr != nil {
+				return HistoryBatch{}, fmt.Errorf("decode history fields: %w", err)
+			}
+			fields = persisted.Fields
+			event.FieldsTruncated = persisted.FieldsTruncated
+			event.TotalFields = persisted.TotalFields
+		}
+		if event.TotalFields == 0 {
+			event.TotalFields = len(fields)
 		}
 		event.Fields = formatHistoryFields(fields)
 		event.BeforeJSON = prettyJSON(beforeRaw)
@@ -2089,7 +2246,7 @@ func (s *Store) loadHistoryBatch(ctx context.Context, batch HistoryBatch, filter
 		}
 		if encryptedURL != "" {
 			if destinationURL, decryptErr := s.box.Decrypt(encryptedURL); decryptErr == nil {
-				delivery.LastError = strings.ReplaceAll(delivery.LastError, destinationURL, notify.RedactURL(destinationURL))
+				delivery.LastError = notify.RedactError(delivery.LastError, destinationURL)
 			}
 		}
 		delivery.NextAttempt = parseOptionalTime(nextAttempt)
@@ -2100,6 +2257,12 @@ func (s *Store) loadHistoryBatch(ctx context.Context, batch HistoryBatch, filter
 		return HistoryBatch{}, err
 	}
 	return batch, nil
+}
+
+func escapeLike(value string) string {
+	value = strings.ReplaceAll(value, `\`, `\\`)
+	value = strings.ReplaceAll(value, `%`, `\%`)
+	return strings.ReplaceAll(value, `_`, `\_`)
 }
 
 func formatHistoryFields(fields []model.FieldChange) []HistoryFieldChange {
@@ -2148,8 +2311,5 @@ func parseOptionalTime(value string) *time.Time {
 }
 
 func truncate(value string, n int) string {
-	if len(value) <= n {
-		return value
-	}
-	return value[:n] + "…"
+	return textutil.Truncate(value, n)
 }

@@ -7,6 +7,7 @@ import (
 	"math/rand/v2"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/crypt0rr/tailstate/internal/model"
@@ -21,6 +22,7 @@ type Engine struct {
 	sender                     notify.Sender
 	wake                       chan struct{}
 	trigger                    chan ReconcileRequest
+	wg                         sync.WaitGroup
 }
 
 // ReconcileRequest asks the scheduler to poll a set of collectors immediately.
@@ -33,7 +35,7 @@ type ReconcileRequest struct {
 }
 
 var (
-	durableTriggerPollInterval = time.Second
+	durableTriggerPollInterval = 30 * time.Second
 	schedulerWaitInterval      = 5 * time.Second
 	deliveryPollInterval       = 2 * time.Second
 	cleanupPollInterval        = time.Hour
@@ -85,7 +87,27 @@ func (e *Engine) Trigger(request ReconcileRequest) {
 	}
 }
 
-func (e *Engine) Run(ctx context.Context) { go e.scheduler(ctx); go e.delivery(ctx); go e.cleanup(ctx) }
+// Run starts the scheduler, delivery worker, and retention worker. Wait must
+// be called after the context is cancelled when the owning process is shutting
+// down so the store is not closed while a worker is still writing to it.
+func (e *Engine) Run(ctx context.Context) {
+	e.wg.Add(3)
+	go func() {
+		defer e.wg.Done()
+		e.scheduler(ctx)
+	}()
+	go func() {
+		defer e.wg.Done()
+		e.delivery(ctx)
+	}()
+	go func() {
+		defer e.wg.Done()
+		e.cleanup(ctx)
+	}()
+}
+
+// Wait blocks until all workers started by Run have stopped.
+func (e *Engine) Wait() { e.wg.Wait() }
 
 func (e *Engine) scheduler(ctx context.Context) {
 	var generation int64
@@ -102,10 +124,20 @@ func (e *Engine) scheduler(ctx context.Context) {
 			}
 		}
 	}
-	defer stop(deviceTimer)
-	defer stop(inventoryTimer)
+	defer func() { stop(deviceTimer) }()
+	defer func() { stop(inventoryTimer) }()
 	for {
-		current, err := e.store.Settings(ctx)
+		var current store.Settings
+		var err error
+		if client == nil {
+			current, err = e.store.Settings(ctx)
+		} else if nextGeneration, generationErr := e.store.SettingsGeneration(ctx); generationErr != nil {
+			err = generationErr
+		} else if nextGeneration == settings.Generation {
+			current = settings
+		} else {
+			current, err = e.store.Settings(ctx)
+		}
 		if err != nil {
 			if !errors.Is(err, context.Canceled) {
 				slog.Debug("monitor waiting for configuration")
@@ -132,7 +164,7 @@ func (e *Engine) scheduler(ctx context.Context) {
 		// Handle the low-latency in-memory request first when one is queued.
 		// The durable queue remains the source of truth and is replayed once
 		// the fast path has drained.
-		if len(e.trigger) == 0 && e.processDurableTriggers(ctx, client, settings) {
+		if len(e.trigger) == 0 && settings.WebhookSecret != "" && e.processDurableTriggers(ctx, client, settings) {
 			continue
 		}
 		select {
@@ -169,14 +201,26 @@ func (e *Engine) poll(ctx context.Context, client *tailscale.Client, settings st
 	results := make([]model.Collected, 0, len(collectors))
 	polled := make([]string, 0, len(collectors))
 	for _, collector := range collectors {
-		if !force && !e.store.CollectorDue(ctx, settings.Generation, collector) {
-			continue
+		if !force {
+			due, dueErr := e.store.CollectorDueWithError(ctx, settings.Generation, collector)
+			if dueErr != nil {
+				slog.Error("check collector schedule", "collector", collector, "error", dueErr)
+			}
+			if !due {
+				continue
+			}
 		}
 		polled = append(polled, collector)
 		wasUnhealthy := e.store.CollectorWasUnhealthy(ctx, settings.Generation, collector)
 		resources, err := client.Collect(ctx, collector)
 		result := model.Collected{Collector: collector, Resources: resources, Error: err, ObservedAt: time.Now().UTC()}
-		if err != nil && tailscale.IsUnsupported(err) {
+		var partialErr *tailscale.PartialError
+		if err != nil && errors.As(err, &partialErr) {
+			result.Error = nil
+			result.Partial = true
+			result.PartialError = err.Error()
+		}
+		if err != nil && tailscale.IsUnsupportedCollector(collector, err) {
 			result.Error = nil
 			result.Unsupported = true
 			slog.Info("collector unsupported", "collector", collector)
@@ -202,13 +246,6 @@ func (e *Engine) poll(ctx context.Context, client *tailscale.Client, settings st
 	if len(polled) == 0 {
 		return success
 	}
-	for _, collector := range polled {
-		interval := settings.InventoryInterval
-		if collector == "devices" {
-			interval = settings.DeviceInterval
-		}
-		e.store.SetNextPoll(ctx, settings.Generation, []string{collector}, time.Now().Add(interval))
-	}
 	batch, err := e.store.ApplyBatchWithBatch(ctx, settings.Generation, results, notify.Digest, triggerIDs...)
 	if err != nil {
 		slog.Error("apply collected inventory", "error", err)
@@ -222,6 +259,21 @@ func (e *Engine) poll(ctx context.Context, client *tailscale.Client, settings st
 	if len(batch.Changes) > 0 {
 		slog.Info("inventory changes detected", "batch_id", batch.ID, "count", len(batch.Changes))
 	}
+	deviceCollectors := make([]string, 0, 1)
+	inventoryCollectors := make([]string, 0, len(polled))
+	for _, collector := range polled {
+		if collector == "devices" {
+			deviceCollectors = append(deviceCollectors, collector)
+		} else {
+			inventoryCollectors = append(inventoryCollectors, collector)
+		}
+	}
+	if err := e.store.SetNextPollErr(ctx, settings.Generation, deviceCollectors, time.Now().Add(settings.DeviceInterval)); err != nil {
+		slog.Error("schedule device collector", "error", err)
+	}
+	if err := e.store.SetNextPollErr(ctx, settings.Generation, inventoryCollectors, time.Now().Add(settings.InventoryInterval)); err != nil {
+		slog.Error("schedule inventory collectors", "error", err)
+	}
 	return success
 }
 
@@ -234,28 +286,41 @@ func (e *Engine) processDurableTriggers(ctx context.Context, client *tailscale.C
 	if len(triggers) == 0 {
 		return false
 	}
-	ids := make([]int64, 0, len(triggers))
-	collectors := make([]string, 0)
-	broad := false
-	maxAttempts := 1
+	type triggerGroup struct {
+		ids         []int64
+		collectors  []string
+		maxAttempts int
+	}
+	groups := make(map[string]*triggerGroup, len(triggers))
 	for _, trigger := range triggers {
-		ids = append(ids, trigger.ID)
-		if trigger.Attempts > maxAttempts {
-			maxAttempts = trigger.Attempts
+		collectors := normalizeCollectors(trigger.Collectors)
+		key := strings.Join(collectors, "\x00")
+		if len(collectors) == 0 {
+			key = "*"
 		}
-		if len(trigger.Collectors) == 0 {
-			broad = true
-			continue
+		group := groups[key]
+		if group == nil {
+			group = &triggerGroup{collectors: collectors, maxAttempts: 1}
+			if key == "*" {
+				group.collectors = allCollectors()
+			}
+			groups[key] = group
 		}
-		collectors = append(collectors, trigger.Collectors...)
+		group.ids = append(group.ids, trigger.ID)
+		if trigger.Attempts > group.maxAttempts {
+			group.maxAttempts = trigger.Attempts
+		}
 	}
-	if broad || len(collectors) == 0 {
-		collectors = allCollectors()
-	} else {
-		collectors = normalizeCollectors(collectors)
+	keys := make([]string, 0, len(groups))
+	for key := range groups {
+		keys = append(keys, key)
 	}
-	success := e.poll(ctx, client, settings, collectors, true, ids...)
-	e.finishTriggers(ctx, ids, success, maxAttempts)
+	sort.Strings(keys)
+	for _, key := range keys {
+		group := groups[key]
+		success := e.poll(ctx, client, settings, group.collectors, true, group.ids...)
+		e.finishTriggers(ctx, group.ids, success, group.maxAttempts)
+	}
 	return true
 }
 
@@ -338,10 +403,12 @@ func (e *Engine) delivery(ctx context.Context) {
 			}
 			for _, item := range items {
 				err = e.sender.Send(ctx, item.Destination.ServiceURL, item.Payload)
+				bookkeepingCtx, cancelBookkeeping := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 				if err == nil {
-					if deliveredErr := e.store.Delivered(ctx, item.ID); deliveredErr != nil {
+					if deliveredErr := e.store.Delivered(bookkeepingCtx, item.ID); deliveredErr != nil {
 						slog.Error("mark notification delivery complete", "outbox_id", item.ID, "destination_id", item.DestinationID, "error", deliveredErr)
 					}
+					cancelBookkeeping()
 					continue
 				}
 				dead := time.Since(item.FirstAttempt) >= 24*time.Hour
@@ -350,9 +417,10 @@ func (e *Engine) delivery(ctx context.Context) {
 				if errors.As(err, &delivery) && delivery.RetryAfter > 0 {
 					delay = delivery.RetryAfter
 				}
-				if retryErr := e.store.Retry(ctx, item.ID, time.Now().Add(delay), err.Error(), dead); retryErr != nil {
+				if retryErr := e.store.Retry(bookkeepingCtx, item.ID, time.Now().Add(delay), err.Error(), dead); retryErr != nil {
 					slog.Error("record notification delivery failure", "outbox_id", item.ID, "destination_id", item.DestinationID, "error", retryErr)
 				}
+				cancelBookkeeping()
 				if dead {
 					slog.Error("notification delivery dead-lettered", "outbox_id", item.ID, "destination_id", item.DestinationID, "error", err)
 				} else {
@@ -364,6 +432,9 @@ func (e *Engine) delivery(ctx context.Context) {
 }
 
 func (e *Engine) cleanup(ctx context.Context) {
+	if err := e.store.Cleanup(ctx, 30*24*time.Hour); err != nil && !errors.Is(err, context.Canceled) {
+		slog.Error("initial retention cleanup failed", "error", err)
+	}
 	ticker := time.NewTicker(cleanupPollInterval)
 	defer ticker.Stop()
 	for {

@@ -4,10 +4,11 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"fmt"
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/crypt0rr/tailstate/internal/textutil"
 )
 
 type Resource struct {
@@ -19,11 +20,13 @@ type Resource struct {
 }
 
 type Collected struct {
-	Collector   string
-	Resources   []Resource
-	Unsupported bool
-	Error       error
-	ObservedAt  time.Time
+	Collector    string
+	Resources    []Resource
+	Unsupported  bool
+	Partial      bool
+	PartialError string
+	Error        error
+	ObservedAt   time.Time
 }
 
 type FieldChange struct {
@@ -33,12 +36,14 @@ type FieldChange struct {
 }
 
 type Change struct {
-	Kind       string        `json:"kind"`
-	Collector  string        `json:"collector"`
-	ResourceID string        `json:"resource_id"`
-	Type       string        `json:"resource_type"`
-	Name       string        `json:"name"`
-	Fields     []FieldChange `json:"fields,omitempty"`
+	Kind            string        `json:"kind"`
+	Collector       string        `json:"collector"`
+	ResourceID      string        `json:"resource_id"`
+	Type            string        `json:"resource_type"`
+	Name            string        `json:"name"`
+	Fields          []FieldChange `json:"fields,omitempty"`
+	FieldsTruncated bool          `json:"fields_truncated,omitempty"`
+	TotalFields     int           `json:"total_fields,omitempty"`
 }
 
 var ignored = map[string]struct{}{
@@ -76,59 +81,87 @@ func Normalize(value any) any {
 }
 
 func NormalizeFor(collector string, value any) any {
-	return normalizeFor(collector, value, true)
+	return normalizeFor(collector, value, true, false, "")
 }
 
-func normalizeFor(collector string, value any, root bool) any {
+func normalizeFor(collector string, value any, root, tenantKeys bool, path string) any {
 	switch v := value.(type) {
 	case map[string]any:
+		openKeys := tenantKeys || (root && collector == "policy")
 		out := make(map[string]any, len(v))
 		for key, child := range v {
 			compact := strings.ToLower(strings.ReplaceAll(strings.ReplaceAll(key, "_", ""), "-", ""))
-			if root && !collectorFieldAllowed(collector, compact) {
+			if root && !openKeys && !collectorFieldAllowed(collector, compact) {
 				continue
 			}
 			if collector == "device_details" && compact == "detail" {
 				continue
 			}
-			if _, drop := ignored[compact]; drop || ignoredForCollector(collector, compact) || strings.Contains(compact, "secret") || strings.Contains(compact, "tokenvalue") {
-				continue
-			}
-			if collector == "users" && compact == "status" {
-				out[key] = normalizeUserStatus(child)
-				continue
-			}
-			if (collector == "posture" || collector == "log_streaming") && compact == "status" {
-				out[key] = normalizeHealthStatus(child)
-				continue
-			}
-			if strings.Contains(compact, "url") || compact == "endpoint" {
-				if fingerprint, ok := redactedFingerprint(child); ok {
-					out[key] = map[string]any{"redacted_sha256": fingerprint}
+			if !tenantKeys {
+				if _, drop := ignored[compact]; drop || ignoredForCollector(collector, compact) {
 					continue
 				}
-				raw, _ := json.Marshal(child)
-				sum := sha256.Sum256(raw)
-				out[key] = map[string]any{"redacted_sha256": hex.EncodeToString(sum[:])}
-				continue
+				if collector == "users" && compact == "status" {
+					out[key] = normalizeUserStatus(child)
+					continue
+				}
+				if (collector == "posture" || collector == "log_streaming") && compact == "status" {
+					out[key] = normalizeHealthStatus(child)
+					continue
+				}
+				if strings.Contains(compact, "url") || compact == "endpoint" {
+					if fingerprint, ok := redactedFingerprint(child); ok {
+						out[key] = map[string]any{"redacted_sha256": fingerprint}
+						continue
+					}
+					raw, _ := json.Marshal(child)
+					sum := sha256.Sum256(raw)
+					out[key] = map[string]any{"redacted_sha256": hex.EncodeToString(sum[:])}
+					continue
+				}
 			}
-			out[key] = normalizeFor(collector, child, false)
+			childPath := key
+			if path != "" {
+				childPath = path + "." + key
+			}
+			out[key] = normalizeFor(collector, child, false, tenantKeySection(collector, compact), childPath)
 		}
 		return out
 	case []any:
 		out := make([]any, len(v))
 		for i := range v {
-			out[i] = normalizeFor(collector, v[i], false)
+			out[i] = normalizeFor(collector, v[i], false, false, path)
 		}
-		sort.SliceStable(out, func(i, j int) bool {
-			a, _ := json.Marshal(out[i])
-			b, _ := json.Marshal(out[j])
-			return string(a) < string(b)
-		})
+		if !orderedArray(collector, path) {
+			sort.SliceStable(out, func(i, j int) bool {
+				a, _ := json.Marshal(out[i])
+				b, _ := json.Marshal(out[j])
+				return string(a) < string(b)
+			})
+		}
 		return out
 	default:
 		return value
 	}
+}
+
+func tenantKeySection(collector, key string) bool {
+	switch collector {
+	case "policy":
+		return key == "groups" || key == "tagowners" || key == "hosts"
+	case "dns":
+		return key == "splitdns" || key == "nameservers" || key == "searchpaths"
+	default:
+		return false
+	}
+}
+
+func orderedArray(collector, path string) bool {
+	if collector != "dns" {
+		return false
+	}
+	compactPath := strings.ToLower(strings.ReplaceAll(strings.ReplaceAll(path, "_", ""), "-", ""))
+	return compactPath == "nameservers" || strings.HasPrefix(compactPath, "nameservers.") || compactPath == "searchpaths" || strings.HasPrefix(compactPath, "searchpaths.")
 }
 
 func redactedFingerprint(value any) (string, bool) {
@@ -212,22 +245,30 @@ func CanonicalFor(collector string, value any) ([]byte, string, error) {
 }
 
 func Diff(oldRaw, newRaw []byte) []FieldChange {
-	var oldValue, newValue any
-	if json.Unmarshal(oldRaw, &oldValue) != nil || json.Unmarshal(newRaw, &newValue) != nil {
-		return []FieldChange{{Field: "value", Old: string(oldRaw), New: string(newRaw)}}
-	}
-	var changes []FieldChange
-	diffValue("", oldValue, newValue, &changes)
-	if len(changes) > 24 {
-		changes = changes[:24]
-	}
-	return changes
+	return DiffDetailed(oldRaw, newRaw).Fields
 }
 
-func diffValue(path string, oldValue, newValue any, changes *[]FieldChange) {
-	if len(*changes) >= 25 {
-		return
+type DiffResult struct {
+	Fields          []FieldChange
+	FieldsTruncated bool
+	TotalFields     int
+}
+
+func DiffDetailed(oldRaw, newRaw []byte) DiffResult {
+	result := DiffResult{}
+	var oldValue, newValue any
+	if json.Unmarshal(oldRaw, &oldValue) != nil || json.Unmarshal(newRaw, &newValue) != nil {
+		result.Fields = []FieldChange{{Field: "value", Old: string(oldRaw), New: string(newRaw)}}
+		result.TotalFields = 1
+		return result
 	}
+	diffValue("", oldValue, newValue, &result)
+	return result
+}
+
+const maxDiffFields = 24
+
+func diffValue(path string, oldValue, newValue any, result *DiffResult) {
 	oldMap, oldOK := oldValue.(map[string]any)
 	newMap, newOK := newValue.(map[string]any)
 	if oldOK && newOK {
@@ -248,7 +289,7 @@ func diffValue(path string, oldValue, newValue any, changes *[]FieldChange) {
 			if path != "" {
 				child = path + "." + key
 			}
-			diffValue(child, oldMap[key], newMap[key], changes)
+			diffValue(child, oldMap[key], newMap[key], result)
 		}
 		return
 	}
@@ -258,7 +299,12 @@ func diffValue(path string, oldValue, newValue any, changes *[]FieldChange) {
 		if path == "" {
 			path = "value"
 		}
-		*changes = append(*changes, FieldChange{Field: path, Old: compact(oldValue), New: compact(newValue)})
+		result.TotalFields++
+		if len(result.Fields) < maxDiffFields {
+			result.Fields = append(result.Fields, FieldChange{Field: path, Old: compact(oldValue), New: compact(newValue)})
+		} else {
+			result.FieldsTruncated = true
+		}
 	}
 }
 
@@ -267,5 +313,5 @@ func compact(value any) any {
 	if len(raw) <= 240 {
 		return value
 	}
-	return fmt.Sprintf("%s…", string(raw[:239]))
+	return textutil.Truncate(string(raw), 240)
 }

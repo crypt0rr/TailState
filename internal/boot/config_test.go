@@ -1,6 +1,9 @@
 package boot
 
-import "testing"
+import (
+	"net/netip"
+	"testing"
+)
 
 func TestLoadRejectsInvalidBootstrapValues(t *testing.T) {
 	tests := []struct {
@@ -34,5 +37,22 @@ func TestLoadAcceptsHTTPMockEndpoints(t *testing.T) {
 	}
 	if config.TailscaleBase != "http://127.0.0.1:1234/api/v2" {
 		t.Fatalf("unexpected API URL: %s", config.TailscaleBase)
+	}
+}
+
+func TestTrustedProxyConfiguration(t *testing.T) {
+	t.Setenv("TAILSTATE_TRUSTED_PROXIES", "127.0.0.1, 10.0.0.0/8")
+	config, err := Load("test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(config.TrustedProxies) != 2 || !config.TrustedProxies[0].Contains(netip.MustParseAddr("127.0.0.1")) || !config.TrustedProxies[1].Contains(netip.MustParseAddr("10.1.2.3")) {
+		t.Fatalf("unexpected trusted proxies: %#v", config.TrustedProxies)
+	}
+	for _, value := range []string{"bad", "127.0.0.1,,10.0.0.0/8"} {
+		t.Setenv("TAILSTATE_TRUSTED_PROXIES", value)
+		if _, err := Load("test"); err == nil {
+			t.Fatalf("invalid trusted proxy %q was accepted", value)
+		}
 	}
 }

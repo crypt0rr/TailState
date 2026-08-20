@@ -60,9 +60,13 @@ func TestDiffAndCanonicalErrorBranches(t *testing.T) {
 	if len(changes) != 24 {
 		t.Fatalf("diff change cap=%d, want 24", len(changes))
 	}
+	detailed := DiffDetailed(mustJSON(t, oldValue), mustJSON(t, newValue))
+	if !detailed.FieldsTruncated || detailed.TotalFields != 30 || len(detailed.Fields) != 24 {
+		t.Fatalf("detailed diff metadata=%+v", detailed)
+	}
 	long := strings.Repeat("x", 300)
 	changes = Diff([]byte(`{"message":"`+long+`"}`), []byte(`{"message":"`+long+`y"}`))
-	if len(changes) != 1 || len(changes[0].Old.(string)) <= 240 || !strings.HasSuffix(changes[0].Old.(string), "…") {
+	if len(changes) != 1 || len(changes[0].Old.(string)) > 240 || !strings.HasSuffix(changes[0].Old.(string), "…") {
 		t.Fatalf("long diff was not compacted: %#v", changes)
 	}
 	if _, _, err := Canonical(map[string]any{"unsupported": func() {}}); err == nil {

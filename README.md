@@ -14,7 +14,7 @@ of truth and the safety net for missed events.
 - Policy section fingerprints without storing policy contents.
 - Credential metadata, webhook configuration inventory, log-streaming configuration/status, contacts, posture integrations, and tailnet settings.
 
-The REST API does not expose authoritative online state. TailState therefore does **not** generate online/offline notifications and ignores `lastSeen`, `connectedToControl`, live user/device connectivity, public endpoints, connectivity metadata, profile-picture URLs, internal rotating node keys, operational status counters, response timestamps, array ordering, and unknown fields outside its monitored schema. Tailscale client-version and `updateAvailable` changes remain alertable.
+The REST API does not expose authoritative online state. TailState therefore does **not** generate online/offline notifications and ignores `lastSeen`, `connectedToControl`, live user/device connectivity, public endpoints, connectivity metadata, profile-picture URLs, internal rotating node keys, operational status counters, response timestamps, ordering in set-like arrays, and unknown fields outside its monitored schema. DNS nameserver and search-path ordering is preserved because position determines resolver behavior. Tailscale client-version and `updateAvailable` changes remain alertable.
 
 ## Quick start
 
@@ -26,7 +26,10 @@ First, create the local environment file and encryption key:
 cp .env.example .env
 mkdir -p secrets
 openssl rand -base64 32 > secrets/tailstate_master_key
-chmod 600 .env secrets/tailstate_master_key
+chmod 600 .env
+# The image runs as UID/GID 10001 and must be able to read the mounted secret.
+sudo chown 10001:10001 secrets/tailstate_master_key
+sudo chmod 400 secrets/tailstate_master_key
 ```
 
 ### Pull the public image
@@ -106,7 +109,7 @@ curl -fsS http://127.0.0.1:8080/readyz
 curl -fsS http://127.0.0.1:8080/metrics
 ```
 
-`/metrics` exposes readiness, pending/dead delivery counts, pending/processing/dead webhook trigger counts, resource counts, and low-cardinality collector health gauges (`supported`, `baseline`, failures, last success, and next poll timestamps) for Prometheus-compatible monitoring.
+`/metrics` exposes readiness, pending/dead delivery counts, pending/processing/dead webhook trigger counts, resource counts, and low-cardinality collector health gauges (`supported`, `baseline`, failures, last success, and next poll timestamps) for Prometheus-compatible monitoring. It is unauthenticated when the optional `TAILSTATE_METRICS_TOKEN` is empty (keep the default loopback bind in that case). Set that variable to require `Authorization: Bearer <token>`; requests without the exact token receive `401`. Do not publish an unauthenticated endpoint through a public reverse proxy.
 
 ## Security and persistence
 
@@ -114,12 +117,29 @@ Compose creates the Docker-managed `tailstate-data` volume and stores `/data/tai
 
 OAuth secrets, the Tailscale webhook secret, every Shoutrrr destination URL, and the evidence-ledger private key are encrypted with AES-256-GCM using `secrets/tailstate_master_key`. Destination credentials and webhook secrets are never echoed into HTML, logs, persisted delivery errors, or the history ledger. Normalized history snapshots are retained for 30 days and exclude volatile and secret fields. OAuth access tokens exist only in memory. Back up the master key separately: TailState intentionally refuses to start if the key is missing or incorrect, and encrypted settings and signed history cannot be recovered without it.
 
-The image is scratch-based, runs as UID/GID `10001`, uses a read-only root filesystem, drops every Linux capability, and publishes the UI only on `127.0.0.1` by default. For remote access, place TailState behind an HTTPS reverse proxy and set:
+The image is scratch-based, runs as UID/GID `10001`, uses a read-only root filesystem, drops every Linux capability, and publishes the UI only on `127.0.0.1` by default. Keep that publish address when using a reverse proxy; let the proxy terminate TLS and expose the public listener:
 
 ```dotenv
-TAILSTATE_BIND_ADDRESS=0.0.0.0
 TAILSTATE_COOKIE_SECURE=true
 ```
+
+For example, a minimal Caddy site is:
+
+```text
+tailstate.example.com {
+    reverse_proxy 127.0.0.1:8080
+}
+```
+
+Point Caddy or nginx at `http://127.0.0.1:8080` and expose only the proxy's
+HTTPS listener. The proxy must preserve the public `Host` and set
+`X-Forwarded-Proto: https` so same-origin form protection and secure cookies
+work as intended. Do not set `TAILSTATE_BIND_ADDRESS=0.0.0.0` unless a firewall
+and TLS-terminating proxy already restrict access to the host port.
+
+If the proxy forwards the original client address, configure only its actual
+source address as trusted, for example `TAILSTATE_TRUSTED_PROXIES=127.0.0.1/32`.
+TailState ignores `X-Forwarded-For` from every other peer.
 
 Do not expose the setup interface directly to the internet.
 
@@ -134,6 +154,30 @@ docker compose exec tailstate /tailstate admin reset
 Then open `/reset`. Resetting the password invalidates existing sessions and any
 outstanding reset token. Reset tokens expire after 30 minutes; generate another
 token if one expires.
+
+### Master-key rotation
+
+The master key protects OAuth credentials, notification URLs, webhook secrets,
+and the evidence signing key. Rotate it while the service is stopped so no
+writer can race the transaction:
+
+```console
+openssl rand -base64 32 > secrets/tailstate_master_key.new
+docker compose stop tailstate
+docker compose run --rm \
+  -v "$PWD/secrets:/keys:ro" \
+  tailstate admin rekey -new-key-file /keys/tailstate_master_key.new
+mv secrets/tailstate_master_key secrets/tailstate_master_key.old
+mv secrets/tailstate_master_key.new secrets/tailstate_master_key
+sudo chown 10001:10001 secrets/tailstate_master_key
+sudo chmod 400 secrets/tailstate_master_key
+docker compose up -d tailstate
+```
+
+The command re-encrypts all protected values in one transaction and preserves
+the evidence signing identity. If it fails, the old key remains valid; do not
+replace the configured key file until the command reports success. Keep the old
+key and a verified database backup until the new deployment has been checked.
 
 ### Backup
 
@@ -162,6 +206,10 @@ docker compose ps
 curl -fsS http://127.0.0.1:8080/healthz
 curl -fsS http://127.0.0.1:8080/readyz
 ```
+
+The service is restarted only after a successful restore. If extraction or
+replacement fails, it remains stopped and the script attempts to restore the
+previous data directory; inspect the pre-restore archive before starting it.
 
 After a restore, sign in and verify that the expected History, evidence,
 notification destinations, and monitoring settings are present. Keep the
@@ -198,7 +246,9 @@ start with webhook acceleration disabled until a secret is entered in Settings.
 Schema v6 adds the encrypted Ed25519 evidence key and the hash-linked evidence
 ledger. Existing event batches are signed automatically on
 the first startup after the upgrade; the public-key fingerprint is shown on the
-History page and new exports use signed evidence format version 2.
+History page and new exports use signed evidence format version 3. Version 3
+packs embed the signed ledger payloads and the intervening chain links so an
+offline verifier can recompute selected entries and detect gaps between them.
 Schema v7 adds expiring, revocable setup and password-reset token records. It
 also bounds notification retries to 24 hours and removes dead-letter rows after
 the normal 30-day retention period. Legacy token hashes remain only as a
@@ -215,9 +265,16 @@ the optional webhook secret are entered in the authenticated UI.
 | `TAILSTATE_DATA_DIR` | `/data` | SQLite directory |
 | `TAILSTATE_MASTER_KEY_FILE` | `/run/secrets/tailstate_master_key` | 32-byte or base64 master key |
 | `TAILSTATE_COOKIE_SECURE` | `false` | Require HTTPS for session cookies |
+| `TAILSTATE_METRICS_TOKEN` | empty | Optional bearer token protecting `/metrics` |
+| `TAILSTATE_TRUSTED_PROXIES` | empty | Comma-separated proxy IPs/CIDRs allowed to supply `X-Forwarded-For` |
 | `TAILSTATE_LOG_LEVEL` | `info` | `info` or `debug` structured logging |
 
 The test-only `TAILSTATE_TS_API_URL` and `TAILSTATE_TS_OAUTH_URL` variables allow local mock servers; production deployments should leave them unset.
+
+`TAILSTATE_CONTAINER_NAME`, `TAILSTATE_IMAGE`, `TAILSTATE_BIND_ADDRESS`,
+`TAILSTATE_PORT`, and `TAILSTATE_MASTER_KEY_FILE` are Compose-file variables;
+they select the container name/image, host publishing address/port, and secret
+file mount. They are not read as application settings by a standalone binary.
 
 ## Local development
 

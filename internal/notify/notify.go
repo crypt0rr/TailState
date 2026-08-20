@@ -12,11 +12,14 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 
 	"github.com/nicholas-fedor/shoutrrr"
 	"github.com/nicholas-fedor/shoutrrr/pkg/types"
+
+	"github.com/crypt0rr/tailstate/internal/textutil"
 )
 
 const (
@@ -191,26 +194,56 @@ func ConvertLegacyMattermostURL(raw string) (string, error) {
 }
 
 func sanitize(message, rawURL string) string {
-	message = strings.ReplaceAll(message, rawURL, RedactURL(rawURL))
+	type replacement struct{ from, to string }
+	replacements := make([]replacement, 0, 12)
+	add := func(from, to string) {
+		if from == "" {
+			return
+		}
+		for _, existing := range replacements {
+			if existing.from == from {
+				return
+			}
+		}
+		replacements = append(replacements, replacement{from: from, to: to})
+	}
+	add(rawURL, RedactURL(rawURL))
 	if parsed, err := url.Parse(rawURL); err == nil {
-		message = strings.ReplaceAll(message, parsed.String(), RedactURL(rawURL))
+		add(parsed.String(), RedactURL(rawURL))
+		add(parsed.RawQuery, "<redacted>")
 		if parsed.User != nil {
-			message = strings.ReplaceAll(message, parsed.User.String(), "<redacted>")
+			add(parsed.User.String(), "<redacted>")
+			add(parsed.User.Username(), "<redacted>")
+			if password, ok := parsed.User.Password(); ok {
+				add(password, "<redacted>")
+			}
 		}
-		if parsed.Host != "" {
-			message = strings.ReplaceAll(message, parsed.Host, "<redacted>")
+		add(parsed.Host, "<redacted>")
+		add(parsed.Path, "/<redacted>")
+		for _, segment := range strings.Split(strings.Trim(parsed.Path, "/"), "/") {
+			add(segment, "<redacted>")
 		}
-		if parsed.Path != "" && parsed.Path != "/" {
-			message = strings.ReplaceAll(message, parsed.Path, "/<redacted>")
-			message = strings.ReplaceAll(message, "/hooks"+parsed.Path, "/hooks/<redacted>")
+		for _, values := range parsed.Query() {
+			for _, value := range values {
+				add(value, "<redacted>")
+			}
 		}
+	}
+	sort.SliceStable(replacements, func(i, j int) bool { return len(replacements[i].from) > len(replacements[j].from) })
+	for _, replacement := range replacements {
+		message = strings.ReplaceAll(message, replacement.from, replacement.to)
 	}
 	return truncate(message, 500)
 }
 
+// RedactError removes destination-specific credentials and routing details
+// from an upstream error before it is persisted or rendered by another
+// package. It is intentionally the same sanitizer used at the transport
+// boundary so injected senders receive the same protection as Shoutrrr.
+func RedactError(message, serviceURL string) string {
+	return sanitize(message, serviceURL)
+}
+
 func truncate(value string, n int) string {
-	if len(value) <= n {
-		return value
-	}
-	return value[:n] + "…"
+	return textutil.Truncate(value, n)
 }

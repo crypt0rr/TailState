@@ -232,7 +232,7 @@ Back up `secrets/tailstate_master_key` separately and securely. A backup is
 only useful with the matching master key: TailState intentionally refuses to
 open encrypted state with a different key.
 
-The backup and restore helpers use the single Renovate-managed pinned Alpine
+The backup and restore helpers use the single Renovate-managed pinned BusyBox
 sidecar in `scripts/backup-image.sh`; CI and release jobs scan that sidecar
 separately. Set `TAILSTATE_BACKUP_IMAGE` only for an explicitly reviewed
 override.

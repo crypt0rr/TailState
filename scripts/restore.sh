@@ -4,7 +4,7 @@ set -euo pipefail
 usage() {
     echo "usage: $0 ARCHIVE.tar.gz --yes [COMPOSE_SERVICE]" >&2
     echo "       A pre-restore archive is created beside ARCHIVE before replacement." >&2
-    echo "       TAILSTATE_BACKUP_IMAGE may override the pinned Alpine sidecar" >&2
+    echo "       TAILSTATE_BACKUP_IMAGE may override the pinned BusyBox sidecar" >&2
 }
 
 if [[ ${1:-} == "-h" || ${1:-} == "--help" ]]; then

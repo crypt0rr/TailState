@@ -3,7 +3,7 @@ set -euo pipefail
 
 usage() {
     echo "usage: $0 [OUTPUT_DIRECTORY] [COMPOSE_SERVICE]" >&2
-    echo "       TAILSTATE_BACKUP_IMAGE may override the pinned Alpine sidecar" >&2
+    echo "       TAILSTATE_BACKUP_IMAGE may override the pinned BusyBox sidecar" >&2
 }
 
 if [[ ${1:-} == "-h" || ${1:-} == "--help" ]]; then

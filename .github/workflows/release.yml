@@ -125,7 +125,7 @@ jobs:
         run: bash scripts/container-smoke.sh tailstate:release-candidate-amd64 18081
       - name: Runtime smoke test (arm64)
         env:
-          DOCKER_DEFAULT_PLATFORM: linux/arm64
+          TAILSTATE_CONTAINER_PLATFORM: linux/arm64
           TAILSTATE_BACKUP_IMAGE: tailstate:backup-sidecar
         run: bash scripts/container-smoke.sh tailstate:release-candidate-arm64 18082
       - name: Promote verified release candidate

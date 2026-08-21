@@ -5,6 +5,10 @@ image="${1:?usage: container-smoke.sh IMAGE [PORT]}"
 port="${2:-18080}"
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 backup_image="$(bash "$script_dir/backup-image.sh")"
+container_platform_args=()
+if [[ -n "${TAILSTATE_CONTAINER_PLATFORM:-}" ]]; then
+    container_platform_args+=(--platform "$TAILSTATE_CONTAINER_PLATFORM")
+fi
 run_id="${GITHUB_RUN_ID:-local}-${BASHPID}"
 container_name="tailstate-smoke-${run_id}"
 volume_name="tailstate-smoke-${run_id}"
@@ -42,6 +46,7 @@ docker run --rm --user 0 \
 docker volume create "$volume_name" >/dev/null
 
 docker run -d \
+    "${container_platform_args[@]}" \
     --name "$container_name" \
     --read-only \
     --cap-drop ALL \

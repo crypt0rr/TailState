@@ -134,7 +134,7 @@ func TestLegacyMigrationDataAndWriteErrors(t *testing.T) {
 		t.Helper()
 		db := migrationErrorDB(t)
 		if _, err := db.Exec(`CREATE TABLE schema_version(version INTEGER NOT NULL); INSERT INTO schema_version VALUES(1);
-CREATE TABLE outbox(id INTEGER PRIMARY KEY,destination_id INTEGER);
+CREATE TABLE outbox(id INTEGER PRIMARY KEY,destination_id INTEGER,status TEXT NOT NULL DEFAULT 'pending',last_error TEXT NOT NULL DEFAULT '');
 CREATE TABLE settings(id INTEGER PRIMARY KEY,mattermost_url_enc TEXT);`); err != nil {
 			t.Fatal(err)
 		}
@@ -194,6 +194,17 @@ CREATE TRIGGER fail_migrated_outbox BEFORE UPDATE ON outbox BEGIN SELECT RAISE(A
 		}
 		if err := migrateSchema(db, box); err == nil || !strings.Contains(err.Error(), "assign migrated outbox rows") {
 			t.Fatalf("outbox assignment migration error=%v", err)
+		}
+	})
+
+	t.Run("orphan outbox dead-letter", func(t *testing.T) {
+		db := legacyDB(t, "")
+		if _, err := db.Exec(`CREATE TABLE notification_destinations(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT NOT NULL,service_url_enc TEXT NOT NULL,enabled INTEGER NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,deleted_at TEXT);
+CREATE TRIGGER fail_orphan_outbox BEFORE UPDATE OF status ON outbox BEGIN SELECT RAISE(ABORT,'orphan dead-letter failed'); END`); err != nil {
+			t.Fatal(err)
+		}
+		if err := migrateSchema(db, box); err == nil || !strings.Contains(err.Error(), "dead-letter orphaned outbox rows") {
+			t.Fatalf("orphan outbox migration error=%v", err)
 		}
 	})
 

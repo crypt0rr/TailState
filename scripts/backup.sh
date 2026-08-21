@@ -3,7 +3,7 @@ set -euo pipefail
 
 usage() {
     echo "usage: $0 [OUTPUT_DIRECTORY] [COMPOSE_SERVICE]" >&2
-    echo "       TAILSTATE_BACKUP_IMAGE may override the pinned Alpine sidecar" >&2
+    echo "       TAILSTATE_BACKUP_IMAGE may override the pinned BusyBox sidecar" >&2
 }
 
 if [[ ${1:-} == "-h" || ${1:-} == "--help" ]]; then
@@ -17,8 +17,8 @@ fi
 
 output_dir="${1:-./backups}"
 service="${2:-tailstate}"
-# renovate: datasource=docker depName=alpine
-backup_image="${TAILSTATE_BACKUP_IMAGE:-alpine:3.24@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b}"
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+backup_image="$(bash "$script_dir/backup-image.sh")"
 host_uid="$(id -u)"
 host_gid="$(id -g)"
 

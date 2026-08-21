@@ -7,3 +7,4 @@ backups/
 *.db-wal
 /tailstate
 coverage.out
+Caddyfile

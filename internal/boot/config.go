@@ -28,7 +28,11 @@ type Config struct {
 
 func Load(version string) (Config, error) {
 	c := Config{
-		ListenAddr:    env("TAILSTATE_LISTEN_ADDR", "0.0.0.0:8080"),
+		// Standalone binaries should not expose the authenticated UI beyond the
+		// local machine by default. The container image and Compose file set an
+		// explicit wildcard listener because their host/network boundary is
+		// configured separately.
+		ListenAddr:    env("TAILSTATE_LISTEN_ADDR", "127.0.0.1:8080"),
 		DataDir:       env("TAILSTATE_DATA_DIR", "/data"),
 		MasterKeyFile: env("TAILSTATE_MASTER_KEY_FILE", "/run/secrets/tailstate_master_key"),
 		MetricsToken:  strings.TrimSpace(env("TAILSTATE_METRICS_TOKEN", "")),
@@ -47,6 +51,9 @@ func Load(version string) (Config, error) {
 		return Config{}, err
 	}
 	c.TrustedProxies = trustedProxies
+	if c.CookieSecure && len(c.TrustedProxies) == 0 {
+		return Config{}, errors.New("TAILSTATE_COOKIE_SECURE requires at least one TAILSTATE_TRUSTED_PROXIES entry")
+	}
 	if c.DataDir == "" || c.ListenAddr == "" {
 		return Config{}, errors.New("data directory and listen address are required")
 	}
@@ -108,6 +115,32 @@ func validateEndpoint(name, value string) error {
 }
 
 func (c Config) DatabasePath() string { return filepath.Join(c.DataDir, "tailstate.db") }
+
+// InsecureHTTPListener reports whether the authenticated UI is served over
+// plaintext HTTP on a non-loopback listener. This is intentionally a warning,
+// not a hard rejection: a container or a local development proxy may own the
+// network boundary, but operators should get an explicit diagnostic when they
+// choose that deployment shape.
+func (c Config) InsecureHTTPListener() bool {
+	if c.CookieSecure {
+		return false
+	}
+	host, _, err := net.SplitHostPort(c.ListenAddr)
+	if err != nil {
+		return false
+	}
+	host = strings.Trim(host, "[]")
+	if host == "" || strings.EqualFold(host, "localhost") {
+		return host == ""
+	}
+	address, err := netip.ParseAddr(host)
+	if err != nil {
+		// A hostname can resolve to a remote interface, so treat it as
+		// externally reachable unless the operator enables secure cookies.
+		return true
+	}
+	return !address.IsLoopback()
+}
 
 func (c Config) MasterKey() ([]byte, error) {
 	return ReadMasterKeyFile(c.MasterKeyFile)

@@ -44,9 +44,13 @@ type HTTPError struct {
 }
 
 // PartialError reports a collector response that contained usable resources
-// but could not complete every related request. Callers may apply the
-// returned resources while preserving existing snapshots for missing items.
-type PartialError struct{ Err error }
+// but could not complete every related request. Count is the number of failed
+// related requests. Callers may apply the returned resources while preserving
+// existing snapshots for missing items.
+type PartialError struct {
+	Err   error
+	Count int
+}
 
 func (e *PartialError) Error() string {
 	if e == nil || e.Err == nil {
@@ -68,19 +72,59 @@ const (
 	maxRetryAfterDelay    = 5 * time.Minute
 )
 
+var deviceDetailsPollTimeout = 2 * time.Minute
+
 func (e *HTTPError) Error() string {
+	endpoint := e.endpoint()
+	message := fmt.Sprintf("Tailscale GET %s returned %d", endpoint, e.Status)
+	if body := safeBody([]byte(e.Body)); body != "" {
+		message += ": " + body
+	}
+	return message
+}
+
+// SafeMessage returns the operator-facing portion of an upstream error. The
+// response body is intentionally omitted because it is untrusted provider
+// text and may contain credentials or other sensitive details. Use this at
+// HTML, logging, and persistence boundaries; Error remains useful for local
+// diagnostics and tests.
+func (e *HTTPError) SafeMessage() string {
+	if e == nil {
+		return "Tailscale request failed"
+	}
+	return fmt.Sprintf("Tailscale request to %s returned HTTP %d", e.endpoint(), e.Status)
+}
+
+// SafeError removes response bodies from Tailscale HTTP errors while
+// preserving the endpoint and status needed for operational diagnosis. It
+// unwraps PartialError values through errors.As as well.
+func SafeError(err error) string {
+	if err == nil {
+		return ""
+	}
+	var httpErr *HTTPError
+	if errors.As(err, &httpErr) {
+		return httpErr.SafeMessage()
+	}
+	return err.Error()
+}
+
+func (e *HTTPError) endpoint() string {
 	endpoint := strings.TrimSpace(e.URL)
 	if parsed, err := url.Parse(endpoint); err == nil {
 		endpoint = parsed.Path
 		if endpoint == "" {
 			endpoint = parsed.Host
 		}
+	} else {
+		endpoint = ""
 	}
 	if endpoint == "" {
 		endpoint = "endpoint"
 	}
-	return fmt.Sprintf("Tailscale GET %s returned %d", endpoint, e.Status)
+	return endpoint
 }
+
 func IsUnsupported(err error) bool {
 	var e *HTTPError
 	return errors.As(err, &e) && (e.Status == http.StatusForbidden || e.Status == http.StatusNotFound)
@@ -144,16 +188,18 @@ func (c *Client) Collect(ctx context.Context, collector string) ([]model.Resourc
 }
 
 func (c *Client) deviceDetails(ctx context.Context) ([]model.Resource, error) {
+	detailCtx, cancel := context.WithTimeout(ctx, deviceDetailsPollTimeout)
+	defer cancel()
 	devices, ok := c.cachedDevices()
 	if !ok {
 		var err error
-		devices, err = c.allPages(ctx, c.tailnet("devices?fields=all"), "devices")
+		devices, err = c.allPages(detailCtx, c.tailnet("devices?fields=all"), "devices")
 		if err != nil {
 			return nil, err
 		}
 		c.cacheDeviceMaps(devices)
 	}
-	return c.deviceDetailsFromDevices(ctx, devices)
+	return c.deviceDetailsFromDevices(detailCtx, devices)
 }
 
 func (c *Client) deviceDetailsFromDevices(ctx context.Context, devices []map[string]any) ([]model.Resource, error) {
@@ -178,6 +224,7 @@ func (c *Client) deviceDetailsFromDevices(ctx context.Context, devices []map[str
 			for job := range jobs {
 				id := idFor(job.device, []string{"id", "nodeId", "nodeID"})
 				if id == "" {
+					results <- detailResult{index: job.index, err: errors.New("device detail response omitted device id")}
 					continue
 				}
 				combined := map[string]any{}
@@ -228,8 +275,10 @@ func (c *Client) deviceDetailsFromDevices(ctx context.Context, devices []map[str
 	close(results)
 	ordered := make([]detailResult, 0, len(devices))
 	var partialErr error
+	partialCount := 0
 	for result := range results {
 		if result.err != nil {
+			partialCount++
 			if partialErr == nil {
 				partialErr = result.err
 			}
@@ -245,7 +294,7 @@ func (c *Client) deviceDetailsFromDevices(ctx context.Context, devices []map[str
 		out = append(out, result.resource)
 	}
 	if partialErr != nil {
-		return out, &PartialError{Err: partialErr}
+		return out, &PartialError{Err: partialErr, Count: partialCount}
 	}
 	return out, nil
 }
@@ -397,17 +446,13 @@ func (c *Client) allPagesWithOptions(ctx context.Context, endpoint, arrayKey str
 		var items []any
 		if objectOK {
 			raw, present := object[arrayKey]
-			if !present {
+			if !present || raw == nil {
 				return nil, fmt.Errorf("%s response has no %s array", arrayKey, arrayKey)
 			}
-			if raw == nil {
-				items = []any{}
-			} else {
-				var ok bool
-				items, ok = raw.([]any)
-				if !ok {
-					return nil, fmt.Errorf("%s response %s is not an array", arrayKey, arrayKey)
-				}
+			var ok bool
+			items, ok = raw.([]any)
+			if !ok {
+				return nil, fmt.Errorf("%s response %s is not an array", arrayKey, arrayKey)
 			}
 		} else {
 			var ok bool
@@ -420,9 +465,14 @@ func (c *Client) allPagesWithOptions(ctx context.Context, endpoint, arrayKey str
 			return nil, fmt.Errorf("%s response has no %s array", arrayKey, arrayKey)
 		}
 		for _, item := range items {
-			if obj, ok := item.(map[string]any); ok {
-				out = append(out, obj)
+			obj, ok := item.(map[string]any)
+			if !ok {
+				// A collection containing primitives or nulls is not a safe
+				// inventory result. Silently dropping those entries could look
+				// like mass removal and mutate snapshots on the next poll.
+				return nil, fmt.Errorf("%s response %s contains a non-object item", arrayKey, arrayKey)
 			}
+			out = append(out, obj)
 		}
 		candidate := ""
 		if objectOK {
@@ -637,5 +687,16 @@ var waitForRetry = sleep
 
 func safeBody(body []byte) string {
 	value := strings.TrimSpace(string(body))
+	value = strings.Map(func(r rune) rune {
+		switch r {
+		case '\n', '\r', '\t':
+			return ' '
+		default:
+			if r < 0x20 {
+				return -1
+			}
+			return r
+		}
+	}, value)
 	return textutil.Truncate(value, 200)
 }

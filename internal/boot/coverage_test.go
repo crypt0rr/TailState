@@ -54,6 +54,16 @@ func TestLoadRejectsCookieAndEndpointEdgeCases(t *testing.T) {
 		t.Fatalf("invalid cookie secure setting error=%v", err)
 	}
 	t.Setenv("TAILSTATE_COOKIE_SECURE", "false")
+	t.Setenv("TAILSTATE_TRUSTED_PROXIES", "")
+	t.Setenv("TAILSTATE_COOKIE_SECURE", "true")
+	if _, err := Load("test"); err == nil || !strings.Contains(err.Error(), "TRUSTED_PROXIES") {
+		t.Fatalf("secure cookies without a trusted proxy were accepted: %v", err)
+	}
+	t.Setenv("TAILSTATE_TRUSTED_PROXIES", "127.0.0.1")
+	if _, err := Load("test"); err != nil {
+		t.Fatalf("secure cookies with a trusted proxy were rejected: %v", err)
+	}
+	t.Setenv("TAILSTATE_COOKIE_SECURE", "false")
 	t.Setenv("TAILSTATE_DATA_DIR", "")
 	if _, err := Load("test"); err == nil || !strings.Contains(err.Error(), "data directory") {
 		t.Fatalf("empty data directory error=%v", err)
@@ -62,5 +72,28 @@ func TestLoadRejectsCookieAndEndpointEdgeCases(t *testing.T) {
 	t.Setenv("TAILSTATE_TS_API_URL", "https://example.com/api#fragment")
 	if _, err := Load("test"); err == nil || !strings.Contains(err.Error(), "fragment") {
 		t.Fatalf("fragment endpoint error=%v", err)
+	}
+}
+
+func TestInsecureHTTPListenerDiagnostic(t *testing.T) {
+	cases := []struct {
+		name   string
+		config Config
+		want   bool
+	}{
+		{name: "loopback IPv4", config: Config{ListenAddr: "127.0.0.1:8080"}},
+		{name: "loopback IPv6", config: Config{ListenAddr: "[::1]:8080"}},
+		{name: "localhost", config: Config{ListenAddr: "localhost:8080"}},
+		{name: "wildcard", config: Config{ListenAddr: "0.0.0.0:8080"}, want: true},
+		{name: "remote", config: Config{ListenAddr: "192.0.2.10:8080"}, want: true},
+		{name: "hostname", config: Config{ListenAddr: "tailstate.internal:8080"}, want: true},
+		{name: "secure proxy", config: Config{ListenAddr: "0.0.0.0:8080", CookieSecure: true}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.config.InsecureHTTPListener(); got != tc.want {
+				t.Fatalf("InsecureHTTPListener()=%v, want %v", got, tc.want)
+			}
+		})
 	}
 }

@@ -3,6 +3,7 @@ package web
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"net/http"
 	"net/http/httptest"
@@ -20,6 +21,7 @@ import (
 	"github.com/crypt0rr/tailstate/internal/secret"
 	"github.com/crypt0rr/tailstate/internal/store"
 	"github.com/crypt0rr/tailstate/internal/webhook"
+	_ "modernc.org/sqlite"
 )
 
 func testServer(t *testing.T) (*Server, *store.Store, string) {
@@ -183,6 +185,7 @@ func TestLoginRejectsCrossOriginRequests(t *testing.T) {
 
 func TestLoginAllowsSameOriginBehindTLSProxy(t *testing.T) {
 	server, _, token := testServer(t)
+	server.config.TrustedProxies = []netip.Prefix{netip.MustParsePrefix("192.0.2.0/24")}
 	claim := url.Values{"token": {token}, "password": {"a secure password"}, "confirm": {"a secure password"}}
 	claimRequest := httptest.NewRequest(http.MethodPost, "/setup/claim", strings.NewReader(claim.Encode()))
 	claimRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
@@ -195,6 +198,7 @@ func TestLoginAllowsSameOriginBehindTLSProxy(t *testing.T) {
 	login := url.Values{"password": {"a secure password"}}
 	request := httptest.NewRequest(http.MethodPost, "http://example.com/login", strings.NewReader(login.Encode()))
 	request.Host = "example.com"
+	request.RemoteAddr = "192.0.2.10:1234"
 	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	request.Header.Set("Origin", "https://example.com")
 	request.Header.Set("X-Forwarded-Proto", "https")
@@ -202,6 +206,31 @@ func TestLoginAllowsSameOriginBehindTLSProxy(t *testing.T) {
 	server.Handler().ServeHTTP(response, request)
 	if response.Code != http.StatusSeeOther {
 		t.Fatalf("proxied same-origin login status %d: %s", response.Code, response.Body.String())
+	}
+}
+
+func TestLoginRejectsForwardedTLSFromUntrustedPeer(t *testing.T) {
+	server, _, token := testServer(t)
+	claim := url.Values{"token": {token}, "password": {"a secure password"}, "confirm": {"a secure password"}}
+	claimRequest := httptest.NewRequest(http.MethodPost, "/setup/claim", strings.NewReader(claim.Encode()))
+	claimRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	claimResponse := httptest.NewRecorder()
+	server.Handler().ServeHTTP(claimResponse, claimRequest)
+	if claimResponse.Code != http.StatusSeeOther {
+		t.Fatalf("claim status %d: %s", claimResponse.Code, claimResponse.Body.String())
+	}
+
+	login := url.Values{"password": {"a secure password"}}
+	request := httptest.NewRequest(http.MethodPost, "http://example.com/login", strings.NewReader(login.Encode()))
+	request.Host = "example.com"
+	request.RemoteAddr = "198.51.100.10:1234"
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.Header.Set("Origin", "https://example.com")
+	request.Header.Set("X-Forwarded-Proto", "https")
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusForbidden {
+		t.Fatalf("untrusted forwarded TLS status %d: %s", response.Code, response.Body.String())
 	}
 }
 
@@ -257,6 +286,7 @@ func TestMetricsExposeCollectorHealthWithoutErrorDetails(t *testing.T) {
 		t.Fatal(err)
 	}
 	request := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	request.RemoteAddr = "127.0.0.1:1234"
 	response := httptest.NewRecorder()
 	server.Handler().ServeHTTP(response, request)
 	body := response.Body.String()
@@ -283,8 +313,127 @@ func TestMetricsTokenProtectsMetricsWhenConfigured(t *testing.T) {
 	authorizedRequest.Header.Set("Authorization", "Bearer metrics-secret")
 	authorized := httptest.NewRecorder()
 	server.Handler().ServeHTTP(authorized, authorizedRequest)
-	if authorized.Code != http.StatusOK || !strings.Contains(authorized.Body.String(), "tailstate_ready") {
+	if authorized.Code != http.StatusOK || !strings.Contains(authorized.Body.String(), "tailstate_ready") || !strings.Contains(authorized.Body.String(), "tailstate_collector_poll_duration_seconds") || !strings.Contains(authorized.Body.String(), "tailstate_collector_partial") || !strings.Contains(authorized.Body.String(), "tailstate_collector_partial_errors") || !strings.Contains(authorized.Body.String(), "tailstate_collector_due_errors_total") {
 		t.Fatalf("authorized metrics status=%d body=%s", authorized.Code, authorized.Body.String())
+	}
+}
+
+func TestMetricsWithoutTokenIsLoopbackOnly(t *testing.T) {
+	server, st, _ := testServer(t)
+	if _, err := st.SaveSettings(context.Background(), store.Settings{Tailnet: "-", OAuthClientID: "client", OAuthClientSecret: "secret", MattermostURL: "https://mattermost.example/hooks/x", DeviceInterval: time.Minute, InventoryInterval: 5 * time.Minute}); err != nil {
+		t.Fatal(err)
+	}
+	remote := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	remote.RemoteAddr = "203.0.113.10:1234"
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, remote)
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("remote metrics status=%d body=%s", response.Code, response.Body.String())
+	}
+	local := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	local.RemoteAddr = "127.0.0.1:1234"
+	response = httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, local)
+	if response.Code != http.StatusOK {
+		t.Fatalf("loopback metrics status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestReadyReportsDegradedBaselineAfterGracePeriod(t *testing.T) {
+	box, err := secret.NewBox(make([]byte, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dbPath := filepath.Join(t.TempDir(), "tailstate.db")
+	st, err := store.Open(dbPath, box)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	config := boot.Config{ListenAddr: "127.0.0.1:0", TailscaleBase: "http://example.invalid", OAuthTokenURL: "http://example.invalid/oauth", Version: "test"}
+	server, err := New(config, st, monitor.New(st, config.TailscaleBase, config.OAuthTokenURL, config.Version))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	generation, err := st.SaveSettings(ctx, store.Settings{Tailnet: "-", OAuthClientID: "client", OAuthClientSecret: "secret", MattermostURL: "https://mattermost.example/hooks/x", DeviceInterval: time.Minute, InventoryInterval: 5 * time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := st.RecordCollectorFailure(ctx, generation, "devices", "upstream secret must stay private"); err != nil {
+		t.Fatal(err)
+	}
+	legacyDB, err := sql.Open("sqlite", "file:"+dbPath+"?_pragma=busy_timeout(5000)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyDB.SetMaxOpenConns(1)
+	defer legacyDB.Close()
+	if _, err := legacyDB.ExecContext(ctx, "UPDATE settings SET configured_at=? WHERE id=1", time.Now().UTC().Add(-20*time.Minute).Format(time.RFC3339Nano)); err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+	body := response.Body.String()
+	if response.Code != http.StatusOK || !strings.Contains(body, `"status":"degraded"`) || !strings.Contains(body, `"baseline":true`) || !strings.Contains(body, `"degraded":true`) || !strings.Contains(body, `"name":"devices"`) {
+		t.Fatalf("degraded readiness response %d: %s", response.Code, body)
+	}
+	if strings.Contains(body, "upstream secret") {
+		t.Fatalf("readiness exposed collector error: %s", body)
+	}
+}
+
+func TestReadyDegradesWhenASecondCollectorStaysUnbaselined(t *testing.T) {
+	box, err := secret.NewBox(make([]byte, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dbPath := filepath.Join(t.TempDir(), "tailstate.db")
+	st, err := store.Open(dbPath, box)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	config := boot.Config{ListenAddr: "127.0.0.1:0", TailscaleBase: "http://example.invalid", OAuthTokenURL: "http://example.invalid/oauth", Version: "test"}
+	server, err := New(config, st, monitor.New(st, config.TailscaleBase, config.OAuthTokenURL, config.Version))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	generation, err := st.SaveSettings(ctx, store.Settings{Tailnet: "-", OAuthClientID: "client", OAuthClientSecret: "secret", MattermostURL: "https://mattermost.example/hooks/x", DeviceInterval: time.Minute, InventoryInterval: 5 * time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := st.RecordCollectorFailure(ctx, generation, "users", "upstream unavailable"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.ApplyBatchWithBatch(ctx, generation, []model.Collected{{Collector: "devices", Resources: []model.Resource{{ID: "device-1", Type: "device", Name: "server", Data: map[string]any{"hostname": "server"}}}}}, func([]model.Change) string { return "baseline" }); err != nil {
+		t.Fatal(err)
+	}
+
+	ready := httptest.NewRecorder()
+	server.Handler().ServeHTTP(ready, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	if ready.Code != http.StatusOK || !strings.Contains(ready.Body.String(), `"baseline":true`) || strings.Contains(ready.Body.String(), `"degraded":true`) {
+		t.Fatalf("partial baseline readiness response %d: %s", ready.Code, ready.Body.String())
+	}
+
+	legacyDB, err := sql.Open("sqlite", "file:"+dbPath+"?_pragma=busy_timeout(5000)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer legacyDB.Close()
+	if _, err := legacyDB.ExecContext(ctx, "UPDATE settings SET configured_at=? WHERE id=1", time.Now().UTC().Add(-20*time.Minute).Format(time.RFC3339Nano)); err != nil {
+		t.Fatal(err)
+	}
+	ready = httptest.NewRecorder()
+	server.Handler().ServeHTTP(ready, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	body := ready.Body.String()
+	if ready.Code != http.StatusOK || !strings.Contains(body, `"status":"degraded"`) || !strings.Contains(body, `"baseline":true`) || !strings.Contains(body, `"degraded":true`) || !strings.Contains(body, `"name":"users"`) {
+		t.Fatalf("partial baseline degraded response %d: %s", ready.Code, body)
+	}
+	if strings.Contains(body, "upstream unavailable") {
+		t.Fatalf("readiness exposed collector error: %s", body)
 	}
 }
 
@@ -342,10 +491,10 @@ func TestHistoryRequiresAuthenticationAndShowsExplainableChanges(t *testing.T) {
 	}
 	baseline := []model.Collected{{Collector: "devices", Resources: []model.Resource{{ID: "device-1", Type: "device", Name: "server", Data: map[string]any{"hostname": "server"}}}}}
 	changed := []model.Collected{{Collector: "devices", Resources: []model.Resource{{ID: "device-1", Type: "device", Name: "server", Data: map[string]any{"hostname": "server-new"}}}}}
-	if _, err := st.ApplyBatch(ctx, generation, baseline, func([]model.Change) string { return "baseline" }); err != nil {
+	if _, err := st.ApplyBatchWithBatch(ctx, generation, baseline, func([]model.Change) string { return "baseline" }); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.ApplyBatch(ctx, generation, changed, func([]model.Change) string { return "digest" }); err != nil {
+	if _, err := st.ApplyBatchWithBatch(ctx, generation, changed, func([]model.Change) string { return "digest" }); err != nil {
 		t.Fatal(err)
 	}
 	authenticated := httptest.NewRequest(http.MethodGet, "/history?event_type=changed&resource=device-1", nil)

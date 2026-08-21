@@ -104,9 +104,11 @@ func (s *SenderImpl) Send(ctx context.Context, serviceURL, message string) error
 			return &DeliveryError{Status: statusCode(sendErr.Error()), Message: sanitize(sendErr.Error(), serviceURL)}
 		}
 	}
-	if err := ctx.Err(); err != nil {
-		return err
-	}
+	// A cancellation that arrives after Shoutrrr has returned successfully
+	// means the provider accepted the message. Reporting that cancellation as
+	// a send failure would leave the outbox pending and duplicate the alert on
+	// restart. The pre-send check above still prevents new work after shutdown;
+	// bookkeeping owns the result once the transport has completed.
 	return nil
 }
 
@@ -125,9 +127,65 @@ type DeliveryError struct {
 
 func (e *DeliveryError) Error() string { return e.Message }
 
-// Permanent is retained for callers of the previous transport. Shoutrrr
-// delivery failures remain retryable until the outbox's 24-hour horizon.
-func (e *DeliveryError) Permanent() bool { return false }
+// SafeDeliveryError converts an upstream delivery error into a bounded,
+// provider-independent reason suitable for logs and durable outbox history.
+// Provider messages may contain response bodies, request URLs, or arbitrary
+// secrets; none of that text is trusted at the persistence boundary.
+func SafeDeliveryError(err error) string {
+	if err == nil {
+		return "notification delivery failed"
+	}
+	var delivery *DeliveryError
+	if errors.As(err, &delivery) && delivery != nil && delivery.Status >= 100 {
+		return fmt.Sprintf("notification delivery failed with HTTP %d", delivery.Status)
+	}
+	if status := statusCode(err.Error()); status >= 100 {
+		return fmt.Sprintf("notification delivery failed with HTTP %d", status)
+	}
+	message := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(message, "deadline exceeded"), strings.Contains(message, "timeout"):
+		return "notification delivery timed out"
+	case strings.Contains(message, "canceled"), strings.Contains(message, "cancelled"):
+		return "notification delivery canceled"
+	default:
+		return "notification delivery failed"
+	}
+}
+
+// SafeDeliveryMessage applies the same trusted-reason policy when a caller
+// only has an error string, such as a store retry boundary or a legacy caller.
+func SafeDeliveryMessage(message string) string {
+	message = strings.TrimSpace(message)
+	switch message {
+	case "destination disabled", "destination removed", "delivery retry window expired", "notification delivery failed", "notification delivery timed out", "notification delivery canceled":
+		return message
+	default:
+		return SafeDeliveryError(errors.New(message))
+	}
+}
+
+// SafeTestError keeps local validation errors useful in the Settings page
+// while replacing provider delivery bodies with the same bounded,
+// provider-independent reason used by durable outbox history. Shoutrrr may
+// include arbitrary response text in DeliveryError, so callers must not
+// render that error directly. When the destination URL is supplied, any
+// non-delivery error is redacted against it before it is rendered. The
+// variadic form preserves compatibility for callers that only have an error;
+// those callers receive the same bounded fallback used by delivery history.
+func SafeTestError(err error, serviceURLs ...string) string {
+	if err == nil {
+		return ""
+	}
+	var delivery *DeliveryError
+	if errors.As(err, &delivery) {
+		return SafeDeliveryError(err)
+	}
+	if len(serviceURLs) > 0 && strings.TrimSpace(serviceURLs[0]) != "" {
+		return RedactError(err.Error(), serviceURLs[0])
+	}
+	return SafeDeliveryError(err)
+}
 
 var statusPattern = regexp.MustCompile(`\b([3-5][0-9]{2})\b`)
 

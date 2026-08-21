@@ -3,7 +3,7 @@ package store
 const schema = `
 PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);
-INSERT INTO schema_version(version) SELECT 7 WHERE NOT EXISTS (SELECT 1 FROM schema_version);
+INSERT INTO schema_version(version) SELECT 9 WHERE NOT EXISTS (SELECT 1 FROM schema_version);
 
 CREATE TABLE IF NOT EXISTS meta (
   key TEXT PRIMARY KEY,
@@ -51,6 +51,14 @@ CREATE TABLE IF NOT EXISTS notification_destinations (
   deleted_at TEXT
 );
 CREATE INDEX IF NOT EXISTS notification_destinations_enabled ON notification_destinations(enabled, deleted_at);
+
+-- The relationships below intentionally remain application-managed instead of
+-- SQLite foreign keys. Snapshots, event history, evidence ledger entries, and
+-- outbox rows are retained across generation changes; destinations are
+-- soft-deleted while their outbox history remains queryable; and webhook
+-- triggers may be compacted independently of their historical batch links.
+-- Adding cascading constraints would either destroy audit history or make
+-- retention/migration impossible without rewriting old databases.
 CREATE TABLE IF NOT EXISTS collector_state (
   generation INTEGER NOT NULL,
   collector TEXT NOT NULL,
@@ -61,6 +69,9 @@ CREATE TABLE IF NOT EXISTS collector_state (
   failure_count INTEGER NOT NULL DEFAULT 0,
   unhealthy_notified INTEGER NOT NULL DEFAULT 0,
   next_poll TEXT,
+  poll_duration_ms INTEGER NOT NULL DEFAULT 0,
+  partial INTEGER NOT NULL DEFAULT 0,
+  partial_error_count INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY(generation, collector)
 );
 CREATE TABLE IF NOT EXISTS snapshots (

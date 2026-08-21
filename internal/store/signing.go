@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -23,6 +24,7 @@ const (
 	evidenceSigningPublicKeyMeta  = "evidence_signing_public_key"
 	evidenceSigningKeyIDMeta      = "evidence_signing_key_id"
 	evidenceLedgerHeadMeta        = "evidence_ledger_head"
+	evidenceLedgerBackfillCutoff  = "evidence_ledger_backfill_cutoff"
 	evidenceLedgerBackfilledMeta  = "evidence_ledger_backfilled_at"
 	evidenceLedgerDomain          = "tailstate-evidence-ledger-v1\n"
 )
@@ -52,24 +54,40 @@ func (s *Store) evidenceLedgerLinks(ctx context.Context, batches []HistoryBatch)
 	if minSequence == 0 {
 		return nil, nil
 	}
+	// Include the immediately preceding entry as a checkpoint when one exists.
+	// A filtered or paginated export may start in the middle of the ledger; the
+	// predecessor lets an offline verifier distinguish a valid range boundary
+	// from a broken chain without exposing the predecessor's event payload.
+	startSequence := minSequence
+	if startSequence > 1 {
+		startSequence--
+	}
 	rows, err := s.db.QueryContext(ctx, `SELECT sequence,batch_id,prev_hash,entry_hash,signature,key_id
-		FROM evidence_ledger WHERE sequence BETWEEN ? AND ? ORDER BY sequence`, minSequence, maxSequence)
+		FROM evidence_ledger WHERE sequence BETWEEN ? AND ? ORDER BY sequence`, startSequence, maxSequence)
 	if err != nil {
 		return nil, err
 	}
+	// The size guard below can return before the normal rows.Close path. Keep
+	// the connection release unconditional so an oversized export cannot leak
+	// a SQLite rows handle and stall later history requests.
 	defer rows.Close()
-	links := make([]EvidenceLedgerLink, 0, min(maxEvidenceLedgerLinks, int(maxSequence-minSequence+1)))
+	links := make([]EvidenceLedgerLink, 0, min(maxEvidenceLedgerLinks, int(maxSequence-startSequence+1)))
 	for rows.Next() {
 		if len(links) >= maxEvidenceLedgerLinks {
 			return nil, ErrEvidencePackTooLarge
 		}
 		var link EvidenceLedgerLink
 		if err := rows.Scan(&link.Sequence, &link.BatchID, &link.PrevHash, &link.EntryHash, &link.Signature, &link.KeyID); err != nil {
+			rows.Close()
 			return nil, err
 		}
 		links = append(links, link)
 	}
 	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
 		return nil, err
 	}
 	return links, nil
@@ -221,12 +239,35 @@ func ParseEvidencePublicKey(raw []byte) ([]byte, error) {
 }
 
 func (s *Store) backfillEvidenceLedger(ctx context.Context) error {
+	return s.backfillEvidenceLedgerUpTo(ctx, 0)
+}
+
+// backfillEvidenceLedgerUpTo imports only batches that existed at the
+// migration boundary. A zero cutoff means no upper bound for this explicit
+// helper; startup skips the helper when its durable cutoff is zero so a
+// missing migration marker can never promote live rows into historical
+// evidence.
+func (s *Store) backfillEvidenceLedgerUpTo(ctx context.Context, cutoff int64) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	rows, err := tx.QueryContext(ctx, "SELECT id FROM event_batches ORDER BY id")
+	// Only batches with a complete event set are eligible for migration
+	// backfill. ApplyBatch writes event_batches and events in one transaction;
+	// an empty or mismatched row is not a valid historical batch and must not be
+	// granted a signed ledger position merely because it exists in SQLite.
+	query := `SELECT b.id
+		FROM event_batches b
+		WHERE b.change_count > 0
+		  AND b.change_count = (SELECT COUNT(*) FROM events e WHERE e.batch_id=b.id)`
+	args := []any{}
+	if cutoff > 0 {
+		query += "\n  AND b.id <= ?"
+		args = append(args, cutoff)
+	}
+	query += "\n ORDER BY b.id"
+	rows, err := tx.QueryContext(ctx, query, args...)
 	if err != nil {
 		return err
 	}
@@ -263,11 +304,46 @@ func (s *Store) backfillEvidenceLedgerOnStartup(ctx context.Context) error {
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return err
 	}
-	if err := s.backfillEvidenceLedger(ctx); err != nil {
+	cutoff, err := s.evidenceLedgerBackfillCutoff(ctx)
+	if err != nil {
 		return err
+	}
+	if cutoff > 0 {
+		if err := s.backfillEvidenceLedgerUpTo(ctx, cutoff); err != nil {
+			return err
+		}
 	}
 	_, err = s.db.ExecContext(ctx, "INSERT INTO meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", evidenceLedgerBackfilledMeta, time.Now().UTC().Format(time.RFC3339Nano))
 	return err
+}
+
+// evidenceLedgerBackfillCutoff establishes a durable upper bound the first
+// time startup backfill runs. Keeping it separate from the completion marker
+// makes retries safe after a partial failure without allowing newly inserted
+// rows to acquire historical ledger positions.
+func (s *Store) evidenceLedgerBackfillCutoff(ctx context.Context) (int64, error) {
+	var encoded string
+	err := s.db.QueryRowContext(ctx, "SELECT value FROM meta WHERE key=?", evidenceLedgerBackfillCutoff).Scan(&encoded)
+	if err == nil {
+		cutoff, parseErr := strconv.ParseInt(strings.TrimSpace(encoded), 10, 64)
+		if parseErr != nil || cutoff < 0 {
+			return 0, fmt.Errorf("invalid evidence ledger backfill cutoff %q", encoded)
+		}
+		return cutoff, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return 0, err
+	}
+	// A missing cutoff is deliberately a zero boundary, not the current
+	// maximum batch ID. Deriving a cutoff from live rows would let rows written
+	// directly into the database acquire a historical ledger position on the
+	// next startup. Only the versioned migration is allowed to authorize a
+	// non-zero backfill boundary.
+	const cutoff int64 = 0
+	if _, err := s.db.ExecContext(ctx, "INSERT INTO meta(key,value) VALUES(?,?)", evidenceLedgerBackfillCutoff, strconv.FormatInt(cutoff, 10)); err != nil {
+		return 0, fmt.Errorf("store evidence ledger backfill cutoff: %w", err)
+	}
+	return cutoff, nil
 }
 
 func (s *Store) appendEvidenceLedgerTx(ctx context.Context, tx *sql.Tx, batchID int64) error {

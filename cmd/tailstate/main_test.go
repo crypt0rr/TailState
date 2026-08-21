@@ -41,6 +41,17 @@ func configureCommandEnvironment(t *testing.T, dataDir string) string {
 	return keyPath
 }
 
+func claimCommandAdmin(t *testing.T, st *store.Store) {
+	t.Helper()
+	token, err := st.NewSetupToken(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Claim(context.Background(), token, "a secure password"); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestRunCommandDispatchAndHealthcheck(t *testing.T) {
 	originalArgs := os.Args
 	t.Cleanup(func() { os.Args = originalArgs })
@@ -158,6 +169,7 @@ func TestLoadAndAdminResetWithConfiguredKey(t *testing.T) {
 	if config.DatabasePath() != filepath.Join(dataDir, "tailstate.db") {
 		t.Fatalf("database path=%q", config.DatabasePath())
 	}
+	claimCommandAdmin(t, st)
 	if err := st.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -216,6 +228,7 @@ func TestAdminResetReportsStoreError(t *testing.T) {
 	if err != nil {
 		t.Fatalf("initialize store: %v", err)
 	}
+	claimCommandAdmin(t, st)
 	if err := st.Close(); err != nil {
 		t.Fatalf("close store: %v", err)
 	}
@@ -333,6 +346,14 @@ func TestEvidenceVerifyCommand(t *testing.T) {
 func TestCommandDispatchesConfiguredOperations(t *testing.T) {
 	dataDir := t.TempDir()
 	configureCommandEnvironment(t, dataDir)
+	_, st, err := load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimCommandAdmin(t, st)
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
 	originalArgs := os.Args
 	t.Cleanup(func() { os.Args = originalArgs })
 
@@ -417,5 +438,48 @@ func TestHealthcheckReportsTransportErrors(t *testing.T) {
 	server.Close()
 	if err := healthcheck([]string{"-url", url}); err == nil {
 		t.Fatal("healthcheck against a closed server unexpectedly succeeded")
+	}
+}
+
+func TestAdminRekeyRotatesConfiguredStore(t *testing.T) {
+	dataDir := t.TempDir()
+	oldKeyPath := configureCommandEnvironment(t, dataDir)
+	_, st, err := load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.SaveSettings(context.Background(), store.Settings{
+		Tailnet: "-", OAuthClientID: "client", OAuthClientSecret: "secret",
+		MattermostURL:  "https://mattermost.example/hooks/token",
+		DeviceInterval: time.Minute, InventoryInterval: 5 * time.Minute,
+	}); err != nil {
+		st.Close()
+		t.Fatal(err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	newKeyPath := filepath.Join(dataDir, "master.key.new")
+	newKey := bytes.Repeat([]byte{0x42}, 32)
+	if err := os.WriteFile(newKeyPath, []byte(base64.StdEncoding.EncodeToString(newKey)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := adminRekey(nil); err == nil || !strings.Contains(err.Error(), "new-key-file is required") {
+		t.Fatal("adminRekey accepted a missing replacement key path")
+	}
+	if err := adminRekey([]string{"-new-key-file", newKeyPath}); err != nil {
+		t.Fatalf("adminRekey failed: %v", err)
+	}
+	t.Setenv("TAILSTATE_MASTER_KEY_FILE", newKeyPath)
+	_, reopened, err := load()
+	if err != nil {
+		t.Fatalf("reopen with rotated key failed: %v", err)
+	}
+	defer reopened.Close()
+	if _, err := reopened.Settings(context.Background()); err != nil {
+		t.Fatalf("rotated settings could not be decrypted: %v", err)
+	}
+	if _, err := os.Stat(oldKeyPath); err != nil {
+		t.Fatalf("original key file disappeared during rekey: %v", err)
 	}
 }

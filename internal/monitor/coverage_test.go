@@ -139,7 +139,7 @@ func TestPollPersistsBaselineAndCorrelatesTrigger(t *testing.T) {
 
 func TestPollHandlesUnsupportedFailureAndRecovery(t *testing.T) {
 	ctx := context.Background()
-	st, settings := monitorTestStore(t)
+	st, settings, db := monitorTestStoreWithDB(t)
 	status := &atomic.Int32{}
 	api := monitorTestAPI(t, status)
 	defer api.Close()
@@ -149,6 +149,14 @@ func TestPollHandlesUnsupportedFailureAndRecovery(t *testing.T) {
 	status.Store(http.StatusNotFound)
 	if !engine.poll(ctx, client, settings, []string{"users"}, true) {
 		t.Fatal("unsupported collector should not fail the poll")
+	}
+	var unsupportedNext string
+	if err := db.QueryRowContext(ctx, "SELECT next_poll FROM collector_state WHERE generation=? AND collector='users'", settings.Generation).Scan(&unsupportedNext); err != nil {
+		t.Fatal(err)
+	}
+	unsupportedAt, err := time.Parse(time.RFC3339Nano, unsupportedNext)
+	if err != nil || time.Until(unsupportedAt) < 5*time.Hour {
+		t.Fatalf("unsupported collector retry was scheduled too soon: %q", unsupportedNext)
 	}
 	status.Store(http.StatusInternalServerError)
 	for i := 0; i < 3; i++ {
@@ -198,6 +206,141 @@ func TestPollHandlesUnsupportedFailureAndRecovery(t *testing.T) {
 	}
 }
 
+func TestPollSanitizesTailscaleProviderErrors(t *testing.T) {
+	ctx := context.Background()
+	st, settings, db := monitorTestStoreWithDB(t)
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/oauth/token" {
+			_, _ = w.Write([]byte(`{"access_token":"access","expires_in":3600}`))
+			return
+		}
+		if r.URL.Path == "/api/v2/tailnet/-/devices" {
+			w.WriteHeader(http.StatusBadGateway)
+			_, _ = w.Write([]byte("UPSTREAM-SECRET-RESPONSE"))
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer api.Close()
+	client := tailscale.New(api.URL+"/api/v2", api.URL+"/oauth/token", "test", tailscale.Credentials{Tailnet: "-", ClientID: "client", ClientSecret: "secret"})
+	engine := New(st, api.URL+"/api/v2", api.URL+"/oauth/token", "test", &scriptedSender{})
+	if engine.poll(ctx, client, settings, []string{"devices"}, true) {
+		t.Fatal("provider failure unexpectedly succeeded")
+	}
+	var lastError string
+	if err := db.QueryRowContext(ctx, "SELECT last_error FROM collector_state WHERE generation=? AND collector='devices'", settings.Generation).Scan(&lastError); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(lastError, "UPSTREAM-SECRET-RESPONSE") || lastError != "Tailscale request to /api/v2/tailnet/-/devices returned HTTP 502" {
+		t.Fatalf("collector error was not sanitized: %q", lastError)
+	}
+}
+
+func TestPollDoesNotBaselineEmptyPartialResponse(t *testing.T) {
+	ctx := context.Background()
+	st, settings := monitorTestStore(t)
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/oauth/token" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"access_token":"access","expires_in":3600}`))
+			return
+		}
+		if r.URL.Path == "/api/v2/tailnet/-/devices" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"devices":[{"id":"device-1","hostname":"server"}]}`))
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer api.Close()
+	client := tailscale.New(api.URL+"/api/v2", api.URL+"/oauth/token", "test", tailscale.Credentials{Tailnet: "-", ClientID: "client", ClientSecret: "secret"})
+	engine := New(st, api.URL+"/api/v2", api.URL+"/oauth/token", "test", &scriptedSender{})
+	if engine.poll(ctx, client, settings, []string{"device_details"}, true) {
+		t.Fatal("empty partial collector response was reported as successful")
+	}
+	status, err := st.Status(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, collector := range status.Collectors {
+		if collector.Name == "device_details" {
+			if collector.Baseline || collector.Partial {
+				t.Fatalf("empty partial response changed collector state: %#v", collector)
+			}
+			if collector.FailureCount != 1 || collector.LastError == "" {
+				t.Fatalf("empty partial response was not recorded as a failure: %#v", collector)
+			}
+			if collector.PartialErrorCount != 0 {
+				t.Fatalf("empty partial response retained an error count: %#v", collector)
+			}
+			return
+		}
+	}
+	t.Fatal("device_details collector state was not created")
+}
+
+func TestPollPersistsUsablePartialErrorCount(t *testing.T) {
+	ctx := context.Background()
+	st, settings := monitorTestStore(t)
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/oauth/token" {
+			_, _ = w.Write([]byte(`{"access_token":"access","expires_in":3600}`))
+			return
+		}
+		switch {
+		case r.URL.Path == "/api/v2/tailnet/-/devices":
+			_, _ = w.Write([]byte(`{"devices":[{"id":"healthy","hostname":"healthy"},{"id":"broken","hostname":"broken"}]}`))
+		case strings.HasPrefix(r.URL.Path, "/api/v2/device/healthy/"):
+			_, _ = w.Write([]byte(`{}`))
+		case strings.HasPrefix(r.URL.Path, "/api/v2/device/broken/"):
+			w.WriteHeader(http.StatusBadGateway)
+			_, _ = w.Write([]byte("detail provider failure"))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer api.Close()
+	client := tailscale.New(api.URL+"/api/v2", api.URL+"/oauth/token", "test", tailscale.Credentials{Tailnet: "-", ClientID: "client", ClientSecret: "secret"})
+	engine := New(st, api.URL+"/api/v2", api.URL+"/oauth/token", "test", &scriptedSender{})
+	if engine.poll(ctx, client, settings, []string{"device_details"}, true) {
+		t.Fatal("usable partial collector response was reported as successful")
+	}
+	status, err := st.Status(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, collector := range status.Collectors {
+		if collector.Name == "device_details" {
+			if !collector.Partial || collector.PartialErrorCount != 1 || collector.FailureCount != 1 {
+				t.Fatalf("partial collector state=%#v", collector)
+			}
+			if collector.LastError == "" || strings.Contains(collector.LastError, "detail provider failure") {
+				t.Fatalf("partial collector error was not sanitized: %q", collector.LastError)
+			}
+			return
+		}
+	}
+	t.Fatal("device_details collector state was not created")
+}
+
+func TestCollectorDueErrorsAreCounted(t *testing.T) {
+	ctx := context.Background()
+	st, settings, db := monitorTestStoreWithDB(t)
+	if _, err := db.ExecContext(ctx, "INSERT INTO collector_state(generation,collector,next_poll) VALUES(?,?,?) ON CONFLICT(generation,collector) DO UPDATE SET next_poll=excluded.next_poll", settings.Generation, "devices", "not-a-timestamp"); err != nil {
+		t.Fatal(err)
+	}
+	api := monitorTestAPI(t, nil)
+	defer api.Close()
+	client := tailscale.New(api.URL+"/api/v2", api.URL+"/oauth/token", "test", tailscale.Credentials{Tailnet: "-", ClientID: "client", ClientSecret: "secret"})
+	engine := New(st, api.URL+"/api/v2", api.URL+"/oauth/token", "test", &scriptedSender{})
+	if !engine.poll(ctx, client, settings, []string{"devices"}, false) {
+		t.Fatal("poll with a malformed schedule should still complete the collector")
+	}
+	if got := engine.CollectorDueErrors(); got != 1 {
+		t.Fatalf("collector due errors=%d, want 1", got)
+	}
+}
+
 func TestProcessDurableTriggersCompletesTargetedWork(t *testing.T) {
 	ctx := context.Background()
 	st, settings := monitorTestStore(t)
@@ -216,6 +359,50 @@ func TestProcessDurableTriggersCompletesTargetedWork(t *testing.T) {
 	processed, _, err := st.RecordWebhookTrigger(ctx, strings.Repeat("b", 64), nil, nil)
 	if err != nil || processed.Status != "processed" || processed.Attempts != 1 {
 		t.Fatalf("durable trigger state=%#v err=%v", processed, err)
+	}
+}
+
+func TestDurableTriggersHaveIndependentCollectorOutcomes(t *testing.T) {
+	ctx := context.Background()
+	st, settings := monitorTestStore(t)
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/oauth/token" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"access_token":"access","expires_in":3600}`))
+			return
+		}
+		switch r.URL.Path {
+		case "/api/v2/tailnet/-/devices":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"devices":[{"id":"device-1","hostname":"server"}]}`))
+		case "/api/v2/tailnet/-/users":
+			w.WriteHeader(http.StatusBadGateway)
+			_, _ = w.Write([]byte("user provider unavailable"))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer api.Close()
+	devices, created, err := st.RecordWebhookTrigger(ctx, strings.Repeat("c", 64), nil, []string{"devices"})
+	if err != nil || !created {
+		t.Fatalf("record device trigger: %#v created=%v err=%v", devices, created, err)
+	}
+	users, created, err := st.RecordWebhookTrigger(ctx, strings.Repeat("d", 64), nil, []string{"users"})
+	if err != nil || !created {
+		t.Fatalf("record user trigger: %#v created=%v err=%v", users, created, err)
+	}
+	client := tailscale.New(api.URL+"/api/v2", api.URL+"/oauth/token", "test", tailscale.Credentials{Tailnet: "-", ClientID: "client", ClientSecret: "secret"})
+	engine := New(st, api.URL+"/api/v2", api.URL+"/oauth/token", "test", &scriptedSender{})
+	if !engine.processDurableTriggers(ctx, client, settings) {
+		t.Fatal("durable trigger groups were not processed")
+	}
+	deviceState, _, err := st.RecordWebhookTrigger(ctx, strings.Repeat("c", 64), nil, nil)
+	if err != nil || deviceState.Status != "processed" {
+		t.Fatalf("successful device trigger state=%#v err=%v", deviceState, err)
+	}
+	userState, _, err := st.RecordWebhookTrigger(ctx, strings.Repeat("d", 64), nil, nil)
+	if err != nil || userState.Status != "pending" || userState.Attempts != 1 {
+		t.Fatalf("failed user trigger state=%#v err=%v", userState, err)
 	}
 }
 

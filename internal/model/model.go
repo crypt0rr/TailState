@@ -20,19 +20,22 @@ type Resource struct {
 }
 
 type Collected struct {
-	Collector    string
-	Resources    []Resource
-	Unsupported  bool
-	Partial      bool
-	PartialError string
-	Error        error
-	ObservedAt   time.Time
+	Collector         string
+	Resources         []Resource
+	Unsupported       bool
+	Partial           bool
+	PartialError      string
+	PartialErrorCount int
+	Error             error
+	ObservedAt        time.Time
 }
 
 type FieldChange struct {
-	Field string `json:"field"`
-	Old   any    `json:"old,omitempty"`
-	New   any    `json:"new,omitempty"`
+	Field      string `json:"field"`
+	Old        any    `json:"old,omitempty"`
+	New        any    `json:"new,omitempty"`
+	OldPresent bool   `json:"old_present,omitempty"`
+	NewPresent bool   `json:"new_present,omitempty"`
 }
 
 type Change struct {
@@ -49,8 +52,21 @@ type Change struct {
 var ignored = map[string]struct{}{
 	"lastseen": {}, "connectedtocontrol": {}, "clientconnectivity": {}, "endpoints": {}, "lastupdated": {},
 	"createdat": {}, "updatedat": {}, "timestamp": {}, "requestedat": {},
-	"accesstoken": {}, "clientsecret": {}, "secret": {}, "token": {}, "password": {},
 	"profilepicurl": {},
+}
+
+// redactedFields are schema-level secret identities. These are deliberately
+// exact matches: arbitrary tenant-controlled dictionary keys may contain words
+// such as "secret" or "token" and must remain visible to drift detection.
+var redactedFields = map[string]struct{}{
+	"accesstoken":   {},
+	"clientsecret":  {},
+	"secret":        {},
+	"signingsecret": {},
+	"token":         {},
+	"tokenvalue":    {},
+	"password":      {},
+	"webhooksecret": {},
 }
 
 var collectorFields = map[string]map[string]struct{}{
@@ -98,6 +114,10 @@ func normalizeFor(collector string, value any, root, tenantKeys bool, path strin
 				continue
 			}
 			if !tenantKeys {
+				if _, redact := redactedFields[compact]; redact {
+					out[key] = redactedValue(child)
+					continue
+				}
 				if _, drop := ignored[compact]; drop || ignoredForCollector(collector, compact) {
 					continue
 				}
@@ -179,6 +199,18 @@ func redactedFingerprint(value any) (string, bool) {
 	return strings.ToLower(encoded), true
 }
 
+func redactedValue(value any) map[string]any {
+	if fingerprint, ok := redactedFingerprint(value); ok {
+		return map[string]any{"redacted_sha256": fingerprint}
+	}
+	raw, err := json.Marshal(value)
+	if err != nil {
+		raw = []byte("<unserializable>")
+	}
+	sum := sha256.Sum256(raw)
+	return map[string]any{"redacted_sha256": hex.EncodeToString(sum[:])}
+}
+
 func collectorFieldAllowed(collector, field string) bool {
 	fields, restricted := collectorFields[collector]
 	if !restricted {
@@ -258,7 +290,7 @@ func DiffDetailed(oldRaw, newRaw []byte) DiffResult {
 	result := DiffResult{}
 	var oldValue, newValue any
 	if json.Unmarshal(oldRaw, &oldValue) != nil || json.Unmarshal(newRaw, &newValue) != nil {
-		result.Fields = []FieldChange{{Field: "value", Old: string(oldRaw), New: string(newRaw)}}
+		result.Fields = []FieldChange{valueChange("value", string(oldRaw), true, string(newRaw), true)}
 		result.TotalFields = 1
 		return result
 	}
@@ -269,9 +301,13 @@ func DiffDetailed(oldRaw, newRaw []byte) DiffResult {
 const maxDiffFields = 24
 
 func diffValue(path string, oldValue, newValue any, result *DiffResult) {
+	diffValuePresent(path, oldValue, true, newValue, true, result)
+}
+
+func diffValuePresent(path string, oldValue any, oldPresent bool, newValue any, newPresent bool, result *DiffResult) {
 	oldMap, oldOK := oldValue.(map[string]any)
 	newMap, newOK := newValue.(map[string]any)
-	if oldOK && newOK {
+	if oldPresent && newPresent && oldOK && newOK {
 		keys := make(map[string]struct{}, len(oldMap)+len(newMap))
 		for k := range oldMap {
 			keys[k] = struct{}{}
@@ -289,23 +325,52 @@ func diffValue(path string, oldValue, newValue any, result *DiffResult) {
 			if path != "" {
 				child = path + "." + key
 			}
-			diffValue(child, oldMap[key], newMap[key], result)
+			oldChild, oldExists := oldMap[key]
+			newChild, newExists := newMap[key]
+			diffValuePresent(child, oldChild, oldExists, newChild, newExists, result)
 		}
 		return
 	}
-	oldJSON, _ := json.Marshal(oldValue)
-	newJSON, _ := json.Marshal(newValue)
-	if string(oldJSON) != string(newJSON) {
-		if path == "" {
-			path = "value"
-		}
-		result.TotalFields++
-		if len(result.Fields) < maxDiffFields {
-			result.Fields = append(result.Fields, FieldChange{Field: path, Old: compact(oldValue), New: compact(newValue)})
-		} else {
-			result.FieldsTruncated = true
-		}
+	oldJSON := diffJSON(oldValue, oldPresent)
+	newJSON := diffJSON(newValue, newPresent)
+	if string(oldJSON) == string(newJSON) {
+		return
 	}
+	if path == "" {
+		path = "value"
+	}
+	result.TotalFields++
+	if len(result.Fields) < maxDiffFields {
+		result.Fields = append(result.Fields, valueChange(path, oldValue, oldPresent, newValue, newPresent))
+	} else {
+		result.FieldsTruncated = true
+	}
+}
+
+func diffJSON(value any, present bool) []byte {
+	if !present {
+		return []byte("<missing>")
+	}
+	raw, _ := json.Marshal(value)
+	return raw
+}
+
+func valueChange(path string, oldValue any, oldPresent bool, newValue any, newPresent bool) FieldChange {
+	change := FieldChange{Field: path, OldPresent: oldPresent, NewPresent: newPresent}
+	if oldPresent {
+		change.Old = compactPreservingNull(oldValue)
+	}
+	if newPresent {
+		change.New = compactPreservingNull(newValue)
+	}
+	return change
+}
+
+func compactPreservingNull(value any) any {
+	if value == nil {
+		return json.RawMessage("null")
+	}
+	return compact(value)
 }
 
 func compact(value any) any {

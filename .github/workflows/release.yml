@@ -5,10 +5,7 @@ on:
     tags: ["v*"]
 
 permissions:
-  contents: write
-  packages: write
-  id-token: write
-  attestations: write
+  contents: read
 
 concurrency:
   group: release-promotion
@@ -26,6 +23,9 @@ jobs:
     needs: quality
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    permissions:
+      contents: write
+      packages: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
@@ -95,6 +95,18 @@ jobs:
           docker tag "$amd64_image" tailstate:release-candidate-amd64
           docker pull "$arm64_image"
           docker tag "$arm64_image" tailstate:release-candidate-arm64
+      - name: Prepare pinned backup sidecar
+        run: |
+          set -euo pipefail
+          backup_image="$(bash scripts/backup-image.sh)"
+          docker pull "$backup_image"
+          docker tag "$backup_image" tailstate:backup-sidecar
+      - name: Scan backup sidecar
+        uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7.4.0
+        with:
+          image: tailstate:backup-sidecar
+          fail-build: true
+          severity-cutoff: high
       - name: Scan amd64 release candidate
         uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7.4.0
         with:
@@ -108,12 +120,16 @@ jobs:
           fail-build: true
           severity-cutoff: high
       - name: Runtime smoke test (amd64)
+        env:
+          TAILSTATE_BACKUP_IMAGE: tailstate:backup-sidecar
         run: bash scripts/container-smoke.sh tailstate:release-candidate-amd64 18081
       - name: Runtime smoke test (arm64)
         env:
           DOCKER_DEFAULT_PLATFORM: linux/arm64
+          TAILSTATE_BACKUP_IMAGE: tailstate:backup-sidecar
         run: bash scripts/container-smoke.sh tailstate:release-candidate-arm64 18082
       - name: Promote verified release candidate
+        id: promote
         env:
           CANDIDATE_IMAGE: ghcr.io/crypt0rr/tailstate:release-candidate-${{ github.sha }}
           CANDIDATE_DIGEST: ${{ steps.candidate.outputs.digest }}
@@ -126,12 +142,60 @@ jobs:
             tag_args+=(--tag "$tag")
           done <<< "$RELEASE_TAGS"
           ((${#tag_args[@]} > 0))
-          docker buildx imagetools create "${tag_args[@]}" "$CANDIDATE_IMAGE@$CANDIDATE_DIGEST"
+          # Add a promotion-only index annotation so stable tags receive a
+          # distinct manifest version. This lets the final cleanup remove the
+          # candidate package version without deleting the stable aliases.
+          docker buildx imagetools create \
+            "${tag_args[@]}" \
+            --annotation "index:com.crypt0rr.tailstate.promoted-from=$CANDIDATE_DIGEST" \
+            "$CANDIDATE_IMAGE@$CANDIDATE_DIGEST"
+          candidate_platforms="$(docker buildx imagetools inspect --raw "$CANDIDATE_IMAGE@$CANDIDATE_DIGEST" | jq -S '[.manifests[] | select(.platform.os and .platform.architecture) | {platform: .platform, digest: .digest}] | sort_by(.platform.os, .platform.architecture, (.platform.variant // ""))')"
+          promoted_digest=""
           while IFS= read -r tag; do
             [[ -n "$tag" ]] || continue
-            promoted_digest="$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$tag")"
-            test "$promoted_digest" = "$CANDIDATE_DIGEST"
+            digest="$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$tag")"
+            test -n "$digest"
+            test "$digest" != "$CANDIDATE_DIGEST"
+            if [[ -z "$promoted_digest" ]]; then
+              promoted_digest="$digest"
+            else
+              test "$digest" = "$promoted_digest"
+            fi
+            promoted_platforms="$(docker buildx imagetools inspect --raw "$tag" | jq -S '[.manifests[] | select(.platform.os and .platform.architecture) | {platform: .platform, digest: .digest}] | sort_by(.platform.os, .platform.architecture, (.platform.variant // ""))')"
+            test "$promoted_platforms" = "$candidate_platforms"
           done <<< "$RELEASE_TAGS"
+          echo "verified=true" >> "$GITHUB_OUTPUT"
+
+      - name: Remove release candidate
+        # The candidate is an implementation detail of this run. Remove it
+        # after both successful promotion and failed validation so a broken
+        # release cannot accumulate immutable GHCR versions. The digest check
+        # ensures this step never attempts to delete a tag that was not pushed.
+        if: ${{ always() && steps.candidate.outputs.digest != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE_TAG: release-candidate-${{ github.sha }}
+          PACKAGE_NAME: ${{ github.event.repository.name }}
+        run: |
+          set -euo pipefail
+          package_name="${PACKAGE_NAME,,}"
+          owner="${GITHUB_REPOSITORY%%/*}"
+          versions_path="/user/packages/container/$package_name/versions?per_page=100"
+          if ! versions_json="$(gh api --paginate --slurp "$versions_path")"; then
+            versions_json="$(gh api --paginate --slurp "/orgs/$owner/packages/container/$package_name/versions?per_page=100")"
+          fi
+          version_id="$(jq -r --arg tag "$CANDIDATE_TAG" '(add // []) | [ .[] | select((.metadata.container.tags // []) | index($tag)) | .id ] | first // empty' <<< "$versions_json")"
+          if [[ -z "$version_id" ]]; then
+            echo "candidate package version for $CANDIDATE_TAG is already absent"
+            exit 0
+          fi
+          candidate_tags="$(jq -r --argjson id "$version_id" '(add // [])[] | select(.id == $id) | (.metadata.container.tags // [])[]?' <<< "$versions_json")"
+          while IFS= read -r tag; do
+            [[ -n "$tag" ]] || continue
+            test "$tag" = "$CANDIDATE_TAG"
+          done <<< "$candidate_tags"
+          gh api --method DELETE "/user/packages/container/$package_name/versions/$version_id" 2>/dev/null || \
+            gh api --method DELETE "/orgs/$owner/packages/container/$package_name/versions/$version_id"
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}

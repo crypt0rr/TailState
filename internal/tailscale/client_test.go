@@ -2,11 +2,14 @@ package tailscale
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestOAuthPaginationAndCollection(t *testing.T) {
@@ -56,12 +59,14 @@ func TestEmptyCollectionResponses(t *testing.T) {
 		path      string
 		body      string
 		wantErr   bool
+		wantMatch string
 	}{
 		{name: "user invites missing array", collector: "user_invites", path: "/api/v2/tailnet/-/user-invites", body: `{}`, wantErr: true},
 		{name: "user invites top-level array", collector: "user_invites", path: "/api/v2/tailnet/-/user-invites", body: `[]`},
 		{name: "webhooks missing array", collector: "webhooks", path: "/api/v2/tailnet/-/webhooks", body: `{}`, wantErr: true},
-		{name: "webhooks null array", collector: "webhooks", path: "/api/v2/tailnet/-/webhooks", body: `{"webhooks":null}`},
+		{name: "webhooks null array", collector: "webhooks", path: "/api/v2/tailnet/-/webhooks", body: `{"webhooks":null}`, wantErr: true},
 		{name: "webhooks empty array", collector: "webhooks", path: "/api/v2/tailnet/-/webhooks", body: `{"webhooks":[]}`},
+		{name: "webhooks non-object item", collector: "webhooks", path: "/api/v2/tailnet/-/webhooks", body: `{"webhooks":[null]}`, wantErr: true, wantMatch: "contains a non-object item"},
 		{name: "strict collection still rejects missing array", collector: "users", path: "/api/v2/tailnet/-/users", body: `{}`, wantErr: true},
 	}
 
@@ -83,7 +88,11 @@ func TestEmptyCollectionResponses(t *testing.T) {
 			client := New(server.URL+"/api/v2", server.URL+"/oauth/token", "test", Credentials{ClientID: "id", ClientSecret: "secret"})
 			resources, err := client.Collect(context.Background(), tt.collector)
 			if tt.wantErr {
-				if err == nil || !strings.Contains(err.Error(), "response has no") {
+				match := tt.wantMatch
+				if match == "" {
+					match = "response has no"
+				}
+				if err == nil || !strings.Contains(err.Error(), match) {
 					t.Fatalf("expected missing-array error, got resources=%#v err=%v", resources, err)
 				}
 				return
@@ -93,6 +102,30 @@ func TestEmptyCollectionResponses(t *testing.T) {
 			}
 			if len(resources) != 0 {
 				t.Fatalf("expected no resources, got %#v", resources)
+			}
+		})
+	}
+}
+
+func TestAbsentCollectionKeyIsNotEmpty(t *testing.T) {
+	for _, collector := range []string{"user_invites", "webhooks"} {
+		t.Run(collector, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/oauth/token":
+					_, _ = w.Write([]byte(`{"access_token":"access","expires_in":3600}`))
+				case "/api/v2/tailnet/-/user-invites", "/api/v2/tailnet/-/webhooks":
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = w.Write([]byte(`{}`))
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer server.Close()
+			client := New(server.URL+"/api/v2", server.URL+"/oauth/token", "test", Credentials{ClientID: "id", ClientSecret: "secret"})
+			resources, err := client.Collect(context.Background(), collector)
+			if err == nil || len(resources) != 0 || !strings.Contains(err.Error(), "response has no") {
+				t.Fatalf("absent %s key was treated as empty: resources=%#v err=%v", collector, resources, err)
 			}
 		})
 	}
@@ -234,6 +267,13 @@ func TestDeviceDetailNotFoundIsPartialNotUnsupported(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "partial collector response") {
 		t.Fatalf("expected partial detail error, got resources=%#v err=%v", resources, err)
 	}
+	var partial *PartialError
+	if !errors.As(err, &partial) {
+		t.Fatalf("partial detail error did not retain its type: %v", err)
+	}
+	if partial.Count != 1 {
+		t.Fatalf("partial detail error count=%d, err=%v", partial.Count, err)
+	}
 	if len(resources) != 1 || resources[0].ID != "healthy" {
 		t.Fatalf("expected only the healthy device detail, got %#v", resources)
 	}
@@ -247,6 +287,67 @@ func TestDeviceDetailNotFoundIsPartialNotUnsupported(t *testing.T) {
 	}
 	if _, unsupported := routes["unsupported"]; unsupported {
 		t.Fatalf("404 detail endpoint was marked unsupported: %#v", data)
+	}
+}
+
+func TestDeviceDetailsDeadlineKeepsHealthyResults(t *testing.T) {
+	previousTimeout := deviceDetailsPollTimeout
+	// Leave enough room for the healthy device's three quick requests under the
+	// race detector while keeping the slow device well outside the deadline.
+	deviceDetailsPollTimeout = 200 * time.Millisecond
+	t.Cleanup(func() { deviceDetailsPollTimeout = previousTimeout })
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/oauth/token":
+			_, _ = w.Write([]byte(`{"access_token":"access","expires_in":3600}`))
+		case "/api/v2/tailnet/-/devices":
+			_, _ = w.Write([]byte(`{"devices":[{"id":"healthy","hostname":"healthy"},{"id":"slow","hostname":"slow"}]}`))
+		case "/api/v2/device/slow/routes", "/api/v2/device/slow/attributes", "/api/v2/device/slow/device-invites":
+			time.Sleep(1 * time.Second)
+			_, _ = w.Write([]byte(`{}`))
+		default:
+			_, _ = w.Write([]byte(`{}`))
+		}
+	}))
+	defer server.Close()
+	client := New(server.URL+"/api/v2", server.URL+"/oauth/token", "test", Credentials{ClientID: "id", ClientSecret: "secret"})
+	resources, err := client.Collect(context.Background(), "device_details")
+	if err == nil || !strings.Contains(err.Error(), "partial collector response") {
+		t.Fatalf("deadline did not produce partial result: resources=%#v err=%v", resources, err)
+	}
+	if len(resources) != 1 || resources[0].ID != "healthy" {
+		t.Fatalf("healthy device detail was lost at deadline: %#v", resources)
+	}
+}
+
+func TestDeviceDetailsFanoutIsBounded(t *testing.T) {
+	var active, maximum atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/oauth/token":
+			_, _ = w.Write([]byte(`{"access_token":"access","expires_in":3600}`))
+		case "/api/v2/tailnet/-/devices":
+			_, _ = w.Write([]byte(`{"devices":[{"id":"1"},{"id":"2"},{"id":"3"},{"id":"4"},{"id":"5"},{"id":"6"},{"id":"7"},{"id":"8"},{"id":"9"},{"id":"10"},{"id":"11"},{"id":"12"}]}`))
+		default:
+			current := active.Add(1)
+			for {
+				old := maximum.Load()
+				if current <= old || maximum.CompareAndSwap(old, current) {
+					break
+				}
+			}
+			time.Sleep(10 * time.Millisecond)
+			active.Add(-1)
+			_, _ = w.Write([]byte(`{}`))
+		}
+	}))
+	defer server.Close()
+	client := New(server.URL+"/api/v2", server.URL+"/oauth/token", "test", Credentials{ClientID: "id", ClientSecret: "secret"})
+	if _, err := client.Collect(context.Background(), "device_details"); err != nil {
+		t.Fatal(err)
+	}
+	if got := maximum.Load(); got > 8 {
+		t.Fatalf("device detail fan-out reached %d concurrent requests, want <=8", got)
 	}
 }
 

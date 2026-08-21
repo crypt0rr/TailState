@@ -10,4 +10,5 @@ target
 *.tgz
 *.zip
 backups/
+Caddyfile
 README.md

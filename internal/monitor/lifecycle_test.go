@@ -75,6 +75,70 @@ func TestSchedulerWaitsForConfigurationAndWake(t *testing.T) {
 	}
 }
 
+func TestSchedulerSettingsCacheRefreshesNonIdentityChanges(t *testing.T) {
+	ctx := context.Background()
+	st, initial := monitorTestStore(t)
+	engine := New(st, "", "", "test", &scriptedSender{})
+
+	cached, revision, err := engine.schedulerSettings(ctx, nil, store.Settings{}, "")
+	if err != nil || cached.OAuthClientSecret != initial.OAuthClientSecret || revision == "" {
+		t.Fatalf("initial scheduler settings=%#v revision=%q err=%v", cached, revision, err)
+	}
+	client := tailscale.New("http://invalid.example", "http://invalid.example/token", "test", tailscale.Credentials{})
+	unchanged, unchangedRevision, err := engine.schedulerSettings(ctx, client, cached, revision)
+	if err != nil || unchangedRevision != revision || unchanged.OAuthClientSecret != cached.OAuthClientSecret {
+		t.Fatalf("unchanged scheduler settings were not reused: %#v revision=%q err=%v", unchanged, unchangedRevision, err)
+	}
+
+	rotated := initial
+	rotated.OAuthClientSecret = "rotated-secret"
+	if generation, err := st.SaveSettings(ctx, rotated); err != nil || generation != initial.Generation {
+		t.Fatalf("non-identity settings update generation=%d err=%v", generation, err)
+	}
+	refreshed, refreshedRevision, err := engine.schedulerSettings(ctx, client, cached, revision)
+	if err != nil || refreshedRevision == revision || refreshed.OAuthClientSecret != "rotated-secret" {
+		t.Fatalf("changed scheduler settings were not refreshed: %#v revision=%q err=%v", refreshed, refreshedRevision, err)
+	}
+	emptyStore, err := store.Open(t.TempDir()+"/empty.db", mustTestBox(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := engineWithStore(emptyStore).schedulerSettings(ctx, nil, store.Settings{}, ""); err == nil {
+		t.Fatal("unconfigured scheduler settings lookup unexpectedly succeeded")
+	}
+	_ = emptyStore.Close()
+
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := engine.schedulerSettings(ctx, client, refreshed, refreshedRevision); err == nil {
+		t.Fatal("scheduler settings lookup succeeded after store close")
+	}
+}
+
+func TestNextPollDelayRetriesWithRetryIntervalAfterFailure(t *testing.T) {
+	delay := nextPollDelay(time.Hour, false)
+	if delay < collectorRetryInterval || delay >= collectorRetryInterval+collectorRetryInterval/10+time.Second {
+		t.Fatalf("failed poll delay=%s is outside retry interval jitter", delay)
+	}
+	if successful := nextPollDelay(time.Second, true); successful < time.Second || successful >= time.Second+time.Second/10+time.Second {
+		t.Fatalf("successful poll delay=%s is outside base interval jitter", successful)
+	}
+}
+
+func mustTestBox(t *testing.T) *secret.Box {
+	t.Helper()
+	box, err := secret.NewBox(make([]byte, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return box
+}
+
+func engineWithStore(st *store.Store) *Engine {
+	return New(st, "", "", "test", &scriptedSender{})
+}
+
 func TestRunAndCleanupCancellation(t *testing.T) {
 	st, _ := monitorTestStore(t)
 	engine := New(st, "", "", "test", &scriptedSender{})
@@ -115,7 +179,9 @@ func TestPollSkipsCollectorsThatAreNotDue(t *testing.T) {
 	ctx := context.Background()
 	st, settings := monitorTestStore(t)
 	engine := New(st, "", "", "test", &scriptedSender{})
-	st.SetNextPoll(ctx, settings.Generation, []string{"devices"}, time.Now().Add(time.Hour))
+	if err := st.SetNextPollErr(ctx, settings.Generation, []string{"devices"}, time.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
 	client := tailscale.New("http://invalid.example", "http://invalid.example/token", "test", tailscale.Credentials{})
 	if !engine.poll(ctx, client, settings, []string{"devices"}, false) {
 		t.Fatal("poll with no due collectors returned false")

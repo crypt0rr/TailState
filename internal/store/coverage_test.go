@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/crypt0rr/tailstate/internal/model"
+	"github.com/crypt0rr/tailstate/internal/notify"
 	"github.com/crypt0rr/tailstate/internal/secret"
 )
 
@@ -26,22 +27,44 @@ func TestStoreLifecycleAndCollectorStateBranches(t *testing.T) {
 	if got, err := st.SettingsGeneration(ctx); err != nil || got != generation {
 		t.Fatalf("SettingsGeneration=%d err=%v, want %d", got, err, generation)
 	}
-	if !st.CollectorDue(ctx, generation, "devices") {
+	firstRevision, err := st.SettingsRevision(ctx)
+	if err != nil || firstRevision == "" {
+		t.Fatalf("SettingsRevision=%q err=%v, want a non-empty marker", firstRevision, err)
+	}
+	rotated := settings()
+	rotated.OAuthClientSecret = "rotated-secret"
+	rotated.DeviceInterval = 2 * time.Minute
+	if got, err := st.SaveSettings(ctx, rotated); err != nil || got != generation {
+		t.Fatalf("non-identity settings update generation=%d err=%v, want %d", got, err, generation)
+	}
+	secondRevision, err := st.SettingsRevision(ctx)
+	if err != nil || secondRevision == firstRevision {
+		t.Fatalf("SettingsRevision did not change after credential/interval update: first=%q second=%q err=%v", firstRevision, secondRevision, err)
+	}
+	loaded, err := st.Settings(ctx)
+	if err != nil || loaded.OAuthClientSecret != "rotated-secret" || loaded.Revision != secondRevision {
+		t.Fatalf("settings revision reload lost updated values: %#v err=%v", loaded, err)
+	}
+	if due, err := st.CollectorDueWithError(ctx, generation, "devices"); err != nil || !due {
 		t.Fatal("collector without state should be due")
 	}
-	st.SetNextPoll(ctx, generation, []string{"devices"}, time.Now().Add(time.Hour))
-	if st.CollectorDue(ctx, generation, "devices") {
+	if err := st.SetNextPollErr(ctx, generation, []string{"devices"}, time.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if due, err := st.CollectorDueWithError(ctx, generation, "devices"); err != nil || due {
 		t.Fatal("future collector was marked due")
 	}
-	st.SetNextPoll(ctx, generation, []string{"devices"}, time.Now().Add(-time.Minute))
-	if !st.CollectorDue(ctx, generation, "devices") {
+	if err := st.SetNextPollErr(ctx, generation, []string{"devices"}, time.Now().Add(-time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if due, err := st.CollectorDueWithError(ctx, generation, "devices"); err != nil || !due {
 		t.Fatal("past collector was not due")
 	}
 	if _, err := st.db.ExecContext(ctx, "UPDATE collector_state SET next_poll='not-a-time' WHERE generation=? AND collector=?", generation, "devices"); err != nil {
 		t.Fatal(err)
 	}
-	if !st.CollectorDue(ctx, generation, "devices") {
-		t.Fatal("malformed next poll was not treated as due")
+	if due, err := st.CollectorDueWithError(ctx, generation, "devices"); !due || err == nil {
+		t.Fatalf("malformed next poll due=%v err=%v; want due with an error", due, err)
 	}
 
 	for attempt := 1; attempt <= 3; attempt++ {
@@ -53,16 +76,16 @@ func TestStoreLifecycleAndCollectorStateBranches(t *testing.T) {
 			t.Fatalf("failure %d notification=%v", attempt, notify)
 		}
 	}
-	if !st.CollectorWasUnhealthy(ctx, generation, "devices") {
+	if unhealthy, err := st.CollectorWasUnhealthyWithError(ctx, generation, "devices"); err != nil || !unhealthy {
 		t.Fatal("collector was not marked unhealthy after threshold")
 	}
 	if notify, _, err := st.RecordCollectorFailure(ctx, generation, "devices", "again"); err != nil || notify {
 		t.Fatalf("fourth failure notification=%v err=%v", notify, err)
 	}
-	if _, err := st.ApplyBatch(ctx, generation, []model.Collected{{Collector: "devices", Resources: []model.Resource{{ID: "device-1", Type: "device", Name: "server", Data: map[string]any{"hostname": "server"}}}}}, func([]model.Change) string { return "digest" }); err != nil {
+	if _, err := st.applyBatch(ctx, generation, []model.Collected{{Collector: "devices", Resources: []model.Resource{{ID: "device-1", Type: "device", Name: "server", Data: map[string]any{"hostname": "server"}}}}}, func([]model.Change) string { return "digest" }); err != nil {
 		t.Fatal(err)
 	}
-	if st.CollectorWasUnhealthy(ctx, generation, "devices") {
+	if unhealthy, err := st.CollectorWasUnhealthyWithError(ctx, generation, "devices"); err != nil || unhealthy {
 		t.Fatal("successful collection did not clear unhealthy state")
 	}
 
@@ -113,6 +136,19 @@ func TestResetPasswordAndDeleteSessionBranches(t *testing.T) {
 	st.DeleteSession(ctx, another)
 	if st.ValidateSession(ctx, another, anotherCSRF, true) {
 		t.Fatal("DeleteSession retained the session")
+	}
+}
+
+func TestSettingsGenerationReportsClosedStore(t *testing.T) {
+	st := testStore(t)
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.currentGeneration(context.Background()); err == nil {
+		t.Fatal("currentGeneration succeeded after database close")
+	}
+	if _, err := st.SettingsGeneration(context.Background()); err == nil {
+		t.Fatal("SettingsGeneration succeeded after database close")
 	}
 }
 
@@ -289,12 +325,156 @@ func TestHistoryFormattingHelpers(t *testing.T) {
 	if got := prettyValue(func() {}); got == "" {
 		t.Fatal("prettyValue fallback returned an empty string")
 	}
-	if parseOptionalTime("") != nil || parseOptionalTime("bad") != nil || parseOptionalTime(time.Now().UTC().Format(time.RFC3339Nano)) == nil {
-		t.Fatal("parseOptionalTime branches incorrect")
-	}
 	if truncate("short", 10) != "short" || !strings.HasSuffix(truncate(strings.Repeat("x", 11), 10), "…") {
 		t.Fatal("truncate branches incorrect")
 	}
+}
+
+func TestPersistedTimestampErrorsSurface(t *testing.T) {
+	ctx := context.Background()
+	t.Run("settings and status", func(t *testing.T) {
+		st := testStore(t)
+		generation, err := st.SaveSettings(ctx, settings())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.Settings(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.db.ExecContext(ctx, "UPDATE settings SET configured_at='bad' WHERE id=1"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.Settings(ctx); err == nil || !strings.Contains(err.Error(), "configured timestamp") {
+			t.Fatalf("invalid configured timestamp was ignored: %v", err)
+		}
+		if _, err := st.db.ExecContext(ctx, "UPDATE settings SET configured_at=? WHERE id=1", time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.applyBatch(ctx, generation, []model.Collected{{Collector: "devices", Resources: []model.Resource{{ID: "device-1", Type: "device", Name: "server", Data: map[string]any{"hostname": "server"}}}}}, func([]model.Change) string { return "baseline" }); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.db.ExecContext(ctx, "UPDATE collector_state SET last_success='bad' WHERE generation=? AND collector='devices'", generation); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.Status(ctx); err == nil || !strings.Contains(err.Error(), "collector success timestamp") {
+			t.Fatalf("invalid collector timestamp was ignored: %v", err)
+		}
+	})
+
+	t.Run("history and delivery", func(t *testing.T) {
+		st := testStore(t)
+		generation, err := st.SaveSettings(ctx, settings())
+		if err != nil {
+			t.Fatal(err)
+		}
+		resource := func(name string) []model.Resource {
+			return []model.Resource{{Collector: "devices", ID: "device-1", Type: "device", Name: name, Data: map[string]any{"hostname": name}}}
+		}
+		if _, err := st.applyBatch(ctx, generation, []model.Collected{{Collector: "devices", Resources: resource("server")}}, notify.Digest); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.applyBatch(ctx, generation, []model.Collected{{Collector: "devices", Resources: resource("changed")}}, notify.Digest); err != nil {
+			t.Fatal(err)
+		}
+		var batchID int64
+		if err := st.db.QueryRowContext(ctx, "SELECT id FROM event_batches ORDER BY id DESC LIMIT 1").Scan(&batchID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.db.ExecContext(ctx, "UPDATE event_batches SET observed_at='bad' WHERE id=?", batchID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.ListHistory(ctx, HistoryFilter{Limit: 10}); err == nil || !strings.Contains(err.Error(), "history batch timestamp") {
+			t.Fatalf("invalid history batch timestamp was ignored: %v", err)
+		}
+		if _, err := st.db.ExecContext(ctx, "UPDATE event_batches SET observed_at=? WHERE id=?", time.Now().UTC().Format(time.RFC3339Nano), batchID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.db.ExecContext(ctx, "UPDATE events SET observed_at='bad' WHERE batch_id=?", batchID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.ListHistory(ctx, HistoryFilter{Limit: 10}); err == nil || !strings.Contains(err.Error(), "history event timestamp") {
+			t.Fatalf("invalid history event timestamp was ignored: %v", err)
+		}
+		if _, err := st.db.ExecContext(ctx, "UPDATE events SET observed_at=? WHERE batch_id=?", time.Now().UTC().Format(time.RFC3339Nano), batchID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.db.ExecContext(ctx, "UPDATE outbox SET next_attempt='bad' WHERE batch_id=?", batchID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.ListHistory(ctx, HistoryFilter{Limit: 10}); err == nil || !strings.Contains(err.Error(), "next attempt") {
+			t.Fatalf("invalid delivery timestamp was ignored: %v", err)
+		}
+		if _, err := st.db.ExecContext(ctx, "UPDATE outbox SET first_attempt='bad',next_attempt=? WHERE batch_id=?", time.Now().UTC().Add(-time.Minute).Format(time.RFC3339Nano), batchID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.DueOutbox(ctx, 10); err == nil || !strings.Contains(err.Error(), "outbox first attempt") {
+			t.Fatalf("invalid outbox timestamp was ignored: %v", err)
+		}
+	})
+
+	t.Run("webhook", func(t *testing.T) {
+		for _, field := range []string{"received_at", "lease_until", "processed_at"} {
+			t.Run(field, func(t *testing.T) {
+				st := testStore(t)
+				bodyHash := strings.Repeat("a", 64)
+				trigger, created, err := st.RecordWebhookTrigger(ctx, bodyHash, nil, nil)
+				if err != nil || !created {
+					t.Fatalf("record webhook trigger: %#v created=%v err=%v", trigger, created, err)
+				}
+				if _, err := st.db.ExecContext(ctx, "UPDATE webhook_triggers SET "+field+"='bad' WHERE id=?", trigger.ID); err != nil {
+					t.Fatal(err)
+				}
+				if _, _, err := st.RecordWebhookTrigger(ctx, bodyHash, nil, nil); err == nil || !strings.Contains(err.Error(), "webhook "+field+" timestamp") {
+					t.Fatalf("invalid webhook timestamp was ignored: %v", err)
+				}
+				if field == "received_at" {
+					if err := st.RetryWebhookTriggers(ctx, []int64{trigger.ID}, time.Now(), "retry"); err == nil || !strings.Contains(err.Error(), "webhook received_at timestamp") {
+						t.Fatalf("invalid webhook retry timestamp was ignored: %v", err)
+					}
+				}
+			})
+		}
+	})
+
+	t.Run("destination", func(t *testing.T) {
+		for _, field := range []string{"created_at", "updated_at", "deleted_at"} {
+			t.Run(field, func(t *testing.T) {
+				st := testStore(t)
+				if _, err := st.SaveSettings(ctx, settings()); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := st.db.ExecContext(ctx, "UPDATE notification_destinations SET "+field+"='bad'"); err != nil {
+					t.Fatal(err)
+				}
+				var err error
+				if field == "deleted_at" {
+					_, err = st.ListDestinations(ctx, true)
+				} else {
+					_, err = st.ListDestinations(ctx)
+				}
+				if err == nil || !strings.Contains(err.Error(), "destination "+strings.TrimSuffix(field, "_at")+" timestamp") {
+					t.Fatalf("invalid destination timestamp was ignored: %v", err)
+				}
+			})
+		}
+		for _, field := range []string{"created_at", "updated_at"} {
+			t.Run("outbox "+field, func(t *testing.T) {
+				st := testStore(t)
+				if _, err := st.SaveSettings(ctx, settings()); err != nil {
+					t.Fatal(err)
+				}
+				if err := st.EnqueueSystem(ctx, "timestamp test"); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := st.db.ExecContext(ctx, "UPDATE notification_destinations SET "+field+"='bad'"); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := st.DueOutbox(ctx, 1); err == nil || !strings.Contains(err.Error(), "outbox destination "+strings.TrimSuffix(field, "_at")+" timestamp") {
+					t.Fatalf("invalid outbox destination timestamp was ignored: %v", err)
+				}
+			})
+		}
+	})
 }
 
 func TestClosedStoreReturnsOperationalErrors(t *testing.T) {
@@ -330,10 +510,10 @@ func TestClosedStoreReturnsOperationalErrors(t *testing.T) {
 	expectErr("Settings", func() error { _, err := st.Settings(ctx); return err })
 	expectErr("WebhookSecret", func() error { _, err := st.WebhookSecret(ctx); return err })
 	expectErr("RecordWebhookTrigger", func() error { _, _, err := st.RecordWebhookTrigger(ctx, strings.Repeat("a", 64), nil, nil); return err })
+	expectErr("ClaimWebhookTrigger", func() error { _, _, err := st.ClaimWebhookTrigger(ctx, 1, time.Minute); return err })
 	expectErr("ClaimWebhookTriggers", func() error { _, err := st.ClaimWebhookTriggers(ctx, 1, time.Minute); return err })
 	expectErr("CompleteWebhookTriggers", func() error { return st.CompleteWebhookTriggers(ctx, []int64{1}) })
 	expectErr("RetryWebhookTriggers", func() error { return st.RetryWebhookTriggers(ctx, []int64{1}, time.Now(), "error") })
-	expectErr("MarkWebhookTriggerProcessed", func() error { return st.MarkWebhookTriggerProcessed(ctx, 1) })
 	expectErr("ListDestinations", func() error { _, err := st.ListDestinations(ctx); return err })
 	expectErr("SaveDestination", func() error {
 		_, err := st.SaveDestination(ctx, NotificationDestination{Name: "test", ServiceURL: "generic://example.invalid"})
@@ -346,7 +526,7 @@ func TestClosedStoreReturnsOperationalErrors(t *testing.T) {
 		return err
 	})
 	expectErr("ApplyBatch", func() error {
-		_, err := st.ApplyBatch(ctx, 1, nil, func([]model.Change) string { return "" })
+		_, err := st.applyBatch(ctx, 1, nil, func([]model.Change) string { return "" })
 		return err
 	})
 	expectErr("ApplyBatchWithBatch", func() error {
@@ -354,7 +534,8 @@ func TestClosedStoreReturnsOperationalErrors(t *testing.T) {
 		return err
 	})
 	expectErr("RecordCollectorFailure", func() error { _, _, err := st.RecordCollectorFailure(ctx, 1, "devices", "error"); return err })
-	if st.CollectorWasUnhealthy(ctx, 1, "devices") {
+	expectErr("RecordCollectorPoll", func() error { return st.RecordCollectorPoll(ctx, 1, "devices", time.Second, false) })
+	if unhealthy, err := st.CollectorWasUnhealthyWithError(ctx, 1, "devices"); err == nil || unhealthy {
 		t.Fatal("CollectorWasUnhealthy succeeded on a closed store")
 	}
 	expectErr("EnqueueSystem", func() error { return st.EnqueueSystem(ctx, "payload") })
@@ -787,7 +968,7 @@ func storeWithHistoryBatch(t *testing.T) (*Store, int64) {
 	baseline := []model.Collected{{Collector: "devices", Resources: []model.Resource{{
 		ID: "device-1", Type: "device", Name: "server", Data: map[string]any{"hostname": "server"},
 	}}}}
-	if _, err := st.ApplyBatch(ctx, generation, baseline, func([]model.Change) string { return "baseline" }); err != nil {
+	if _, err := st.applyBatch(ctx, generation, baseline, func([]model.Change) string { return "baseline" }); err != nil {
 		t.Fatal(err)
 	}
 	changed := []model.Collected{{Collector: "devices", Resources: []model.Resource{{
@@ -906,6 +1087,21 @@ func setupCoverageAdmin(t *testing.T, st *Store) {
 	}
 	if err := st.Claim(ctx, token, "a secure password"); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestSetupTokenCannotBeIssuedAfterClaim(t *testing.T) {
+	st := testStore(t)
+	setupCoverageAdmin(t, st)
+	if token, err := st.NewSetupToken(context.Background()); err == nil || token != "" || !strings.Contains(err.Error(), "already configured") {
+		t.Fatalf("NewSetupToken after claim returned token=%q err=%v", token, err)
+	}
+}
+
+func TestResetTokenRequiresAdministrator(t *testing.T) {
+	st := testStore(t)
+	if token, err := st.NewResetToken(context.Background()); err == nil || token != "" || !strings.Contains(err.Error(), "not configured") {
+		t.Fatalf("NewResetToken before claim returned token=%q err=%v", token, err)
 	}
 }
 
@@ -1084,7 +1280,7 @@ func TestApplyBatchTransactionErrorBranches(t *testing.T) {
 				t.Fatal(err)
 			}
 			baseline := []model.Collected{{Collector: "devices", Resources: []model.Resource{{ID: "device-1", Type: "device", Name: "server", Data: map[string]any{"hostname": "server"}}}}}
-			if _, err := st.ApplyBatch(ctx, generation, baseline, func([]model.Change) string { return "baseline" }); err != nil && tt.table != "evidence_ledger" {
+			if _, err := st.applyBatch(ctx, generation, baseline, func([]model.Change) string { return "baseline" }); err != nil && tt.table != "evidence_ledger" {
 				// The event batch and outbox cases should fail only on the changed write;
 				// the evidence-ledger case also fails during the baseline backfill.
 				t.Fatal(err)
@@ -1208,8 +1404,8 @@ func TestDestinationAndVersionWriteErrorBranches(t *testing.T) {
 		if _, err := st.db.ExecContext(ctx, "DROP TABLE collector_state"); err != nil {
 			t.Fatal(err)
 		}
-		if !st.CollectorDue(ctx, 1, "devices") {
-			t.Fatal("CollectorDue did not treat a query failure as due")
+		if due, err := st.CollectorDueWithError(ctx, 1, "devices"); !due || err == nil {
+			t.Fatalf("CollectorDue due=%v err=%v; want due with a query error", due, err)
 		}
 	})
 
@@ -1249,7 +1445,7 @@ func TestApplyBatchWriteErrorBranches(t *testing.T) {
 		if _, err := st.db.ExecContext(ctx, `CREATE TRIGGER fail_baseline_update BEFORE UPDATE OF baseline_at ON settings BEGIN SELECT RAISE(ABORT,'baseline update failed'); END`); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := st.ApplyBatch(ctx, generation, baseline, func([]model.Change) string { return "baseline" }); err == nil {
+		if _, err := st.applyBatch(ctx, generation, baseline, func([]model.Change) string { return "baseline" }); err == nil {
 			t.Fatal("ApplyBatch ignored baseline update failure")
 		}
 	})
@@ -1259,49 +1455,49 @@ func TestApplyBatchWriteErrorBranches(t *testing.T) {
 		if _, err := st.db.ExecContext(ctx, `CREATE TRIGGER fail_snapshot_insert BEFORE INSERT ON snapshots BEGIN SELECT RAISE(ABORT,'snapshot insert failed'); END`); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := st.ApplyBatch(ctx, generation, baseline, func([]model.Change) string { return "baseline" }); err == nil {
+		if _, err := st.applyBatch(ctx, generation, baseline, func([]model.Change) string { return "baseline" }); err == nil {
 			t.Fatal("ApplyBatch ignored snapshot insert failure")
 		}
 	})
 
 	t.Run("snapshot update", func(t *testing.T) {
 		st, generation := configuredCoverageStore(t)
-		if _, err := st.ApplyBatch(ctx, generation, baseline, func([]model.Change) string { return "baseline" }); err != nil {
+		if _, err := st.applyBatch(ctx, generation, baseline, func([]model.Change) string { return "baseline" }); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := st.db.ExecContext(ctx, `CREATE TRIGGER fail_snapshot_update BEFORE UPDATE ON snapshots BEGIN SELECT RAISE(ABORT,'snapshot update failed'); END`); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := st.ApplyBatch(ctx, generation, changed, func([]model.Change) string { return "changed" }); err == nil {
+		if _, err := st.applyBatch(ctx, generation, changed, func([]model.Change) string { return "changed" }); err == nil {
 			t.Fatal("ApplyBatch ignored snapshot update failure")
 		}
 	})
 
 	t.Run("snapshot delete", func(t *testing.T) {
 		st, generation := configuredCoverageStore(t)
-		if _, err := st.ApplyBatch(ctx, generation, baseline, func([]model.Change) string { return "baseline" }); err != nil {
+		if _, err := st.applyBatch(ctx, generation, baseline, func([]model.Change) string { return "baseline" }); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := st.ApplyBatch(ctx, generation, []model.Collected{{Collector: "devices"}}, func([]model.Change) string { return "missing" }); err != nil {
+		if _, err := st.applyBatch(ctx, generation, []model.Collected{{Collector: "devices"}}, func([]model.Change) string { return "missing" }); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := st.db.ExecContext(ctx, `CREATE TRIGGER fail_snapshot_delete BEFORE DELETE ON snapshots BEGIN SELECT RAISE(ABORT,'snapshot delete failed'); END`); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := st.ApplyBatch(ctx, generation, []model.Collected{{Collector: "devices"}}, func([]model.Change) string { return "removed" }); err == nil {
+		if _, err := st.applyBatch(ctx, generation, []model.Collected{{Collector: "devices"}}, func([]model.Change) string { return "removed" }); err == nil {
 			t.Fatal("ApplyBatch ignored snapshot delete failure")
 		}
 	})
 
 	t.Run("collector state update", func(t *testing.T) {
 		st, generation := configuredCoverageStore(t)
-		if _, err := st.ApplyBatch(ctx, generation, baseline, func([]model.Change) string { return "baseline" }); err != nil {
+		if _, err := st.applyBatch(ctx, generation, baseline, func([]model.Change) string { return "baseline" }); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := st.db.ExecContext(ctx, `CREATE TRIGGER fail_collector_state_update BEFORE UPDATE ON collector_state WHEN NEW.collector='devices' BEGIN SELECT RAISE(ABORT,'collector state update failed'); END`); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := st.ApplyBatch(ctx, generation, changed, func([]model.Change) string { return "changed" }); err == nil {
+		if _, err := st.applyBatch(ctx, generation, changed, func([]model.Change) string { return "changed" }); err == nil {
 			t.Fatal("ApplyBatch ignored collector state update failure")
 		}
 	})
@@ -1309,7 +1505,7 @@ func TestApplyBatchWriteErrorBranches(t *testing.T) {
 	for _, table := range []string{"event_batch_triggers", "events"} {
 		t.Run(table+" insert", func(t *testing.T) {
 			st, generation := configuredCoverageStore(t)
-			if _, err := st.ApplyBatch(ctx, generation, baseline, func([]model.Change) string { return "baseline" }); err != nil {
+			if _, err := st.applyBatch(ctx, generation, baseline, func([]model.Change) string { return "baseline" }); err != nil {
 				t.Fatal(err)
 			}
 			trigger := "fail_" + table + "_insert"
@@ -1483,7 +1679,7 @@ func TestApplyBatchCreatesNewBaselineResourceChange(t *testing.T) {
 	ctx := context.Background()
 	st, generation := configuredCoverageStore(t)
 	baseline := []model.Collected{{Collector: "devices", Resources: []model.Resource{{ID: "device-1", Type: "device", Name: "one", Data: map[string]any{"hostname": "one"}}}}}
-	if _, err := st.ApplyBatch(ctx, generation, baseline, func([]model.Change) string { return "baseline" }); err != nil {
+	if _, err := st.applyBatch(ctx, generation, baseline, func([]model.Change) string { return "baseline" }); err != nil {
 		t.Fatal(err)
 	}
 	withNewResource := []model.Collected{{Collector: "devices", Resources: []model.Resource{

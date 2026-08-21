@@ -31,15 +31,18 @@ jobs:
           cache: true
       - run: test -z "$(gofmt -l .)"
       - run: go vet ./...
-      - run: go test -race -covermode=atomic -coverprofile=coverage.out ./...
+      - run: go test -race -covermode=atomic -coverpkg=./... -coverprofile=coverage.out ./...
+      - name: Run security and drift invariant suite
+        run: >-
+          go test -race -count=1
+          -run '^(TestTamperedExportFailsVerification|TestDriftAcrossUnsupportedWindowIsReported|TestBaselineIsSilent|TestRemovalRequiresTwoPolls|TestMassRemovalGuardPreservesSnapshots|TestTenantControlledSecretNamedKeysRemainVisible|TestSecondMattermostDestinationDoesNotOverwriteTheFirst|TestDestinationURLNeverReachesPersistedError|TestDestinationQueryCredentialsStayOutOfOutbox|TestDeliveryRedactsInjectedSenderErrors|TestDestinationTestAndUnknownMutationErrors|TestRestartMidDeliveryRecordsOutcome|TestFinishTriggersOutlivesShutdownCancellation|TestTriggerQueuesTargetedCollectorsAndRetainsOverflowScopes|TestFastTriggerClaimOnlyOwnsPendingDurableRows|TestDurableTriggersHaveIndependentCollectorOutcomes|TestEvidenceLedgerSurvivesHistoryRetention|TestLoginRejectsForwardedTLSFromUntrustedPeer|TestSetupDoesNotExposeStorageErrors|TestHomeReportsStorageErrors|TestPersistedTimestampErrorsSurface|TestAbsentCollectionKeyIsNotEmpty|TestSetupTokenCannotBeIssuedAfterClaim|TestResetTokenRequiresAdministrator)$'
+          ./...
       - name: Enforce coverage baseline
         run: |
           total=$(go tool cover -func=coverage.out | awk '/^total:/ {gsub("%", "", $3); print $3}')
           awk -v total="$total" 'BEGIN { if (total < 90.0) { printf "coverage %.1f%% is below the 90.0%% baseline\n", total; exit 1 } }'
-      - run: go install honnef.co/go/tools/cmd/staticcheck@v0.7.0
-      - run: staticcheck ./...
-      - run: go install golang.org/x/vuln/cmd/govulncheck@v1.6.0
-      - run: govulncheck ./...
+      - run: go tool staticcheck ./...
+      - run: go tool govulncheck ./...
 
   container:
     runs-on: ubuntu-latest
@@ -53,14 +56,42 @@ jobs:
           load: true
           tags: tailstate:ci
           build-args: VERSION=${{ inputs.version || 'dev' }}
+      - name: Prepare pinned backup sidecar
+        run: |
+          set -euo pipefail
+          backup_image="$(bash scripts/backup-image.sh)"
+          docker pull "$backup_image"
+          docker tag "$backup_image" tailstate:backup-sidecar
+      - name: Scan backup sidecar
+        uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7.4.0
+        with:
+          image: tailstate:backup-sidecar
+          fail-build: true
+          severity-cutoff: high
       - uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7.4.0
         with:
           image: tailstate:ci
           fail-build: true
           severity-cutoff: high
       - name: Runtime smoke test
+        env:
+          TAILSTATE_BACKUP_IMAGE: tailstate:backup-sidecar
         run: bash scripts/container-smoke.sh tailstate:ci 18080
+      - name: Documented Compose startup smoke test
+        env:
+          TAILSTATE_BACKUP_IMAGE: tailstate:backup-sidecar
+        run: bash scripts/compose-smoke.sh tailstate:ci 18083
+      - name: Validate HTTPS proxy Compose override
+        run: |
+          set -euo pipefail
+          docker compose -f compose.yaml -f compose.remote.yaml config >/tmp/tailstate-remote-compose.yaml
+          grep -q 'caddy:2.10-alpine' /tmp/tailstate-remote-compose.yaml
+          grep -q 'published: "80"' /tmp/tailstate-remote-compose.yaml
+          grep -q 'published: "443"' /tmp/tailstate-remote-compose.yaml
+          ! grep -q 'published: "8080"' /tmp/tailstate-remote-compose.yaml
       - name: Backup and restore smoke test
+        env:
+          TAILSTATE_BACKUP_IMAGE: tailstate:backup-sidecar
         run: bash scripts/container-backup-restore-smoke.sh tailstate:ci 18082
       - uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
       - uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0

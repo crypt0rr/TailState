@@ -104,6 +104,9 @@ func serveContext(ctx context.Context) error {
 		level = slog.LevelDebug
 	}
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: level})))
+	if config.InsecureHTTPListener() {
+		slog.Warn("authenticated UI is exposed on a non-loopback plaintext listener; configure TAILSTATE_COOKIE_SECURE=true behind a trusted HTTPS proxy or bind TAILSTATE_LISTEN_ADDR to loopback")
+	}
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	exists, err := st.AdminExists(ctx)

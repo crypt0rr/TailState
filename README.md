@@ -70,7 +70,7 @@ The setup interface then asks for:
 3. At least one notification destination using a Shoutrrr URL.
 4. Device and secondary inventory polling intervals.
 
-Add destinations on the authenticated Settings page, then save monitoring settings. Each destination is validated and can be tested independently. TailState then performs a Tailscale API check and builds a silent baseline. The status page shows baseline counts, collector capabilities, source health, and delivery state.
+Add destinations on the authenticated Settings page, then save monitoring settings. Each destination is validated and can be tested independently. TailState then performs a Tailscale API check and builds a silent baseline. The status page shows baseline counts, collector capabilities, source health, and delivery state. Rotating the OAuth secret or changing poll intervals refreshes the monitor without discarding the existing baseline; changing the tailnet or OAuth client identity starts a new generation.
 
 The authenticated **History** page keeps a 30-day, searchable ledger of semantic inventory changes. Each poll is grouped into a batch with the affected collector, resource, previous/current normalized snapshots, field-level differences, and the delivery state for every destination. Use it to investigate a notification without exposing credentials or volatile API fields. The page shows the fingerprint of the Ed25519 key used to sign evidence exports.
 
@@ -109,13 +109,20 @@ curl -fsS http://127.0.0.1:8080/readyz
 curl -fsS http://127.0.0.1:8080/metrics
 ```
 
-`/metrics` exposes readiness, pending/dead delivery counts, pending/processing/dead webhook trigger counts, resource counts, and low-cardinality collector health gauges (`supported`, `baseline`, failures, last success, and next poll timestamps) for Prometheus-compatible monitoring. It is unauthenticated when the optional `TAILSTATE_METRICS_TOKEN` is empty (keep the default loopback bind in that case). Set that variable to require `Authorization: Bearer <token>`; requests without the exact token receive `401`. Do not publish an unauthenticated endpoint through a public reverse proxy.
+`/metrics` exposes readiness, pending/dead delivery counts, notification destination totals and enabled counts (plus a paused gauge when every destination is disabled), pending/processing/dead webhook trigger counts, resource counts, low-cardinality collector health gauges (`supported`, `baseline`, partial-result state, partial error count, failures, poll duration, last success, and next poll timestamps), and the scheduler's total database-error counter (`tailstate_collector_due_errors_total`) for Prometheus-compatible monitoring. The `device_details` collector uses a bounded eight-worker fan-out and a two-minute per-collector deadline; usable partial results are retained and marked in the status page and metrics with the number of failed detail requests. When `TAILSTATE_METRICS_TOKEN` is empty, only loopback requests are accepted; remote requests receive `401`. Set that variable for Prometheus or a reverse proxy to require `Authorization: Bearer <token>` from any network location. Do not publish the endpoint without a token through a public reverse proxy.
+
+`/readyz` reports each collector's baseline state. It returns `503` while setup
+is incomplete or before the first baseline; after the 15-minute first-baseline
+grace period, a persistently failing collector is reported as `degraded` and
+readiness remains available for orchestration while the collector continues to
+retry. The response includes sanitized collector names, baseline flags, and
+failure counts without upstream error text.
 
 ## Security and persistence
 
 Compose creates the Docker-managed `tailstate-data` volume and stores `/data/tailstate.db` there. Snapshots, events, baseline state, sessions, and the delivery outbox survive container replacement.
 
-OAuth secrets, the Tailscale webhook secret, every Shoutrrr destination URL, and the evidence-ledger private key are encrypted with AES-256-GCM using `secrets/tailstate_master_key`. Destination credentials and webhook secrets are never echoed into HTML, logs, persisted delivery errors, or the history ledger. Normalized history snapshots are retained for 30 days and exclude volatile and secret fields. OAuth access tokens exist only in memory. Back up the master key separately: TailState intentionally refuses to start if the key is missing or incorrect, and encrypted settings and signed history cannot be recovered without it.
+OAuth secrets, the Tailscale webhook secret, every Shoutrrr destination URL, and the evidence-ledger private key are encrypted with AES-256-GCM using `secrets/tailstate_master_key`. Destination credentials and upstream provider response bodies are never echoed into HTML, logs, persisted delivery errors, or the history ledger; delivery history keeps only bounded, provider-independent status reasons. Normalized history snapshots are retained for 30 days, exclude volatile fields, and replace known secret values with one-way fingerprints so presence and rotation remain auditable without exposing the value. OAuth access tokens exist only in memory. Back up the master key separately: TailState intentionally refuses to start if the key is missing or incorrect, and encrypted settings and signed history cannot be recovered without it.
 
 The image is scratch-based, runs as UID/GID `10001`, uses a read-only root filesystem, drops every Linux capability, and publishes the UI only on `127.0.0.1` by default. Keep that publish address when using a reverse proxy; let the proxy terminate TLS and expose the public listener:
 
@@ -131,15 +138,46 @@ tailstate.example.com {
 }
 ```
 
-Point Caddy or nginx at `http://127.0.0.1:8080` and expose only the proxy's
-HTTPS listener. The proxy must preserve the public `Host` and set
+If the reverse proxy should run in Compose instead of on the host, copy the
+worked example and replace its hostname:
+
+```console
+cp Caddyfile.example Caddyfile
+```
+
+The override uses Compose's `!reset` merge tag (Docker Compose v2.24 or newer)
+to remove the base file's loopback port publish; do not replace it with an
+empty `ports: []` list.
+
+Then use the tracked [`compose.remote.yaml`](compose.remote.yaml) override. It
+removes TailState's host port and exposes only Caddy while keeping the proxy
+and application wiring reproducible.
+
+With the copied `Caddyfile`, start the private listener and HTTPS proxy
+together. The proxy has a public network for ACME certificate renewal and a
+separate fixed-address private network for TailState. The fixed proxy address and
+`TAILSTATE_TRUSTED_PROXIES` setting are paired intentionally; if you choose a
+different subnet or proxy address, change both values together:
+
+```console
+docker compose -f compose.yaml -f compose.remote.yaml up -d
+```
+
+For a host-installed Caddy or nginx, point the proxy at `http://127.0.0.1:8080`
+and expose only the proxy's HTTPS listener. `TAILSTATE_BIND_ADDRESS` controls only the host-side Compose
+port publish; it does not change the in-container `TAILSTATE_LISTEN_ADDR`.
+The proxy must preserve the public `Host` and set
 `X-Forwarded-Proto: https` so same-origin form protection and secure cookies
 work as intended. Do not set `TAILSTATE_BIND_ADDRESS=0.0.0.0` unless a firewall
 and TLS-terminating proxy already restrict access to the host port.
 
-If the proxy forwards the original client address, configure only its actual
-source address as trusted, for example `TAILSTATE_TRUSTED_PROXIES=127.0.0.1/32`.
-TailState ignores `X-Forwarded-For` from every other peer.
+If the proxy forwards the original client address or terminates TLS, configure
+only its actual source address as trusted, for example
+`TAILSTATE_TRUSTED_PROXIES=127.0.0.1/32`. TailState ignores
+`X-Forwarded-For` and `X-Forwarded-Proto` from every other peer.
+Enabling `TAILSTATE_COOKIE_SECURE=true` without a trusted proxy is rejected at
+startup because this binary serves plain HTTP and must receive the proxy's
+authenticated HTTPS indication.
 
 Do not expose the setup interface directly to the internet.
 
@@ -194,11 +232,16 @@ Back up `secrets/tailstate_master_key` separately and securely. A backup is
 only useful with the matching master key: TailState intentionally refuses to
 open encrypted state with a different key.
 
+The backup and restore helpers use the single Renovate-managed pinned BusyBox
+sidecar in `scripts/backup-image.sh`; CI and release jobs scan that sidecar
+separately. Set `TAILSTATE_BACKUP_IMAGE` only for an explicitly reviewed
+override.
+
 Restore into the same Compose project only after confirming the archive and
 key are from the same point in time. The command requires an explicit
-`--yes`, verifies the checksum when present, rejects unsafe archive paths, and
-creates a pre-restore archive beside the source archive before replacing the
-data volume:
+`--yes`, verifies the checksum when present, rejects unsafe paths and
+symlink/device/FIFO entries before touching the data volume, and creates a
+pre-restore archive beside the source archive before replacing the data volume:
 
 ```console
 ./scripts/restore.sh ./backups/tailstate-data-20260813T120000Z.tar.gz --yes
@@ -207,9 +250,11 @@ curl -fsS http://127.0.0.1:8080/healthz
 curl -fsS http://127.0.0.1:8080/readyz
 ```
 
-The service is restarted only after a successful restore. If extraction or
-replacement fails, it remains stopped and the script attempts to restore the
-previous data directory; inspect the pre-restore archive before starting it.
+The service is restarted only after a successful restore. The replacement is
+staged inside the data volume and applied with same-filesystem renames; if a
+rename fails, the script rolls the previous entries back without copying the
+live database. If extraction or replacement still fails, the service remains
+stopped; inspect the pre-restore archive before starting it.
 
 After a restore, sign in and verify that the expected History, evidence,
 notification destinations, and monitoring settings are present. Keep the
@@ -229,14 +274,23 @@ in a disposable project before relying on the procedure for an outage.
 - Shoutrrr deliveries retry independently for up to 24 hours across restarts, then remain visible as dead letters until the 30-day operational retention window expires. Disabling or removing a destination dead-letters its pending items; newly added destinations receive only future notifications.
 - If every destination is disabled, monitoring continues and notifications are reported as paused.
 - API collector failures alert after three consecutive failures and once on recovery.
-- Plan-specific unavailable endpoints appear as unsupported and retry every six hours.
+- A single 403/404 from an optional plan-specific endpoint is marked unsupported
+  and retried every six hours; an established baseline and snapshots remain
+  intact across that interval, so recovery reports drift instead of silently
+  rebasing.
 - Starting a different TailState release queues one durable notification containing the previous and current versions.
 
 Version tracking is introduced in v0.3.0. Its first startup records the release silently because earlier releases did not persist their version; subsequent upgrades include both exact versions in the notification.
 
 ### Migration from older releases
 
-On the first startup after this upgrade, an existing encrypted Mattermost webhook is converted automatically to a native `mattermost://` destination when it uses the standard `/hooks/<token>` path. Other paths are preserved as a `generic://` JSON webhook with the existing TailState username and satellite icon. Existing pending outbox items are assigned to the migrated destination. The legacy encrypted column is retained but no longer used for new configuration.
+Before upgrading an existing data volume, stop TailState and create a verified
+backup with the matching master key. Startup verifies that key before applying
+schema changes; a wrong key therefore exits without mutating the database. If a
+migration fails, leave the service stopped, keep the original database and key,
+and restore the pre-upgrade archive before retrying or rolling back the image.
+
+On the first startup after this upgrade, an existing encrypted Mattermost webhook is converted automatically to a native `mattermost://` destination when it uses the standard `/hooks/<token>` path. Other paths are preserved as a `generic://` JSON webhook with the existing TailState username and satellite icon. Existing pending outbox items are assigned to the migrated destination; if no legacy destination is configured, those orphaned pending rows are retained as dead letters with a safe explanation instead of remaining undeliverable forever. The legacy encrypted column is retained but no longer used for new configuration.
 
 The schema v4 migration also adds encrypted storage for the optional Tailscale
 webhook secret, a deduplicated webhook trigger ledger, and trigger IDs on
@@ -244,13 +298,25 @@ history batches. Schema v5 adds trigger leases, retry state, and many-to-many
 links between coalesced triggers and history batches. Existing installations
 start with webhook acceleration disabled until a secret is entered in Settings.
 Schema v6 adds the encrypted Ed25519 evidence key and the hash-linked evidence
-ledger. Existing event batches are signed automatically on
-the first startup after the upgrade; the public-key fingerprint is shown on the
+ledger. Existing complete event batches are signed automatically once on the
+first startup after the upgrade; the migration records a durable batch cutoff,
+so rows written after the upgrade can never be promoted into that historical
+backfill. TailState never infers a missing cutoff from live rows, so a database
+row written directly outside the versioned migration is not silently treated as
+historical evidence. Empty or incomplete database rows are not promoted into the
+historical chain. The public-key fingerprint is shown on the
 History page and new exports use signed evidence format version 3. Version 3
-packs embed the signed ledger payloads and the intervening chain links so an
-offline verifier can recompute selected entries and detect gaps between them.
-Schema v7 adds expiring, revocable setup and password-reset token records. It
-also bounds notification retries to 24 hours and removes dead-letter rows after
+packs embed the signed ledger payloads, intervening chain links, and the
+preceding checkpoint for filtered or paginated ranges so an offline verifier
+can recompute selected entries and detect gaps between them. Ledger rows are
+retained after event snapshots age out, preserving the checkpoint needed to
+distinguish normal retention from a broken chain.
+Schema v7 adds expiring, revocable setup and password-reset token records. Schema
+v8 records the latest collector poll duration and whether its result was partial,
+so the status page and metrics can distinguish usable-but-degraded data from a
+fully successful poll. Schema v9 records the number of failed related requests in
+the latest partial collector result. The schema v7 migration also bounds notification retries
+to 24 hours and removes dead-letter rows after
 the normal 30-day retention period. Legacy token hashes remain only as a
 rollback aid and are removed by cleanup once their active token record expires.
 
@@ -261,18 +327,25 @@ the optional webhook secret are entered in the authenticated UI.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `TAILSTATE_LISTEN_ADDR` | `0.0.0.0:8080` | Listener inside the container |
+| `TAILSTATE_LISTEN_ADDR` | `127.0.0.1:8080` | Listener for a standalone binary; the image sets `0.0.0.0:8080` inside the container |
 | `TAILSTATE_DATA_DIR` | `/data` | SQLite directory |
 | `TAILSTATE_MASTER_KEY_FILE` | `/run/secrets/tailstate_master_key` | 32-byte or base64 master key |
+| `TAILSTATE_MEMORY_LIMIT` | `512m` | Compose-only container memory ceiling; increase only after sizing for the deployment |
 | `TAILSTATE_COOKIE_SECURE` | `false` | Require HTTPS for session cookies |
-| `TAILSTATE_METRICS_TOKEN` | empty | Optional bearer token protecting `/metrics` |
-| `TAILSTATE_TRUSTED_PROXIES` | empty | Comma-separated proxy IPs/CIDRs allowed to supply `X-Forwarded-For` |
+| `TAILSTATE_METRICS_TOKEN` | empty | Loopback-only `/metrics` when empty; bearer token for remote scrapes |
+| `TAILSTATE_TRUSTED_PROXIES` | empty | Comma-separated proxy IPs/CIDRs allowed to supply `X-Forwarded-For` and `X-Forwarded-Proto` |
 | `TAILSTATE_LOG_LEVEL` | `info` | `info` or `debug` structured logging |
 
 The test-only `TAILSTATE_TS_API_URL` and `TAILSTATE_TS_OAUTH_URL` variables allow local mock servers; production deployments should leave them unset.
 
+Standalone binaries bind the authenticated UI to loopback by default. If you
+explicitly bind a plaintext listener beyond loopback, TailState logs a warning;
+use `TAILSTATE_COOKIE_SECURE=true` and a configured trusted HTTPS proxy for
+remote access. Compose keeps the application listener on the private container
+network and publishes it on loopback by default.
+
 `TAILSTATE_CONTAINER_NAME`, `TAILSTATE_IMAGE`, `TAILSTATE_BIND_ADDRESS`,
-`TAILSTATE_PORT`, and `TAILSTATE_MASTER_KEY_FILE` are Compose-file variables;
+`TAILSTATE_PORT`, `TAILSTATE_MASTER_KEY_FILE`, and `TAILSTATE_MEMORY_LIMIT` are Compose-file variables;
 they select the container name/image, host publishing address/port, and secret
 file mount. They are not read as application settings by a standalone binary.
 
@@ -297,9 +370,19 @@ TAILSTATE_MASTER_KEY_FILE="$PWD/secrets/tailstate_master_key" \
 go run ./cmd/tailstate serve
 ```
 
+Before changing the container or persistence path, run the isolated Compose
+smoke test used by CI:
+
+```console
+bash scripts/compose-smoke.sh tailstate:dev
+```
+
+Contributor workflow, security boundaries, and the complete validation matrix
+are documented in [CONTRIBUTING.md](CONTRIBUTING.md).
+
 ## Releases
 
-Pushing a semantic tag such as `v1.0.0` starts the verified release promotion workflow. The exact tagged commit must pass the reusable CI gate, including tests, coverage, Staticcheck, Govulncheck, an Anchore high-severity scan, runtime healthchecks, backup/restore validation, and a multi-architecture build. Release promotion first pushes one immutable candidate manifest, scans and smoke-tests both platform images by digest, and only then assigns the version, minor, and `latest` tags to that same verified digest. The workflow publishes signed-build metadata, an SBOM, and `linux/amd64` plus `linux/arm64` images to:
+Pushing a semantic tag such as `v1.0.0` starts the verified release promotion workflow. The exact tagged commit must pass the reusable CI gate, including tests, coverage, Staticcheck, Govulncheck, an Anchore high-severity scan, runtime healthchecks, backup/restore validation, and a multi-architecture build. Release promotion first pushes one immutable candidate manifest, scans and smoke-tests both platform images by digest, and only then creates an annotated stable manifest copy whose platform digests match the candidate. The version, minor, and stable-only `latest` tags point to that verified copy; the temporary candidate package version is removed after the aliases are verified. The workflow publishes signed-build metadata, an SBOM, and `linux/amd64` plus `linux/arm64` images to:
 
 ```text
 ghcr.io/crypt0rr/tailstate

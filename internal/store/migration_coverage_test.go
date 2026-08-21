@@ -111,6 +111,8 @@ func TestVersionedMigrationsReportSchemaWriteErrors(t *testing.T) {
 		{version: 4, call: migrateSchemaV4ToV5, trigger: "fail_durable_webhook_schema_version", want: "record durable webhook migration"},
 		{version: 5, call: migrateSchemaV5ToV6, trigger: "fail_evidence_schema_version", want: "record evidence ledger migration"},
 		{version: 6, call: migrateSchemaV6ToV7, trigger: "fail_auth_schema_version", want: "record authentication token migration"},
+		{version: 7, call: migrateSchemaV7ToV8, trigger: "fail_collector_telemetry_schema_version", want: "record collector telemetry migration"},
+		{version: 8, call: migrateSchemaV8ToV9, trigger: "fail_partial_error_count_schema_version", want: "record partial error count migration"},
 	}
 	for _, tt := range tests {
 		t.Run("version "+strconv.Itoa(tt.version), func(t *testing.T) {
@@ -122,6 +124,144 @@ func TestVersionedMigrationsReportSchemaWriteErrors(t *testing.T) {
 				t.Fatalf("migration error=%v, want substring %q", err, tt.want)
 			}
 		})
+	}
+}
+
+func TestMigrateSchemaV7ToV8AddsCollectorTelemetry(t *testing.T) {
+	db := migrationErrorDB(t)
+	if _, err := db.Exec(`CREATE TABLE schema_version(version INTEGER NOT NULL);
+INSERT INTO schema_version VALUES(7);
+CREATE TABLE collector_state(
+  generation INTEGER NOT NULL,
+  collector TEXT NOT NULL,
+  supported INTEGER NOT NULL DEFAULT 1,
+  baseline INTEGER NOT NULL DEFAULT 0,
+  last_success TEXT,
+  last_error TEXT NOT NULL DEFAULT '',
+  failure_count INTEGER NOT NULL DEFAULT 0,
+  unhealthy_notified INTEGER NOT NULL DEFAULT 0,
+  next_poll TEXT,
+  PRIMARY KEY(generation,collector)
+);
+INSERT INTO collector_state(generation,collector) VALUES(1,'devices');`); err != nil {
+		t.Fatal(err)
+	}
+	if err := migrateSchemaV7ToV8(db); err != nil {
+		t.Fatal(err)
+	}
+	var version int
+	if err := db.QueryRow("SELECT version FROM schema_version").Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if version != 8 {
+		t.Fatalf("schema version=%d, want 8", version)
+	}
+	for _, column := range []string{"poll_duration_ms", "partial"} {
+		var found int
+		if err := db.QueryRow("SELECT COUNT(*) FROM pragma_table_info('collector_state') WHERE name=?", column).Scan(&found); err != nil {
+			t.Fatal(err)
+		}
+		if found != 1 {
+			t.Fatalf("collector telemetry column %q missing", column)
+		}
+	}
+	var duration int64
+	var partial int
+	if err := db.QueryRow("SELECT poll_duration_ms,partial FROM collector_state WHERE generation=1 AND collector='devices'").Scan(&duration, &partial); err != nil {
+		t.Fatal(err)
+	}
+	if duration != 0 || partial != 0 {
+		t.Fatalf("collector telemetry defaults duration=%d partial=%d", duration, partial)
+	}
+}
+
+func TestMigrateSchemaV8ToV9AddsPartialErrorCount(t *testing.T) {
+	db := migrationErrorDB(t)
+	if _, err := db.Exec(`CREATE TABLE schema_version(version INTEGER NOT NULL);
+INSERT INTO schema_version VALUES(8);
+CREATE TABLE collector_state(
+  generation INTEGER NOT NULL,
+  collector TEXT NOT NULL,
+  supported INTEGER NOT NULL DEFAULT 1,
+  baseline INTEGER NOT NULL DEFAULT 0,
+  last_success TEXT,
+  last_error TEXT NOT NULL DEFAULT '',
+  failure_count INTEGER NOT NULL DEFAULT 0,
+  unhealthy_notified INTEGER NOT NULL DEFAULT 0,
+  next_poll TEXT,
+  poll_duration_ms INTEGER NOT NULL DEFAULT 0,
+  partial INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY(generation,collector)
+);
+INSERT INTO collector_state(generation,collector) VALUES(1,'device_details');`); err != nil {
+		t.Fatal(err)
+	}
+	if err := migrateSchemaV8ToV9(db); err != nil {
+		t.Fatal(err)
+	}
+	var version, found, count int
+	if err := db.QueryRow("SELECT version FROM schema_version").Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if version != 9 {
+		t.Fatalf("schema version=%d, want 9", version)
+	}
+	if err := db.QueryRow("SELECT COUNT(*) FROM pragma_table_info('collector_state') WHERE name='partial_error_count'").Scan(&found); err != nil {
+		t.Fatal(err)
+	}
+	if found != 1 {
+		t.Fatal("partial error count column missing")
+	}
+	if err := db.QueryRow("SELECT partial_error_count FROM collector_state WHERE generation=1 AND collector='device_details'").Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("partial error count default=%d, want 0", count)
+	}
+}
+
+func TestMigrateSchemaV8ToV9ReportsMissingCollectorState(t *testing.T) {
+	db := migrationErrorDB(t)
+	if _, err := db.Exec(`CREATE TABLE schema_version(version INTEGER NOT NULL);
+INSERT INTO schema_version VALUES(8);`); err != nil {
+		t.Fatal(err)
+	}
+	if err := migrateSchemaV8ToV9(db); err == nil || !strings.Contains(err.Error(), "add collector_state.partial_error_count") {
+		t.Fatalf("missing collector state migration error=%v", err)
+	}
+}
+
+func TestMigrateSchemaV7ToV8RecordsEvidenceBackfillCutoff(t *testing.T) {
+	db := migrationErrorDB(t)
+	if _, err := db.Exec(`CREATE TABLE schema_version(version INTEGER NOT NULL);
+INSERT INTO schema_version VALUES(7);
+CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+CREATE TABLE event_batches(id INTEGER PRIMARY KEY AUTOINCREMENT);
+CREATE TABLE collector_state(
+  generation INTEGER NOT NULL,
+  collector TEXT NOT NULL,
+  supported INTEGER NOT NULL DEFAULT 1,
+  baseline INTEGER NOT NULL DEFAULT 0,
+  last_success TEXT,
+  last_error TEXT NOT NULL DEFAULT '',
+  failure_count INTEGER NOT NULL DEFAULT 0,
+  unhealthy_notified INTEGER NOT NULL DEFAULT 0,
+  next_poll TEXT,
+  PRIMARY KEY(generation,collector)
+);
+INSERT INTO event_batches DEFAULT VALUES;
+INSERT INTO event_batches DEFAULT VALUES;`); err != nil {
+		t.Fatal(err)
+	}
+	if err := migrateSchemaV7ToV8(db); err != nil {
+		t.Fatal(err)
+	}
+	var cutoff string
+	if err := db.QueryRow("SELECT value FROM meta WHERE key=?", evidenceLedgerBackfillCutoff).Scan(&cutoff); err != nil {
+		t.Fatal(err)
+	}
+	if cutoff != "2" {
+		t.Fatalf("evidence ledger cutoff=%q, want 2", cutoff)
 	}
 }
 

@@ -4,7 +4,7 @@ set -euo pipefail
 usage() {
     echo "usage: $0 ARCHIVE.tar.gz --yes [COMPOSE_SERVICE]" >&2
     echo "       A pre-restore archive is created beside ARCHIVE before replacement." >&2
-    echo "       TAILSTATE_BACKUP_IMAGE may override the pinned Alpine sidecar" >&2
+    echo "       TAILSTATE_BACKUP_IMAGE may override the pinned BusyBox sidecar" >&2
 }
 
 if [[ ${1:-} == "-h" || ${1:-} == "--help" ]]; then
@@ -18,8 +18,8 @@ fi
 
 archive="$(cd "$(dirname "$1")" && pwd -P)/$(basename "$1")"
 service="${3:-tailstate}"
-# renovate: datasource=docker depName=alpine
-backup_image="${TAILSTATE_BACKUP_IMAGE:-alpine:3.24@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b}"
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+backup_image="$(bash "$script_dir/backup-image.sh")"
 host_uid="$(id -u)"
 host_gid="$(id -g)"
 
@@ -48,6 +48,15 @@ if ! entries="$(docker run --rm --volume "$archive_dir:/backup:ro" "$backup_imag
 fi
 if printf '%s\n' "$entries" | grep -Eq '(^/|(^|/)\.\.(\/|$))'; then
     echo "archive contains an unsafe absolute or parent-directory path" >&2
+    exit 1
+fi
+if ! entry_types="$(docker run --rm --volume "$archive_dir:/backup:ro" "$backup_image" tar tvzf "/backup/$archive_name")"; then
+    echo "archive metadata cannot be inspected: $archive" >&2
+    exit 1
+fi
+unsafe_type="$(printf '%s\n' "$entry_types" | awk 'substr($1, 1, 1) ~ /^[lbcpsh]$/ { print; exit }')"
+if [[ -n "$unsafe_type" ]]; then
+    echo "archive contains an unsafe link or special file: $unsafe_type" >&2
     exit 1
 fi
 
@@ -88,20 +97,38 @@ docker run --rm \
     --volume "$archive_dir:/backup:ro" \
     "$backup_image" \
     sh -ec '
-        restore_dir="$(mktemp -d /tmp/tailstate-restore.XXXXXX)"
-        previous_dir="$(mktemp -d /tmp/tailstate-previous.XXXXXX)"
-        backup_ready=0
+        restore_dir="$(mktemp -d /data/.tailstate-restore.XXXXXX)"
+        previous_dir="$(mktemp -d /data/.tailstate-previous.XXXXXX)"
+        # 0: staged only, 1: old entries are moving, 2: new entries are
+        # moving, 3: replacement committed. The phase lets rollback restore
+        # the right set if a rename fails midway through either pass.
+        phase=0
+        move_entries() {
+            source="$1"
+            target="$2"
+            for entry in "$source"/* "$source"/.[!.]* "$source"/..?*; do
+                [ -e "$entry" ] || [ -L "$entry" ] || continue
+                [ "$entry" = "$restore_dir" ] && continue
+                [ "$entry" = "$previous_dir" ] && continue
+                mv -- "$entry" "$target"/
+            done
+        }
         restore_failed() {
             status=$?
             trap - EXIT
-            if [ "$status" -ne 0 ] && [ "$backup_ready" -eq 1 ]; then
-                rm -rf /data/* /data/.[!.]* /data/..?* 2>/dev/null || true
-                cp -a "$previous_dir"/. /data/ || {
+            if [ "$status" -ne 0 ] && [ "$phase" -eq 1 ]; then
+                move_entries "$previous_dir" /data || status=1
+            elif [ "$status" -ne 0 ] && [ "$phase" -eq 2 ]; then
+                # Both temporary directories live in the data volume, so all
+                # moves are same-filesystem renames. Roll back any partially
+                # applied replacement without copying the original database.
+                move_entries /data "$restore_dir" || status=1
+                move_entries "$previous_dir" /data || status=1
+                if [ "$status" -ne 0 ]; then
                     echo "restore rollback failed; recover from the pre-restore archive" >&2
-                    status=1
-                }
+                fi
             fi
-            rm -rf "$restore_dir" "$previous_dir"
+            rm -rf "$restore_dir" "$previous_dir" 2>/dev/null || true
             exit "$status"
         }
         trap restore_failed EXIT
@@ -111,10 +138,12 @@ docker run --rm \
             echo "archive contains an unsafe special file: $unsafe" >&2
             exit 1
         fi
-        cp -a /data/. "$previous_dir"/
-        backup_ready=1
-        find /data -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
-        cp -a "$restore_dir"/. /data/
+        phase=1
+        move_entries /data "$previous_dir"
+        phase=2
+        move_entries "$restore_dir" /data
+        phase=3
+        rm -rf "$restore_dir" "$previous_dir"
     ' -- "$archive_name"
 
 printf 'Restored %s into the %s data volume.\nPre-restore backup: %s\n' "$archive" "$service" "$pre_restore_path"

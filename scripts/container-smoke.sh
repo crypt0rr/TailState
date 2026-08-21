@@ -9,12 +9,21 @@ run_id="${GITHUB_RUN_ID:-local}-${BASHPID}"
 container_name="tailstate-smoke-${run_id}"
 volume_name="tailstate-smoke-${run_id}"
 key_file="$(mktemp)"
+host_uid="$(id -u)"
+host_gid="$(id -g)"
 
 # The function is invoked indirectly by the EXIT trap.
 # shellcheck disable=SC2317
 cleanup() {
     docker rm -f "$container_name" >/dev/null 2>&1 || true
     docker volume rm "$volume_name" >/dev/null 2>&1 || true
+    if [[ -e "$key_file" ]]; then
+        docker run --rm --user 0 \
+            --volume "$key_file:/run/secrets/cleanup-key" \
+            "$backup_image" \
+            sh -ec 'chown "$1:$2" /run/secrets/cleanup-key && chmod 0600 /run/secrets/cleanup-key' \
+            -- "$host_uid" "$host_gid" >/dev/null 2>&1 || true
+    fi
     rm -f "$key_file"
 }
 trap cleanup EXIT

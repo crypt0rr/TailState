@@ -6,6 +6,8 @@ port="${2:-18083}"
 run_id="${GITHUB_RUN_ID:-local}-${BASHPID}"
 container_name="tailstate-backup-smoke-${run_id}"
 key_file="$(mktemp)"
+host_uid="$(id -u)"
+host_gid="$(id -g)"
 backup_dir="$(mktemp -d)"
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 compose_file="$repo_dir/compose.yaml"
@@ -20,6 +22,13 @@ cleanup() {
         COMPOSE_PROJECT_NAME="tailstate-backup-smoke-${run_id}" \
         docker compose -f "$compose_file" down -v >/dev/null 2>&1 || true
     rm -rf "$backup_dir"
+    if [[ -e "$key_file" ]]; then
+        docker run --rm --user 0 \
+            --volume "$key_file:/run/secrets/cleanup-key" \
+            "$backup_image" \
+            sh -ec 'chown "$1:$2" /run/secrets/cleanup-key && chmod 0600 /run/secrets/cleanup-key' \
+            -- "$host_uid" "$host_gid" >/dev/null 2>&1 || true
+    fi
     rm -f "$key_file"
 }
 wait_health() {

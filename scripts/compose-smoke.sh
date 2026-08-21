@@ -9,6 +9,8 @@ run_id="${GITHUB_RUN_ID:-local}-${BASHPID}"
 project="tailstate-compose-smoke-${run_id}"
 container_name="tailstate-compose-${run_id}"
 key_file="$(mktemp)"
+host_uid="$(id -u)"
+host_gid="$(id -g)"
 
 # The function is invoked indirectly by the EXIT trap.
 # shellcheck disable=SC2317
@@ -19,6 +21,13 @@ cleanup() {
         TAILSTATE_PORT="$port" \
         TAILSTATE_MASTER_KEY_FILE="$key_file" \
         docker compose -f "$repo_dir/compose.yaml" down --volumes --remove-orphans >/dev/null 2>&1 || true
+    if [[ -n "${backup_image:-}" && -e "$key_file" ]]; then
+        docker run --rm --user 0 \
+            --volume "$key_file:/run/secrets/cleanup-key" \
+            "$backup_image" \
+            sh -ec 'chown "$1:$2" /run/secrets/cleanup-key && chmod 0600 /run/secrets/cleanup-key' \
+            -- "$host_uid" "$host_gid" >/dev/null 2>&1 || true
+    fi
     rm -f "$key_file"
 }
 trap cleanup EXIT

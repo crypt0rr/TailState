@@ -159,12 +159,29 @@ func TestPollHandlesUnsupportedFailureAndRecovery(t *testing.T) {
 		t.Fatalf("unsupported collector retry was scheduled too soon: %q", unsupportedNext)
 	}
 	status.Store(http.StatusInternalServerError)
+	if engine.poll(ctx, client, settings, []string{"users"}, true) {
+		t.Fatal("transient failure after unsupported state unexpectedly succeeded")
+	}
+	current, err := st.Status(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var users store.CollectorState
+	for _, collector := range current.Collectors {
+		if collector.Name == "users" {
+			users = collector
+		}
+	}
+	if !users.Supported || users.LastError == "" || users.LastError == "unsupported" {
+		t.Fatalf("transient failure retained unsupported health state: %+v", users)
+	}
+
 	for i := 0; i < 3; i++ {
 		if engine.poll(ctx, client, settings, []string{"devices"}, true) {
 			t.Fatalf("failed collector poll %d unexpectedly succeeded", i+1)
 		}
 	}
-	current, err := st.Status(ctx)
+	current, err = st.Status(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}

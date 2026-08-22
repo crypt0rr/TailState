@@ -303,7 +303,12 @@ func (s *Store) RecordCollectorFailure(ctx context.Context, generation int64, co
 	if notify {
 		notified = 1
 	}
-	_, err = tx.ExecContext(ctx, `INSERT INTO collector_state(generation,collector,supported,baseline,last_error,failure_count,unhealthy_notified,partial,partial_error_count) VALUES(?,?,1,0,?,?,?,0,0) ON CONFLICT(generation,collector) DO UPDATE SET last_error=excluded.last_error,failure_count=excluded.failure_count,unhealthy_notified=excluded.unhealthy_notified,partial=0,partial_error_count=0`, generation, collector, message, failures, notified)
+	// A non-unsupported error proves that the endpoint is reachable enough to
+	// classify the collector as supported, even if it is currently unhealthy.
+	// This also lets the UI distinguish a transient failure after an explicit
+	// unsupported response from a still-unsupported collector. Preserve the
+	// existing baseline: failures must not reset drift comparison state.
+	_, err = tx.ExecContext(ctx, `INSERT INTO collector_state(generation,collector,supported,baseline,last_error,failure_count,unhealthy_notified,partial,partial_error_count) VALUES(?,?,1,0,?,?,?,0,0) ON CONFLICT(generation,collector) DO UPDATE SET supported=1,last_error=excluded.last_error,failure_count=excluded.failure_count,unhealthy_notified=excluded.unhealthy_notified,partial=0,partial_error_count=0`, generation, collector, message, failures, notified)
 	if err != nil {
 		return false, false, err
 	}

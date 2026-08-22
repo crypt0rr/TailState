@@ -61,10 +61,11 @@ func TestEmptyCollectionResponses(t *testing.T) {
 		wantErr   bool
 		wantMatch string
 	}{
-		{name: "user invites missing array", collector: "user_invites", path: "/api/v2/tailnet/-/user-invites", body: `{}`, wantErr: true},
+		{name: "user invites missing array", collector: "user_invites", path: "/api/v2/tailnet/-/user-invites", body: `{}`, wantErr: true, wantMatch: "empty collection must be returned as []"},
 		{name: "user invites top-level array", collector: "user_invites", path: "/api/v2/tailnet/-/user-invites", body: `[]`},
-		{name: "webhooks missing array", collector: "webhooks", path: "/api/v2/tailnet/-/webhooks", body: `{}`, wantErr: true},
+		{name: "webhooks missing array", collector: "webhooks", path: "/api/v2/tailnet/-/webhooks", body: `{}`, wantErr: true, wantMatch: "empty collection must be returned as []"},
 		{name: "webhooks null array", collector: "webhooks", path: "/api/v2/tailnet/-/webhooks", body: `{"webhooks":null}`, wantErr: true},
+		{name: "webhooks wrong array type", collector: "webhooks", path: "/api/v2/tailnet/-/webhooks", body: `{"webhooks":{}}`, wantErr: true, wantMatch: "empty collection must be returned as []"},
 		{name: "webhooks empty array", collector: "webhooks", path: "/api/v2/tailnet/-/webhooks", body: `{"webhooks":[]}`},
 		{name: "webhooks non-object item", collector: "webhooks", path: "/api/v2/tailnet/-/webhooks", body: `{"webhooks":[null]}`, wantErr: true, wantMatch: "contains a non-object item"},
 		{name: "strict collection still rejects missing array", collector: "users", path: "/api/v2/tailnet/-/users", body: `{}`, wantErr: true},
@@ -239,6 +240,44 @@ func TestDeviceDetailsDoNotRefetchCoreDevice(t *testing.T) {
 	data, ok := resources[0].Data.(map[string]any)
 	if !ok || data["routes"] == nil || data["postureAttributes"] == nil || data["deviceInvites"] == nil {
 		t.Fatalf("secondary details missing: %#v", resources[0].Data)
+	}
+}
+
+func TestBeginPollRefreshesDeviceDetailsList(t *testing.T) {
+	deviceListCalls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/oauth/token":
+			_, _ = w.Write([]byte(`{"access_token":"access","expires_in":3600}`))
+		case "/api/v2/tailnet/-/devices":
+			deviceListCalls++
+			if deviceListCalls == 1 {
+				_, _ = w.Write([]byte(`{"devices":[{"id":"old","hostname":"old"}]}`))
+			} else {
+				_, _ = w.Write([]byte(`{"devices":[{"id":"new","hostname":"new"}]}`))
+			}
+		case "/api/v2/device/new/routes", "/api/v2/device/new/attributes", "/api/v2/device/new/device-invites":
+			_, _ = w.Write([]byte(`{}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	client := New(server.URL+"/api/v2", server.URL+"/oauth/token", "test", Credentials{ClientID: "id", ClientSecret: "secret"})
+	if _, err := client.Collect(context.Background(), "devices"); err != nil {
+		t.Fatal(err)
+	}
+	client.BeginPoll()
+	resources, err := client.Collect(context.Background(), "device_details")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deviceListCalls != 2 {
+		t.Fatalf("device list calls=%d, want a fresh list after BeginPoll", deviceListCalls)
+	}
+	if len(resources) != 1 || resources[0].ID != "new" {
+		t.Fatalf("device details used a stale device list: %#v", resources)
 	}
 }
 
@@ -435,5 +474,30 @@ func TestPaginationCannotLeaveConfiguredAPIOrigin(t *testing.T) {
 	}
 	if externalCalls != 0 {
 		t.Fatalf("external pagination target was requested %d time(s)", externalCalls)
+	}
+}
+
+func TestPaginationRejectsRepeatedPageURL(t *testing.T) {
+	var deviceRequests int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/oauth/token":
+			_, _ = w.Write([]byte(`{"access_token":"access","expires_in":3600}`))
+		case "/api/v2/tailnet/-/devices":
+			deviceRequests++
+			_, _ = w.Write([]byte(`{"devices":[{"id":"1"}],"next":"/api/v2/tailnet/-/devices?fields=all"}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	client := New(server.URL+"/api/v2", server.URL+"/oauth/token", "test", Credentials{ClientID: "id", ClientSecret: "secret"})
+	resources, err := client.Collect(context.Background(), "devices")
+	if err == nil || !strings.Contains(err.Error(), "pagination repeated the same page URL") {
+		t.Fatalf("repeated pagination URL error=%v resources=%#v", err, resources)
+	}
+	if deviceRequests != 1 {
+		t.Fatalf("repeated pagination URL was requested %d times, want 1", deviceRequests)
 	}
 }

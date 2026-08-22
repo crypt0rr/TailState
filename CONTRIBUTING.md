@@ -14,12 +14,25 @@ Run the same fast checks used by CI:
 
 ```console
 gofmt -w cmd internal
+go mod tidy -diff
 go vet ./...
 go test -race -covermode=atomic -coverpkg=./... -coverprofile=coverage.out ./...
 go tool staticcheck ./...
 go tool govulncheck ./...
 git diff --check
 ```
+
+When changing dependency declarations or the Renovate configuration, also
+validate the updater metadata and its local dependency lookup:
+
+```console
+npx --yes -p renovate renovate-config-validator renovate.json
+RENOVATE_LOG_LEVEL=warn npx --yes -p renovate renovate --platform=local --dry-run=lookup
+```
+
+The module tidy check is intentional: Go analysis tools are declared in
+`go.mod`, so their content checksums must be present in `go.sum` for a clean
+runner to execute `go tool staticcheck` and `go tool govulncheck`.
 
 For container or Compose changes, also run:
 

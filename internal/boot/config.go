@@ -154,7 +154,17 @@ func ReadMasterKeyFile(path string) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read master key %s: %w", path, err)
 	}
+	// Prefer an exact raw 32-byte file before trying textual encodings. A raw
+	// key is allowed to contain only Base64 characters; decoding such a key
+	// first would turn it into a shorter value and reject an otherwise valid
+	// master key.
+	if len(raw) == 32 {
+		return append([]byte(nil), raw...), nil
+	}
 	value := strings.TrimSpace(string(raw))
+	if len(value) == 32 {
+		return []byte(value), nil
+	}
 	key, err := base64.StdEncoding.DecodeString(value)
 	if err != nil {
 		key = []byte(value)

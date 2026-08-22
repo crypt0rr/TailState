@@ -182,7 +182,7 @@ func (e *Engine) scheduler(ctx context.Context) {
 		}
 		settingsChanged := client == nil || currentRevision != settingsRevision
 		if settingsChanged {
-			identityChanged := client == nil || generation != current.Generation
+			identityChanged := schedulerIdentityChanged(client, generation, current.Generation)
 			generation = current.Generation
 			settingsRevision = currentRevision
 			settings = current
@@ -209,12 +209,15 @@ func (e *Engine) scheduler(ctx context.Context) {
 					collectors = allCollectors()
 				}
 				requestedIDs := requestTriggerIDs(request)
-				triggerIDs := e.claimFastTriggers(ctx, requestedIDs)
+				claims := e.claimFastTriggerClaims(ctx, requestedIDs)
+				triggerIDs := webhookTriggerIDs(claims)
 				if len(requestedIDs) > 0 && len(triggerIDs) == 0 {
 					continue
 				}
-				success := e.poll(ctx, client, settings, collectors, true, triggerIDs...)
-				e.finishTriggers(ctx, triggerIDs, success, 1)
+				outcome := e.pollWithOutcomes(ctx, client, settings, collectors, true, triggerIDs...)
+				for _, claim := range claims {
+					e.finishClaimedTriggers(ctx, []store.WebhookTrigger{claim}, outcome.succeeds(claim.Collectors), claim.Attempts)
+				}
 			}
 			continue
 		}
@@ -231,7 +234,6 @@ func (e *Engine) scheduler(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-e.wake:
-			client = nil
 			continue
 		case request := <-e.trigger:
 			collectors := request.Collectors
@@ -239,28 +241,101 @@ func (e *Engine) scheduler(ctx context.Context) {
 				collectors = allCollectors()
 			}
 			requestedIDs := requestTriggerIDs(request)
-			triggerIDs := e.claimFastTriggers(ctx, requestedIDs)
+			claims := e.claimFastTriggerClaims(ctx, requestedIDs)
+			triggerIDs := webhookTriggerIDs(claims)
 			if len(requestedIDs) > 0 && len(triggerIDs) == 0 {
 				continue
 			}
-			success := e.poll(ctx, client, settings, collectors, true, triggerIDs...)
-			e.finishTriggers(ctx, triggerIDs, success, 1)
+			outcome := e.pollWithOutcomes(ctx, client, settings, collectors, true, triggerIDs...)
+			for _, claim := range claims {
+				e.finishClaimedTriggers(ctx, []store.WebhookTrigger{claim}, outcome.succeeds(claim.Collectors), claim.Attempts)
+			}
 		case <-triggerTimer.C:
 			// The durable queue is checked at the top of the loop. This timer
 			// also wakes the scheduler when a retry becomes due after a crash.
 			continue
 		case <-deviceTimer.C:
 			pollSuccess := e.poll(ctx, client, settings, tailscale.CoreCollectors, false)
-			deviceTimer.Reset(nextPollDelay(settings.DeviceInterval, pollSuccess))
+			deviceTimer.Reset(e.pollTimerDelay(ctx, settings.Generation, tailscale.CoreCollectors, settings.DeviceInterval, pollSuccess))
 		case <-inventoryTimer.C:
 			pollSuccess := e.poll(ctx, client, settings, tailscale.InventoryCollectors, false)
-			inventoryTimer.Reset(nextPollDelay(settings.InventoryInterval, pollSuccess))
+			inventoryTimer.Reset(e.pollTimerDelay(ctx, settings.Generation, tailscale.InventoryCollectors, settings.InventoryInterval, pollSuccess))
 		}
 	}
 }
 
+// pollTimerDelay keeps the configured interval as the normal cadence while
+// honoring an earlier per-collector deadline. Unsupported responses use a
+// short confirmation retry and transient failures use a bounded retry; either
+// must wake the scheduler even when the inventory interval is several hours.
+func (e *Engine) pollTimerDelay(ctx context.Context, generation int64, collectors []string, base time.Duration, successful bool) time.Duration {
+	delay := nextPollDelay(base, successful)
+	deadline, found, err := e.store.EarliestCollectorDue(ctx, generation, collectors)
+	if err != nil {
+		slog.Error("read collector next poll deadline", "error", err)
+		return delay
+	}
+	if !found {
+		return delay
+	}
+	if deadline.IsZero() {
+		// A missing deadline means the row is due now. Keep a small floor so a
+		// transient write failure cannot turn the scheduler into a tight loop.
+		return min(delay, time.Second)
+	}
+	if remaining := time.Until(deadline); remaining < delay {
+		if remaining <= 0 {
+			return min(delay, time.Second)
+		}
+		return remaining
+	}
+	return delay
+}
+
+// schedulerIdentityChanged distinguishes a first configuration or tailnet/
+// OAuth identity change from a settings refresh that only rotates credentials
+// or polling intervals. The cached client remains usable for the latter; the
+// schedulerSettings revision check reloads the new secret without discarding
+// the established inventory identity.
+func schedulerIdentityChanged(client *tailscale.Client, previousGeneration, currentGeneration int64) bool {
+	return client == nil || previousGeneration != currentGeneration
+}
+
+type pollOutcome struct {
+	success    bool
+	collectors map[string]bool
+}
+
+func (p pollOutcome) succeeds(collectors []string) bool {
+	collectors = normalizeCollectors(collectors)
+	if len(collectors) == 0 {
+		return p.success
+	}
+	for _, collector := range collectors {
+		if ok, found := p.collectors[collector]; !found || !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// poll preserves the scheduler's aggregate success contract. Trigger
+// reconciliation uses pollWithOutcomes so a failure in one collector does not
+// retry a durable trigger that only requested collectors which completed.
 func (e *Engine) poll(ctx context.Context, client *tailscale.Client, settings store.Settings, collectors []string, force bool, triggerIDs ...int64) bool {
+	return e.pollWithOutcomes(ctx, client, settings, collectors, force, triggerIDs...).success
+}
+
+func (e *Engine) pollWithOutcomes(ctx context.Context, client *tailscale.Client, settings store.Settings, collectors []string, force bool, triggerIDs ...int64) pollOutcome {
 	triggerIDs = uniquePositive(triggerIDs)
+	collectors = normalizeCollectors(collectors)
+	outcome := pollOutcome{success: true, collectors: make(map[string]bool, len(collectors))}
+	if client != nil {
+		// Keep the device list shared by devices/device_details only for this
+		// reconciliation. A webhook targeting device_details must not reuse a
+		// list from an earlier scheduled poll.
+		client.BeginPoll()
+	}
 	success := true
 	results := make([]model.Collected, 0, len(collectors))
 	polled := make([]string, 0, len(collectors))
@@ -296,6 +371,7 @@ func (e *Engine) poll(ctx context.Context, client *tailscale.Client, settings st
 		duration := time.Since(started)
 		cancel()
 		result := model.Collected{Collector: collector, Resources: resources, Error: err, ObservedAt: time.Now().UTC()}
+		collectorSuccess := true
 		var partialErr *tailscale.PartialError
 		if err != nil && errors.As(err, &partialErr) {
 			if len(resources) > 0 {
@@ -312,6 +388,7 @@ func (e *Engine) poll(ctx context.Context, client *tailscale.Client, settings st
 				}
 			}
 			success = false
+			collectorSuccess = false
 		}
 		if err != nil && tailscale.IsUnsupportedCollector(collector, err) {
 			result.Error = nil
@@ -319,6 +396,7 @@ func (e *Engine) poll(ctx context.Context, client *tailscale.Client, settings st
 			slog.Info("collector unsupported", "collector", collector)
 		} else if err != nil {
 			success = false
+			collectorSuccess = false
 			safeError := tailscale.SafeError(err)
 			shouldNotify, _, storeErr := e.store.RecordCollectorFailure(ctx, settings.Generation, collector, safeError)
 			if storeErr != nil {
@@ -335,11 +413,13 @@ func (e *Engine) poll(ctx context.Context, client *tailscale.Client, settings st
 				slog.Error("enqueue collector recovery notification", "collector", collector, "error", enqueueErr)
 			}
 		}
+		outcome.collectors[collector] = collectorSuccess
 		results = append(results, result)
 		measurements = append(measurements, measurement{collector: collector, duration: duration, partial: result.Partial})
 	}
 	if len(polled) == 0 {
-		return success
+		outcome.success = success
+		return outcome
 	}
 	batch, err := e.store.ApplyBatchWithBatch(ctx, settings.Generation, results, notify.Digest, triggerIDs...)
 	if err != nil {
@@ -347,12 +427,20 @@ func (e *Engine) poll(ctx context.Context, client *tailscale.Client, settings st
 		if retryErr := e.store.SetNextPollErr(ctx, settings.Generation, polled, time.Now().Add(collectorRetryInterval)); retryErr != nil {
 			slog.Error("schedule collector retry after apply failure", "error", retryErr)
 		}
-		return false
+		for _, collector := range polled {
+			outcome.collectors[collector] = false
+		}
+		outcome.success = false
+		return outcome
 	}
 	if len(triggerIDs) > 0 && batch.Generation == 0 {
 		// Settings changed while the poll was running. Keep the durable
 		// triggers queued so the new generation can reconcile them.
-		return false
+		for _, collector := range polled {
+			outcome.collectors[collector] = false
+		}
+		outcome.success = false
+		return outcome
 	}
 	for _, item := range measurements {
 		if telemetryErr := e.store.RecordCollectorPoll(ctx, settings.Generation, item.collector, item.duration, item.partial); telemetryErr != nil {
@@ -390,7 +478,8 @@ func (e *Engine) poll(ctx context.Context, client *tailscale.Client, settings st
 	if err := e.store.SetNextPollErr(ctx, settings.Generation, retryCollectors, time.Now().Add(collectorRetryInterval)); err != nil {
 		slog.Error("schedule collector retry", "error", err)
 	}
-	return success
+	outcome.success = success
+	return outcome
 }
 
 func (e *Engine) processDurableTriggers(ctx context.Context, client *tailscale.Client, settings store.Settings) bool {
@@ -411,9 +500,8 @@ func (e *Engine) processDurableTriggers(ctx context.Context, client *tailscale.C
 		return false
 	}
 	type triggerGroup struct {
-		ids         []int64
-		collectors  []string
-		maxAttempts int
+		claims     []store.WebhookTrigger
+		collectors []string
 	}
 	groups := make(map[string]*triggerGroup, len(triggers))
 	for _, trigger := range triggers {
@@ -424,16 +512,13 @@ func (e *Engine) processDurableTriggers(ctx context.Context, client *tailscale.C
 		}
 		group := groups[key]
 		if group == nil {
-			group = &triggerGroup{collectors: collectors, maxAttempts: 1}
+			group = &triggerGroup{collectors: collectors}
 			if key == "*" {
 				group.collectors = allCollectors()
 			}
 			groups[key] = group
 		}
-		group.ids = append(group.ids, trigger.ID)
-		if trigger.Attempts > group.maxAttempts {
-			group.maxAttempts = trigger.Attempts
-		}
+		group.claims = append(group.claims, trigger)
 	}
 	keys := make([]string, 0, len(groups))
 	for key := range groups {
@@ -442,25 +527,27 @@ func (e *Engine) processDurableTriggers(ctx context.Context, client *tailscale.C
 	sort.Strings(keys)
 	for _, key := range keys {
 		group := groups[key]
-		success := e.poll(ctx, client, settings, group.collectors, true, group.ids...)
-		e.finishTriggers(ctx, group.ids, success, group.maxAttempts)
+		triggerIDs := webhookTriggerIDs(group.claims)
+		outcome := e.pollWithOutcomes(ctx, client, settings, group.collectors, true, triggerIDs...)
+		for _, claim := range group.claims {
+			e.finishClaimedTriggers(ctx, []store.WebhookTrigger{claim}, outcome.succeeds(claim.Collectors), claim.Attempts)
+		}
 	}
 	return true
 }
 
-func (e *Engine) finishTriggers(ctx context.Context, ids []int64, success bool, attempts int) {
-	ids = uniquePositive(ids)
-	if len(ids) == 0 {
+// finishClaimedTriggers persists the result against the exact lease returned
+// by the claim operation. This fences a slow worker after its lease expires
+// and another worker starts a newer attempt for the same trigger.
+func (e *Engine) finishClaimedTriggers(ctx context.Context, claims []store.WebhookTrigger, success bool, attempts int) {
+	if len(claims) == 0 {
 		return
 	}
-	// A shutdown can cancel the poll context immediately after the upstream
-	// request completes. Keep the durable trigger outcome write alive briefly so
-	// a successfully reconciled webhook is not left processing until lease
-	// expiry, and a failed one is not silently lost.
+	ids := webhookTriggerIDs(claims)
 	bookkeepingCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancel()
 	if success {
-		if err := e.store.CompleteWebhookTriggers(bookkeepingCtx, ids); err != nil {
+		if err := e.store.CompleteClaimedWebhookTriggers(bookkeepingCtx, claims); err != nil {
 			slog.Error("complete durable webhook triggers", "trigger_ids", ids, "error", err)
 		}
 		return
@@ -468,7 +555,7 @@ func (e *Engine) finishTriggers(ctx context.Context, ids []int64, success bool, 
 	if attempts <= 0 {
 		attempts = 1
 	}
-	if err := e.store.RetryWebhookTriggers(bookkeepingCtx, ids, time.Now().Add(retryDelay(attempts)), "collector reconciliation failed"); err != nil {
+	if err := e.store.RetryClaimedWebhookTriggers(bookkeepingCtx, claims, time.Now().Add(retryDelay(attempts)), "collector reconciliation failed"); err != nil {
 		slog.Error("retry durable webhook triggers", "trigger_ids", ids, "error", err)
 	}
 }
@@ -480,19 +567,53 @@ func allCollectors() []string {
 }
 
 func normalizeCollectors(collectors []string) []string {
+	known := make(map[string]struct{}, len(tailscale.CoreCollectors)+len(tailscale.InventoryCollectors))
+	for _, collector := range tailscale.CoreCollectors {
+		known[collector] = struct{}{}
+	}
+	for _, collector := range tailscale.InventoryCollectors {
+		known[collector] = struct{}{}
+	}
 	seen := make(map[string]struct{}, len(collectors))
+	unknown := false
 	for _, collector := range collectors {
 		collector = strings.TrimSpace(collector)
 		if collector != "" {
+			if _, ok := known[collector]; !ok {
+				// Unknown provider metadata must trigger a broad reconciliation.
+				// Silently targeting an unsupported collector would retry a
+				// durable webhook until its dead-letter horizon instead of
+				// preserving the safety property of unknown events.
+				unknown = true
+				continue
+			}
 			seen[collector] = struct{}{}
 		}
+	}
+	if unknown {
+		return nil
 	}
 	out := make([]string, 0, len(seen))
 	for collector := range seen {
 		out = append(out, collector)
 	}
-	sort.Strings(out)
+	sort.Slice(out, func(i, j int) bool {
+		left, right := collectorPriority(out[i]), collectorPriority(out[j])
+		if left != right {
+			return left < right
+		}
+		return out[i] < out[j]
+	})
 	return out
+}
+
+func collectorPriority(collector string) int {
+	for index, core := range tailscale.CoreCollectors {
+		if collector == core {
+			return index
+		}
+	}
+	return len(tailscale.CoreCollectors)
 }
 
 func requestTriggerIDs(request ReconcileRequest) []int64 {
@@ -503,24 +624,31 @@ func requestTriggerIDs(request ReconcileRequest) []int64 {
 	return uniquePositive(ids)
 }
 
-// claimFastTriggers arbitrates ownership with the durable trigger worker. A
-// webhook request may be queued for immediate handling while its durable row
-// is already being claimed by the safety-net worker; only one path should
-// reconcile and finalize that row.
-func (e *Engine) claimFastTriggers(ctx context.Context, ids []int64) []int64 {
+func (e *Engine) claimFastTriggerClaims(ctx context.Context, ids []int64) []store.WebhookTrigger {
 	ids = uniquePositive(ids)
 	if len(ids) == 0 {
 		return nil
 	}
-	claimed := make([]int64, 0, len(ids))
+	claimed := make([]store.WebhookTrigger, 0, len(ids))
 	for _, id := range ids {
-		if _, ok, err := e.store.ClaimWebhookTrigger(ctx, id, 0); err != nil {
+		trigger, ok, err := e.store.ClaimWebhookTrigger(ctx, id, 0)
+		if err != nil {
 			slog.Error("claim fast webhook trigger", "trigger_id", id, "error", err)
 		} else if ok {
-			claimed = append(claimed, id)
+			claimed = append(claimed, trigger)
 		}
 	}
 	return claimed
+}
+
+func webhookTriggerIDs(claims []store.WebhookTrigger) []int64 {
+	ids := make([]int64, 0, len(claims))
+	for _, claim := range claims {
+		if claim.ID > 0 {
+			ids = append(ids, claim.ID)
+		}
+	}
+	return uniquePositive(ids)
 }
 
 func uniquePositive(values []int64) []int64 {
@@ -546,7 +674,7 @@ func (e *Engine) delivery(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			items, err := e.store.DueOutbox(ctx, 10)
+			items, err := e.store.ClaimDueOutbox(ctx, 10)
 			if err != nil {
 				slog.Error("load outbox", "error", err)
 				continue
@@ -555,7 +683,7 @@ func (e *Engine) delivery(ctx context.Context) {
 				err = e.sender.Send(ctx, item.Destination.ServiceURL, item.Payload)
 				bookkeepingCtx, cancelBookkeeping := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 				if err == nil {
-					if deliveredErr := e.store.Delivered(bookkeepingCtx, item.ID); deliveredErr != nil {
+					if deliveredErr := e.store.DeliveredClaimed(bookkeepingCtx, item); deliveredErr != nil {
 						slog.Error("mark notification delivery complete", "outbox_id", item.ID, "destination_id", item.DestinationID, "error", deliveredErr)
 					}
 					cancelBookkeeping()
@@ -572,7 +700,7 @@ func (e *Engine) delivery(ctx context.Context) {
 				if errors.As(err, &delivery) && delivery.RetryAfter > 0 {
 					delay = delivery.RetryAfter
 				}
-				if retryErr := e.store.Retry(bookkeepingCtx, item.ID, time.Now().Add(delay), safeMessage, dead); retryErr != nil {
+				if retryErr := e.store.RetryClaimed(bookkeepingCtx, item, time.Now().Add(delay), safeMessage, dead); retryErr != nil {
 					slog.Error("record notification delivery failure", "outbox_id", item.ID, "destination_id", item.DestinationID, "error", retryErr)
 				}
 				cancelBookkeeping()

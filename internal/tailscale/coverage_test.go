@@ -130,6 +130,9 @@ func TestTailscaleHelpersAndHTTPError(t *testing.T) {
 	if got := retryAfter("86400", time.Minute); got != 5*time.Minute {
 		t.Fatalf("large seconds Retry-After=%s, want five-minute cap", got)
 	}
+	if got := retryAfter(strings.Repeat("9", 40), time.Minute); got != 5*time.Minute {
+		t.Fatalf("overflowing seconds Retry-After=%s, want five-minute cap", got)
+	}
 	future := time.Now().Add(2 * time.Second).UTC().Format(http.TimeFormat)
 	if got := retryAfter(future, time.Minute); got <= 0 || got > 3*time.Second {
 		t.Fatalf("date Retry-After=%s", got)

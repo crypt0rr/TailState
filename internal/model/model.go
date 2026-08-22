@@ -181,7 +181,12 @@ func orderedArray(collector, path string) bool {
 		return false
 	}
 	compactPath := strings.ToLower(strings.ReplaceAll(strings.ReplaceAll(path, "_", ""), "-", ""))
-	return compactPath == "nameservers" || strings.HasPrefix(compactPath, "nameservers.") || compactPath == "searchpaths" || strings.HasPrefix(compactPath, "searchpaths.")
+	for _, segment := range strings.Split(compactPath, ".") {
+		if segment == "nameservers" || segment == "searchpaths" {
+			return true
+		}
+	}
+	return false
 }
 
 func redactedFingerprint(value any) (string, bool) {

@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/crypt0rr/tailstate/internal/secret"
 )
@@ -28,7 +29,7 @@ func TestNotificationDestinationFanoutAndDisable(t *testing.T) {
 	if err := st.EnqueueSystem(ctx, "payload"); err != nil {
 		t.Fatal(err)
 	}
-	items, err := st.DueOutbox(ctx, 10)
+	items, err := testDueOutbox(st, ctx, 10)
 	if err != nil || len(items) != 2 {
 		t.Fatalf("expected two destination rows, got %d: %v", len(items), err)
 	}
@@ -48,9 +49,74 @@ func TestNotificationDestinationFanoutAndDisable(t *testing.T) {
 	if err := st.EnqueueSystem(ctx, "future"); err != nil {
 		t.Fatal(err)
 	}
-	items, err = st.DueOutbox(ctx, 10)
+	items, err = testDueOutbox(st, ctx, 10)
 	if err != nil || len(items) != 2 {
 		t.Fatalf("expected one old and one future row, got %d: %v", len(items), err)
+	}
+}
+
+func TestDestinationLifecycleDoesNotAllowLateDeliveryBookkeeping(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	if _, err := st.SaveSettings(ctx, settings()); err != nil {
+		t.Fatal(err)
+	}
+	destinations, err := st.ListDestinations(ctx)
+	if err != nil || len(destinations) != 1 {
+		t.Fatalf("destinations=%#v err=%v", destinations, err)
+	}
+	destinationID := destinations[0].ID
+
+	if err := st.EnqueueSystem(ctx, "disable race"); err != nil {
+		t.Fatal(err)
+	}
+	items, err := testDueOutbox(st, ctx, 10)
+	if err != nil || len(items) != 1 {
+		t.Fatalf("outbox=%#v err=%v", items, err)
+	}
+	if err := st.SetDestinationEnabled(ctx, destinationID, false); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate a sender completing after the destination lifecycle transaction
+	// has dead-lettered the pending row.
+	if err := testDelivered(st, ctx, items[0].ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := testRetry(st, ctx, items[0].ID, time.Now().UTC().Add(time.Minute), "late sender failure", false); err != nil {
+		t.Fatal(err)
+	}
+	var status, lastError string
+	if err := st.db.QueryRowContext(ctx, "SELECT status,last_error FROM outbox WHERE id=?", items[0].ID).Scan(&status, &lastError); err != nil {
+		t.Fatal(err)
+	}
+	if status != "dead" || lastError != "destination disabled" {
+		t.Fatalf("late bookkeeping changed disabled row: status=%q last_error=%q", status, lastError)
+	}
+
+	if err := st.SetDestinationEnabled(ctx, destinationID, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.EnqueueSystem(ctx, "remove race"); err != nil {
+		t.Fatal(err)
+	}
+	items, err = testDueOutbox(st, ctx, 10)
+	if err != nil || len(items) != 1 {
+		t.Fatalf("outbox after re-enable=%#v err=%v", items, err)
+	}
+	if err := st.DeleteDestination(ctx, destinationID); err != nil {
+		t.Fatal(err)
+	}
+	if err := testDelivered(st, ctx, items[0].ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := testRetry(st, ctx, items[0].ID, time.Now().UTC().Add(time.Minute), "late sender failure", false); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.db.QueryRowContext(ctx, "SELECT status,last_error FROM outbox WHERE id=?", items[0].ID).Scan(&status, &lastError); err != nil {
+		t.Fatal(err)
+	}
+	if status != "dead" || lastError != "destination removed" {
+		t.Fatalf("late bookkeeping changed removed row: status=%q last_error=%q", status, lastError)
 	}
 }
 
@@ -71,6 +137,29 @@ func TestSecondMattermostDestinationDoesNotOverwriteTheFirst(t *testing.T) {
 	}
 	if first == second || len(destinations) != 2 {
 		t.Fatalf("second destination overwrote the first: ids=%d/%d destinations=%#v", first, second, destinations)
+	}
+}
+
+func TestDestinationUpdateReusesCiphertextWhenURLUnchanged(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	id, err := st.SaveDestination(ctx, NotificationDestination{Name: "primary", ServiceURL: "generic://example.invalid/hook", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var before string
+	if err := st.db.QueryRowContext(ctx, "SELECT service_url_enc FROM notification_destinations WHERE id=?", id).Scan(&before); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.SaveDestination(ctx, NotificationDestination{ID: id, Name: "renamed", ServiceURL: "generic://example.invalid/hook", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	var after string
+	if err := st.db.QueryRowContext(ctx, "SELECT service_url_enc FROM notification_destinations WHERE id=?", id).Scan(&after); err != nil {
+		t.Fatal(err)
+	}
+	if before != after {
+		t.Fatal("unchanged destination URL was re-encrypted")
 	}
 }
 

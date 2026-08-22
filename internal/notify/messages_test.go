@@ -61,6 +61,13 @@ func TestHealthAndUpdateMessagesEscapeInput(t *testing.T) {
 	if strings.Contains(got, "!<img src=x>") || !strings.Contains(got, `\!\<img src=x\>`) {
 		t.Fatalf("device name retained HTML or image syntax: %s", got)
 	}
+	got = Digest([]model.Change{{Kind: "created", Collector: "devices", Name: "prod\x00\x07\tserver"}})
+	if strings.ContainsAny(got, "\x00\x07\t") {
+		t.Fatalf("device name retained control characters: %q", got)
+	}
+	if !strings.Contains(got, "prod   server") {
+		t.Fatalf("control characters were not replaced with inert spaces: %q", got)
+	}
 }
 
 func TestDigestStopsAddingFieldsNearBound(t *testing.T) {

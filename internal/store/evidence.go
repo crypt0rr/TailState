@@ -14,6 +14,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/crypt0rr/tailstate/internal/model"
 )
 
 const (
@@ -183,6 +185,9 @@ func (s *Store) ExportEvidencePack(ctx context.Context, filter HistoryFilter) ([
 		}
 		pack.Batches = append(pack.Batches, converted)
 	}
+	if err := validateLedgerBatchState(pack.Batches); err != nil {
+		return nil, err
+	}
 	content, err := evidencePayload(pack)
 	if err != nil {
 		return nil, err
@@ -290,7 +295,177 @@ func evidenceSignaturePayload(pack EvidencePack) []byte {
 	return []byte("tailstate-evidence-pack-v3\n" + pack.ContentSHA256 + "\n" + pack.LedgerHead + "\n" + pack.GeneratedAt + "\n" + pack.SigningKeyID)
 }
 
+func validateLedgerBatchState(batches []EvidenceBatch) error {
+	hasLedgeredBatch := false
+	hasUnledgeredBatch := false
+	for _, batch := range batches {
+		if batch.LedgerSequence < 0 {
+			return fmt.Errorf("invalid ledger sequence for batch %d", batch.ID)
+		}
+		if batch.LedgerSequence == 0 {
+			hasUnledgeredBatch = true
+		} else {
+			hasLedgeredBatch = true
+		}
+	}
+	if hasLedgeredBatch && hasUnledgeredBatch {
+		return errors.New("evidence ledger metadata is incomplete: pack mixes ledgered and unledgered batches")
+	}
+	return nil
+}
+
+// verifyLedgerPayloadBinding checks that the human-readable export is a
+// faithful projection of the signed ledger payload. A filtered history export
+// may intentionally omit events, so every visible event is matched against
+// the complete payload rather than requiring the two lists to have the same
+// length. This keeps the ledger proof useful for filtered exports while still
+// preventing a payload/event mismatch from being accepted as verified.
+func verifyLedgerPayloadBinding(batch EvidenceBatch, ledgerBatch evidenceLedgerBatch) error {
+	if ledgerBatch.BatchID != batch.ID || ledgerBatch.Generation != batch.Generation {
+		return fmt.Errorf("ledger payload metadata mismatch for batch %d", batch.ID)
+	}
+	changeCount := batch.LedgerChangeCount
+	if changeCount == 0 {
+		changeCount = batch.ChangeCount
+	}
+	if ledgerBatch.ChangeCount != changeCount {
+		return fmt.Errorf("ledger payload metadata mismatch for batch %d", batch.ID)
+	}
+	if len(ledgerBatch.Events) != ledgerBatch.ChangeCount {
+		return fmt.Errorf("ledger payload event count mismatch for batch %d", batch.ID)
+	}
+	observedAt, err := time.Parse(time.RFC3339Nano, ledgerBatch.ObservedAt)
+	if err != nil || !observedAt.Equal(batch.ObservedAt) {
+		return fmt.Errorf("ledger payload timestamp mismatch for batch %d", batch.ID)
+	}
+	if ledgerBatch.TriggerID != batch.TriggerID || !equalInt64Slices(ledgerBatch.TriggerIDs, batch.TriggerIDs) {
+		return fmt.Errorf("ledger payload trigger metadata mismatch for batch %d", batch.ID)
+	}
+
+	byID := make(map[int64]evidenceLedgerEvent, len(ledgerBatch.Events))
+	for _, event := range ledgerBatch.Events {
+		if _, exists := byID[event.ID]; exists {
+			return fmt.Errorf("ledger payload contains duplicate event %d for batch %d", event.ID, batch.ID)
+		}
+		byID[event.ID] = event
+	}
+	seen := make(map[int64]struct{}, len(batch.Events))
+	for _, event := range batch.Events {
+		if _, exists := seen[event.ID]; exists {
+			return fmt.Errorf("evidence export contains duplicate event %d for batch %d", event.ID, batch.ID)
+		}
+		seen[event.ID] = struct{}{}
+		ledgerEvent, exists := byID[event.ID]
+		if !exists {
+			return fmt.Errorf("ledger payload is missing event %d for batch %d", event.ID, batch.ID)
+		}
+		if err := verifyLedgerEventBinding(event, ledgerEvent, batch.ID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func verifyLedgerEventBinding(event EvidenceEvent, ledgerEvent evidenceLedgerEvent, batchID int64) error {
+	if event.BatchID != batchID || event.Generation != ledgerEvent.Generation || event.Collector != ledgerEvent.Collector || event.EventType != ledgerEvent.EventType || event.ResourceID != ledgerEvent.ResourceID || event.Name != ledgerEvent.Name {
+		return fmt.Errorf("ledger payload event metadata mismatch for event %d in batch %d", event.ID, batchID)
+	}
+	observedAt, err := time.Parse(time.RFC3339Nano, ledgerEvent.ObservedAt)
+	if err != nil || !observedAt.Equal(event.ObservedAt) {
+		return fmt.Errorf("ledger payload event timestamp mismatch for event %d in batch %d", event.ID, batchID)
+	}
+	fields, fieldsTruncated, totalFields, err := evidenceFieldsFromLedger([]byte(ledgerEvent.Changes))
+	if err != nil {
+		return fmt.Errorf("decode ledger event fields for event %d in batch %d: %w", event.ID, batchID, err)
+	}
+	if fieldsTruncated != event.FieldsTruncated || totalFields != event.TotalFields || !equalEvidenceFields(fields, event.Fields) {
+		return fmt.Errorf("ledger payload event fields mismatch for event %d in batch %d", event.ID, batchID)
+	}
+	if !equalEvidenceJSON(evidenceJSON(prettyJSON([]byte(ledgerEvent.Before))), event.Before) || !equalEvidenceJSON(evidenceJSON(prettyJSON([]byte(ledgerEvent.After))), event.After) {
+		return fmt.Errorf("ledger payload event snapshot mismatch for event %d in batch %d", event.ID, batchID)
+	}
+	return nil
+}
+
+func evidenceFieldsFromLedger(raw []byte) ([]EvidenceField, bool, int, error) {
+	var fields []model.FieldChange
+	var fieldsTruncated bool
+	var totalFields int
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		var persisted persistedFields
+		if envelopeErr := json.Unmarshal(raw, &persisted); envelopeErr != nil {
+			return nil, false, 0, envelopeErr
+		}
+		fields = persisted.Fields
+		fieldsTruncated = persisted.FieldsTruncated
+		totalFields = persisted.TotalFields
+	}
+	if totalFields == 0 {
+		totalFields = len(fields)
+	}
+	historyFields := formatHistoryFields(fields)
+	converted := make([]EvidenceField, 0, len(historyFields))
+	for _, field := range historyFields {
+		converted = append(converted, EvidenceField{
+			Field:      field.Field,
+			Old:        evidenceJSON(field.Old),
+			New:        evidenceJSON(field.New),
+			OldPresent: field.HasOld,
+			NewPresent: field.HasNew,
+		})
+	}
+	return converted, fieldsTruncated, totalFields, nil
+}
+
+func equalEvidenceFields(left, right []EvidenceField) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index].Field != right[index].Field || left[index].OldPresent != right[index].OldPresent || left[index].NewPresent != right[index].NewPresent || !equalEvidenceJSON(left[index].Old, right[index].Old) || !equalEvidenceJSON(left[index].New, right[index].New) {
+			return false
+		}
+	}
+	return true
+}
+
+func equalEvidenceJSON(left, right json.RawMessage) bool {
+	left = canonicalEvidenceJSON(left)
+	right = canonicalEvidenceJSON(right)
+	return bytes.Equal(left, right)
+}
+
+func canonicalEvidenceJSON(raw json.RawMessage) []byte {
+	if len(raw) == 0 {
+		return nil
+	}
+	var value any
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return append([]byte(nil), raw...)
+	}
+	canonical, err := json.Marshal(value)
+	if err != nil {
+		return append([]byte(nil), raw...)
+	}
+	return canonical
+}
+
+func equalInt64Slices(left, right []int64) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
+}
+
 func verifyLedgerLinks(pack EvidencePack) error {
+	if err := validateLedgerBatchState(pack.Batches); err != nil {
+		return err
+	}
 	batchesBySequence := make(map[int64]EvidenceBatch, len(pack.Batches))
 	for _, batch := range pack.Batches {
 		if batch.LedgerKeyID != "" && batch.LedgerKeyID != pack.SigningKeyID {
@@ -385,6 +560,9 @@ func verifyLedgerLinks(pack EvidencePack) error {
 				return fmt.Errorf("invalid ledger link previous hash at sequence %d: %w", link.Sequence, err)
 			}
 		}
+		if index == 0 && link.Sequence == 1 && link.PrevHash != "" {
+			return errors.New("evidence ledger genesis link has a previous hash")
+		}
 		if link.Signature == "" {
 			return fmt.Errorf("ledger signature is missing at sequence %d", link.Sequence)
 		}
@@ -415,7 +593,16 @@ func verifyLedgerLinks(pack EvidencePack) error {
 			return fmt.Errorf("decode ledger payload for batch %d: %w", batch.ID, err)
 		}
 		var ledgerBatch evidenceLedgerBatch
-		if err := json.Unmarshal(payload, &ledgerBatch); err != nil {
+		decoder := json.NewDecoder(bytes.NewReader(payload))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&ledgerBatch); err != nil {
+			return fmt.Errorf("decode ledger payload for batch %d: %w", batch.ID, err)
+		}
+		var trailing any
+		if err := decoder.Decode(&trailing); err != io.EOF {
+			if err == nil {
+				return fmt.Errorf("ledger payload for batch %d contains trailing JSON", batch.ID)
+			}
 			return fmt.Errorf("decode ledger payload for batch %d: %w", batch.ID, err)
 		}
 		changeCount := batch.LedgerChangeCount
@@ -428,6 +615,9 @@ func verifyLedgerLinks(pack EvidencePack) error {
 		digest := ledgerDigest(batch.LedgerPrevHash, payload)
 		if hex.EncodeToString(digest[:]) != batch.LedgerHash {
 			return fmt.Errorf("ledger hash recomputation failed for batch %d", batch.ID)
+		}
+		if err := verifyLedgerPayloadBinding(batch, ledgerBatch); err != nil {
+			return err
 		}
 	}
 	return nil

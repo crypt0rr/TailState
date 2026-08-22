@@ -180,6 +180,22 @@ func TestDNSCanonicalizationPreservesResolverOrder(t *testing.T) {
 	}
 }
 
+func TestNestedDNSCanonicalizationPreservesResolverOrder(t *testing.T) {
+	first := map[string]any{"split-dns": map[string]any{"corp.example": map[string]any{"nameservers": []any{"1.1.1.1", "9.9.9.9"}, "search_paths": []any{"corp.example", "lab.example"}}}}
+	second := map[string]any{"split-dns": map[string]any{"corp.example": map[string]any{"nameservers": []any{"9.9.9.9", "1.1.1.1"}, "search_paths": []any{"lab.example", "corp.example"}}}}
+	_, firstHash, err := CanonicalFor("dns", first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, secondHash, err := CanonicalFor("dns", second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstHash == secondHash {
+		t.Fatal("nested order-significant DNS configuration was normalized as unordered")
+	}
+}
+
 func TestTailnetAddressChangeDetected(t *testing.T) {
 	a, _, _ := Canonical(map[string]any{"addresses": []any{"100.64.0.1"}})
 	b, _, _ := Canonical(map[string]any{"addresses": []any{"100.64.0.2"}})

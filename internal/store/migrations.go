@@ -68,6 +68,52 @@ func verifyLegacyMasterKey(db *sql.DB, box *secret.Box) error {
 	return nil
 }
 
+// verifyDatabaseVersionPreflight refuses to treat a non-empty SQLite file as
+// a fresh TailState database when its schema marker is missing or malformed.
+// Bootstrap DDL inserts the current schema version when schema_version does
+// not exist (or is empty); doing that against an older or hand-edited file
+// would skip every migration and can leave existing data incompatible with the
+// runtime. The check is read-only so a failed startup cannot mutate the file
+// it is trying to protect.
+func verifyDatabaseVersionPreflight(db *sql.DB) error {
+	var versionTable int
+	if err := db.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='schema_version'").Scan(&versionTable); err != nil {
+		return fmt.Errorf("inspect database schema marker: %w", err)
+	}
+	if versionTable == 0 {
+		var objects int
+		if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master
+			WHERE name NOT LIKE 'sqlite_%' AND type IN ('table','index','view','trigger')`).Scan(&objects); err != nil {
+			return fmt.Errorf("inspect unversioned database objects: %w", err)
+		}
+		if objects > 0 {
+			return errors.New("refusing to bootstrap an unversioned existing database; restore a verified backup or add a supported schema migration")
+		}
+		return nil
+	}
+
+	// The bootstrap DDL inserts the current version only when the marker table
+	// has no rows. A damaged or hand-edited database could therefore appear
+	// current while still containing an older layout if the marker is empty or
+	// duplicated. Validate the marker before any CREATE/INSERT statements so
+	// those files fail closed without changing their contents.
+	var markerRows int
+	if err := db.QueryRow("SELECT COUNT(*) FROM schema_version").Scan(&markerRows); err != nil {
+		return fmt.Errorf("inspect database schema marker rows: %w", err)
+	}
+	if markerRows != 1 {
+		return fmt.Errorf("refusing to use database with %d schema version markers; restore a verified backup or add a supported schema migration", markerRows)
+	}
+	var version int
+	if err := db.QueryRow("SELECT version FROM schema_version").Scan(&version); err != nil {
+		return fmt.Errorf("inspect database schema version: %w", err)
+	}
+	if version < 1 || version > currentSchemaVersion {
+		return fmt.Errorf("refusing to use unsupported database schema version %d before bootstrap DDL (supported versions: 1-%d)", version, currentSchemaVersion)
+	}
+	return nil
+}
+
 func tableColumns(db *sql.DB, table string) (bool, map[string]bool, error) {
 	var present int
 	if err := db.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE name=? AND type IN ('table','view')", table).Scan(&present); err != nil {
@@ -178,6 +224,18 @@ func migrateSchema(db *sql.DB, box *secret.Box) error {
 		}
 		return migrateSchema(db, box)
 	}
+	if version == 9 {
+		if err := migrateSchemaV9ToV10(db); err != nil {
+			return err
+		}
+		return migrateSchema(db, box)
+	}
+	if version == 10 {
+		if err := migrateSchemaV10ToV11(db); err != nil {
+			return err
+		}
+		return migrateSchema(db, box)
+	}
 	if version != 1 {
 		return fmt.Errorf("database schema version %d requires a newer migration path", version)
 	}
@@ -215,7 +273,13 @@ func migrateSchema(db *sql.DB, box *secret.Box) error {
 			hasDestination = true
 		}
 	}
-	rows.Close()
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("inspect outbox schema rows: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("close outbox schema inspection: %w", err)
+	}
 	if !hasDestination {
 		if _, err := tx.Exec("ALTER TABLE outbox ADD COLUMN destination_id INTEGER"); err != nil {
 			return fmt.Errorf("upgrade outbox destinations: %w", err)
@@ -255,11 +319,11 @@ func migrateSchema(db *sql.DB, box *secret.Box) error {
 			return fmt.Errorf("assign migrated outbox rows: %w", err)
 		}
 	}
-	// A v1 database can contain pending notifications without a configured
-	// Mattermost URL. Once the destination-specific outbox is in place those
-	// rows can never be selected for delivery, so leave an explicit audit trail
-	// instead of reporting them forever as pending.
-	if _, err := tx.Exec("UPDATE outbox SET status='dead',last_error='no notification destination configured' WHERE destination_id IS NULL AND status='pending'"); err != nil {
+	// A v1 database can contain pending or in-flight notifications without a
+	// configured Mattermost URL. Once the destination-specific outbox is in place
+	// those rows can never be selected for delivery, so leave an explicit audit
+	// trail instead of reporting them forever as pending or processing.
+	if _, err := tx.Exec("UPDATE outbox SET status='dead',last_error='no notification destination configured' WHERE destination_id IS NULL AND status IN ('pending','processing')"); err != nil {
 		return fmt.Errorf("dead-letter orphaned outbox rows: %w", err)
 	}
 	if _, err := tx.Exec("UPDATE schema_version SET version=2"); err != nil {
@@ -542,6 +606,49 @@ func migrateSchemaV8ToV9(db *sql.DB) error {
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit partial error count migration: %w", err)
+	}
+	return nil
+}
+
+func migrateSchemaV9ToV10(db *sql.DB) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin webhook lease fencing migration: %w", err)
+	}
+	defer tx.Rollback()
+	if err := addColumnIfMissing(tx, "webhook_triggers", "lease_token", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if _, err := tx.Exec("UPDATE schema_version SET version=10"); err != nil {
+		return fmt.Errorf("record webhook lease fencing migration: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit webhook lease fencing migration: %w", err)
+	}
+	return nil
+}
+
+func migrateSchemaV10ToV11(db *sql.DB) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin outbox lease fencing migration: %w", err)
+	}
+	defer tx.Rollback()
+	for _, column := range []struct {
+		table, name, definition string
+	}{
+		{table: "outbox", name: "lease_until", definition: "TEXT"},
+		{table: "outbox", name: "lease_token", definition: "TEXT NOT NULL DEFAULT ''"},
+	} {
+		if err := addColumnIfMissing(tx, column.table, column.name, column.definition); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.Exec("UPDATE schema_version SET version=11"); err != nil {
+		return fmt.Errorf("record outbox lease fencing migration: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit outbox lease fencing migration: %w", err)
 	}
 	return nil
 }

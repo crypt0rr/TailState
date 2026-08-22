@@ -42,10 +42,10 @@ func TestEvidenceExportPreservesExplicitNullPresence(t *testing.T) {
 	recovered := model.Collected{Collector: "devices", Resources: []model.Resource{{
 		ID: "device-1", Type: "device", Name: "server", Data: map[string]any{},
 	}}}
-	if _, err := st.applyBatch(ctx, generation, []model.Collected{baseline}, func([]model.Change) string { return "baseline" }); err != nil {
+	if _, err := testApplyBatch(st, ctx, generation, []model.Collected{baseline}, func([]model.Change) string { return "baseline" }); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.applyBatch(ctx, generation, []model.Collected{recovered}, func([]model.Change) string { return "changed" }); err != nil {
+	if _, err := testApplyBatch(st, ctx, generation, []model.Collected{recovered}, func([]model.Change) string { return "changed" }); err != nil {
 		t.Fatal(err)
 	}
 	encoded, err := st.ExportEvidencePack(ctx, HistoryFilter{Limit: 10})
@@ -134,11 +134,11 @@ func TestHistoryPersistsExplainableChangesAndDeliveryState(t *testing.T) {
 	if len(history.Deliveries) != 1 || history.Deliveries[0].Destination != "Mattermost" || history.Deliveries[0].Status != "pending" {
 		t.Fatalf("unexpected delivery history: %#v", history.Deliveries)
 	}
-	items, err := st.DueOutbox(ctx, 10)
+	items, err := testDueOutbox(st, ctx, 10)
 	if err != nil || len(items) != 1 || items[0].BatchID != batch.ID {
 		t.Fatalf("outbox batch correlation missing: %#v %v", items, err)
 	}
-	if err := st.Retry(ctx, items[0].ID, time.Now().UTC().Add(time.Minute), "delivery failed for "+items[0].Destination.ServiceURL, false); err != nil {
+	if err := testRetry(st, ctx, items[0].ID, time.Now().UTC().Add(time.Minute), "delivery failed for "+items[0].Destination.ServiceURL, false); err != nil {
 		t.Fatal(err)
 	}
 	page, err = st.ListHistory(ctx, HistoryFilter{Limit: 10})
@@ -161,6 +161,53 @@ func TestHistoryPersistsExplainableChangesAndDeliveryState(t *testing.T) {
 	}
 }
 
+func TestHistoryCorrelationOutlivesWebhookRetention(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	generation, err := st.SaveSettings(ctx, settings())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := testApplyBatch(st, ctx, generation, []model.Collected{historyResource("server", "100.64.0.1")}, func([]model.Change) string { return "baseline" }); err != nil {
+		t.Fatal(err)
+	}
+	trigger, created, err := st.RecordWebhookTrigger(ctx, strings.Repeat("c", 64), []string{"policyUpdate"}, []string{"devices"})
+	if err != nil || !created {
+		t.Fatalf("record webhook trigger: %#v created=%v err=%v", trigger, created, err)
+	}
+	if _, err := st.ApplyBatchWithBatch(ctx, generation, []model.Collected{historyResource("server-new", "100.64.0.2")}, func([]model.Change) string { return "changed" }, trigger.ID); err != nil {
+		t.Fatal(err)
+	}
+	oldReceived := time.Now().UTC().Add(-31 * 24 * time.Hour).Format(time.RFC3339Nano)
+	if _, err := st.db.ExecContext(ctx, "UPDATE webhook_triggers SET status='processed',received_at=?,processed_at=? WHERE id=?", oldReceived, oldReceived, trigger.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Cleanup(ctx, 30*24*time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	var triggerCount int
+	if err := st.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM webhook_triggers WHERE id=?", trigger.ID).Scan(&triggerCount); err != nil {
+		t.Fatal(err)
+	}
+	if triggerCount != 0 {
+		t.Fatalf("retained webhook trigger row after cleanup: %d", triggerCount)
+	}
+	page, err := st.ListHistory(ctx, HistoryFilter{Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Batches) != 1 || len(page.Batches[0].TriggerIDs) != 1 || page.Batches[0].TriggerIDs[0] != trigger.ID {
+		t.Fatalf("history correlation was lost when trigger was compacted: %#v", page.Batches)
+	}
+	pack, err := st.ExportEvidencePack(ctx, HistoryFilter{Limit: 10})
+	if err != nil {
+		t.Fatalf("export after webhook compaction: %v", err)
+	}
+	if err := VerifyEvidencePack(pack); err != nil {
+		t.Fatalf("evidence verification lost compacted webhook correlation: %v", err)
+	}
+}
+
 func TestDestinationURLNeverReachesPersistedError(t *testing.T) {
 	ctx := context.Background()
 	st := testStore(t)
@@ -168,18 +215,18 @@ func TestDestinationURLNeverReachesPersistedError(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.applyBatch(ctx, generation, []model.Collected{historyResource("server", "100.64.0.1")}, func([]model.Change) string { return "baseline" }); err != nil {
+	if _, err := testApplyBatch(st, ctx, generation, []model.Collected{historyResource("server", "100.64.0.1")}, func([]model.Change) string { return "baseline" }); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.applyBatch(ctx, generation, []model.Collected{historyResource("server-new", "100.64.0.2")}, func([]model.Change) string { return "changed" }); err != nil {
+	if _, err := testApplyBatch(st, ctx, generation, []model.Collected{historyResource("server-new", "100.64.0.2")}, func([]model.Change) string { return "changed" }); err != nil {
 		t.Fatal(err)
 	}
-	items, err := st.DueOutbox(ctx, 10)
+	items, err := testDueOutbox(st, ctx, 10)
 	if err != nil || len(items) != 1 {
 		t.Fatalf("expected one due notification: %#v err=%v", items, err)
 	}
 	secretURL := items[0].Destination.ServiceURL
-	if err := st.Retry(ctx, items[0].ID, time.Now().UTC().Add(time.Minute), "request failed for "+secretURL, false); err != nil {
+	if err := testRetry(st, ctx, items[0].ID, time.Now().UTC().Add(time.Minute), "request failed for "+secretURL, false); err != nil {
 		t.Fatal(err)
 	}
 	page, err := st.ListHistory(ctx, HistoryFilter{Limit: 10})
@@ -206,13 +253,13 @@ func TestDestinationQueryCredentialsStayOutOfOutbox(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.applyBatch(ctx, generation, []model.Collected{historyResource("server", "100.64.0.1")}, func([]model.Change) string { return "baseline" }); err != nil {
+	if _, err := testApplyBatch(st, ctx, generation, []model.Collected{historyResource("server", "100.64.0.1")}, func([]model.Change) string { return "baseline" }); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.applyBatch(ctx, generation, []model.Collected{historyResource("server-new", "100.64.0.2")}, func([]model.Change) string { return "changed" }); err != nil {
+	if _, err := testApplyBatch(st, ctx, generation, []model.Collected{historyResource("server-new", "100.64.0.2")}, func([]model.Change) string { return "changed" }); err != nil {
 		t.Fatal(err)
 	}
-	items, err := st.DueOutbox(ctx, 10)
+	items, err := testDueOutbox(st, ctx, 10)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -226,7 +273,7 @@ func TestDestinationQueryCredentialsStayOutOfOutbox(t *testing.T) {
 	if item.ID == 0 {
 		t.Fatalf("query destination outbox row missing: %#v", items)
 	}
-	if err := st.Retry(ctx, item.ID, time.Now().UTC().Add(time.Minute), "provider rejected "+item.Destination.ServiceURL, false); err != nil {
+	if err := testRetry(st, ctx, item.ID, time.Now().UTC().Add(time.Minute), "provider rejected "+item.Destination.ServiceURL, false); err != nil {
 		t.Fatal(err)
 	}
 	var persisted string
@@ -261,24 +308,36 @@ func TestHistoryResourceFilterTreatsWildcardsLiterally(t *testing.T) {
 	}
 	baseline := model.Collected{Collector: "devices", Resources: []model.Resource{
 		{ID: "device%1", Type: "device", Name: "percent", Data: map[string]any{"hostname": "percent"}},
+		{ID: "device_3", Type: "device", Name: "underscore", Data: map[string]any{"hostname": "underscore"}},
+		{ID: `device\4`, Type: "device", Name: "backslash", Data: map[string]any{"hostname": "backslash"}},
 		{ID: "device-2", Type: "device", Name: "plain", Data: map[string]any{"hostname": "plain"}},
 	}}
-	if _, err := st.applyBatch(ctx, generation, []model.Collected{baseline}, func([]model.Change) string { return "baseline" }); err != nil {
+	if _, err := testApplyBatch(st, ctx, generation, []model.Collected{baseline}, func([]model.Change) string { return "baseline" }); err != nil {
 		t.Fatal(err)
 	}
 	changed := model.Collected{Collector: "devices", Resources: []model.Resource{
 		{ID: "device%1", Type: "device", Name: "percent", Data: map[string]any{"hostname": "percent-new"}},
+		{ID: "device_3", Type: "device", Name: "underscore", Data: map[string]any{"hostname": "underscore-new"}},
+		{ID: `device\4`, Type: "device", Name: "backslash", Data: map[string]any{"hostname": "backslash-new"}},
 		{ID: "device-2", Type: "device", Name: "plain", Data: map[string]any{"hostname": "plain-new"}},
 	}}
-	if _, err := st.applyBatch(ctx, generation, []model.Collected{changed}, func([]model.Change) string { return "changed" }); err != nil {
+	if _, err := testApplyBatch(st, ctx, generation, []model.Collected{changed}, func([]model.Change) string { return "changed" }); err != nil {
 		t.Fatal(err)
 	}
-	page, err := st.ListHistory(ctx, HistoryFilter{ResourceID: "%", Limit: 10})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(page.Batches) != 1 || len(page.Batches[0].Events) != 1 || page.Batches[0].Events[0].ResourceID != "device%1" {
-		t.Fatalf("wildcard filter was not literal: %#v", page)
+	for _, test := range []struct {
+		query, wantID string
+	}{
+		{query: "%", wantID: "device%1"},
+		{query: "_", wantID: "device_3"},
+		{query: `\`, wantID: `device\4`},
+	} {
+		page, listErr := st.ListHistory(ctx, HistoryFilter{ResourceID: test.query, Limit: 10})
+		if listErr != nil {
+			t.Fatal(listErr)
+		}
+		if len(page.Batches) != 1 || len(page.Batches[0].Events) != 1 || page.Batches[0].Events[0].ResourceID != test.wantID {
+			t.Fatalf("literal filter %q returned unexpected history: %#v", test.query, page)
+		}
 	}
 }
 
@@ -289,7 +348,7 @@ func TestHistoryCorrelatesCoalescedWebhookTriggers(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.applyBatch(ctx, generation, []model.Collected{historyResource("server", "100.64.0.1")}, func([]model.Change) string { return "baseline" }); err != nil {
+	if _, err := testApplyBatch(st, ctx, generation, []model.Collected{historyResource("server", "100.64.0.1")}, func([]model.Change) string { return "baseline" }); err != nil {
 		t.Fatal(err)
 	}
 	first, _, err := st.RecordWebhookTrigger(ctx, strings.Repeat("d", 64), []string{"policyUpdate"}, []string{"devices"})
@@ -323,18 +382,18 @@ func TestTamperedExportFailsVerification(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.applyBatch(ctx, generation, []model.Collected{historyResource("server", "100.64.0.1")}, func([]model.Change) string { return "baseline" }); err != nil {
+	if _, err := testApplyBatch(st, ctx, generation, []model.Collected{historyResource("server", "100.64.0.1")}, func([]model.Change) string { return "baseline" }); err != nil {
 		t.Fatal(err)
 	}
 	batch, err := st.ApplyBatchWithBatch(ctx, generation, []model.Collected{historyResource("server-new", "100.64.0.2")}, func([]model.Change) string { return "changed" })
 	if err != nil {
 		t.Fatal(err)
 	}
-	items, err := st.DueOutbox(ctx, 10)
+	items, err := testDueOutbox(st, ctx, 10)
 	if err != nil || len(items) != 1 {
 		t.Fatalf("expected one outbox item: %d %v", len(items), err)
 	}
-	if err := st.Retry(ctx, items[0].ID, time.Now().UTC().Add(time.Minute), "delivery failed for "+items[0].Destination.ServiceURL, true); err != nil {
+	if err := testRetry(st, ctx, items[0].ID, time.Now().UTC().Add(time.Minute), "delivery failed for "+items[0].Destination.ServiceURL, true); err != nil {
 		t.Fatal(err)
 	}
 
@@ -371,7 +430,7 @@ func TestHistoryPaginationAndRemovalSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.applyBatch(ctx, generation, []model.Collected{historyResource("server", "100.64.0.1")}, func([]model.Change) string { return "baseline" }); err != nil {
+	if _, err := testApplyBatch(st, ctx, generation, []model.Collected{historyResource("server", "100.64.0.1")}, func([]model.Change) string { return "baseline" }); err != nil {
 		t.Fatal(err)
 	}
 	first, err := st.ApplyBatchWithBatch(ctx, generation, []model.Collected{historyResource("server-one", "100.64.0.1")}, func([]model.Change) string { return "first" })
@@ -492,13 +551,22 @@ CREATE TABLE outbox(id INTEGER PRIMARY KEY AUTOINCREMENT,destination_id INTEGER 
 	if triggerTable != 1 {
 		t.Fatal("schema migration did not create webhook trigger storage")
 	}
-	for _, column := range []string{"attempts", "next_attempt_at", "lease_until", "last_error"} {
+	for _, column := range []string{"attempts", "next_attempt_at", "lease_until", "lease_token", "last_error"} {
 		var found int
 		if err := st.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM pragma_table_info('webhook_triggers') WHERE name=?", column).Scan(&found); err != nil {
 			t.Fatal(err)
 		}
 		if found != 1 {
 			t.Fatalf("schema migration did not add webhook trigger column %q", column)
+		}
+	}
+	for _, column := range []string{"lease_until", "lease_token"} {
+		var found int
+		if err := st.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM pragma_table_info('outbox') WHERE name=?", column).Scan(&found); err != nil {
+			t.Fatal(err)
+		}
+		if found != 1 {
+			t.Fatalf("schema migration did not add outbox column %q", column)
 		}
 	}
 	var linkTable int
@@ -539,10 +607,10 @@ func TestCleanupRemovesExpiredHistoryBatches(t *testing.T) {
 	}
 	baseline := historyResource("server", "100.64.0.1")
 	changed := historyResource("server-new", "100.64.0.2")
-	if _, err := st.applyBatch(ctx, generation, []model.Collected{baseline}, func([]model.Change) string { return "baseline" }); err != nil {
+	if _, err := testApplyBatch(st, ctx, generation, []model.Collected{baseline}, func([]model.Change) string { return "baseline" }); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.applyBatch(ctx, generation, []model.Collected{changed}, func([]model.Change) string { return "changed" }); err != nil {
+	if _, err := testApplyBatch(st, ctx, generation, []model.Collected{changed}, func([]model.Change) string { return "changed" }); err != nil {
 		t.Fatal(err)
 	}
 	old := time.Now().UTC().Add(-48 * time.Hour).Format(time.RFC3339Nano)

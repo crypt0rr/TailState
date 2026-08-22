@@ -24,6 +24,16 @@ type persistedFields struct {
 	TotalFields     int                 `json:"total_fields,omitempty"`
 }
 
+const (
+	// A previously baselined collector must not be demoted to a six-hour
+	// unsupported window on one transient 403/404. Require a second
+	// consecutive response before changing its capability state, while still
+	// demoting collectors that have never produced a baseline immediately.
+	unsupportedConfirmationMessage = "unsupported response pending confirmation"
+	unsupportedRetryInterval       = 5 * time.Minute
+	unsupportedDemotionInterval    = 6 * time.Hour
+)
+
 func (s *Store) ApplyBatchWithBatch(ctx context.Context, generation int64, results []model.Collected, digest func([]model.Change) string, triggerIDs ...int64) (ChangeBatchResult, error) {
 	triggerIDs = uniquePositiveIDs(triggerIDs)
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -51,7 +61,23 @@ func (s *Store) ApplyBatchWithBatch(ctx context.Context, generation int64, resul
 			continue
 		}
 		if result.Unsupported {
-			next := now.Add(6 * time.Hour).Format(time.RFC3339Nano)
+			var supported, baseline int
+			var lastError string
+			stateErr := tx.QueryRowContext(ctx, "SELECT supported,baseline,last_error FROM collector_state WHERE generation=? AND collector=?", generation, result.Collector).Scan(&supported, &baseline, &lastError)
+			if stateErr != nil && !errors.Is(stateErr, sql.ErrNoRows) {
+				return ChangeBatchResult{}, stateErr
+			}
+			if stateErr == nil && supported == 1 && baseline == 1 && lastError != unsupportedConfirmationMessage {
+				next := now.Add(unsupportedRetryInterval).Format(time.RFC3339Nano)
+				_, err = tx.ExecContext(ctx, `UPDATE collector_state
+					SET supported=1,last_error=?,failure_count=1,next_poll=?,partial=0,partial_error_count=0
+					WHERE generation=? AND collector=?`, unsupportedConfirmationMessage, next, generation, result.Collector)
+				if err != nil {
+					return ChangeBatchResult{}, err
+				}
+				continue
+			}
+			next := now.Add(unsupportedDemotionInterval).Format(time.RFC3339Nano)
 			_, err = tx.ExecContext(ctx, `INSERT INTO collector_state(generation,collector,supported,baseline,last_error,next_poll,partial) VALUES(?,?,0,0,'unsupported',?,0) ON CONFLICT(generation,collector) DO UPDATE SET supported=0,last_error='unsupported',next_poll=excluded.next_poll,partial=0`, generation, result.Collector, next)
 			if err != nil {
 				return ChangeBatchResult{}, err
@@ -137,12 +163,12 @@ func (s *Store) ApplyBatchWithBatch(ctx context.Context, generation int64, resul
 			}
 		}
 		if !result.Partial {
-			// Treat a sudden large disappearance as degraded data, but do not
+			// Treat a sudden majority disappearance as degraded data, but do not
 			// suppress removals forever if the upstream keeps returning the same
 			// shape. Two consecutive guarded responses are enough to establish
 			// that the new population is stable; the following poll resumes the
 			// normal two-poll removal confirmation path.
-			suspicious := len(missingRows) >= 3 && len(missingRows) >= len(seen)
+			suspicious := len(missingRows) >= 3 && len(missingRows) > len(seen)
 			confirmedMissing := len(missingRows) > 0
 			for _, missing := range missingRows {
 				if missing.missing == 0 {

@@ -313,6 +313,8 @@ func TestVerifyLedgerLinksRejectsInvalidChains(t *testing.T) {
 		{name: "hash length", pack: EvidencePack{SigningKeyID: keyID, Batches: []EvidenceBatch{{ID: 1, LedgerSequence: 1, LedgerHash: "short"}}}, want: "invalid ledger hash"},
 		{name: "hash encoding", pack: EvidencePack{SigningKeyID: keyID, Batches: []EvidenceBatch{{ID: 1, LedgerSequence: 1, LedgerHash: strings.Repeat("z", 64)}}}, want: "invalid ledger hash"},
 		{name: "chain mismatch", pack: EvidencePack{SigningKeyID: keyID, Batches: []EvidenceBatch{{ID: 2, LedgerSequence: 2, LedgerPrevHash: strings.Repeat("a", 64), LedgerHash: strings.Repeat("b", 64)}, {ID: 1, LedgerSequence: 1, LedgerHash: strings.Repeat("c", 64)}}}, want: "evidence ledger chain mismatch"},
+		{name: "mixed ledger state", pack: EvidencePack{SigningKeyID: keyID, Batches: []EvidenceBatch{{ID: 1, LedgerSequence: 1, LedgerHash: strings.Repeat("a", 64)}, {ID: 2, LedgerSequence: 0}}}, want: "mixes ledgered and unledgered batches"},
+		{name: "negative sequence", pack: EvidencePack{SigningKeyID: keyID, Batches: []EvidenceBatch{{ID: 1, LedgerSequence: -1}}}, want: "invalid ledger sequence"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -466,6 +468,21 @@ func TestEvidenceLedgerStartupDoesNotInferMissingCutoffFromRows(t *testing.T) {
 	}
 	if count != 0 {
 		t.Fatalf("startup inferred a historical cutoff and signed batch %d", batchID)
+	}
+}
+
+func TestEvidenceExportRejectsMixedLedgerState(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	insertCompleteSigningBatch(t, st)
+	if err := st.backfillEvidenceLedger(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// A row inserted after the one-time backfill has no ledger entry. It must
+	// not be silently included beside authenticated history in a signed pack.
+	insertCompleteSigningBatch(t, st)
+	if _, err := st.ExportEvidencePack(ctx, HistoryFilter{Limit: 10}); err == nil || !strings.Contains(err.Error(), "mixes ledgered and unledgered batches") {
+		t.Fatalf("mixed ledger export was accepted: %v", err)
 	}
 }
 

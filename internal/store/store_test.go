@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -60,6 +61,36 @@ func TestSetupSessionAndSettingsEncryption(t *testing.T) {
 	generation, err = st.SaveSettings(ctx, changed)
 	if err != nil || generation != 1 {
 		t.Fatalf("credential rotation unexpectedly changed generation: %d %v", generation, err)
+	}
+}
+
+func TestSaveSettingsReusesUnchangedEncryptedValues(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	configured := settings()
+	configured.WebhookSecret = "webhook-secret"
+	if _, err := st.SaveSettings(ctx, configured); err != nil {
+		t.Fatal(err)
+	}
+	var oauthBefore, webhookBefore, legacyBefore, destinationBefore string
+	if err := st.db.QueryRowContext(ctx, "SELECT oauth_secret_enc,webhook_secret_enc,mattermost_url_enc FROM settings WHERE id=1").Scan(&oauthBefore, &webhookBefore, &legacyBefore); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.db.QueryRowContext(ctx, "SELECT service_url_enc FROM notification_destinations WHERE name='Mattermost' AND deleted_at IS NULL").Scan(&destinationBefore); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.SaveSettings(ctx, configured); err != nil {
+		t.Fatal(err)
+	}
+	var oauthAfter, webhookAfter, legacyAfter, destinationAfter string
+	if err := st.db.QueryRowContext(ctx, "SELECT oauth_secret_enc,webhook_secret_enc,mattermost_url_enc FROM settings WHERE id=1").Scan(&oauthAfter, &webhookAfter, &legacyAfter); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.db.QueryRowContext(ctx, "SELECT service_url_enc FROM notification_destinations WHERE name='Mattermost' AND deleted_at IS NULL").Scan(&destinationAfter); err != nil {
+		t.Fatal(err)
+	}
+	if oauthBefore != oauthAfter || webhookBefore != webhookAfter || legacyBefore != legacyAfter || destinationBefore != destinationAfter {
+		t.Fatalf("unchanged settings were re-encrypted: oauth=%t webhook=%t legacy=%t destination=%t", oauthBefore != oauthAfter, webhookBefore != webhookAfter, legacyBefore != legacyAfter, destinationBefore != destinationAfter)
 	}
 }
 
@@ -168,7 +199,7 @@ func TestCleanupDeadLettersExpiredOutboxAndPurgesOldDeadLetters(t *testing.T) {
 	if err := st.EnqueueSystem(ctx, "fresh retry"); err != nil {
 		t.Fatal(err)
 	}
-	items, err := st.DueOutbox(ctx, 10)
+	items, err := testDueOutbox(st, ctx, 10)
 	if err != nil || len(items) != 2 {
 		t.Fatalf("outbox=%#v err=%v", items, err)
 	}
@@ -217,6 +248,57 @@ func TestCleanupDeadLettersExpiredOutboxAndPurgesOldDeadLetters(t *testing.T) {
 	}
 	if count != 0 {
 		t.Fatalf("old dead-letter row remained: %d", count)
+	}
+}
+
+func TestCleanupDeadLettersExpiredWebhookTriggersWithoutDeletingActiveLease(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	first, created, err := st.RecordWebhookTrigger(ctx, strings.Repeat("a", 64), nil, nil)
+	if err != nil || !created {
+		t.Fatalf("record pending trigger: %#v created=%v err=%v", first, created, err)
+	}
+	second, created, err := st.RecordWebhookTrigger(ctx, strings.Repeat("b", 64), nil, nil)
+	if err != nil || !created {
+		t.Fatalf("record processing trigger: %#v created=%v err=%v", second, created, err)
+	}
+	oldReceived := time.Now().UTC().Add(-webhookTriggerRetryWindow - time.Hour).Format(time.RFC3339Nano)
+	activeLease := time.Now().UTC().Add(time.Hour).Format(time.RFC3339Nano)
+	if _, err := st.db.ExecContext(ctx, "UPDATE webhook_triggers SET received_at=? WHERE id=?", oldReceived, first.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.db.ExecContext(ctx, "UPDATE webhook_triggers SET received_at=?,status='processing',lease_until=?,lease_token='active-lease' WHERE id=?", oldReceived, activeLease, second.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := st.Cleanup(ctx, 30*24*time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	var status, lastError, leaseToken string
+	if err := st.db.QueryRowContext(ctx, "SELECT status,last_error,lease_token FROM webhook_triggers WHERE id=?", first.ID).Scan(&status, &lastError, &leaseToken); err != nil {
+		t.Fatal(err)
+	}
+	if status != "dead" || lastError != "reconciliation retry window expired" || leaseToken != "" {
+		t.Fatalf("expired pending trigger status=%q error=%q lease=%q", status, lastError, leaseToken)
+	}
+	if err := st.db.QueryRowContext(ctx, "SELECT status,lease_token FROM webhook_triggers WHERE id=?", second.ID).Scan(&status, &leaseToken); err != nil {
+		t.Fatal(err)
+	}
+	if status != "processing" || leaseToken != "active-lease" {
+		t.Fatalf("active webhook lease was changed during cleanup: status=%q lease=%q", status, leaseToken)
+	}
+
+	if _, err := st.db.ExecContext(ctx, "UPDATE webhook_triggers SET lease_until=? WHERE id=?", time.Now().UTC().Add(-time.Minute).Format(time.RFC3339Nano), second.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Cleanup(ctx, 30*24*time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.db.QueryRowContext(ctx, "SELECT status,last_error,lease_token FROM webhook_triggers WHERE id=?", second.ID).Scan(&status, &lastError, &leaseToken); err != nil {
+		t.Fatal(err)
+	}
+	if status != "dead" || lastError != "reconciliation retry window expired" || leaseToken != "" {
+		t.Fatalf("expired processing trigger status=%q error=%q lease=%q", status, lastError, leaseToken)
 	}
 }
 
@@ -289,7 +371,7 @@ func TestWebhookSecretIsEncryptedAndTriggerBodiesAreDeduplicated(t *testing.T) {
 	if err != nil || created || second.ID != first.ID || len(second.EventTypes) != 1 || second.EventTypes[0] != "policyUpdate" {
 		t.Fatalf("deduplication failed: %#v created=%v err=%v", second, created, err)
 	}
-	if err := st.CompleteWebhookTriggers(ctx, []int64{first.ID}); err != nil {
+	if err := testCompleteWebhookTriggers(st, ctx, []int64{first.ID}); err != nil {
 		t.Fatal(err)
 	}
 	processed, _, err := st.RecordWebhookTrigger(ctx, strings.Repeat("a", 64), nil, nil)
@@ -315,7 +397,7 @@ func TestWebhookTriggersAreDurableAndRetryable(t *testing.T) {
 	if claimed[0].Status != "processing" || claimed[0].Attempts != 1 || claimed[0].LeaseUntil == nil {
 		t.Fatalf("trigger was not leased: %#v", claimed[0])
 	}
-	if err := st.RetryWebhookTriggers(ctx, []int64{first.ID}, time.Now().UTC().Add(time.Hour), "temporary collector failure"); err != nil {
+	if err := testRetryWebhookTriggers(st, ctx, []int64{first.ID}, time.Now().UTC().Add(time.Hour), "temporary collector failure"); err != nil {
 		t.Fatal(err)
 	}
 	if retry, _, err := st.RecordWebhookTrigger(ctx, strings.Repeat("b", 64), nil, nil); err != nil || retry.Status != "pending" || retry.Attempts != 1 {
@@ -331,7 +413,7 @@ func TestWebhookTriggersAreDurableAndRetryable(t *testing.T) {
 	if err != nil || len(claimed) != 1 || claimed[0].Attempts != 2 {
 		t.Fatalf("retry was not reclaimed: %#v err=%v", claimed, err)
 	}
-	if err := st.CompleteWebhookTriggers(ctx, []int64{first.ID}); err != nil {
+	if err := testCompleteWebhookTriggers(st, ctx, []int64{first.ID}); err != nil {
 		t.Fatal(err)
 	}
 	processed, _, err := st.RecordWebhookTrigger(ctx, strings.Repeat("b", 64), nil, nil)
@@ -347,12 +429,303 @@ func TestWebhookTriggersAreDurableAndRetryable(t *testing.T) {
 	if _, err := st.db.ExecContext(ctx, "UPDATE webhook_triggers SET received_at=?,next_attempt_at=? WHERE id=?", old, old, dead.ID); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.RetryWebhookTriggers(ctx, []int64{dead.ID}, time.Now().UTC(), "collector failure"); err != nil {
+	if err := testRetryWebhookTriggers(st, ctx, []int64{dead.ID}, time.Now().UTC(), "collector reconciliation failed"); err != nil {
 		t.Fatal(err)
 	}
 	deadState, _, err := st.RecordWebhookTrigger(ctx, strings.Repeat("c", 64), nil, nil)
-	if err != nil || deadState.Status != "dead" || deadState.LastError != "collector failure" {
+	if err != nil || deadState.Status != "dead" || deadState.LastError != "collector reconciliation failed" {
 		t.Fatalf("expired trigger was not dead-lettered: %#v err=%v", deadState, err)
+	}
+}
+
+func TestWebhookClaimLeaseFencingAndExpiredRetry(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	trigger, created, err := st.RecordWebhookTrigger(ctx, strings.Repeat("8", 64), nil, nil)
+	if err != nil || !created {
+		t.Fatalf("record trigger: %#v created=%v err=%v", trigger, created, err)
+	}
+	first, claimed, err := st.ClaimWebhookTrigger(ctx, trigger.ID, time.Minute)
+	if err != nil || !claimed || first.LeaseToken == "" {
+		t.Fatalf("first claim: %#v claimed=%v err=%v", first, claimed, err)
+	}
+	if err := st.CompleteClaimedWebhookTriggers(ctx, []WebhookTrigger{{ID: first.ID}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.RetryClaimedWebhookTriggers(ctx, []WebhookTrigger{{ID: first.ID}}, time.Now().UTC(), "collector reconciliation failed"); err != nil {
+		t.Fatal(err)
+	}
+	if err := testRetryWebhookTriggers(st, ctx, []int64{first.ID}, time.Now().UTC(), "reconciliation retry window expired"); err != nil {
+		t.Fatal(err)
+	}
+	second, claimed, err := st.ClaimWebhookTrigger(ctx, trigger.ID, time.Minute)
+	if err != nil || !claimed || second.LeaseToken == first.LeaseToken {
+		t.Fatalf("second claim did not rotate the lease: %#v claimed=%v err=%v", second, claimed, err)
+	}
+	if err := st.CompleteClaimedWebhookTriggers(ctx, []WebhookTrigger{first}); err != nil {
+		t.Fatal(err)
+	}
+	current, _, err := st.RecordWebhookTrigger(ctx, strings.Repeat("8", 64), nil, nil)
+	if err != nil || current.Status != "processing" || current.LeaseToken != second.LeaseToken {
+		t.Fatalf("stale completion changed current claim: %#v err=%v", current, err)
+	}
+	if err := st.CompleteClaimedWebhookTriggers(ctx, []WebhookTrigger{second, second}); err != nil {
+		t.Fatal(err)
+	}
+	current, _, err = st.RecordWebhookTrigger(ctx, strings.Repeat("8", 64), nil, nil)
+	if err != nil || current.Status != "processed" {
+		t.Fatalf("current completion failed: %#v err=%v", current, err)
+	}
+
+	dead, created, err := st.RecordWebhookTrigger(ctx, strings.Repeat("9", 64), nil, nil)
+	if err != nil || !created {
+		t.Fatalf("record expired trigger: %#v created=%v err=%v", dead, created, err)
+	}
+	deadClaim, claimed, err := st.ClaimWebhookTrigger(ctx, dead.ID, time.Minute)
+	if err != nil || !claimed {
+		t.Fatalf("claim expired trigger: %#v claimed=%v err=%v", deadClaim, claimed, err)
+	}
+	old := time.Now().UTC().Add(-webhookTriggerRetryWindow - time.Minute).Format(time.RFC3339Nano)
+	if _, err := st.db.ExecContext(ctx, "UPDATE webhook_triggers SET received_at=? WHERE id=?", old, dead.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.RetryClaimedWebhookTriggers(ctx, []WebhookTrigger{deadClaim}, time.Now().UTC(), "collector reconciliation failed"); err != nil {
+		t.Fatal(err)
+	}
+	deadState, _, err := st.RecordWebhookTrigger(ctx, strings.Repeat("9", 64), nil, nil)
+	if err != nil || deadState.Status != "dead" || deadState.LeaseToken != "" {
+		t.Fatalf("expired claim was not dead-lettered: %#v err=%v", deadState, err)
+	}
+}
+
+func TestOutboxClaimLeaseFencingAndExpiredRetry(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	if _, err := st.SaveSettings(ctx, settings()); err != nil {
+		t.Fatal(err)
+	}
+	if claims, err := st.ClaimDueOutbox(ctx, 0); err != nil || len(claims) != 0 {
+		t.Fatalf("empty default outbox claim: %#v err=%v", claims, err)
+	}
+	if claims, err := st.ClaimDueOutbox(ctx, 100); err != nil || len(claims) != 0 {
+		t.Fatalf("empty bounded outbox claim: %#v err=%v", claims, err)
+	}
+	if err := st.DeliveredClaimed(ctx, OutboxItem{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.RetryClaimed(ctx, OutboxItem{}, time.Now(), "ignored", false); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.EnqueueSystem(ctx, "lease-fenced delivery"); err != nil {
+		t.Fatal(err)
+	}
+	firstClaims, err := st.ClaimDueOutbox(ctx, 10, time.Minute)
+	if err != nil || len(firstClaims) != 1 || firstClaims[0].LeaseToken == "" {
+		t.Fatalf("first outbox claim: %#v err=%v", firstClaims, err)
+	}
+	statusSnapshot, err := st.Status(ctx)
+	if err != nil || statusSnapshot.Pending != 0 || statusSnapshot.Processing != 1 {
+		t.Fatalf("processing outbox state was not visible: %#v err=%v", statusSnapshot, err)
+	}
+	if secondClaims, err := st.ClaimDueOutbox(ctx, 10, time.Minute); err != nil || len(secondClaims) != 0 {
+		t.Fatalf("active outbox lease was claimed twice: %#v err=%v", secondClaims, err)
+	}
+	oldLease := time.Now().UTC().Add(-time.Minute).Format(time.RFC3339Nano)
+	if _, err := st.db.ExecContext(ctx, "UPDATE outbox SET lease_until=? WHERE id=?", oldLease, firstClaims[0].ID); err != nil {
+		t.Fatal(err)
+	}
+	secondClaims, err := st.ClaimDueOutbox(ctx, 10, time.Minute)
+	if err != nil || len(secondClaims) != 1 || secondClaims[0].LeaseToken == firstClaims[0].LeaseToken {
+		t.Fatalf("expired outbox lease was not rotated: %#v err=%v", secondClaims, err)
+	}
+	if err := st.DeliveredClaimed(ctx, firstClaims[0]); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.RetryClaimed(ctx, firstClaims[0], time.Now().UTC(), "stale delivery failure", false); err != nil {
+		t.Fatal(err)
+	}
+	var status, token string
+	var attempts int
+	if err := st.db.QueryRowContext(ctx, "SELECT status,lease_token,attempts FROM outbox WHERE id=?", firstClaims[0].ID).Scan(&status, &token, &attempts); err != nil {
+		t.Fatal(err)
+	}
+	if status != "processing" || token != secondClaims[0].LeaseToken || attempts != 2 {
+		t.Fatalf("stale outbox bookkeeping changed current claim: status=%q token=%q attempts=%d", status, token, attempts)
+	}
+	if err := st.DeliveredClaimed(ctx, secondClaims[0]); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.db.QueryRowContext(ctx, "SELECT status,lease_token FROM outbox WHERE id=?", firstClaims[0].ID).Scan(&status, &token); err != nil {
+		t.Fatal(err)
+	}
+	if status != "delivered" || token != "" {
+		t.Fatalf("current outbox claim did not complete: status=%q token=%q", status, token)
+	}
+
+	if err := st.EnqueueSystem(ctx, "expired delivery"); err != nil {
+		t.Fatal(err)
+	}
+	claims, err := st.ClaimDueOutbox(ctx, 10, time.Minute)
+	if err != nil || len(claims) != 1 {
+		t.Fatalf("expired candidate claim: %#v err=%v", claims, err)
+	}
+	oldAttempt := time.Now().UTC().Add(-outboxRetryWindow - time.Minute).Format(time.RFC3339Nano)
+	if _, err := st.db.ExecContext(ctx, "UPDATE outbox SET first_attempt=? WHERE id=?", oldAttempt, claims[0].ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.RetryClaimed(ctx, claims[0], time.Now().UTC(), "delivery failed", true); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.db.QueryRowContext(ctx, "SELECT status,lease_token FROM outbox WHERE id=?", claims[0].ID).Scan(&status, &token); err != nil {
+		t.Fatal(err)
+	}
+	if status != "dead" || token != "" {
+		t.Fatalf("expired outbox claim was not dead-lettered: status=%q token=%q", status, token)
+	}
+	if err := st.EnqueueSystem(ctx, "cleanup expired in-flight delivery"); err != nil {
+		t.Fatal(err)
+	}
+	cleanupClaims, err := st.ClaimDueOutbox(ctx, 10, time.Minute)
+	if err != nil || len(cleanupClaims) != 1 {
+		t.Fatalf("cleanup candidate claim: %#v err=%v", cleanupClaims, err)
+	}
+	if _, err := st.db.ExecContext(ctx, "UPDATE outbox SET first_attempt=?,lease_until=? WHERE id=?", oldAttempt, oldLease, cleanupClaims[0].ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Cleanup(ctx, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.db.QueryRowContext(ctx, "SELECT status,lease_token FROM outbox WHERE id=?", cleanupClaims[0].ID).Scan(&status, &token); err != nil {
+		t.Fatal(err)
+	}
+	if status != "dead" || token != "" {
+		t.Fatalf("cleanup did not dead-letter expired in-flight delivery: status=%q token=%q", status, token)
+	}
+}
+
+func TestClaimDueOutboxDeadLettersExpiredRowsBeforeDelivery(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	if _, err := st.SaveSettings(ctx, settings()); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.EnqueueSystem(ctx, "expired pending"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.EnqueueSystem(ctx, "expired lease"); err != nil {
+		t.Fatal(err)
+	}
+	items, err := testDueOutbox(st, ctx, 10)
+	if err != nil || len(items) != 2 {
+		t.Fatalf("due outbox=%#v err=%v", items, err)
+	}
+	oldAttempt := time.Now().UTC().Add(-outboxRetryWindow - time.Minute).Format(time.RFC3339Nano)
+	oldLease := time.Now().UTC().Add(-time.Minute).Format(time.RFC3339Nano)
+	for _, item := range items {
+		if item.Payload == "expired lease" {
+			if _, err := st.db.ExecContext(ctx, "UPDATE outbox SET status='processing',first_attempt=?,lease_until=? WHERE id=?", oldAttempt, oldLease, item.ID); err != nil {
+				t.Fatal(err)
+			}
+			continue
+		}
+		if _, err := st.db.ExecContext(ctx, "UPDATE outbox SET first_attempt=? WHERE id=?", oldAttempt, item.ID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	claims, err := st.ClaimDueOutbox(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(claims) != 0 {
+		t.Fatalf("expired outbox rows were delivered: %#v", claims)
+	}
+	rows, err := st.db.QueryContext(ctx, "SELECT status,last_error FROM outbox ORDER BY id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var status, lastError string
+		if err := rows.Scan(&status, &lastError); err != nil {
+			t.Fatal(err)
+		}
+		if status != "dead" || lastError != "delivery retry window expired" {
+			t.Fatalf("expired outbox row status=%q error=%q", status, lastError)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestWebhookRetryMessageIsRedacted(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	trigger, created, err := st.RecordWebhookTrigger(ctx, strings.Repeat("d", 64), nil, nil)
+	if err != nil || !created {
+		t.Fatalf("record trigger: %#v created=%v err=%v", trigger, created, err)
+	}
+	secretURL := "https://provider.example/hooks/secret-token?token=credential"
+	if err := testRetryWebhookTriggers(st, ctx, []int64{trigger.ID}, time.Now().UTC(), secretURL); err != nil {
+		t.Fatal(err)
+	}
+	var persisted string
+	if err := st.db.QueryRowContext(ctx, "SELECT last_error FROM webhook_triggers WHERE id=?", trigger.ID).Scan(&persisted); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(persisted, secretURL) || strings.Contains(persisted, "secret-token") || strings.Contains(persisted, "credential") {
+		t.Fatalf("webhook retry error leaked into SQLite: %q", persisted)
+	}
+	if persisted != "notification delivery failed" {
+		t.Fatalf("persisted webhook retry error=%q, want bounded reason", persisted)
+	}
+	stored, _, err := st.RecordWebhookTrigger(ctx, strings.Repeat("d", 64), nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(stored.LastError, secretURL) || strings.Contains(stored.LastError, "secret-token") || strings.Contains(stored.LastError, "credential") {
+		t.Fatalf("webhook retry error leaked provider details: %q", stored.LastError)
+	}
+	if stored.LastError != "notification delivery failed" {
+		t.Fatalf("webhook retry error=%q, want bounded reason", stored.LastError)
+	}
+}
+
+func TestWebhookTriggerMetadataReadIsBoundedAndValidated(t *testing.T) {
+	ctx := context.Background()
+	tests := []struct {
+		name    string
+		column  string
+		value   func() string
+		wantErr string
+	}{
+		{name: "event null", column: "event_types_json", value: func() string { return "null" }, wantErr: "event metadata must be a JSON array"},
+		{name: "collector object", column: "collectors_json", value: func() string { return `{"collector":"devices"}` }, wantErr: "collector metadata must be a JSON array"},
+		{name: "event too many values", column: "event_types_json", value: func() string {
+			values := make([]string, maxWebhookEventTypes+1)
+			for i := range values {
+				values[i] = fmt.Sprintf("event-%d", i)
+			}
+			encoded, _ := json.Marshal(values)
+			return string(encoded)
+		}, wantErr: "event metadata contains too many values"},
+		{name: "collector control value", column: "collectors_json", value: func() string { return `["devices\n"]` }, wantErr: "collector metadata contains an invalid value"},
+		{name: "event oversized json", column: "event_types_json", value: func() string { return fmt.Sprintf("[%q]", strings.Repeat("x", maxWebhookMetadataJSONBytes)) }, wantErr: "event metadata JSON is empty or too large"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			st := testStore(t)
+			bodyHash := strings.Repeat("a", 64)
+			if _, _, err := st.RecordWebhookTrigger(ctx, bodyHash, []string{"nodeCreated"}, []string{"devices"}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := st.db.ExecContext(ctx, "UPDATE webhook_triggers SET "+tt.column+"=? WHERE body_hash=?", tt.value(), bodyHash); err != nil {
+				t.Fatal(err)
+			}
+			if _, _, err := st.RecordWebhookTrigger(ctx, bodyHash, nil, nil); err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("metadata error = %v, want %q", err, tt.wantErr)
+			}
+		})
 	}
 }
 
@@ -386,6 +759,29 @@ func TestHasDueWebhookTriggersIsReadOnlyAndIncludesExpiredRows(t *testing.T) {
 	}
 }
 
+func TestHasDueWebhookTriggersSkipsActiveProcessingLease(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	now := time.Now().UTC()
+	trigger, created, err := st.RecordWebhookTrigger(ctx, strings.Repeat("8", 64), nil, nil)
+	if err != nil || !created {
+		t.Fatalf("record trigger created=%v err=%v", created, err)
+	}
+	old := now.Add(-webhookTriggerRetryWindow - time.Minute).Format(time.RFC3339Nano)
+	activeLease := now.Add(time.Minute).Format(time.RFC3339Nano)
+	if _, err := st.db.ExecContext(ctx, `UPDATE webhook_triggers
+		SET status='processing',received_at=?,next_attempt_at=?,lease_until=?,lease_token='active'
+		WHERE id=?`, old, old, activeLease, trigger.ID); err != nil {
+		t.Fatal(err)
+	}
+	if due, err := st.HasDueWebhookTriggers(ctx, now); err != nil || due {
+		t.Fatalf("active processing lease was reported due=%v err=%v", due, err)
+	}
+	if due, err := st.HasDueWebhookTriggers(ctx, now.Add(2*time.Minute)); err != nil || !due {
+		t.Fatalf("expired processing lease was not reported due=%v err=%v", due, err)
+	}
+}
+
 func TestFastWebhookClaimIsExclusiveWithDurableClaim(t *testing.T) {
 	ctx := context.Background()
 	st := testStore(t)
@@ -413,7 +809,7 @@ func TestFastWebhookClaimIsExclusiveWithDurableClaim(t *testing.T) {
 	if _, fast, err := st.ClaimWebhookTrigger(ctx, trigger.ID, time.Minute); err != nil || fast {
 		t.Fatalf("second fast claim unexpectedly acquired trigger: fast=%v err=%v", fast, err)
 	}
-	if err := st.CompleteWebhookTriggers(ctx, []int64{trigger.ID}); err != nil {
+	if err := testCompleteWebhookTriggers(st, ctx, []int64{trigger.ID}); err != nil {
 		t.Fatal(err)
 	}
 	future, created, err := st.RecordWebhookTrigger(ctx, strings.Repeat("e", 64), nil, nil)
@@ -479,11 +875,11 @@ func TestUnsupportedCollectorSilentlyBaselinesWhenItReturns(t *testing.T) {
 		t.Fatal(err)
 	}
 	unsupported := []model.Collected{{Collector: "contacts", Unsupported: true}}
-	if changes, err := st.applyBatch(ctx, generation, unsupported, func([]model.Change) string { return "digest" }); err != nil || len(changes) != 0 {
+	if changes, err := testApplyBatch(st, ctx, generation, unsupported, func([]model.Change) string { return "digest" }); err != nil || len(changes) != 0 {
 		t.Fatalf("unsupported collector produced changes: %#v %v", changes, err)
 	}
 	returned := []model.Collected{{Collector: "contacts", Resources: []model.Resource{{ID: "contacts", Type: "contacts", Name: "Tailnet contacts", Data: map[string]any{"email": "owner@example.com"}}}}}
-	changes, err := st.applyBatch(ctx, generation, returned, func([]model.Change) string { return "digest" })
+	changes, err := testApplyBatch(st, ctx, generation, returned, func([]model.Change) string { return "digest" })
 	if err != nil || len(changes) != 0 {
 		t.Fatalf("returning collector did not silently baseline: %#v %v", changes, err)
 	}
@@ -505,6 +901,47 @@ func TestUnsupportedCollectorSilentlyBaselinesWhenItReturns(t *testing.T) {
 	}
 }
 
+func TestBaselinedCollectorRequiresConsecutiveUnsupportedResponses(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	generation, err := st.SaveSettings(ctx, settings())
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseline := []model.Collected{{Collector: "contacts", Resources: []model.Resource{{ID: "contacts", Type: "contacts", Name: "Tailnet contacts", Data: map[string]any{"email": "owner@example.com"}}}}}
+	if _, err := testApplyBatch(st, ctx, generation, baseline, func([]model.Change) string { return "baseline" }); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := testApplyBatch(st, ctx, generation, []model.Collected{{Collector: "contacts", Unsupported: true}}, func([]model.Change) string { return "first unsupported" }); err != nil {
+		t.Fatal(err)
+	}
+	var supported, baselineFlag int
+	var lastError, nextPoll string
+	if err := st.db.QueryRowContext(ctx, "SELECT supported,baseline,last_error,next_poll FROM collector_state WHERE generation=? AND collector='contacts'", generation).Scan(&supported, &baselineFlag, &lastError, &nextPoll); err != nil {
+		t.Fatal(err)
+	}
+	firstRetry, err := time.Parse(time.RFC3339Nano, nextPoll)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if supported != 1 || baselineFlag != 1 || lastError != unsupportedConfirmationMessage || time.Until(firstRetry) <= 0 || time.Until(firstRetry) > time.Hour {
+		t.Fatalf("first unsupported response demoted a valid baseline: supported=%d baseline=%d error=%q next=%q", supported, baselineFlag, lastError, nextPoll)
+	}
+	if _, err := testApplyBatch(st, ctx, generation, []model.Collected{{Collector: "contacts", Unsupported: true}}, func([]model.Change) string { return "second unsupported" }); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.db.QueryRowContext(ctx, "SELECT supported,baseline,last_error,next_poll FROM collector_state WHERE generation=? AND collector='contacts'", generation).Scan(&supported, &baselineFlag, &lastError, &nextPoll); err != nil {
+		t.Fatal(err)
+	}
+	confirmedRetry, err := time.Parse(time.RFC3339Nano, nextPoll)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if supported != 0 || baselineFlag != 1 || lastError != "unsupported" || time.Until(confirmedRetry) < 5*time.Hour {
+		t.Fatalf("second unsupported response did not demote the collector: supported=%d baseline=%d error=%q next=%q", supported, baselineFlag, lastError, nextPoll)
+	}
+}
+
 func TestDriftAcrossUnsupportedWindowIsReported(t *testing.T) {
 	ctx := context.Background()
 	st := testStore(t)
@@ -517,13 +954,13 @@ func TestDriftAcrossUnsupportedWindowIsReported(t *testing.T) {
 			"id": "device-1", "hostname": "server", "authorized": authorized,
 		}}}
 	}
-	if _, err := st.applyBatch(ctx, generation, []model.Collected{{Collector: "devices", Resources: resource(false)}}, func([]model.Change) string { return "baseline" }); err != nil {
+	if _, err := testApplyBatch(st, ctx, generation, []model.Collected{{Collector: "devices", Resources: resource(false)}}, func([]model.Change) string { return "baseline" }); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.applyBatch(ctx, generation, []model.Collected{{Collector: "devices", Unsupported: true}}, func([]model.Change) string { return "unsupported" }); err != nil {
+	if _, err := testApplyBatch(st, ctx, generation, []model.Collected{{Collector: "devices", Unsupported: true}}, func([]model.Change) string { return "unsupported" }); err != nil {
 		t.Fatal(err)
 	}
-	changes, err := st.applyBatch(ctx, generation, []model.Collected{{Collector: "devices", Resources: resource(true)}}, func([]model.Change) string { return "recovered" })
+	changes, err := testApplyBatch(st, ctx, generation, []model.Collected{{Collector: "devices", Resources: resource(true)}}, func([]model.Change) string { return "recovered" })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -540,16 +977,16 @@ func TestUnsupportedWindowPreservesRemovalDetection(t *testing.T) {
 		t.Fatal(err)
 	}
 	resource := []model.Resource{{Collector: "devices", ID: "device-1", Type: "device", Name: "server", Data: map[string]any{"hostname": "server"}}}
-	if _, err := st.applyBatch(ctx, generation, []model.Collected{{Collector: "devices", Resources: resource}}, func([]model.Change) string { return "baseline" }); err != nil {
+	if _, err := testApplyBatch(st, ctx, generation, []model.Collected{{Collector: "devices", Resources: resource}}, func([]model.Change) string { return "baseline" }); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.applyBatch(ctx, generation, []model.Collected{{Collector: "devices", Unsupported: true}}, func([]model.Change) string { return "unsupported" }); err != nil {
+	if _, err := testApplyBatch(st, ctx, generation, []model.Collected{{Collector: "devices", Unsupported: true}}, func([]model.Change) string { return "unsupported" }); err != nil {
 		t.Fatal(err)
 	}
-	if changes, err := st.applyBatch(ctx, generation, []model.Collected{{Collector: "devices"}}, func([]model.Change) string { return "first recovery" }); err != nil || len(changes) != 0 {
+	if changes, err := testApplyBatch(st, ctx, generation, []model.Collected{{Collector: "devices"}}, func([]model.Change) string { return "first recovery" }); err != nil || len(changes) != 0 {
 		t.Fatalf("first recovery unexpectedly changed state: %#v err=%v", changes, err)
 	}
-	changes, err := st.applyBatch(ctx, generation, []model.Collected{{Collector: "devices"}}, func([]model.Change) string { return "second recovery" })
+	changes, err := testApplyBatch(st, ctx, generation, []model.Collected{{Collector: "devices"}}, func([]model.Change) string { return "second recovery" })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -566,7 +1003,7 @@ func TestCredentialRotationPreservesInventory(t *testing.T) {
 		t.Fatal(err)
 	}
 	baseline := []model.Collected{{Collector: "devices", Resources: []model.Resource{{ID: "1", Type: "device", Name: "server", Data: map[string]any{"hostname": "server"}}}}}
-	if _, err := st.applyBatch(ctx, firstGeneration, baseline, func([]model.Change) string { return "digest" }); err != nil {
+	if _, err := testApplyBatch(st, ctx, firstGeneration, baseline, func([]model.Change) string { return "digest" }); err != nil {
 		t.Fatal(err)
 	}
 	rotated := settings()
@@ -586,9 +1023,98 @@ func TestCredentialRotationPreservesInventory(t *testing.T) {
 		t.Fatalf("baseline snapshot was lost after credential rotation: %d", count)
 	}
 	changed := []model.Collected{{Collector: "devices", Resources: []model.Resource{{ID: "1", Type: "device", Name: "server", Data: map[string]any{"hostname": "server-new"}}}}}
-	changes, err := st.applyBatch(ctx, secondGeneration, changed, func([]model.Change) string { return "digest" })
+	changes, err := testApplyBatch(st, ctx, secondGeneration, changed, func([]model.Change) string { return "digest" })
 	if err != nil || len(changes) != 1 || changes[0].Kind != "changed" {
 		t.Fatalf("change after credential rotation was not detected: %#v %v", changes, err)
+	}
+}
+
+func TestIdentityChangeDeadLettersPendingEventNotifications(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	firstGeneration, err := st.SaveSettings(ctx, settings())
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseline := []model.Collected{{Collector: "devices", Resources: []model.Resource{{ID: "1", Type: "device", Name: "server", Data: map[string]any{"hostname": "server"}}}}}
+	changed := []model.Collected{{Collector: "devices", Resources: []model.Resource{{ID: "1", Type: "device", Name: "server", Data: map[string]any{"hostname": "new-server"}}}}}
+	if _, err := st.ApplyBatchWithBatch(ctx, firstGeneration, baseline, func([]model.Change) string { return "baseline" }); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.ApplyBatchWithBatch(ctx, firstGeneration, changed, func([]model.Change) string { return "changed" }); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.EnqueueSystem(ctx, "release notification"); err != nil {
+		t.Fatal(err)
+	}
+	var oldID, systemID int64
+	if err := st.db.QueryRowContext(ctx, "SELECT id FROM outbox WHERE batch_id IS NOT NULL ORDER BY id LIMIT 1").Scan(&oldID); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.db.QueryRowContext(ctx, "SELECT id FROM outbox WHERE batch_id IS NULL ORDER BY id LIMIT 1").Scan(&systemID); err != nil {
+		t.Fatal(err)
+	}
+	rotated := settings()
+	rotated.OAuthClientID = "new-client"
+	secondGeneration, err := st.SaveSettings(ctx, rotated)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if secondGeneration == firstGeneration {
+		t.Fatal("identity change did not create a new generation")
+	}
+	var oldStatus, oldError, systemStatus string
+	if err := st.db.QueryRowContext(ctx, "SELECT status,last_error FROM outbox WHERE id=?", oldID).Scan(&oldStatus, &oldError); err != nil {
+		t.Fatal(err)
+	}
+	if oldStatus != "dead" || oldError != "monitoring identity changed" {
+		t.Fatalf("old identity notification status=%q error=%q", oldStatus, oldError)
+	}
+	if err := st.db.QueryRowContext(ctx, "SELECT status FROM outbox WHERE id=?", systemID).Scan(&systemStatus); err != nil {
+		t.Fatal(err)
+	}
+	if systemStatus != "pending" {
+		t.Fatalf("system notification status=%q, want pending", systemStatus)
+	}
+}
+
+func TestEarliestCollectorDueHandlesEmptyImmediateAndInvalidRows(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	generation, err := st.SaveSettings(ctx, settings())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deadline, found, err := st.EarliestCollectorDue(ctx, generation, nil); err != nil || found || !deadline.IsZero() {
+		t.Fatalf("empty collector deadline=%v found=%v err=%v", deadline, found, err)
+	}
+	if deadline, found, err := st.EarliestCollectorDue(ctx, generation, []string{"missing"}); err != nil || found || !deadline.IsZero() {
+		t.Fatalf("missing collector deadline=%v found=%v err=%v", deadline, found, err)
+	}
+	first := time.Now().UTC().Add(5 * time.Minute)
+	second := first.Add(time.Hour)
+	if err := st.SetNextPollErr(ctx, generation, []string{"devices"}, first); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetNextPollErr(ctx, generation, []string{"users"}, second); err != nil {
+		t.Fatal(err)
+	}
+	deadline, found, err := st.EarliestCollectorDue(ctx, generation, []string{"users", "devices"})
+	if err != nil || !found || deadline.Before(first) || deadline.After(first.Add(time.Second)) {
+		t.Fatalf("earliest collector deadline=%v found=%v err=%v", deadline, found, err)
+	}
+	if _, err := st.db.ExecContext(ctx, "UPDATE collector_state SET next_poll='' WHERE generation=? AND collector='devices'", generation); err != nil {
+		t.Fatal(err)
+	}
+	deadline, found, err = st.EarliestCollectorDue(ctx, generation, []string{"devices", "users"})
+	if err != nil || !found || !deadline.IsZero() {
+		t.Fatalf("immediate collector deadline=%v found=%v err=%v", deadline, found, err)
+	}
+	if _, err := st.db.ExecContext(ctx, "UPDATE collector_state SET next_poll='not-a-timestamp' WHERE generation=? AND collector='users'", generation); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := st.EarliestCollectorDue(ctx, generation, []string{"users"}); err == nil || !strings.Contains(err.Error(), "parse collector next poll timestamp") {
+		t.Fatalf("invalid collector deadline error=%v", err)
 	}
 }
 
@@ -626,6 +1152,80 @@ func TestStatusDoesNotDecryptConfiguredSecrets(t *testing.T) {
 	}
 }
 
+func TestStatusReportsBaselineGraceDegradation(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	generation, err := st.SaveSettings(ctx, settings())
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().UTC().Add(-baselineGracePeriod - time.Minute).Format(time.RFC3339Nano)
+	if _, err := st.db.ExecContext(ctx, "UPDATE settings SET configured_at=? WHERE id=1", old); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.db.ExecContext(ctx, `INSERT INTO collector_state(generation,collector,supported,baseline,last_error,failure_count,next_poll)
+		VALUES(?,?,1,0,'',0,?)`, generation, "devices", old); err != nil {
+		t.Fatal(err)
+	}
+	status, err := st.Status(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !status.BaselineReady || !status.BaselineDegraded || !strings.Contains(status.BaselineReason, "waiting for: devices") {
+		t.Fatalf("baseline grace status=%#v", status)
+	}
+}
+
+func TestStatusReportsPostBaselineCollectorDegradation(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	generation, err := st.SaveSettings(ctx, settings())
+	if err != nil {
+		t.Fatal(err)
+	}
+	observed := time.Now().UTC().Add(-time.Minute).Format(time.RFC3339Nano)
+	if _, err := st.db.ExecContext(ctx, "UPDATE settings SET baseline_at=?,configured_at=? WHERE id=1", observed, observed); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.db.ExecContext(ctx, `INSERT INTO collector_state(generation,collector,supported,baseline,last_error,failure_count,partial,partial_error_count,next_poll)
+		VALUES(?,?,1,1,'upstream unavailable',2,0,0,?)`, generation, "devices", observed); err != nil {
+		t.Fatal(err)
+	}
+	// A confirmed plan limitation is not a transient health failure and should
+	// not make an established baseline appear unavailable.
+	if _, err := st.db.ExecContext(ctx, `INSERT INTO collector_state(generation,collector,supported,baseline,last_error,failure_count,partial,partial_error_count,next_poll)
+		VALUES(?,?,0,1,'unsupported',0,0,0,?)`, generation, "log_streaming", observed); err != nil {
+		t.Fatal(err)
+	}
+	status, err := st.Status(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !status.BaselineReady || !status.BaselineDegraded || status.BaselineReason != "collector health degraded: devices" {
+		t.Fatalf("post-baseline failure was hidden: %#v", status)
+	}
+	if _, err := st.db.ExecContext(ctx, "UPDATE collector_state SET failure_count=0,last_error='',partial=1 WHERE generation=? AND collector='devices'", generation); err != nil {
+		t.Fatal(err)
+	}
+	status, err = st.Status(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !status.BaselineDegraded || status.BaselineReason != "collector health degraded: devices" {
+		t.Fatalf("partial collector degradation was hidden: %#v", status)
+	}
+	if _, err := st.db.ExecContext(ctx, "UPDATE collector_state SET partial=0 WHERE generation=? AND collector='devices'", generation); err != nil {
+		t.Fatal(err)
+	}
+	status, err = st.Status(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.BaselineDegraded || status.BaselineReason != "" {
+		t.Fatalf("healthy collectors remained degraded: %#v", status)
+	}
+}
+
 func TestTrackAppVersionQueuesConfiguredUpdatesOnce(t *testing.T) {
 	ctx := context.Background()
 	st := testStore(t)
@@ -648,7 +1248,7 @@ func TestTrackAppVersionQueuesConfiguredUpdatesOnce(t *testing.T) {
 	if err != nil || notified {
 		t.Fatalf("same version was queued again: notified=%v err=%v", notified, err)
 	}
-	items, err := st.DueOutbox(ctx, 10)
+	items, err := testDueOutbox(st, ctx, 10)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -673,7 +1273,7 @@ func TestTrackAppVersionIgnoresDevelopmentBuild(t *testing.T) {
 	if notified, err := st.TrackAppVersion(ctx, "0.3.1", format); err != nil || !notified {
 		t.Fatalf("release update after development build was not queued: notified=%v err=%v", notified, err)
 	}
-	items, err := st.DueOutbox(ctx, 10)
+	items, err := testDueOutbox(st, ctx, 10)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -690,12 +1290,12 @@ func TestBaselineIsSilent(t *testing.T) {
 		t.Fatal(err)
 	}
 	first := []model.Collected{{Collector: "devices", Resources: []model.Resource{{ID: "1", Type: "device", Name: "server", Collector: "devices", Data: map[string]any{"addresses": []any{"100.64.0.1"}}}}}}
-	changes, err := st.applyBatch(ctx, generation, first, func([]model.Change) string { return "digest" })
+	changes, err := testApplyBatch(st, ctx, generation, first, func([]model.Change) string { return "digest" })
 	if err != nil || len(changes) != 0 {
 		t.Fatalf("baseline emitted changes: %#v %v", changes, err)
 	}
 	second := []model.Collected{{Collector: "devices", Resources: []model.Resource{{ID: "1", Type: "device", Name: "server", Collector: "devices", Data: map[string]any{"addresses": []any{"100.64.0.2"}}}}}}
-	changes, err = st.applyBatch(ctx, generation, second, func([]model.Change) string { return "digest" })
+	changes, err = testApplyBatch(st, ctx, generation, second, func([]model.Change) string { return "digest" })
 	if err != nil || len(changes) != 1 || changes[0].Kind != "changed" {
 		t.Fatalf("change not detected: %#v %v", changes, err)
 	}
@@ -712,7 +1312,7 @@ func TestCollectorPollTelemetryIsVisibleInStatus(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.applyBatch(ctx, generation, []model.Collected{{Collector: "devices", Resources: []model.Resource{{ID: "1", Type: "device", Name: "server", Collector: "devices", Data: map[string]any{"hostname": "server"}}}}}, func([]model.Change) string { return "baseline" }); err != nil {
+	if _, err := testApplyBatch(st, ctx, generation, []model.Collected{{Collector: "devices", Resources: []model.Resource{{ID: "1", Type: "device", Name: "server", Collector: "devices", Data: map[string]any{"hostname": "server"}}}}}, func([]model.Change) string { return "baseline" }); err != nil {
 		t.Fatal(err)
 	}
 	if err := st.RecordCollectorPoll(ctx, generation, "devices", 1234*time.Millisecond, true); err != nil {
@@ -734,7 +1334,7 @@ func TestCollectorPollTelemetryClampsNegativeDuration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.applyBatch(ctx, generation, []model.Collected{{Collector: "devices", Resources: []model.Resource{{ID: "1", Type: "device", Name: "server", Collector: "devices", Data: map[string]any{"hostname": "server"}}}}}, func([]model.Change) string { return "baseline" }); err != nil {
+	if _, err := testApplyBatch(st, ctx, generation, []model.Collected{{Collector: "devices", Resources: []model.Resource{{ID: "1", Type: "device", Name: "server", Collector: "devices", Data: map[string]any{"hostname": "server"}}}}}, func([]model.Change) string { return "baseline" }); err != nil {
 		t.Fatal(err)
 	}
 	if err := st.RecordCollectorPoll(ctx, generation, "devices", -time.Second, false); err != nil {
@@ -757,18 +1357,18 @@ func TestRemovalRequiresTwoPolls(t *testing.T) {
 		t.Fatal(err)
 	}
 	first := []model.Collected{{Collector: "devices", Resources: []model.Resource{{ID: "1", Type: "device", Name: "server", Collector: "devices", Data: map[string]any{"addresses": []any{"100.64.0.1"}}}}}}
-	if _, err := st.applyBatch(ctx, generation, first, func([]model.Change) string { return "digest" }); err != nil {
+	if _, err := testApplyBatch(st, ctx, generation, first, func([]model.Change) string { return "digest" }); err != nil {
 		t.Fatal(err)
 	}
 	empty := []model.Collected{{Collector: "devices", Resources: nil}}
-	changes, err := st.applyBatch(ctx, generation, empty, func([]model.Change) string { return "digest" })
+	changes, err := testApplyBatch(st, ctx, generation, empty, func([]model.Change) string { return "digest" })
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(changes) != 0 {
 		t.Fatal("removed after one missing poll")
 	}
-	changes, err = st.applyBatch(ctx, generation, empty, func([]model.Change) string { return "digest" })
+	changes, err = testApplyBatch(st, ctx, generation, empty, func([]model.Change) string { return "digest" })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -789,10 +1389,10 @@ func TestMassRemovalGuardPreservesSnapshots(t *testing.T) {
 		id := fmt.Sprintf("device-%d", i)
 		resources[i] = model.Resource{ID: id, Type: "device", Name: id, Collector: "devices", Data: map[string]any{"hostname": id}}
 	}
-	if _, err := st.applyBatch(ctx, generation, []model.Collected{{Collector: "devices", Resources: resources}}, func([]model.Change) string { return "baseline" }); err != nil {
+	if _, err := testApplyBatch(st, ctx, generation, []model.Collected{{Collector: "devices", Resources: resources}}, func([]model.Change) string { return "baseline" }); err != nil {
 		t.Fatal(err)
 	}
-	changes, err := st.applyBatch(ctx, generation, []model.Collected{{Collector: "devices"}}, func([]model.Change) string { return "degraded" })
+	changes, err := testApplyBatch(st, ctx, generation, []model.Collected{{Collector: "devices"}}, func([]model.Change) string { return "degraded" })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -817,7 +1417,7 @@ func TestMassRemovalGuardPreservesSnapshots(t *testing.T) {
 	// removals suppressed forever. The first two suspicious responses are
 	// guarded; the next normal poll starts the ordinary two-poll confirmation.
 	for poll := 0; poll < 2; poll++ {
-		changes, err = st.applyBatch(ctx, generation, []model.Collected{{Collector: "devices"}}, func([]model.Change) string { return "degraded" })
+		changes, err = testApplyBatch(st, ctx, generation, []model.Collected{{Collector: "devices"}}, func([]model.Change) string { return "degraded" })
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -825,7 +1425,7 @@ func TestMassRemovalGuardPreservesSnapshots(t *testing.T) {
 			t.Fatalf("mass removal guard emitted changes on confirmation poll %d: %#v", poll, changes)
 		}
 	}
-	changes, err = st.applyBatch(ctx, generation, []model.Collected{{Collector: "devices"}}, func([]model.Change) string { return "degraded" })
+	changes, err = testApplyBatch(st, ctx, generation, []model.Collected{{Collector: "devices"}}, func([]model.Change) string { return "degraded" })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -834,14 +1434,55 @@ func TestMassRemovalGuardPreservesSnapshots(t *testing.T) {
 	}
 }
 
+func TestMassRemovalGuardProtectsMajorityDisappearance(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	generation, err := st.SaveSettings(ctx, settings())
+	if err != nil {
+		t.Fatal(err)
+	}
+	resources := make([]model.Resource, 5)
+	for i := range resources {
+		id := fmt.Sprintf("device-%d", i)
+		resources[i] = model.Resource{ID: id, Type: "device", Name: id, Collector: "devices", Data: map[string]any{"hostname": id}}
+	}
+	if _, err := testApplyBatch(st, ctx, generation, []model.Collected{{Collector: "devices", Resources: resources}}, func([]model.Change) string { return "baseline" }); err != nil {
+		t.Fatal(err)
+	}
+	// Three of five resources disappearing at once is a majority loss, but it
+	// is still more likely to be a truncated upstream response than three real
+	// deletions. The guard must preserve all five snapshots for confirmation.
+	changes, err := testApplyBatch(st, ctx, generation, []model.Collected{{Collector: "devices", Resources: resources[:2]}}, func([]model.Change) string { return "degraded" })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(changes) != 0 {
+		t.Fatalf("majority disappearance emitted changes: %#v", changes)
+	}
+	var count int
+	if err := st.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM snapshots WHERE generation=? AND collector='devices'", generation).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != len(resources) {
+		t.Fatalf("majority disappearance deleted snapshots: %d", count)
+	}
+	var lastError string
+	if err := st.db.QueryRowContext(ctx, "SELECT last_error FROM collector_state WHERE generation=? AND collector='devices'", generation).Scan(&lastError); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(lastError, "possible mass removal guarded") {
+		t.Fatalf("majority disappearance did not record collector health: %q", lastError)
+	}
+}
+
 func TestFailedCollectorCannotRemoveSnapshots(t *testing.T) {
 	ctx := context.Background()
 	st := testStore(t)
 	generation, _ := st.SaveSettings(ctx, settings())
 	baseline := []model.Collected{{Collector: "devices", Resources: []model.Resource{{ID: "1", Type: "device", Name: "server", Data: map[string]any{"hostname": "server"}}}}}
-	_, _ = st.applyBatch(ctx, generation, baseline, func([]model.Change) string { return "" })
+	_, _ = testApplyBatch(st, ctx, generation, baseline, func([]model.Change) string { return "" })
 	failed := []model.Collected{{Collector: "devices", Error: context.DeadlineExceeded}}
-	changes, err := st.applyBatch(ctx, generation, failed, func([]model.Change) string { return "" })
+	changes, err := testApplyBatch(st, ctx, generation, failed, func([]model.Change) string { return "" })
 	if err != nil || len(changes) != 0 {
 		t.Fatalf("failed poll changed state: %#v %v", changes, err)
 	}
@@ -860,13 +1501,13 @@ func TestPartialCollectorCannotRemoveSnapshots(t *testing.T) {
 		{ID: "1", Type: "device", Name: "server", Data: map[string]any{"hostname": "server"}},
 		{ID: "2", Type: "device", Name: "router", Data: map[string]any{"hostname": "router"}},
 	}}}
-	if _, err := st.applyBatch(ctx, generation, baseline, func([]model.Change) string { return "" }); err != nil {
+	if _, err := testApplyBatch(st, ctx, generation, baseline, func([]model.Change) string { return "" }); err != nil {
 		t.Fatal(err)
 	}
 	partial := []model.Collected{{Collector: "devices", Partial: true, PartialError: "detail request failed", PartialErrorCount: 2, Resources: []model.Resource{
 		{ID: "1", Type: "device", Name: "server", Data: map[string]any{"hostname": "server-new"}},
 	}}}
-	changes, err := st.applyBatch(ctx, generation, partial, func([]model.Change) string { return "" })
+	changes, err := testApplyBatch(st, ctx, generation, partial, func([]model.Change) string { return "" })
 	if err != nil || len(changes) != 1 || changes[0].Kind != "changed" {
 		t.Fatalf("partial change not recorded: %#v %v", changes, err)
 	}
@@ -907,10 +1548,10 @@ func TestOutboxSurvivesRestart(t *testing.T) {
 	}
 	baseline := []model.Collected{{Collector: "devices", Resources: []model.Resource{{ID: "1", Type: "device", Name: "server", Data: map[string]any{"addresses": []any{"100.64.0.1"}}}}}}
 	changed := []model.Collected{{Collector: "devices", Resources: []model.Resource{{ID: "1", Type: "device", Name: "server", Data: map[string]any{"addresses": []any{"100.64.0.2"}}}}}}
-	if _, err := st.applyBatch(ctx, generation, baseline, func([]model.Change) string { return "baseline" }); err != nil {
+	if _, err := testApplyBatch(st, ctx, generation, baseline, func([]model.Change) string { return "baseline" }); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.applyBatch(ctx, generation, changed, func([]model.Change) string { return "durable digest" }); err != nil {
+	if _, err := testApplyBatch(st, ctx, generation, changed, func([]model.Change) string { return "durable digest" }); err != nil {
 		t.Fatal(err)
 	}
 	if err := st.Close(); err != nil {
@@ -922,7 +1563,7 @@ func TestOutboxSurvivesRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer reopened.Close()
-	items, err := reopened.DueOutbox(ctx, 10)
+	items, err := testDueOutbox(reopened, ctx, 10)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -958,7 +1599,7 @@ func TestNewIgnoredFieldsSilentlyRenormalizeExistingSnapshots(t *testing.T) {
 			},
 		},
 	}}}}
-	if _, err := st.applyBatch(ctx, generation, baseline, func([]model.Change) string { return "digest" }); err != nil {
+	if _, err := testApplyBatch(st, ctx, generation, baseline, func([]model.Change) string { return "digest" }); err != nil {
 		t.Fatal(err)
 	}
 
@@ -980,7 +1621,7 @@ func TestNewIgnoredFieldsSilentlyRenormalizeExistingSnapshots(t *testing.T) {
 			},
 		},
 	}}}}
-	changes, err := st.applyBatch(ctx, generation, current, func([]model.Change) string { return "digest" })
+	changes, err := testApplyBatch(st, ctx, generation, current, func([]model.Change) string { return "digest" })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1023,7 +1664,7 @@ func TestStoredInviteURLFingerprintMigratesWithoutChange(t *testing.T) {
 	baseline := []model.Collected{{Collector: "device_details", Resources: []model.Resource{{
 		ID: "1", Type: "device_details", Name: "server", Data: currentData,
 	}}}}
-	if _, err := st.applyBatch(ctx, generation, baseline, func([]model.Change) string { return "digest" }); err != nil {
+	if _, err := testApplyBatch(st, ctx, generation, baseline, func([]model.Change) string { return "digest" }); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1038,7 +1679,7 @@ func TestStoredInviteURLFingerprintMigratesWithoutChange(t *testing.T) {
 	current := []model.Collected{{Collector: "device_details", Resources: []model.Resource{{
 		ID: "1", Type: "device_details", Name: "server", Data: currentData,
 	}}}}
-	changes, err := st.applyBatch(ctx, generation, current, func([]model.Change) string { return "digest" })
+	changes, err := testApplyBatch(st, ctx, generation, current, func([]model.Change) string { return "digest" })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1066,7 +1707,7 @@ func TestDeviceRuntimeMigrationKeepsClientUpdateAlert(t *testing.T) {
 			"hostname": "server", "multipleConnections": false, "machineKey": "machine:old", "nodeKey": "node:old", "updateAvailable": false,
 		},
 	}}}}
-	if _, err := st.applyBatch(ctx, generation, baseline, func([]model.Change) string { return "digest" }); err != nil {
+	if _, err := testApplyBatch(st, ctx, generation, baseline, func([]model.Change) string { return "digest" }); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1079,7 +1720,7 @@ func TestDeviceRuntimeMigrationKeepsClientUpdateAlert(t *testing.T) {
 			"hostname": "server", "multipleConnections": true, "machineKey": "machine:new", "nodeKey": "node:new", "updateAvailable": false,
 		},
 	}}}}
-	changes, err := st.applyBatch(ctx, generation, runtimeOnly, func([]model.Change) string { return "digest" })
+	changes, err := testApplyBatch(st, ctx, generation, runtimeOnly, func([]model.Change) string { return "digest" })
 	if err != nil || len(changes) != 0 {
 		t.Fatalf("device runtime migration emitted changes: %#v %v", changes, err)
 	}
@@ -1089,7 +1730,7 @@ func TestDeviceRuntimeMigrationKeepsClientUpdateAlert(t *testing.T) {
 			"hostname": "server", "multipleConnections": true, "machineKey": "machine:new", "nodeKey": "node:new", "updateAvailable": true,
 		},
 	}}}}
-	changes, err = st.applyBatch(ctx, generation, clientUpdate, func([]model.Change) string { return "digest" })
+	changes, err = testApplyBatch(st, ctx, generation, clientUpdate, func([]model.Change) string { return "digest" })
 	if err != nil || len(changes) != 1 || len(changes[0].Fields) != 1 || changes[0].Fields[0].Field != "updateAvailable" {
 		t.Fatalf("client update availability was not preserved: %#v %v", changes, err)
 	}

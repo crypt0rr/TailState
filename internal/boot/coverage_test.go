@@ -36,6 +36,15 @@ func TestConfigDatabasePathAndMasterKeyFormats(t *testing.T) {
 	if err != nil || string(key) != string(rawKey) {
 		t.Fatalf("encoded master key=%q err=%v", key, err)
 	}
+	base64LookingPath := filepath.Join(dir, "raw-base64-looking")
+	base64LookingKey := []byte(strings.Repeat("A", 32))
+	if err := os.WriteFile(base64LookingPath, base64LookingKey, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	key, err = (Config{MasterKeyFile: base64LookingPath}).MasterKey()
+	if err != nil || string(key) != string(base64LookingKey) {
+		t.Fatalf("base64-looking raw master key=%q err=%v", key, err)
+	}
 	wrongPath := filepath.Join(dir, "wrong")
 	if err := os.WriteFile(wrongPath, []byte("too-short"), 0o600); err != nil {
 		t.Fatal(err)

@@ -47,6 +47,31 @@ func TestValidateAndRedact(t *testing.T) {
 	}
 }
 
+func TestDestinationURLRedactsEncodedComponents(t *testing.T) {
+	encodedQueryMessage := sanitize("provider rejected SUPER%2FSECRET%2B123", "generic://hooks.example.com/post?token=SUPER%2FSECRET%2B123&template=json")
+	if strings.Contains(encodedQueryMessage, "SUPER%2FSECRET%2B123") || strings.Contains(encodedQueryMessage, "SUPER/SECRET+123") {
+		t.Fatalf("percent-encoded query credential leaked through sanitization: %s", encodedQueryMessage)
+	}
+	encodedComponentMessage := sanitize(
+		"provider rejected /hooks/super%2Fsecret fragment%2Fcredential SECRETKEY=1",
+		"generic://hooks.example.com/hooks/super%2Fsecret?SECRETKEY=1#fragment%2Fcredential",
+	)
+	for _, secret := range []string{"super%2Fsecret", "super/secret", "fragment%2Fcredential", "fragment/credential", "SECRETKEY"} {
+		if strings.Contains(encodedComponentMessage, secret) {
+			t.Fatalf("encoded URL component %q leaked through sanitization: %s", secret, encodedComponentMessage)
+		}
+	}
+	doubleEncodedMessage := sanitize(
+		"provider rejected SECRET/VALUE and /hooks/DOUBLE/PATH",
+		"generic://hooks.example.com/hooks/DOUBLE%252FPATH?token=SECRET%252FVALUE",
+	)
+	for _, secret := range []string{"SECRET/VALUE", "SECRET%2FVALUE", "DOUBLE/PATH", "DOUBLE%2FPATH"} {
+		if strings.Contains(doubleEncodedMessage, secret) {
+			t.Fatalf("repeatedly encoded URL component %q leaked through sanitization: %s", secret, doubleEncodedMessage)
+		}
+	}
+}
+
 func TestSendGenericWebhook(t *testing.T) {
 	var body string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

@@ -387,3 +387,35 @@ func TestClientExhaustsTransportRetries(t *testing.T) {
 		t.Fatalf("transport attempts=%d, want 4", attempts)
 	}
 }
+
+func TestClientBoundsRetryWindow(t *testing.T) {
+	originalWait := waitForRetry
+	var retryDeadline time.Time
+	waitForRetry = func(ctx context.Context, _ time.Duration) bool {
+		var ok bool
+		retryDeadline, ok = ctx.Deadline()
+		if !ok {
+			t.Error("retry context has no deadline")
+		}
+		return true
+	}
+	t.Cleanup(func() { waitForRetry = originalWait })
+
+	client := New("https://api.example.test/api/v2", "https://oauth.example.test/token", "test", Credentials{})
+	client.token, client.expires = "cached", time.Now().Add(time.Hour)
+	client.http = &http.Client{Transport: coverageRoundTripper(func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusTooManyRequests,
+			Status:     "429",
+			Header:     http.Header{"Retry-After": []string{"86400"}},
+			Body:       io.NopCloser(strings.NewReader("busy")),
+		}, nil
+	})}
+	if _, err := client.get(context.Background(), "https://api.example.test/api/v2/devices"); err == nil {
+		t.Fatal("retry exhaustion unexpectedly succeeded")
+	}
+	remaining := time.Until(retryDeadline)
+	if retryDeadline.IsZero() || remaining <= 0 || remaining > maxRequestRetryDuration {
+		t.Fatalf("retry window=%s, want a positive duration no greater than %s", remaining, maxRequestRetryDuration)
+	}
+}

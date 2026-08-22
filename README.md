@@ -70,7 +70,7 @@ The setup interface then asks for:
 3. At least one notification destination using a Shoutrrr URL.
 4. Device and secondary inventory polling intervals.
 
-Add destinations on the authenticated Settings page, then save monitoring settings. Each destination is validated and can be tested independently. TailState then performs a Tailscale API check and builds a silent baseline. The status page shows baseline counts, collector capabilities, source health, and delivery state. Rotating the OAuth secret or changing poll intervals refreshes the monitor without discarding the existing baseline; changing the tailnet or OAuth client identity starts a new generation.
+Add destinations on the authenticated Settings page, then save monitoring settings. Each destination is validated and can be tested independently. TailState then performs a Tailscale API check and builds a silent baseline. The status page shows baseline counts, collector capabilities, source health, and delivery state. Rotating the OAuth secret or changing poll intervals refreshes the monitor without discarding the existing baseline; changing the tailnet or OAuth client identity starts a new generation and dead-letters pending event notifications from the previous identity while preserving their history for audit. System and release notifications remain eligible for delivery.
 
 The authenticated **History** page keeps a 30-day, searchable ledger of semantic inventory changes. Each poll is grouped into a batch with the affected collector, resource, previous/current normalized snapshots, field-level differences, and the delivery state for every destination. Use it to investigate a notification without exposing credentials or volatile API fields. The page shows the fingerprint of the Ed25519 key used to sign evidence exports.
 
@@ -116,7 +116,12 @@ is incomplete or before the first baseline; after the 15-minute first-baseline
 grace period, a persistently failing collector is reported as `degraded` and
 readiness remains available for orchestration while the collector continues to
 retry. The response includes sanitized collector names, baseline flags, and
-failure counts without upstream error text.
+failure counts plus bounded per-collector reasons (`baseline pending`,
+`partial`, `unsupported`, `retrying`, or `healthy`) without upstream error
+text. Once a historical baseline exists, readiness remains available while
+supported collectors that fail, return partial data, or are still awaiting a
+new baseline keep the overall state visibly `degraded`; confirmed
+plan-unsupported collectors remain informational.
 
 ## Security and persistence
 
@@ -239,9 +244,11 @@ override.
 
 Restore into the same Compose project only after confirming the archive and
 key are from the same point in time. The command requires an explicit
-`--yes`, verifies the checksum when present, rejects unsafe paths and
-symlink/device/FIFO entries before touching the data volume, and creates a
-pre-restore archive beside the source archive before replacing the data volume:
+`--yes`, verifies the checksum when present, checks that the archive directory
+is writable and has room for a conservative pre-restore copy, rejects unsafe
+paths and symlink/device/FIFO entries before touching the data volume, and
+creates a pre-restore archive beside the source archive before replacing the
+data volume:
 
 ```console
 ./scripts/restore.sh ./backups/tailstate-data-20260813T120000Z.tar.gz --yes
@@ -271,14 +278,24 @@ in a disposable project before relying on the procedure for an outage.
 - Every change batch is also recorded in the authenticated History page with field-level diffs and redacted normalized before/after snapshots. Filters support collector, change type, and resource name or ID; history is retained for 30 days.
 - The History page can download a filtered, redacted JSON evidence pack for incident reports and offline review. Packs include normalized snapshots, field diffs, destination delivery outcomes, a SHA-256 content hash, and an Ed25519 signature over a hash-linked event ledger; exports are limited to 100 batches, 2,000 events, and 5 MiB. A changed export fails verification.
 - Verify an export offline with `tailstate evidence verify --file tailstate-drift-evidence.json`. Verification checks the content hash, embedded public key fingerprint, signature, and included ledger links. For independent trust, print the instance public key with `tailstate evidence public-key`, save it as a base64 file, and pass it with `--public-key public.key`.
-- Shoutrrr deliveries retry independently for up to 24 hours across restarts, then remain visible as dead letters until the 30-day operational retention window expires. Disabling or removing a destination dead-letters its pending items; newly added destinations receive only future notifications.
+- Shoutrrr deliveries retry independently for up to 24 hours across restarts, then remain visible as dead letters until the 30-day operational retention window expires. Delivery is at-least-once: each outbox row is leased while a sender is in flight, and if the process stops after a provider accepts a message but before the durable bookkeeping update commits, that message may be sent again after the lease expires. Per-lease fencing prevents a stale worker from changing a newer retry attempt. Disabling or removing a destination dead-letters its pending or in-flight items; newly added destinations receive only future notifications.
+- Tailscale API retries honor `Retry-After` while capping a provider delay at five minutes and the complete retry window for one request at 30 seconds. Collectors also have a two-minute poll deadline, so a throttled endpoint cannot stall the scheduler indefinitely.
 - If every destination is disabled, monitoring continues and notifications are reported as paused.
 - API collector failures alert after three consecutive failures and once on recovery.
-- A single 403/404 from an optional plan-specific endpoint is marked unsupported
-  and retried every six hours; an established baseline and snapshots remain
-  intact across that interval, so recovery reports drift instead of silently
-  rebasing. A later non-403/404 failure is recorded as a transient supported
-  collector failure rather than retaining the unsupported label.
+- A 403/404 from an optional plan-specific endpoint is treated as an
+  unsupported response. Collectors that have never produced a baseline are
+  retried every six hours. For an established baseline, the first response is
+  recorded as pending confirmation and retried after five minutes; only a
+  second consecutive response opens the six-hour unsupported window. Baselines
+  and snapshots remain intact across that interval, so recovery reports drift
+  instead of silently rebasing. A later non-403/404 failure is recorded as a
+  transient supported collector failure rather than retaining the unsupported
+  label.
+- Collection endpoints must return the documented array field. TailState treats
+  an omitted, `null`, or wrong-typed `userInvites` or `webhooks` field as an
+  invalid upstream response and preserves the last known snapshots; an
+  explicitly returned `[]` is the healthy empty result. This prevents a
+  malformed or permission-filtered response from looking like mass removal.
 - Starting a different TailState release queues one durable notification containing the previous and current versions.
 
 Version tracking is introduced in v0.3.0. Its first startup records the release silently because earlier releases did not persist their version; subsequent upgrades include both exact versions in the notification.
@@ -290,8 +307,12 @@ backup with the matching master key. Startup verifies that key before applying
 schema changes; a wrong key therefore exits without mutating the database. If a
 migration fails, leave the service stopped, keep the original database and key,
 and restore the pre-upgrade archive before retrying or rolling back the image.
+TailState also refuses to bootstrap a non-empty database that has no valid
+`schema_version` marker (including an empty, duplicated, or unsupported
+marker); restore a verified backup or use a release that ships the required
+migration instead of allowing a malformed file to be treated as new.
 
-On the first startup after this upgrade, an existing encrypted Mattermost webhook is converted automatically to a native `mattermost://` destination when it uses the standard `/hooks/<token>` path. Other paths are preserved as a `generic://` JSON webhook with the existing TailState username and satellite icon. Existing pending outbox items are assigned to the migrated destination; if no legacy destination is configured, those orphaned pending rows are retained as dead letters with a safe explanation instead of remaining undeliverable forever. The legacy encrypted column is retained but no longer used for new configuration.
+On the first startup after this upgrade, an existing encrypted Mattermost webhook is converted automatically to a native `mattermost://` destination when it uses the standard `/hooks/<token>` path. Other paths are preserved as a `generic://` JSON webhook with the existing TailState username and satellite icon. Existing outbox items are assigned to the migrated destination; if no legacy destination is configured, orphaned pending or in-flight rows are retained as dead letters with a safe explanation instead of remaining undeliverable forever. The legacy encrypted column is retained but no longer used for new configuration.
 
 The schema v4 migration also adds encrypted storage for the optional Tailscale
 webhook secret, a deduplicated webhook trigger ledger, and trigger IDs on
@@ -309,14 +330,20 @@ historical chain. The public-key fingerprint is shown on the
 History page and new exports use signed evidence format version 3. Version 3
 packs embed the signed ledger payloads, intervening chain links, and the
 preceding checkpoint for filtered or paginated ranges so an offline verifier
-can recompute selected entries and detect gaps between them. Ledger rows are
-retained after event snapshots age out, preserving the checkpoint needed to
-distinguish normal retention from a broken chain.
+can recompute selected entries, bind the visible event projection to each
+signed ledger payload, and detect gaps between them. Ledger rows are retained
+after event snapshots age out, preserving the checkpoint needed to distinguish
+normal retention from a broken chain.
 Schema v7 adds expiring, revocable setup and password-reset token records. Schema
 v8 records the latest collector poll duration and whether its result was partial,
 so the status page and metrics can distinguish usable-but-degraded data from a
 fully successful poll. Schema v9 records the number of failed related requests in
-the latest partial collector result. The schema v7 migration also bounds notification retries
+the latest partial collector result, and schema v10 adds per-lease fencing tokens
+to durable webhook triggers so an expired worker cannot finalize a newer attempt.
+Schema v11 adds the same lease and fencing state to notification outbox rows,
+preventing duplicate claims during overlapping workers and stale delivery
+bookkeeping after a restart.
+The schema v7 migration also bounds notification retries
 to 24 hours and removes dead-letter rows after
 the normal 30-day retention period. Legacy token hashes remain only as a
 rollback aid and are removed by cleanup once their active token record expires.

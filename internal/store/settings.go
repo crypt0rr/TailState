@@ -25,16 +25,12 @@ func (s *Store) SaveSettings(ctx context.Context, in Settings) (int64, error) {
 	if in.DeviceInterval < 15*time.Second || in.InventoryInterval < 30*time.Second {
 		return 0, errors.New("poll intervals are too short")
 	}
-	secretEnc, err := s.box.Encrypt(in.OAuthClientSecret)
-	if err != nil {
-		return 0, err
-	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, err
 	}
 	defer tx.Rollback()
-	var oldTailnet, oldClient, oldSecretEnc, oldWebhookSecretEnc string
+	var secretEnc, oldTailnet, oldClient, oldSecretEnc, oldWebhookSecretEnc string
 	var generation int64
 	generationChanged := false
 	settingsExists := true
@@ -45,21 +41,39 @@ func (s *Store) SaveSettings(ctx context.Context, in Settings) (int64, error) {
 	} else if err != nil {
 		return 0, err
 	} else {
-		if _, decryptErr := s.box.Decrypt(oldSecretEnc); decryptErr != nil {
+		oldSecret, decryptErr := s.box.Decrypt(oldSecretEnc)
+		if decryptErr != nil {
 			return 0, decryptErr
+		}
+		if oldSecret == in.OAuthClientSecret {
+			secretEnc = oldSecretEnc
 		}
 		if oldTailnet != in.Tailnet || oldClient != in.OAuthClientID {
 			generation++
 			generationChanged = true
 		}
 	}
+	if secretEnc == "" {
+		secretEnc, err = s.box.Encrypt(in.OAuthClientSecret)
+		if err != nil {
+			return 0, err
+		}
+	}
 	webhookSecretEnc := oldWebhookSecretEnc
 	if in.ClearWebhookSecret {
 		webhookSecretEnc = ""
 	} else if in.WebhookSecret != "" {
-		webhookSecretEnc, err = s.box.Encrypt(in.WebhookSecret)
-		if err != nil {
-			return 0, err
+		reuse := false
+		if oldWebhookSecretEnc != "" {
+			if oldWebhookSecret, decryptErr := s.box.Decrypt(oldWebhookSecretEnc); decryptErr == nil && oldWebhookSecret == in.WebhookSecret {
+				reuse = true
+			}
+		}
+		if !reuse {
+			webhookSecretEnc, err = s.box.Encrypt(in.WebhookSecret)
+			if err != nil {
+				return 0, err
+			}
 		}
 	}
 	legacyURLEnc := ""
@@ -71,9 +85,11 @@ func (s *Store) SaveSettings(ctx context.Context, in Settings) (int64, error) {
 		if convertErr != nil {
 			return 0, convertErr
 		}
-		legacyURLEnc, err = s.box.Encrypt(in.MattermostURL)
-		if err != nil {
-			return 0, err
+		if oldLegacyURL, decryptErr := s.box.Decrypt(legacyURLEnc); decryptErr != nil || oldLegacyURL != in.MattermostURL {
+			legacyURLEnc, err = s.box.Encrypt(in.MattermostURL)
+			if err != nil {
+				return 0, err
+			}
 		}
 		var destinationID int64
 		lookupErr := tx.QueryRowContext(ctx, "SELECT id FROM notification_destinations WHERE name=? AND deleted_at IS NULL ORDER BY id LIMIT 1", "Mattermost").Scan(&destinationID)
@@ -109,6 +125,17 @@ func (s *Store) SaveSettings(ctx context.Context, in Settings) (int64, error) {
 			return 0, err
 		}
 		if _, err := tx.ExecContext(ctx, "DELETE FROM collector_state WHERE generation<>?", generation); err != nil {
+			return 0, err
+		}
+		// Event-linked notifications describe the previous Tailnet/OAuth
+		// identity. Keep their history for audit, but do not deliver them after
+		// the monitor has switched identities. System/version notifications use a
+		// NULL batch_id and intentionally remain eligible for delivery.
+		if _, err := tx.ExecContext(ctx, `UPDATE outbox
+			SET status='dead',next_attempt=?,last_error='monitoring identity changed'
+			WHERE status='pending' AND batch_id IS NOT NULL AND batch_id IN (
+				SELECT id FROM event_batches WHERE generation<>?
+			)`, now, generation); err != nil {
 			return 0, err
 		}
 	}

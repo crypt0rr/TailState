@@ -46,11 +46,11 @@ func TestRekeyPreservesEncryptedStateAndEvidenceIdentity(t *testing.T) {
 	changed := model.Collected{Collector: "devices", Resources: []model.Resource{{
 		ID: "device-1", Type: "device", Name: "server", Data: map[string]any{"hostname": "server-new"},
 	}}}
-	if _, err := st.applyBatch(ctx, generation, []model.Collected{baseline}, func([]model.Change) string { return "baseline" }); err != nil {
+	if _, err := testApplyBatch(st, ctx, generation, []model.Collected{baseline}, func([]model.Change) string { return "baseline" }); err != nil {
 		st.Close()
 		t.Fatal(err)
 	}
-	if _, err := st.applyBatch(ctx, generation, []model.Collected{changed}, func([]model.Change) string { return "changed" }); err != nil {
+	if _, err := testApplyBatch(st, ctx, generation, []model.Collected{changed}, func([]model.Change) string { return "changed" }); err != nil {
 		st.Close()
 		t.Fatal(err)
 	}
@@ -129,5 +129,73 @@ func TestRekeyRollsBackWhenAnEncryptedValueIsCorrupt(t *testing.T) {
 	}
 	if _, err := st.box.Decrypt(encoded); err != nil {
 		t.Fatalf("transaction did not preserve the original key after rollback: %v", err)
+	}
+}
+
+func TestRekeyFailureLeavesOriginalDatabaseUsable(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "tailstate.db")
+	oldBox, err := secret.NewBox([]byte(strings.Repeat("d", 32)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err := Open(path, oldBox)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.SaveSettings(ctx, settings()); err != nil {
+		st.Close()
+		t.Fatal(err)
+	}
+	if _, err := st.SaveDestination(ctx, NotificationDestination{Name: "secondary", ServiceURL: "generic://notify.example/path", Enabled: true}); err != nil {
+		st.Close()
+		t.Fatal(err)
+	}
+	keyID, err := st.EvidenceSigningKeyID(ctx)
+	if err != nil {
+		st.Close()
+		t.Fatal(err)
+	}
+	if _, err := st.db.ExecContext(ctx, `CREATE TRIGGER fail_rekey_evidence_key
+		BEFORE UPDATE OF value ON meta
+		WHEN NEW.key='evidence_signing_private_key_enc'
+		BEGIN SELECT RAISE(ABORT,'evidence key rotation failed'); END`); err != nil {
+		st.Close()
+		t.Fatal(err)
+	}
+	newBox, err := secret.NewBox([]byte(strings.Repeat("e", 32)))
+	if err != nil {
+		st.Close()
+		t.Fatal(err)
+	}
+	if err := st.Rekey(ctx, newBox); err == nil {
+		st.Close()
+		t.Fatal("rekey succeeded despite an injected metadata failure")
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := Open(path, oldBox)
+	if err != nil {
+		t.Fatalf("original master key could not reopen the database after rollback: %v", err)
+	}
+	defer reopened.Close()
+	gotSettings, err := reopened.Settings(ctx)
+	if err != nil {
+		t.Fatalf("settings after failed rekey: %v", err)
+	}
+	if gotSettings.OAuthClientSecret != "secret" {
+		t.Fatalf("original encrypted settings changed after failed rekey: %q", gotSettings.OAuthClientSecret)
+	}
+	destinations, err := reopened.ListDestinations(ctx)
+	if err != nil {
+		t.Fatalf("destinations after failed rekey: %v", err)
+	}
+	if len(destinations) != 2 {
+		t.Fatalf("destinations after failed rekey = %d, want 2", len(destinations))
+	}
+	if got, err := reopened.EvidenceSigningKeyID(ctx); err != nil || got != keyID {
+		t.Fatalf("evidence identity after failed rekey = %q/%v, want %q", got, err, keyID)
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"unicode"
 
 	"github.com/crypt0rr/tailstate/internal/model"
 )
@@ -57,7 +58,12 @@ func Update(previous, current string) string {
 }
 
 func escape(value string) string {
-	value = strings.NewReplacer("\n", " ", "\r", " ").Replace(value)
+	value = strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) {
+			return ' '
+		}
+		return r
+	}, value)
 	// Escape Markdown syntax that can change links, emphasis, headings, HTML,
 	// or block structure. Backticks are rendered as apostrophes because these
 	// values are placed in code/bold spans by the message builders.

@@ -49,6 +49,43 @@ func TestSchedulerInitialPollAndCancellation(t *testing.T) {
 	}
 }
 
+func TestSchedulerDrainsOverflowRequestsAfterInitialPoll(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	st, _ := monitorTestStore(t)
+	api := monitorTestAPI(t, nil)
+	defer api.Close()
+	engine := New(st, api.URL+"/api/v2", api.URL+"/oauth/token", "test", &scriptedSender{})
+	done := make(chan struct{})
+	go func() {
+		engine.scheduler(ctx)
+		close(done)
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		status, err := st.Status(context.Background())
+		if err == nil && status.BaselineAt != nil {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	status, err := st.Status(context.Background())
+	if err != nil || status.BaselineAt == nil {
+		t.Fatalf("scheduler did not complete its initial poll: status=%#v err=%v", status, err)
+	}
+	engine.triggerOverflowMu.Lock()
+	engine.triggerOverflow = append(engine.triggerOverflow, ReconcileRequest{})
+	engine.triggerOverflowMu.Unlock()
+	engine.Wake()
+	time.Sleep(100 * time.Millisecond)
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("scheduler did not stop after overflow request")
+	}
+}
+
 func TestSchedulerWaitsForConfigurationAndWake(t *testing.T) {
 	box, err := secret.NewBox(make([]byte, 32))
 	if err != nil {
@@ -116,6 +153,19 @@ func TestSchedulerSettingsCacheRefreshesNonIdentityChanges(t *testing.T) {
 	}
 }
 
+func TestSchedulerIdentityRefreshKeepsNonIdentitySettingsOnSameClient(t *testing.T) {
+	client := tailscale.New("http://invalid.example", "http://invalid.example/token", "test", tailscale.Credentials{})
+	if schedulerIdentityChanged(client, 7, 7) {
+		t.Fatal("credential or interval refresh incorrectly reset the monitor identity")
+	}
+	if !schedulerIdentityChanged(client, 7, 8) {
+		t.Fatal("tailnet or OAuth identity change did not reset the monitor identity")
+	}
+	if !schedulerIdentityChanged(nil, 0, 0) {
+		t.Fatal("initial scheduler configuration did not create a monitor identity")
+	}
+}
+
 func TestNextPollDelayRetriesWithRetryIntervalAfterFailure(t *testing.T) {
 	delay := nextPollDelay(time.Hour, false)
 	if delay < collectorRetryInterval || delay >= collectorRetryInterval+collectorRetryInterval/10+time.Second {
@@ -123,6 +173,41 @@ func TestNextPollDelayRetriesWithRetryIntervalAfterFailure(t *testing.T) {
 	}
 	if successful := nextPollDelay(time.Second, true); successful < time.Second || successful >= time.Second+time.Second/10+time.Second {
 		t.Fatalf("successful poll delay=%s is outside base interval jitter", successful)
+	}
+}
+
+func TestPollTimerDelayHonorsEarlierCollectorDeadline(t *testing.T) {
+	ctx := context.Background()
+	st, settings := monitorTestStore(t)
+	deadline := time.Now().UTC().Add(5 * time.Minute)
+	if err := st.SetNextPollErr(ctx, settings.Generation, []string{"device_details"}, deadline); err != nil {
+		t.Fatal(err)
+	}
+	engine := New(st, "", "", "test", &scriptedSender{})
+	delay := engine.pollTimerDelay(ctx, settings.Generation, []string{"device_details"}, 12*time.Hour, true)
+	if delay <= 0 || delay > 5*time.Minute {
+		t.Fatalf("scheduler ignored earlier collector deadline: %s", delay)
+	}
+}
+
+func TestPollTimerDelayHandlesMissingCollectors(t *testing.T) {
+	ctx := context.Background()
+	st, settings := monitorTestStore(t)
+	engine := New(st, "", "", "test", &scriptedSender{})
+	if delay := engine.pollTimerDelay(ctx, settings.Generation, []string{"missing"}, time.Hour, true); delay < time.Hour || delay >= time.Hour+time.Hour/10+time.Second {
+		t.Fatalf("missing collector timer delay=%s", delay)
+	}
+}
+
+func TestPollTimerDelayFallsBackWhenStoreUnavailable(t *testing.T) {
+	st, settings := monitorTestStore(t)
+	engine := New(st, "", "", "test", &scriptedSender{})
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	delay := engine.pollTimerDelay(context.Background(), settings.Generation, []string{"devices"}, time.Hour, true)
+	if delay < time.Hour || delay >= time.Hour+time.Hour/10+time.Second {
+		t.Fatalf("unavailable store timer delay=%s", delay)
 	}
 }
 
@@ -228,7 +313,11 @@ func TestProcessDurableBroadTriggerAndFailureHelpers(t *testing.T) {
 	if err != nil || !created {
 		t.Fatalf("record retry trigger: %#v created=%v err=%v", retry, created, err)
 	}
-	engine.finishTriggers(ctx, []int64{retry.ID, retry.ID, 0, -1}, false, 0)
+	claim, claimed, err := st.ClaimWebhookTrigger(ctx, retry.ID, time.Minute)
+	if err != nil || !claimed {
+		t.Fatalf("claim retry trigger: claimed=%v err=%v", claimed, err)
+	}
+	engine.finishClaimedTriggers(ctx, []store.WebhookTrigger{claim, claim}, false, 0)
 	requeued, _, err := st.RecordWebhookTrigger(ctx, strings.Repeat("d", 64), nil, nil)
 	if err != nil || requeued.Status != "pending" || requeued.LastError == "" {
 		t.Fatalf("retry trigger state=%#v err=%v", requeued, err)

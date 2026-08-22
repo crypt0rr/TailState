@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"strings"
 	"time"
@@ -64,6 +65,7 @@ type Status struct {
 	ResourceCounts      map[string]int
 	Collectors          []CollectorState
 	Pending             int
+	Processing          int
 	Dead                int
 	Destinations        int
 	EnabledDestinations int
@@ -80,6 +82,8 @@ type OutboxItem struct {
 	Payload       string
 	Attempts      int
 	FirstAttempt  time.Time
+	LeaseUntil    *time.Time
+	LeaseToken    string
 }
 
 type ChangeBatch struct {
@@ -103,6 +107,7 @@ type WebhookTrigger struct {
 	Attempts    int
 	NextAttempt time.Time
 	LeaseUntil  *time.Time
+	LeaseToken  string
 	LastError   string
 	ProcessedAt *time.Time
 }
@@ -173,7 +178,7 @@ type HistoryPage struct {
 	HasNext    bool
 }
 
-const currentSchemaVersion = 9
+const currentSchemaVersion = 11
 
 const (
 	webhookTriggerRetryWindow = 24 * time.Hour
@@ -182,10 +187,14 @@ const (
 	setupTokenLifetime        = 30 * time.Minute
 	resetTokenLifetime        = 30 * time.Minute
 	outboxRetryWindow         = 24 * time.Hour
+	outboxLease               = 2 * time.Minute
 	baselineGracePeriod       = 15 * time.Minute
 )
 
 func Open(path string, box *secret.Box) (*Store, error) {
+	if box == nil {
+		return nil, errors.New("master key is required")
+	}
 	if err := os.MkdirAll(filepathDir(path), 0o700); err != nil {
 		return nil, err
 	}
@@ -210,28 +219,40 @@ func Open(path string, box *secret.Box) (*Store, error) {
 			return nil, err
 		}
 	}
+	if err := verifyDatabaseVersionPreflight(db); err != nil {
+		db.Close()
+		return nil, err
+	}
+	// Migrations are transactional per version, but a later step can still
+	// leave an older step committed before startup stops. Warn before any DDL
+	// so operators have an actionable recovery point in the normal startup
+	// logs, and keep the database/key pair available for a verified restore.
+	var existingVersion int
+	if err := db.QueryRow("SELECT version FROM schema_version ORDER BY version DESC LIMIT 1").Scan(&existingVersion); err == nil && existingVersion < currentSchemaVersion {
+		slog.Warn("database schema migration pending; stop TailState and create a verified backup before retrying", "from_version", existingVersion, "to_version", currentSchemaVersion, "database", path)
+	}
 	if _, err := db.Exec(schema); err != nil {
 		db.Close()
-		return nil, fmt.Errorf("migrate database: %w", err)
+		return nil, fmt.Errorf("database schema setup failed; stop TailState and restore the verified pre-upgrade backup before retrying: %w", err)
 	}
 	if err := migrateSchema(db, box); err != nil {
 		db.Close()
-		return nil, err
+		return nil, fmt.Errorf("database migration failed; stop TailState and restore the verified pre-upgrade backup before retrying: %w", err)
 	}
 	// The due index depends on columns introduced by the v4-to-v5 migration.
 	// Keep it out of the bootstrap DDL so historical v4 databases can reach
 	// that migration before the index is created.
 	if _, err := db.Exec("CREATE INDEX IF NOT EXISTS webhook_triggers_due ON webhook_triggers(status, next_attempt_at, id)"); err != nil {
 		db.Close()
-		return nil, fmt.Errorf("create webhook trigger due index: %w", err)
+		return nil, fmt.Errorf("database migration failed while creating webhook trigger index; stop TailState and restore the verified pre-upgrade backup before retrying: %w", err)
 	}
 	if _, err := db.Exec("CREATE INDEX IF NOT EXISTS events_batch_id ON events(batch_id, id)"); err != nil {
 		db.Close()
-		return nil, fmt.Errorf("create event history index: %w", err)
+		return nil, fmt.Errorf("database migration failed while creating event history index; stop TailState and restore the verified pre-upgrade backup before retrying: %w", err)
 	}
 	if _, err := db.Exec("CREATE INDEX IF NOT EXISTS outbox_batch_id ON outbox(batch_id, id)"); err != nil {
 		db.Close()
-		return nil, fmt.Errorf("create outbox batch index: %w", err)
+		return nil, fmt.Errorf("database migration failed while creating outbox history index; stop TailState and restore the verified pre-upgrade backup before retrying: %w", err)
 	}
 	st := &Store{db: db, box: box}
 	present, err = verifyExistingMasterKey(db, box)

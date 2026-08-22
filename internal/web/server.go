@@ -76,6 +76,7 @@ type readinessCollector struct {
 	PartialErrorCount int    `json:"partial_error_count"`
 	PollDuration      int64  `json:"poll_duration_ms"`
 	FailureCount      int    `json:"failure_count"`
+	Reason            string `json:"reason,omitempty"`
 }
 
 func New(config boot.Config, st *store.Store, engine *monitor.Engine) (*Server, error) {
@@ -232,6 +233,10 @@ func (s *Server) claim(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.FormValue("password") != r.FormValue("confirm") {
+		// Password confirmation is part of the unauthenticated setup surface.
+		// Count mismatches as failed claims so an attacker cannot bypass the
+		// endpoint throttle by repeatedly submitting different confirmations.
+		s.recordFailure(ip)
 		s.render(w, "setup", pageData{Error: "Passwords do not match."})
 		return
 	}
@@ -307,28 +312,59 @@ func (s *Server) loginPost(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) sameOriginRequest(r *http.Request) bool {
 	origin := strings.TrimSpace(r.Header.Get("Origin"))
-	if origin == "" {
-		return !strings.EqualFold(strings.TrimSpace(r.Header.Get("Sec-Fetch-Site")), "cross-site")
+	if origin != "" {
+		// An explicit Origin is the strongest browser signal. Do not let a
+		// proxy or user agent that reports a broad Fetch Metadata value turn a
+		// valid same-origin form into a false CSRF rejection.
+		return s.sameOriginURL(r, origin)
 	}
-	parsed, err := url.Parse(origin)
-	if err != nil || parsed.Host == "" {
+	fetchSite := strings.ToLower(strings.TrimSpace(r.Header.Get("Sec-Fetch-Site")))
+	if fetchSite == "cross-site" || fetchSite == "same-site" {
+		// same-site is still potentially cross-origin. A sibling subdomain can
+		// submit a form without an Origin header, so it must not be treated as
+		// safe.
 		return false
 	}
-	host := r.Host
-	if host == "" {
-		host = r.URL.Host
+	// Some browsers omit Origin on form submissions but still send a Referer.
+	// Treat a cross-origin Referer as CSRF evidence instead of relying solely
+	// on the Fetch Metadata header.
+	if referer := strings.TrimSpace(r.Header.Get("Referer")); referer != "" {
+		return s.sameOriginURL(r, referer)
 	}
-	if !strings.EqualFold(parsed.Host, host) {
+	return true
+}
+
+func (s *Server) sameOriginURL(r *http.Request, raw string) bool {
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Host == "" || parsed.User != nil || parsed.Fragment != "" {
+		return false
+	}
+	host := strings.TrimSpace(r.Host)
+	if host == "" {
+		host = strings.TrimSpace(r.URL.Host)
+	}
+	requestURL, err := url.Parse("//" + host)
+	if err != nil || requestURL.Host == "" || !strings.EqualFold(parsed.Hostname(), requestURL.Hostname()) {
 		return false
 	}
 	scheme := "http"
 	if r.TLS != nil || (s.isTrustedProxy(remoteIP(r)) && strings.EqualFold(strings.TrimSpace(strings.Split(r.Header.Get("X-Forwarded-Proto"), ",")[0]), "https")) {
 		scheme = "https"
 	}
-	if scheme == "https" {
-		return strings.EqualFold(parsed.Scheme, "https")
+	if !strings.EqualFold(parsed.Scheme, scheme) {
+		return false
 	}
-	return strings.EqualFold(parsed.Scheme, "http")
+	return effectiveOriginPort(parsed.Port(), scheme) == effectiveOriginPort(requestURL.Port(), scheme)
+}
+
+func effectiveOriginPort(port, scheme string) string {
+	if port != "" {
+		return port
+	}
+	if scheme == "https" {
+		return "443"
+	}
+	return "80"
 }
 func (s *Server) logout(w http.ResponseWriter, r *http.Request) {
 	if !s.authenticated(r, true) {
@@ -567,7 +603,12 @@ func (s *Server) settingsPost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if destinations, err := s.store.ListDestinations(r.Context()); err != nil {
-		data.Error = "load notification destinations failed: " + err.Error()
+		// Storage failures may include table names, driver details, or future
+		// provider-specific context. Keep those details in server logs only;
+		// the authenticated settings page should not become an internal error
+		// oracle.
+		slog.Error("load notification destinations for settings update", "error", err)
+		data.Error = "Notification destinations are temporarily unavailable. Try again."
 		s.render(w, "settings", data)
 		return
 	} else {
@@ -584,7 +625,8 @@ func (s *Server) settingsPost(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if _, err := s.store.SaveSettings(r.Context(), input); err != nil {
-		data.Error = err.Error()
+		slog.Error("save settings", "error", err)
+		data.Error = "Settings could not be saved. Check the values and try again."
 		s.render(w, "settings", data)
 		return
 	}
@@ -659,8 +701,9 @@ func (s *Server) destinationPost(w http.ResponseWriter, r *http.Request) {
 		}
 		enabled := r.FormValue("enabled") == "on" || r.FormValue("enabled") == "true"
 		if _, err := s.store.SaveDestination(ctx, store.NotificationDestination{ID: id, Name: r.FormValue("name"), ServiceURL: serviceURL, Enabled: enabled}); err != nil {
+			slog.Error("save notification destination", "error", err)
 			data := s.currentSettingsData(ctx, csrf)
-			data.Error = "Notification destination was not saved: " + err.Error()
+			data.Error = destinationMutationMessage("save", err)
 			s.render(w, "settings", data)
 			return
 		}
@@ -695,20 +738,38 @@ func (s *Server) destinationPost(w http.ResponseWriter, r *http.Request) {
 			enabled = false
 		}
 		if err := s.store.SetDestinationEnabled(ctx, id, enabled); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			slog.Error("update notification destination", "error", err)
+			http.Error(w, destinationMutationMessage("update", err), http.StatusBadRequest)
 			return
 		}
 		s.engine.Wake()
 		http.Redirect(w, r, "/settings", http.StatusSeeOther)
 	case "delete":
 		if err := s.store.DeleteDestination(ctx, id); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			slog.Error("remove notification destination", "error", err)
+			http.Error(w, destinationMutationMessage("remove", err), http.StatusBadRequest)
 			return
 		}
 		s.engine.Wake()
 		http.Redirect(w, r, "/settings", http.StatusSeeOther)
 	default:
 		http.Error(w, "unknown destination action", http.StatusBadRequest)
+	}
+}
+
+func destinationMutationMessage(action string, err error) string {
+	if strings.EqualFold(strings.TrimSpace(err.Error()), "notification destination not found") {
+		return "Notification destination not found."
+	}
+	switch action {
+	case "save":
+		return "Notification destination was not saved. Check the name and URL."
+	case "update":
+		return "Notification destination could not be updated."
+	case "remove":
+		return "Notification destination could not be removed."
+	default:
+		return "Notification destination operation failed."
 	}
 }
 
@@ -781,6 +842,7 @@ func (s *Server) ready(w http.ResponseWriter, r *http.Request) {
 			PartialErrorCount: collector.PartialErrorCount,
 			PollDuration:      collector.PollDurationMS,
 			FailureCount:      collector.FailureCount,
+			Reason:            readinessCollectorReason(collector),
 		})
 	}
 	state := "not_ready"
@@ -805,6 +867,25 @@ func (s *Server) ready(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, code, response)
 }
+
+// readinessCollectorReason is intentionally a bounded vocabulary. Collector
+// errors can contain upstream response text, credentials, or tenant-controlled
+// values; /readyz is unauthenticated and must never echo those details.
+func readinessCollectorReason(collector store.CollectorState) string {
+	switch {
+	case !collector.Supported:
+		return "unsupported"
+	case collector.Partial:
+		return "partial"
+	case collector.FailureCount >= 1:
+		return "retrying"
+	case !collector.Baseline:
+		return "baseline pending"
+	default:
+		return "healthy"
+	}
+}
+
 func (s *Server) metrics(w http.ResponseWriter, r *http.Request) {
 	if !s.metricsAuthorized(r) {
 		w.Header().Set("WWW-Authenticate", `Bearer realm="tailstate-metrics"`)
@@ -832,7 +913,7 @@ func (s *Server) metrics(w http.ResponseWriter, r *http.Request) {
 		dueErrors = s.engine.CollectorDueErrors()
 	}
 	fmt.Fprintf(w, "# TYPE tailstate_collector_due_errors_total counter\ntailstate_collector_due_errors_total %d\n", dueErrors)
-	fmt.Fprintf(w, "# TYPE tailstate_outbox_pending gauge\ntailstate_outbox_pending %d\n# TYPE tailstate_outbox_dead gauge\ntailstate_outbox_dead %d\n", status.Pending, status.Dead)
+	fmt.Fprintf(w, "# TYPE tailstate_outbox_pending gauge\ntailstate_outbox_pending %d\n# TYPE tailstate_outbox_processing gauge\ntailstate_outbox_processing %d\n# TYPE tailstate_outbox_dead gauge\ntailstate_outbox_dead %d\n", status.Pending, status.Processing, status.Dead)
 	fmt.Fprintf(w, "# TYPE tailstate_webhook_triggers_pending gauge\ntailstate_webhook_triggers_pending %d\n# TYPE tailstate_webhook_triggers_processing gauge\ntailstate_webhook_triggers_processing %d\n# TYPE tailstate_webhook_triggers_dead gauge\ntailstate_webhook_triggers_dead %d\n", status.WebhookPending, status.WebhookProcessing, status.WebhookDead)
 	paused := 0
 	if status.Configured && status.EnabledDestinations == 0 {

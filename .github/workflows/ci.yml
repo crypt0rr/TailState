@@ -30,13 +30,22 @@ jobs:
           go-version-file: go.mod
           cache: true
       - run: test -z "$(gofmt -l .)"
+      - name: Verify Go module files are tidy
+        run: go mod tidy -diff
       - run: go vet ./...
       - run: go test -race -covermode=atomic -coverpkg=./... -coverprofile=coverage.out ./...
       - name: Run security and drift invariant suite
-        run: >-
-          go test -race -count=1
-          -run '^(TestTamperedExportFailsVerification|TestDriftAcrossUnsupportedWindowIsReported|TestBaselineIsSilent|TestRemovalRequiresTwoPolls|TestMassRemovalGuardPreservesSnapshots|TestTenantControlledSecretNamedKeysRemainVisible|TestSecondMattermostDestinationDoesNotOverwriteTheFirst|TestDestinationURLNeverReachesPersistedError|TestDestinationQueryCredentialsStayOutOfOutbox|TestDeliveryRedactsInjectedSenderErrors|TestDestinationTestAndUnknownMutationErrors|TestRestartMidDeliveryRecordsOutcome|TestFinishTriggersOutlivesShutdownCancellation|TestTriggerQueuesTargetedCollectorsAndRetainsOverflowScopes|TestFastTriggerClaimOnlyOwnsPendingDurableRows|TestDurableTriggersHaveIndependentCollectorOutcomes|TestEvidenceLedgerSurvivesHistoryRetention|TestLoginRejectsForwardedTLSFromUntrustedPeer|TestSetupDoesNotExposeStorageErrors|TestHomeReportsStorageErrors|TestPersistedTimestampErrorsSurface|TestAbsentCollectionKeyIsNotEmpty|TestSetupTokenCannotBeIssuedAfterClaim|TestResetTokenRequiresAdministrator)$'
-          ./...
+        run: |
+          set -euo pipefail
+          invariant_regex='^(TestTamperedExportFailsVerification|TestVerifyLedgerLinksRejectsInvalidChains|TestEvidenceLedgerGenesisCheckpointHasNoPredecessor|TestEvidenceExportRejectsMixedLedgerState|TestDriftAcrossUnsupportedWindowIsReported|TestBaselinedCollectorRequiresConsecutiveUnsupportedResponses|TestBaselineIsSilent|TestRemovalRequiresTwoPolls|TestMassRemovalGuardPreservesSnapshots|TestMassRemovalGuardProtectsMajorityDisappearance|TestTenantControlledSecretNamedKeysRemainVisible|TestSecondMattermostDestinationDoesNotOverwriteTheFirst|TestDestinationLifecycleDoesNotAllowLateDeliveryBookkeeping|TestDestinationURLNeverReachesPersistedError|TestDestinationQueryCredentialsStayOutOfOutbox|TestDeliveryRedactsInjectedSenderErrors|TestDestinationURLRedactsEncodedComponents|TestDestinationTestAndUnknownMutationErrors|TestRestartMidDeliveryRecordsOutcome|TestOutboxClaimLeaseFencingAndExpiredRetry|TestClaimDueOutboxDeadLettersExpiredRowsBeforeDelivery|TestCleanupDeadLettersExpiredWebhookTriggersWithoutDeletingActiveLease|TestHasDueWebhookTriggersSkipsActiveProcessingLease|TestOpenRejectsUnversionedExistingDatabaseBeforeBootstrapDDL|TestOpenRejectsMalformedSchemaVersionBeforeBootstrapDDL|TestFinishTriggersOutlivesShutdownCancellation|TestFinishTriggersCannotOverwriteRequeuedTrigger|TestWebhookClaimLeaseFencingAndExpiredRetry|TestTriggerQueuesTargetedCollectorsAndRetainsOverflowScopes|TestFastTriggerClaimOnlyOwnsPendingDurableRows|TestDurableTriggersHaveIndependentCollectorOutcomes|TestEvidenceLedgerSurvivesHistoryRetention|TestWebhookTriggerMetadataReadIsBoundedAndValidated|TestHistoryResourceFilterTreatsWildcardsLiterally|TestSchedulerIdentityRefreshKeepsNonIdentitySettingsOnSameClient|TestPollTimerDelayHonorsEarlierCollectorDeadline|TestPollTimerDelayHandlesMissingCollectors|TestPollTimerDelayFallsBackWhenStoreUnavailable|TestIdentityChangeDeadLettersPendingEventNotifications|TestEarliestCollectorDueHandlesEmptyImmediateAndInvalidRows|TestReadinessCollectorReasonUsesBoundedVocabulary|TestStatusReportsPostBaselineCollectorDegradation|TestWebhookRetryMessageIsRedacted|TestLoginRejectsForwardedTLSFromUntrustedPeer|TestLoginRejectsCrossOriginReferer|TestLoginRejectsSameSiteFetchWithoutOrigin|TestLoginAcceptsExplicitSameOriginWithSameSiteMetadata|TestSameOriginNormalizesDefaultPorts|TestSetupPasswordMismatchConsumesThrottleBudget|TestSetupDoesNotExposeStorageErrors|TestHomeReportsStorageErrors|TestPersistedTimestampErrorsSurface|TestAbsentCollectionKeyIsNotEmpty|TestClientBoundsRetryWindow|TestSetupTokenCannotBeIssuedAfterClaim|TestResetTokenRequiresAdministrator)$'
+          invariant_log="${RUNNER_TEMP:-/tmp}/tailstate-invariant-tests.log"
+          go test -race -count=1 -v -run "$invariant_regex" ./... | tee "$invariant_log"
+          while IFS= read -r test_name; do
+            grep -E -q -- "^--- PASS: ${test_name}( |$)" "$invariant_log" || {
+              echo "invariant test did not run: ${test_name}" >&2
+              exit 1
+            }
+          done < <(grep -oE 'Test[A-Za-z0-9_]+' <<< "$invariant_regex")
       - name: Enforce coverage baseline
         run: |
           total=$(go tool cover -func=coverage.out | awk '/^total:/ {gsub("%", "", $3); print $3}')
@@ -85,7 +94,7 @@ jobs:
         run: |
           set -euo pipefail
           docker compose -f compose.yaml -f compose.remote.yaml config >/tmp/tailstate-remote-compose.yaml
-          grep -q 'caddy:2.10-alpine' /tmp/tailstate-remote-compose.yaml
+          grep -q 'caddy:2.11-alpine' /tmp/tailstate-remote-compose.yaml
           grep -q 'published: "80"' /tmp/tailstate-remote-compose.yaml
           grep -q 'published: "443"' /tmp/tailstate-remote-compose.yaml
           ! grep -q 'published: "8080"' /tmp/tailstate-remote-compose.yaml

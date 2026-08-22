@@ -100,7 +100,7 @@ func (s *Store) SaveDestination(ctx context.Context, destination NotificationDes
 		return 0, err
 	}
 	if !destination.Enabled {
-		if _, err := tx.ExecContext(ctx, "UPDATE outbox SET status='dead',last_error='destination disabled' WHERE destination_id=? AND status='pending'", id); err != nil {
+		if _, err := tx.ExecContext(ctx, "UPDATE outbox SET status='dead',last_error='destination disabled',lease_until=NULL,lease_token='' WHERE destination_id=? AND status IN ('pending','processing')", id); err != nil {
 			return 0, err
 		}
 	}
@@ -131,7 +131,7 @@ func (s *Store) SetDestinationEnabled(ctx context.Context, id int64, enabled boo
 		return errors.New("notification destination not found")
 	}
 	if !enabled {
-		if _, err := tx.ExecContext(ctx, "UPDATE outbox SET status='dead',last_error='destination disabled' WHERE destination_id=? AND status='pending'", id); err != nil {
+		if _, err := tx.ExecContext(ctx, "UPDATE outbox SET status='dead',last_error='destination disabled',lease_until=NULL,lease_token='' WHERE destination_id=? AND status IN ('pending','processing')", id); err != nil {
 			return err
 		}
 	}
@@ -158,19 +158,30 @@ func (s *Store) DeleteDestination(ctx context.Context, id int64) error {
 	if n == 0 {
 		return errors.New("notification destination not found")
 	}
-	if _, err := tx.ExecContext(ctx, "UPDATE outbox SET status='dead',last_error='destination removed' WHERE destination_id=? AND status='pending'", id); err != nil {
+	if _, err := tx.ExecContext(ctx, "UPDATE outbox SET status='dead',last_error='destination removed',lease_until=NULL,lease_token='' WHERE destination_id=? AND status IN ('pending','processing')", id); err != nil {
 		return err
 	}
 	return tx.Commit()
 }
 
 func upsertDestinationTx(ctx context.Context, tx *sql.Tx, box *secret.Box, id int64, name, serviceURL string, enabled bool) (int64, error) {
-	encoded, err := box.Encrypt(serviceURL)
-	if err != nil {
-		return 0, err
-	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	if id > 0 {
+		var existingEncoded string
+		if err := tx.QueryRowContext(ctx, "SELECT service_url_enc FROM notification_destinations WHERE id=? AND deleted_at IS NULL", id).Scan(&existingEncoded); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return 0, errors.New("notification destination not found")
+			}
+			return 0, err
+		}
+		encoded := existingEncoded
+		if existing, decryptErr := box.Decrypt(existingEncoded); decryptErr != nil || existing != serviceURL {
+			var err error
+			encoded, err = box.Encrypt(serviceURL)
+			if err != nil {
+				return 0, err
+			}
+		}
 		result, err := tx.ExecContext(ctx, "UPDATE notification_destinations SET name=?,service_url_enc=?,enabled=?,updated_at=? WHERE id=? AND deleted_at IS NULL", name, encoded, boolInt(enabled), now, id)
 		if err != nil {
 			return 0, err
@@ -183,6 +194,10 @@ func upsertDestinationTx(ctx context.Context, tx *sql.Tx, box *secret.Box, id in
 			return 0, errors.New("notification destination not found")
 		}
 		return id, nil
+	}
+	encoded, err := box.Encrypt(serviceURL)
+	if err != nil {
+		return 0, err
 	}
 	result, err := tx.ExecContext(ctx, "INSERT INTO notification_destinations(name,service_url_enc,enabled,created_at,updated_at) VALUES(?,?,?,?,?)", name, encoded, boolInt(enabled), now, now)
 	if err != nil {

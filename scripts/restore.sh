@@ -34,6 +34,16 @@ if [[ -f "$checksum" ]]; then
     (cd "$archive_dir" && sha256sum -c "$(basename "$checksum")")
 fi
 
+# The successful path writes a pre-restore archive beside the source archive.
+# Check that destination before stopping TailState; otherwise a read-only or
+# full backup directory would leave a healthy service stopped even though no
+# restore mutation had begun.
+write_probe="$(mktemp "$archive_dir/.tailstate-restore-write.XXXXXX")" || {
+    echo "restore directory is not writable: $archive_dir" >&2
+    exit 1
+}
+rm -f "$write_probe"
+
 mapfile -t containers < <(docker compose ps -aq "$service")
 if [[ ${#containers[@]} -ne 1 || -z "${containers[0]}" ]]; then
     echo "expected exactly one existing Compose container for service $service" >&2
@@ -41,6 +51,26 @@ if [[ ${#containers[@]} -ne 1 || -z "${containers[0]}" ]]; then
 fi
 container="${containers[0]}"
 running="$(docker inspect --format '{{.State.Running}}' "$container")"
+
+# The pre-restore archive is written after the service is stopped. Refuse to
+# enter that state when the destination filesystem cannot conservatively hold
+# an uncompressed copy of the data volume plus a small metadata margin. This
+# turns a predictable disk-full condition into a safe preflight failure; the
+# atomic swap and rollback still handle space exhaustion that occurs later.
+available_kib="$(df -Pk "$archive_dir" | awk 'NR == 2 { print $4; exit }')"
+if [[ "$available_kib" =~ ^[0-9]+$ ]]; then
+    if ! data_kib="$(docker run --rm --volumes-from "$container" "$backup_image" du -sk /data | awk 'NR == 1 { print $1; exit }')"; then
+        echo "could not measure the data volume before restore" >&2
+        exit 1
+    fi
+    if [[ "$data_kib" =~ ^[0-9]+$ ]]; then
+        required_kib=$((data_kib + 1024))
+        if (( available_kib < required_kib )); then
+            echo "insufficient free space for the pre-restore archive: ${available_kib} KiB available, ${required_kib} KiB required" >&2
+            exit 1
+        fi
+    fi
+fi
 
 if ! entries="$(docker run --rm --volume "$archive_dir:/backup:ro" "$backup_image" tar tzf "/backup/$archive_name")"; then
     echo "archive cannot be listed: $archive" >&2

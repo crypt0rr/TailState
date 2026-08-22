@@ -76,17 +76,51 @@ func TestNotifyTestAndErrorHelpers(t *testing.T) {
 	if got := SafeDeliveryError(&DeliveryError{Status: http.StatusBadGateway, Message: "provider body contains secret"}); got != "notification delivery failed with HTTP 502" {
 		t.Fatalf("safe HTTP delivery reason=%q", got)
 	}
+	for _, tc := range []struct {
+		name string
+		err  error
+		want string
+	}{
+		{name: "nil", want: "notification delivery failed"},
+		{name: "status in generic error", err: errors.New("provider returned 429 while busy"), want: "notification delivery failed with HTTP 429"},
+		{name: "deadline", err: errors.New("context deadline exceeded"), want: "notification delivery timed out"},
+		{name: "timeout", err: errors.New("socket timeout"), want: "notification delivery timed out"},
+		{name: "canceled", err: errors.New("request canceled by caller"), want: "notification delivery canceled"},
+		{name: "cancelled", err: errors.New("request cancelled by caller"), want: "notification delivery canceled"},
+		{name: "unknown", err: errors.New("provider rejected the request"), want: "notification delivery failed"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := SafeDeliveryError(tc.err); got != tc.want {
+				t.Fatalf("SafeDeliveryError(%v)=%q, want %q", tc.err, got, tc.want)
+			}
+		})
+	}
 	if got := SafeDeliveryMessage("upstream response contains an unrelated credential"); got != "notification delivery failed" {
 		t.Fatalf("safe generic delivery reason=%q", got)
 	}
 	if got := SafeDeliveryMessage("request timeout after 15s"); got != "notification delivery timed out" {
 		t.Fatalf("safe timeout delivery reason=%q", got)
 	}
+	if got := SafeDeliveryMessage("no notification destination configured"); got != "no notification destination configured" {
+		t.Fatalf("safe migration delivery reason=%q", got)
+	}
+	if got := SafeDeliveryMessage("monitoring identity changed"); got != "monitoring identity changed" {
+		t.Fatalf("safe identity-change delivery reason=%q", got)
+	}
+	if got := SafeDeliveryMessage("collector reconciliation failed"); got != "collector reconciliation failed" {
+		t.Fatalf("safe reconciliation delivery reason=%q", got)
+	}
+	if got := SafeDeliveryMessage("reconciliation retry window expired"); got != "reconciliation retry window expired" {
+		t.Fatalf("safe reconciliation expiry reason=%q", got)
+	}
 	if got := SafeTestError(&DeliveryError{Status: http.StatusBadGateway, Message: "provider body contains secret"}); got != "notification delivery failed with HTTP 502" {
 		t.Fatalf("safe notification test reason=%q", got)
 	}
 	if got := SafeTestError(errors.New("invalid notification URL (generic://host)"), "generic://host"); got != "invalid notification URL (generic://<redacted>)" {
 		t.Fatalf("validation notification test reason=%q", got)
+	}
+	if got := SafeTestError(errors.New("provider response contained a secret"), "generic://host/path?token=secret"); got != "notification delivery failed" {
+		t.Fatalf("untyped provider notification test reason=%q", got)
 	}
 	secretURL := "mattermost://TailState:password@chat.example/hooks/secret-token?icon=:satellite:"
 	got := SafeTestError(errors.New("provider rejected request for "+secretURL), secretURL)
@@ -95,6 +129,18 @@ func TestNotifyTestAndErrorHelpers(t *testing.T) {
 	}
 	if got := SafeTestError(errors.New("provider response contained a secret")); got != "notification delivery failed" {
 		t.Fatalf("unscoped notification test error=%q", got)
+	}
+	if got := SafeTestError(nil); got != "" {
+		t.Fatalf("nil notification test error=%q", got)
+	}
+	if got := SafeTestError(errors.New("create notification sender: invalid service"), "generic://host/path?token=secret"); got != "create notification sender: invalid service" {
+		t.Fatalf("unredacted sender validation error=%q", got)
+	}
+	if got := SafeTestError(errors.New("notification URL is required")); got != "notification URL is required" {
+		t.Fatalf("missing destination validation was collapsed into a delivery failure: %q", got)
+	}
+	if got := SafeTestError(errors.New("invalid notification URL (generic://host)")); got != "notification configuration is invalid" {
+		t.Fatalf("validation details leaked without a destination URL: %q", got)
 	}
 }
 

@@ -113,6 +113,8 @@ func TestVersionedMigrationsReportSchemaWriteErrors(t *testing.T) {
 		{version: 6, call: migrateSchemaV6ToV7, trigger: "fail_auth_schema_version", want: "record authentication token migration"},
 		{version: 7, call: migrateSchemaV7ToV8, trigger: "fail_collector_telemetry_schema_version", want: "record collector telemetry migration"},
 		{version: 8, call: migrateSchemaV8ToV9, trigger: "fail_partial_error_count_schema_version", want: "record partial error count migration"},
+		{version: 9, call: migrateSchemaV9ToV10, trigger: "fail_webhook_lease_fencing_schema_version", want: "record webhook lease fencing migration"},
+		{version: 10, call: migrateSchemaV10ToV11, trigger: "fail_outbox_lease_fencing_schema_version", want: "record outbox lease fencing migration"},
 	}
 	for _, tt := range tests {
 		t.Run("version "+strconv.Itoa(tt.version), func(t *testing.T) {
@@ -228,6 +230,103 @@ INSERT INTO schema_version VALUES(8);`); err != nil {
 	}
 	if err := migrateSchemaV8ToV9(db); err == nil || !strings.Contains(err.Error(), "add collector_state.partial_error_count") {
 		t.Fatalf("missing collector state migration error=%v", err)
+	}
+}
+
+func TestMigrateSchemaV9ToV10AddsWebhookLeaseToken(t *testing.T) {
+	db := migrationErrorDB(t)
+	if _, err := db.Exec(`CREATE TABLE schema_version(version INTEGER NOT NULL);
+INSERT INTO schema_version VALUES(9);
+CREATE TABLE webhook_triggers(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  body_hash TEXT NOT NULL UNIQUE,
+  received_at TEXT NOT NULL,
+  event_types_json BLOB NOT NULL,
+  collectors_json BLOB NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',
+  attempts INTEGER NOT NULL DEFAULT 0,
+  next_attempt_at TEXT NOT NULL,
+  lease_until TEXT,
+  last_error TEXT NOT NULL DEFAULT '',
+  processed_at TEXT
+);`); err != nil {
+		t.Fatal(err)
+	}
+	if err := migrateSchemaV9ToV10(db); err != nil {
+		t.Fatal(err)
+	}
+	var version, found int
+	if err := db.QueryRow("SELECT version FROM schema_version").Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if version != 10 {
+		t.Fatalf("schema version=%d, want 10", version)
+	}
+	if err := db.QueryRow("SELECT COUNT(*) FROM pragma_table_info('webhook_triggers') WHERE name='lease_token'").Scan(&found); err != nil {
+		t.Fatal(err)
+	}
+	if found != 1 {
+		t.Fatal("webhook lease token column missing")
+	}
+}
+
+func TestMigrateSchemaV9ToV10ReportsMissingWebhookTriggers(t *testing.T) {
+	db := migrationErrorDB(t)
+	if _, err := db.Exec(`CREATE TABLE schema_version(version INTEGER NOT NULL);
+INSERT INTO schema_version VALUES(9);`); err != nil {
+		t.Fatal(err)
+	}
+	if err := migrateSchemaV9ToV10(db); err == nil || !strings.Contains(err.Error(), "add webhook_triggers.lease_token") {
+		t.Fatalf("missing webhook lease token migration error=%v", err)
+	}
+}
+
+func TestMigrateSchemaV10ToV11AddsOutboxLeaseColumns(t *testing.T) {
+	db := migrationErrorDB(t)
+	if _, err := db.Exec(`CREATE TABLE schema_version(version INTEGER NOT NULL);
+INSERT INTO schema_version VALUES(10);
+CREATE TABLE outbox(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  payload TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',
+  attempts INTEGER NOT NULL DEFAULT 0,
+  next_attempt TEXT NOT NULL,
+  first_attempt TEXT NOT NULL,
+  last_error TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  delivered_at TEXT
+);`); err != nil {
+		t.Fatal(err)
+	}
+	if err := migrateSchemaV10ToV11(db); err != nil {
+		t.Fatal(err)
+	}
+	var version int
+	if err := db.QueryRow("SELECT version FROM schema_version").Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if version != 11 {
+		t.Fatalf("schema version=%d, want 11", version)
+	}
+	for _, column := range []string{"lease_until", "lease_token"} {
+		var found int
+		if err := db.QueryRow("SELECT COUNT(*) FROM pragma_table_info('outbox') WHERE name=?", column).Scan(&found); err != nil {
+			t.Fatal(err)
+		}
+		if found != 1 {
+			t.Fatalf("outbox lease column %q missing", column)
+		}
+	}
+}
+
+func TestMigrateSchemaV10ToV11ReportsMissingOutbox(t *testing.T) {
+	db := migrationErrorDB(t)
+	if _, err := db.Exec(`CREATE TABLE schema_version(version INTEGER NOT NULL);
+INSERT INTO schema_version VALUES(10);`); err != nil {
+		t.Fatal(err)
+	}
+	if err := migrateSchemaV10ToV11(db); err == nil || !strings.Contains(err.Error(), "add outbox.lease_until") {
+		t.Fatalf("missing outbox lease migration error=%v", err)
 	}
 }
 

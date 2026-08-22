@@ -3,6 +3,8 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -20,6 +22,16 @@ func openCoverageDB(t *testing.T, path string) *sql.DB {
 	}
 	t.Cleanup(func() { _ = db.Close() })
 	return db
+}
+
+func TestOpenRejectsNilMasterKeyBeforeCreatingDatabase(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "tailstate.db")
+	if _, err := Open(path, nil); err == nil || err.Error() != "master key is required" {
+		t.Fatalf("Open(nil) error = %v", err)
+	}
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("Open(nil) created or left a database at %s: %v", path, err)
+	}
 }
 
 func TestOpenCreatesHistoryLookupIndexes(t *testing.T) {
@@ -262,10 +274,109 @@ INSERT INTO settings VALUES(1,'-','client',?,?,60,300,1,'2026-01-01T00:00:00Z',N
 	}
 }
 
+func TestOpenRejectsUnversionedExistingDatabaseBeforeBootstrapDDL(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "tailstate.db")
+	db := openCoverageDB(t, path)
+	if _, err := db.ExecContext(context.Background(), `CREATE TABLE settings(id INTEGER PRIMARY KEY);`); err != nil {
+		t.Fatalf("create unversioned settings table: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	box, err := secret.NewBox(make([]byte, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(path, box); err == nil || !strings.Contains(err.Error(), "unversioned existing database") {
+		t.Fatalf("unversioned database Open error = %v", err)
+	}
+	inspection := openCoverageDB(t, path)
+	defer inspection.Close()
+	var schemaTables, settingsTables int
+	if err := inspection.QueryRowContext(context.Background(), "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='schema_version'").Scan(&schemaTables); err != nil {
+		t.Fatal(err)
+	}
+	if err := inspection.QueryRowContext(context.Background(), "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='settings'").Scan(&settingsTables); err != nil {
+		t.Fatal(err)
+	}
+	if schemaTables != 0 || settingsTables != 1 {
+		t.Fatalf("unversioned startup changed schema: schema_version=%d settings=%d", schemaTables, settingsTables)
+	}
+}
+
+func TestOpenRejectsMalformedSchemaVersionBeforeBootstrapDDL(t *testing.T) {
+	cases := []struct {
+		name       string
+		definition string
+		want       string
+	}{
+		{
+			name:       "empty marker",
+			definition: `CREATE TABLE schema_version(version INTEGER NOT NULL); CREATE TABLE settings(id INTEGER PRIMARY KEY);`,
+			want:       "0 schema version markers",
+		},
+		{
+			name:       "duplicate markers",
+			definition: `CREATE TABLE schema_version(version INTEGER NOT NULL); INSERT INTO schema_version VALUES(1),(1); CREATE TABLE settings(id INTEGER PRIMARY KEY);`,
+			want:       "2 schema version markers",
+		},
+		{
+			name:       "unsupported marker",
+			definition: `CREATE TABLE schema_version(version INTEGER NOT NULL); INSERT INTO schema_version VALUES(0); CREATE TABLE settings(id INTEGER PRIMARY KEY);`,
+			want:       "unsupported database schema version 0",
+		},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "tailstate.db")
+			db := openCoverageDB(t, path)
+			if _, err := db.ExecContext(context.Background(), tt.definition); err != nil {
+				t.Fatalf("create malformed schema fixture: %v", err)
+			}
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+			box, err := secret.NewBox(make([]byte, 32))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Open(path, box); err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("malformed schema Open error = %v, want %q", err, tt.want)
+			}
+			inspection := openCoverageDB(t, path)
+			defer inspection.Close()
+			var settingsTables, currentTables, schemaRows int
+			if err := inspection.QueryRowContext(context.Background(), "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='settings'").Scan(&settingsTables); err != nil {
+				t.Fatal(err)
+			}
+			if err := inspection.QueryRowContext(context.Background(), "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('meta','admin','notification_destinations')").Scan(&currentTables); err != nil {
+				t.Fatal(err)
+			}
+			if err := inspection.QueryRowContext(context.Background(), "SELECT COUNT(*) FROM schema_version").Scan(&schemaRows); err != nil {
+				t.Fatal(err)
+			}
+			if settingsTables != 1 || currentTables != 0 {
+				t.Fatalf("bootstrap DDL changed existing schema: settings=%d current_tables=%d", settingsTables, currentTables)
+			}
+			wantRows := 0
+			if strings.Contains(tt.name, "duplicate") {
+				wantRows = 2
+			} else if strings.Contains(tt.name, "unsupported") {
+				wantRows = 1
+			}
+			if schemaRows != wantRows {
+				t.Fatalf("bootstrap DDL changed schema marker rows to %d, want %d", schemaRows, wantRows)
+			}
+		})
+	}
+}
+
 func TestOpenReportsConflictingMetaObject(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "tailstate.db")
 	db := openCoverageDB(t, path)
-	if _, err := db.ExecContext(context.Background(), "CREATE VIEW meta AS SELECT 1 AS key, 1 AS value"); err != nil {
+	if _, err := db.ExecContext(context.Background(), `CREATE TABLE schema_version(version INTEGER NOT NULL);
+		INSERT INTO schema_version VALUES(11);
+		CREATE VIEW meta AS SELECT 1 AS key, 1 AS value`); err != nil {
 		t.Fatalf("create conflicting meta view: %v", err)
 	}
 	if err := db.Close(); err != nil {
@@ -322,5 +433,40 @@ func TestOpenReportsEvidenceLedgerBackfillError(t *testing.T) {
 	}
 	if _, err := Open(path, box); err == nil || !strings.Contains(err.Error(), "backfill evidence ledger") {
 		t.Fatalf("Open error = %v", err)
+	}
+}
+
+func TestOpenMigrationFailureIncludesRecoveryGuidance(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "tailstate.db")
+	box, err := secret.NewBox(make([]byte, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err := Open(path, box)
+	if err != nil {
+		t.Fatalf("initial Open: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db := openCoverageDB(t, path)
+	if _, err := db.ExecContext(context.Background(), "UPDATE schema_version SET version=8"); err != nil {
+		t.Fatalf("rewind schema version: %v", err)
+	}
+	if _, err := db.ExecContext(context.Background(), `CREATE TRIGGER fail_partial_error_count_schema_version
+		BEFORE UPDATE ON schema_version
+		BEGIN SELECT RAISE(ABORT,'partial error count migration failed'); END`); err != nil {
+		t.Fatalf("create migration trigger: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := Open(path, box); err == nil ||
+		!strings.Contains(err.Error(), "database migration failed") ||
+		!strings.Contains(err.Error(), "restore the verified pre-upgrade backup before retrying") ||
+		!strings.Contains(err.Error(), "partial error count migration failed") {
+		t.Fatalf("migration recovery error = %v", err)
 	}
 }

@@ -3,7 +3,7 @@ package store
 const schema = `
 PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);
-INSERT INTO schema_version(version) SELECT 9 WHERE NOT EXISTS (SELECT 1 FROM schema_version);
+INSERT INTO schema_version(version) SELECT 11 WHERE NOT EXISTS (SELECT 1 FROM schema_version);
 
 CREATE TABLE IF NOT EXISTS meta (
   key TEXT PRIMARY KEY,
@@ -50,15 +50,36 @@ CREATE TABLE IF NOT EXISTS notification_destinations (
   updated_at TEXT NOT NULL,
   deleted_at TEXT
 );
+-- Destination names are display labels, not identities. Duplicate names are
+-- intentionally allowed so two endpoints from the same provider can retain
+-- distinct durable IDs and delivery history.
 CREATE INDEX IF NOT EXISTS notification_destinations_enabled ON notification_destinations(enabled, deleted_at);
 
--- The relationships below intentionally remain application-managed instead of
--- SQLite foreign keys. Snapshots, event history, evidence ledger entries, and
--- outbox rows are retained across generation changes; destinations are
--- soft-deleted while their outbox history remains queryable; and webhook
--- triggers may be compacted independently of their historical batch links.
--- Adding cascading constraints would either destroy audit history or make
--- retention/migration impossible without rewriting old databases.
+-- Relationship policy: these links are intentionally application-managed
+-- instead of SQLite foreign keys. The store methods enforce the following
+-- invariants while preserving durable history:
+--   * collector_state and snapshots are keyed by the active settings
+--     generation; changing the tailnet or OAuth identity replaces that
+--     generation in one transaction rather than cascading row deletes.
+--   * events belong to event_batches, and outbox rows may point at a batch;
+--     retention deletes events before empty batches and keeps delivered/dead
+--     outbox history independently, so a cascading delete would erase audit
+--     evidence or make retention order-dependent.
+--   * event_batches.trigger_id and event_batch_triggers.trigger_id point at
+--     webhook_triggers only as optional reconciliation correlation. Webhook
+--     trigger rows have their own retry/retention lifecycle, so deleting or
+--     compacting a trigger must not delete the already-recorded event batch;
+--     event_batch_triggers rows are cleaned up only after their batch goes
+--     away.
+--   * evidence_ledger entries deliberately outlive event_batches to preserve
+--     the signed chain and its checkpoints after history retention.
+--   * outbox rows keep notification_destinations IDs after a destination is
+--     soft-deleted so delivery history remains queryable and labels can be
+--     rendered as "Removed destination".
+-- Adding cascading constraints would therefore destroy audit history or make
+-- migrations/retention impossible without rewriting old databases. Every
+-- write path uses generation checks, existence checks, soft-delete predicates,
+-- and cleanup queries for these relationships instead.
 CREATE TABLE IF NOT EXISTS collector_state (
   generation INTEGER NOT NULL,
   collector TEXT NOT NULL,
@@ -111,6 +132,7 @@ CREATE TABLE IF NOT EXISTS webhook_triggers (
   attempts INTEGER NOT NULL DEFAULT 0,
   next_attempt_at TEXT NOT NULL,
   lease_until TEXT,
+  lease_token TEXT NOT NULL DEFAULT '',
   last_error TEXT NOT NULL DEFAULT '',
   processed_at TEXT
 );
@@ -152,7 +174,9 @@ CREATE TABLE IF NOT EXISTS outbox (
   first_attempt TEXT NOT NULL,
   last_error TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL,
-  delivered_at TEXT
+  delivered_at TEXT,
+  lease_until TEXT,
+  lease_token TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS outbox_due ON outbox(status, next_attempt);
 `

@@ -82,7 +82,7 @@ func TestStoreLifecycleAndCollectorStateBranches(t *testing.T) {
 	if notify, _, err := st.RecordCollectorFailure(ctx, generation, "devices", "again"); err != nil || notify {
 		t.Fatalf("fourth failure notification=%v err=%v", notify, err)
 	}
-	if _, err := st.applyBatch(ctx, generation, []model.Collected{{Collector: "devices", Resources: []model.Resource{{ID: "device-1", Type: "device", Name: "server", Data: map[string]any{"hostname": "server"}}}}}, func([]model.Change) string { return "digest" }); err != nil {
+	if _, err := testApplyBatch(st, ctx, generation, []model.Collected{{Collector: "devices", Resources: []model.Resource{{ID: "device-1", Type: "device", Name: "server", Data: map[string]any{"hostname": "server"}}}}}, func([]model.Change) string { return "digest" }); err != nil {
 		t.Fatal(err)
 	}
 	if unhealthy, err := st.CollectorWasUnhealthyWithError(ctx, generation, "devices"); err != nil || unhealthy {
@@ -166,14 +166,14 @@ func TestDestinationDeleteAndDeliveredBranches(t *testing.T) {
 	if err := st.EnqueueSystem(ctx, "pending payload"); err != nil {
 		t.Fatal(err)
 	}
-	items, err := st.DueOutbox(ctx, 10)
+	items, err := testDueOutbox(st, ctx, 10)
 	if err != nil || len(items) != 1 {
 		t.Fatalf("outbox=%#v err=%v", items, err)
 	}
 	if _, err := st.db.ExecContext(ctx, "UPDATE outbox SET last_error='old error' WHERE id=?", items[0].ID); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.Delivered(ctx, items[0].ID); err != nil {
+	if err := testDelivered(st, ctx, items[0].ID); err != nil {
 		t.Fatal(err)
 	}
 	var status, lastError string
@@ -350,7 +350,7 @@ func TestPersistedTimestampErrorsSurface(t *testing.T) {
 		if _, err := st.db.ExecContext(ctx, "UPDATE settings SET configured_at=? WHERE id=1", time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := st.applyBatch(ctx, generation, []model.Collected{{Collector: "devices", Resources: []model.Resource{{ID: "device-1", Type: "device", Name: "server", Data: map[string]any{"hostname": "server"}}}}}, func([]model.Change) string { return "baseline" }); err != nil {
+		if _, err := testApplyBatch(st, ctx, generation, []model.Collected{{Collector: "devices", Resources: []model.Resource{{ID: "device-1", Type: "device", Name: "server", Data: map[string]any{"hostname": "server"}}}}}, func([]model.Change) string { return "baseline" }); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := st.db.ExecContext(ctx, "UPDATE collector_state SET last_success='bad' WHERE generation=? AND collector='devices'", generation); err != nil {
@@ -370,10 +370,10 @@ func TestPersistedTimestampErrorsSurface(t *testing.T) {
 		resource := func(name string) []model.Resource {
 			return []model.Resource{{Collector: "devices", ID: "device-1", Type: "device", Name: name, Data: map[string]any{"hostname": name}}}
 		}
-		if _, err := st.applyBatch(ctx, generation, []model.Collected{{Collector: "devices", Resources: resource("server")}}, notify.Digest); err != nil {
+		if _, err := testApplyBatch(st, ctx, generation, []model.Collected{{Collector: "devices", Resources: resource("server")}}, notify.Digest); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := st.applyBatch(ctx, generation, []model.Collected{{Collector: "devices", Resources: resource("changed")}}, notify.Digest); err != nil {
+		if _, err := testApplyBatch(st, ctx, generation, []model.Collected{{Collector: "devices", Resources: resource("changed")}}, notify.Digest); err != nil {
 			t.Fatal(err)
 		}
 		var batchID int64
@@ -407,7 +407,7 @@ func TestPersistedTimestampErrorsSurface(t *testing.T) {
 		if _, err := st.db.ExecContext(ctx, "UPDATE outbox SET first_attempt='bad',next_attempt=? WHERE batch_id=?", time.Now().UTC().Add(-time.Minute).Format(time.RFC3339Nano), batchID); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := st.DueOutbox(ctx, 10); err == nil || !strings.Contains(err.Error(), "outbox first attempt") {
+		if _, err := testDueOutbox(st, ctx, 10); err == nil || !strings.Contains(err.Error(), "outbox first attempt") {
 			t.Fatalf("invalid outbox timestamp was ignored: %v", err)
 		}
 	})
@@ -428,7 +428,7 @@ func TestPersistedTimestampErrorsSurface(t *testing.T) {
 					t.Fatalf("invalid webhook timestamp was ignored: %v", err)
 				}
 				if field == "received_at" {
-					if err := st.RetryWebhookTriggers(ctx, []int64{trigger.ID}, time.Now(), "retry"); err == nil || !strings.Contains(err.Error(), "webhook received_at timestamp") {
+					if err := testRetryWebhookTriggers(st, ctx, []int64{trigger.ID}, time.Now(), "retry"); err == nil || !strings.Contains(err.Error(), "webhook received_at timestamp") {
 						t.Fatalf("invalid webhook retry timestamp was ignored: %v", err)
 					}
 				}
@@ -469,11 +469,26 @@ func TestPersistedTimestampErrorsSurface(t *testing.T) {
 				if _, err := st.db.ExecContext(ctx, "UPDATE notification_destinations SET "+field+"='bad'"); err != nil {
 					t.Fatal(err)
 				}
-				if _, err := st.DueOutbox(ctx, 1); err == nil || !strings.Contains(err.Error(), "outbox destination "+strings.TrimSuffix(field, "_at")+" timestamp") {
+				if _, err := testDueOutbox(st, ctx, 1); err == nil || !strings.Contains(err.Error(), "outbox destination "+strings.TrimSuffix(field, "_at")+" timestamp") {
 					t.Fatalf("invalid outbox destination timestamp was ignored: %v", err)
 				}
 			})
 		}
+		t.Run("outbox lease_until", func(t *testing.T) {
+			st := testStore(t)
+			if _, err := st.SaveSettings(ctx, settings()); err != nil {
+				t.Fatal(err)
+			}
+			if err := st.EnqueueSystem(ctx, "lease timestamp test"); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := st.db.ExecContext(ctx, "UPDATE outbox SET lease_until='bad'"); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := testDueOutbox(st, ctx, 1); err == nil || !strings.Contains(err.Error(), "outbox lease timestamp") {
+				t.Fatalf("invalid outbox lease timestamp was ignored: %v", err)
+			}
+		})
 	})
 }
 
@@ -512,8 +527,8 @@ func TestClosedStoreReturnsOperationalErrors(t *testing.T) {
 	expectErr("RecordWebhookTrigger", func() error { _, _, err := st.RecordWebhookTrigger(ctx, strings.Repeat("a", 64), nil, nil); return err })
 	expectErr("ClaimWebhookTrigger", func() error { _, _, err := st.ClaimWebhookTrigger(ctx, 1, time.Minute); return err })
 	expectErr("ClaimWebhookTriggers", func() error { _, err := st.ClaimWebhookTriggers(ctx, 1, time.Minute); return err })
-	expectErr("CompleteWebhookTriggers", func() error { return st.CompleteWebhookTriggers(ctx, []int64{1}) })
-	expectErr("RetryWebhookTriggers", func() error { return st.RetryWebhookTriggers(ctx, []int64{1}, time.Now(), "error") })
+	expectErr("CompleteWebhookTriggers", func() error { return testCompleteWebhookTriggers(st, ctx, []int64{1}) })
+	expectErr("RetryWebhookTriggers", func() error { return testRetryWebhookTriggers(st, ctx, []int64{1}, time.Now(), "error") })
 	expectErr("ListDestinations", func() error { _, err := st.ListDestinations(ctx); return err })
 	expectErr("SaveDestination", func() error {
 		_, err := st.SaveDestination(ctx, NotificationDestination{Name: "test", ServiceURL: "generic://example.invalid"})
@@ -526,7 +541,7 @@ func TestClosedStoreReturnsOperationalErrors(t *testing.T) {
 		return err
 	})
 	expectErr("ApplyBatch", func() error {
-		_, err := st.applyBatch(ctx, 1, nil, func([]model.Change) string { return "" })
+		_, err := testApplyBatch(st, ctx, 1, nil, func([]model.Change) string { return "" })
 		return err
 	})
 	expectErr("ApplyBatchWithBatch", func() error {
@@ -539,9 +554,14 @@ func TestClosedStoreReturnsOperationalErrors(t *testing.T) {
 		t.Fatal("CollectorWasUnhealthy succeeded on a closed store")
 	}
 	expectErr("EnqueueSystem", func() error { return st.EnqueueSystem(ctx, "payload") })
-	expectErr("DueOutbox", func() error { _, err := st.DueOutbox(ctx, 1); return err })
-	expectErr("Delivered", func() error { return st.Delivered(ctx, 1) })
-	expectErr("Retry", func() error { return st.Retry(ctx, 1, time.Now(), "error", false) })
+	expectErr("DueOutbox", func() error { _, err := testDueOutbox(st, ctx, 1); return err })
+	expectErr("ClaimDueOutbox", func() error { _, err := st.ClaimDueOutbox(ctx, 1); return err })
+	expectErr("Delivered", func() error { return testDelivered(st, ctx, 1) })
+	expectErr("DeliveredClaimed", func() error { return st.DeliveredClaimed(ctx, OutboxItem{ID: 1, LeaseToken: "lease"}) })
+	expectErr("Retry", func() error { return testRetry(st, ctx, 1, time.Now(), "error", false) })
+	expectErr("RetryClaimed", func() error {
+		return st.RetryClaimed(ctx, OutboxItem{ID: 1, LeaseToken: "lease"}, time.Now(), "error", false)
+	})
 	expectErr("Status", func() error { _, err := st.Status(ctx); return err })
 	expectErr("Cleanup", func() error { return st.Cleanup(ctx, time.Hour) })
 	expectErr("ListHistory", func() error { _, err := st.ListHistory(ctx, HistoryFilter{}); return err })
@@ -570,7 +590,8 @@ func TestStoreSchemaErrorPaths(t *testing.T) {
 	})
 	dropAndExpect(t, "webhook_triggers", func(st *Store) error { _, err := st.ClaimWebhookTriggers(ctx, 1, time.Minute); return err })
 	dropAndExpect(t, "notification_destinations", func(st *Store) error { _, err := st.ListDestinations(ctx); return err })
-	dropAndExpect(t, "outbox", func(st *Store) error { _, err := st.DueOutbox(ctx, 1); return err })
+	dropAndExpect(t, "outbox", func(st *Store) error { _, err := testDueOutbox(st, ctx, 1); return err })
+	dropAndExpect(t, "outbox", func(st *Store) error { _, err := st.ClaimDueOutbox(ctx, 1); return err })
 	dropAndExpect(t, "settings", func(st *Store) error { _, err := st.Status(ctx); return err })
 	dropAndExpect(t, "event_batches", func(st *Store) error { _, err := st.ListHistory(ctx, HistoryFilter{}); return err })
 }
@@ -892,14 +913,14 @@ func TestWebhookTriggerDurabilityErrorBranches(t *testing.T) {
 		if _, err := st.db.ExecContext(ctx, "DROP TABLE webhook_triggers"); err != nil {
 			t.Fatal(err)
 		}
-		if err := st.CompleteWebhookTriggers(ctx, []int64{1}); err == nil {
+		if err := testCompleteWebhookTriggers(st, ctx, []int64{1}); err == nil {
 			t.Fatal("CompleteWebhookTriggers succeeded without its table")
 		}
 	})
 
 	t.Run("retry unknown trigger", func(t *testing.T) {
 		st := testStore(t)
-		if err := st.RetryWebhookTriggers(ctx, []int64{99999}, time.Now(), ""); err != nil {
+		if err := testRetryWebhookTriggers(st, ctx, []int64{99999}, time.Now(), ""); err != nil {
 			t.Fatalf("unknown trigger retry error=%v", err)
 		}
 	})
@@ -909,7 +930,7 @@ func TestWebhookTriggerDurabilityErrorBranches(t *testing.T) {
 		if _, err := st.db.ExecContext(ctx, "DROP TABLE webhook_triggers"); err != nil {
 			t.Fatal(err)
 		}
-		if err := st.RetryWebhookTriggers(ctx, []int64{1}, time.Now(), "retry"); err == nil {
+		if err := testRetryWebhookTriggers(st, ctx, []int64{1}, time.Now(), "retry"); err == nil {
 			t.Fatal("RetryWebhookTriggers succeeded without its table")
 		}
 	})
@@ -929,7 +950,7 @@ func TestWebhookTriggerDurabilityErrorBranches(t *testing.T) {
 		if _, err := st.db.ExecContext(ctx, "UPDATE webhook_triggers SET received_at=? WHERE id=?", old, trigger.ID); err != nil {
 			t.Fatal(err)
 		}
-		if err := st.RetryWebhookTriggers(ctx, []int64{trigger.ID, pending.ID}, time.Now(), ""); err != nil {
+		if err := testRetryWebhookTriggers(st, ctx, []int64{trigger.ID, pending.ID}, time.Now(), ""); err != nil {
 			t.Fatal(err)
 		}
 		dead, _, err := st.RecordWebhookTrigger(ctx, bodyHash, nil, nil)
@@ -951,7 +972,7 @@ func TestWebhookTriggerDurabilityErrorBranches(t *testing.T) {
 		if _, err := st.db.ExecContext(ctx, `CREATE TRIGGER fail_webhook_retry BEFORE UPDATE OF status ON webhook_triggers BEGIN SELECT RAISE(ABORT,'retry update failed'); END`); err != nil {
 			t.Fatal(err)
 		}
-		if err := st.RetryWebhookTriggers(ctx, []int64{trigger.ID}, time.Now(), "retry"); err == nil {
+		if err := testRetryWebhookTriggers(st, ctx, []int64{trigger.ID}, time.Now(), "retry"); err == nil {
 			t.Fatal("RetryWebhookTriggers ignored update failure")
 		}
 	})
@@ -968,7 +989,7 @@ func storeWithHistoryBatch(t *testing.T) (*Store, int64) {
 	baseline := []model.Collected{{Collector: "devices", Resources: []model.Resource{{
 		ID: "device-1", Type: "device", Name: "server", Data: map[string]any{"hostname": "server"},
 	}}}}
-	if _, err := st.applyBatch(ctx, generation, baseline, func([]model.Change) string { return "baseline" }); err != nil {
+	if _, err := testApplyBatch(st, ctx, generation, baseline, func([]model.Change) string { return "baseline" }); err != nil {
 		t.Fatal(err)
 	}
 	changed := []model.Collected{{Collector: "devices", Resources: []model.Resource{{
@@ -1280,7 +1301,7 @@ func TestApplyBatchTransactionErrorBranches(t *testing.T) {
 				t.Fatal(err)
 			}
 			baseline := []model.Collected{{Collector: "devices", Resources: []model.Resource{{ID: "device-1", Type: "device", Name: "server", Data: map[string]any{"hostname": "server"}}}}}
-			if _, err := st.applyBatch(ctx, generation, baseline, func([]model.Change) string { return "baseline" }); err != nil && tt.table != "evidence_ledger" {
+			if _, err := testApplyBatch(st, ctx, generation, baseline, func([]model.Change) string { return "baseline" }); err != nil && tt.table != "evidence_ledger" {
 				// The event batch and outbox cases should fail only on the changed write;
 				// the evidence-ledger case also fails during the baseline backfill.
 				t.Fatal(err)
@@ -1308,7 +1329,7 @@ func TestDestinationDecryptionErrorBranches(t *testing.T) {
 	if _, err := st.ListDestinations(ctx); err == nil {
 		t.Fatal("ListDestinations accepted a corrupt encrypted URL")
 	}
-	if _, err := st.DueOutbox(ctx, 10); err == nil {
+	if _, err := testDueOutbox(st, ctx, 10); err == nil {
 		t.Fatal("DueOutbox accepted a corrupt encrypted URL")
 	}
 }
@@ -1445,7 +1466,7 @@ func TestApplyBatchWriteErrorBranches(t *testing.T) {
 		if _, err := st.db.ExecContext(ctx, `CREATE TRIGGER fail_baseline_update BEFORE UPDATE OF baseline_at ON settings BEGIN SELECT RAISE(ABORT,'baseline update failed'); END`); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := st.applyBatch(ctx, generation, baseline, func([]model.Change) string { return "baseline" }); err == nil {
+		if _, err := testApplyBatch(st, ctx, generation, baseline, func([]model.Change) string { return "baseline" }); err == nil {
 			t.Fatal("ApplyBatch ignored baseline update failure")
 		}
 	})
@@ -1455,49 +1476,49 @@ func TestApplyBatchWriteErrorBranches(t *testing.T) {
 		if _, err := st.db.ExecContext(ctx, `CREATE TRIGGER fail_snapshot_insert BEFORE INSERT ON snapshots BEGIN SELECT RAISE(ABORT,'snapshot insert failed'); END`); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := st.applyBatch(ctx, generation, baseline, func([]model.Change) string { return "baseline" }); err == nil {
+		if _, err := testApplyBatch(st, ctx, generation, baseline, func([]model.Change) string { return "baseline" }); err == nil {
 			t.Fatal("ApplyBatch ignored snapshot insert failure")
 		}
 	})
 
 	t.Run("snapshot update", func(t *testing.T) {
 		st, generation := configuredCoverageStore(t)
-		if _, err := st.applyBatch(ctx, generation, baseline, func([]model.Change) string { return "baseline" }); err != nil {
+		if _, err := testApplyBatch(st, ctx, generation, baseline, func([]model.Change) string { return "baseline" }); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := st.db.ExecContext(ctx, `CREATE TRIGGER fail_snapshot_update BEFORE UPDATE ON snapshots BEGIN SELECT RAISE(ABORT,'snapshot update failed'); END`); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := st.applyBatch(ctx, generation, changed, func([]model.Change) string { return "changed" }); err == nil {
+		if _, err := testApplyBatch(st, ctx, generation, changed, func([]model.Change) string { return "changed" }); err == nil {
 			t.Fatal("ApplyBatch ignored snapshot update failure")
 		}
 	})
 
 	t.Run("snapshot delete", func(t *testing.T) {
 		st, generation := configuredCoverageStore(t)
-		if _, err := st.applyBatch(ctx, generation, baseline, func([]model.Change) string { return "baseline" }); err != nil {
+		if _, err := testApplyBatch(st, ctx, generation, baseline, func([]model.Change) string { return "baseline" }); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := st.applyBatch(ctx, generation, []model.Collected{{Collector: "devices"}}, func([]model.Change) string { return "missing" }); err != nil {
+		if _, err := testApplyBatch(st, ctx, generation, []model.Collected{{Collector: "devices"}}, func([]model.Change) string { return "missing" }); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := st.db.ExecContext(ctx, `CREATE TRIGGER fail_snapshot_delete BEFORE DELETE ON snapshots BEGIN SELECT RAISE(ABORT,'snapshot delete failed'); END`); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := st.applyBatch(ctx, generation, []model.Collected{{Collector: "devices"}}, func([]model.Change) string { return "removed" }); err == nil {
+		if _, err := testApplyBatch(st, ctx, generation, []model.Collected{{Collector: "devices"}}, func([]model.Change) string { return "removed" }); err == nil {
 			t.Fatal("ApplyBatch ignored snapshot delete failure")
 		}
 	})
 
 	t.Run("collector state update", func(t *testing.T) {
 		st, generation := configuredCoverageStore(t)
-		if _, err := st.applyBatch(ctx, generation, baseline, func([]model.Change) string { return "baseline" }); err != nil {
+		if _, err := testApplyBatch(st, ctx, generation, baseline, func([]model.Change) string { return "baseline" }); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := st.db.ExecContext(ctx, `CREATE TRIGGER fail_collector_state_update BEFORE UPDATE ON collector_state WHEN NEW.collector='devices' BEGIN SELECT RAISE(ABORT,'collector state update failed'); END`); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := st.applyBatch(ctx, generation, changed, func([]model.Change) string { return "changed" }); err == nil {
+		if _, err := testApplyBatch(st, ctx, generation, changed, func([]model.Change) string { return "changed" }); err == nil {
 			t.Fatal("ApplyBatch ignored collector state update failure")
 		}
 	})
@@ -1505,7 +1526,7 @@ func TestApplyBatchWriteErrorBranches(t *testing.T) {
 	for _, table := range []string{"event_batch_triggers", "events"} {
 		t.Run(table+" insert", func(t *testing.T) {
 			st, generation := configuredCoverageStore(t)
-			if _, err := st.applyBatch(ctx, generation, baseline, func([]model.Change) string { return "baseline" }); err != nil {
+			if _, err := testApplyBatch(st, ctx, generation, baseline, func([]model.Change) string { return "baseline" }); err != nil {
 				t.Fatal(err)
 			}
 			trigger := "fail_" + table + "_insert"
@@ -1613,18 +1634,61 @@ func TestAuthenticationAndOutboxBoundaryBranches(t *testing.T) {
 		if err := st.EnqueueSystem(ctx, "payload"); err != nil {
 			t.Fatal(err)
 		}
-		items, err := st.DueOutbox(ctx, 1)
+		items, err := testDueOutbox(st, ctx, 1)
 		if err != nil || len(items) != 1 {
 			t.Fatalf("outbox=%#v err=%v", items, err)
 		}
 		if _, err := st.db.ExecContext(ctx, `CREATE TRIGGER fail_outbox_delivered BEFORE UPDATE OF status,attempts ON outbox WHEN NEW.status IN ('delivered','pending') BEGIN SELECT RAISE(ABORT,'delivery update failed'); END`); err != nil {
 			t.Fatal(err)
 		}
-		if err := st.Delivered(ctx, items[0].ID); err == nil {
+		if err := testDelivered(st, ctx, items[0].ID); err == nil {
 			t.Fatal("Delivered ignored update failure")
 		}
-		if err := st.Retry(ctx, items[0].ID, time.Now(), "retry", false); err == nil {
+		if err := testRetry(st, ctx, items[0].ID, time.Now(), "retry", false); err == nil {
 			t.Fatal("Retry ignored update failure")
+		}
+	})
+
+	t.Run("claim recovery update", func(t *testing.T) {
+		st, _ := configuredCoverageStore(t)
+		if err := st.EnqueueSystem(ctx, "claim recovery"); err != nil {
+			t.Fatal(err)
+		}
+		old := time.Now().UTC().Add(-time.Minute).Format(time.RFC3339Nano)
+		if _, err := st.db.ExecContext(ctx, "UPDATE outbox SET status='processing',lease_until=?", old); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.db.ExecContext(ctx, `CREATE TRIGGER fail_outbox_reclaim BEFORE UPDATE OF status ON outbox WHEN NEW.status='pending' BEGIN SELECT RAISE(ABORT,'outbox reclaim failed'); END`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.ClaimDueOutbox(ctx, 1); err == nil || !strings.Contains(err.Error(), "outbox reclaim failed") {
+			t.Fatalf("ClaimDueOutbox ignored lease recovery failure: %v", err)
+		}
+	})
+
+	t.Run("claim query error", func(t *testing.T) {
+		st, _ := configuredCoverageStore(t)
+		if err := st.EnqueueSystem(ctx, "claim query"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.db.ExecContext(ctx, "DROP TABLE notification_destinations"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.ClaimDueOutbox(ctx, 1); err == nil {
+			t.Fatal("ClaimDueOutbox succeeded without destinations")
+		}
+	})
+
+	t.Run("claim processing update", func(t *testing.T) {
+		st, _ := configuredCoverageStore(t)
+		if err := st.EnqueueSystem(ctx, "claim processing"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.db.ExecContext(ctx, `CREATE TRIGGER fail_outbox_processing BEFORE UPDATE OF status ON outbox WHEN NEW.status='processing' BEGIN SELECT RAISE(ABORT,'outbox processing failed'); END`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.ClaimDueOutbox(ctx, 1); err == nil || !strings.Contains(err.Error(), "outbox processing failed") {
+			t.Fatalf("ClaimDueOutbox ignored processing claim failure: %v", err)
 		}
 	})
 
@@ -1638,10 +1702,10 @@ func TestAuthenticationAndOutboxBoundaryBranches(t *testing.T) {
 
 	t.Run("empty webhook lifecycle operations", func(t *testing.T) {
 		st := testStore(t)
-		if err := st.CompleteWebhookTriggers(ctx, nil); err != nil {
+		if err := testCompleteWebhookTriggers(st, ctx, nil); err != nil {
 			t.Fatal(err)
 		}
-		if err := st.RetryWebhookTriggers(ctx, nil, time.Now(), ""); err != nil {
+		if err := testRetryWebhookTriggers(st, ctx, nil, time.Now(), ""); err != nil {
 			t.Fatal(err)
 		}
 	})
@@ -1679,7 +1743,7 @@ func TestApplyBatchCreatesNewBaselineResourceChange(t *testing.T) {
 	ctx := context.Background()
 	st, generation := configuredCoverageStore(t)
 	baseline := []model.Collected{{Collector: "devices", Resources: []model.Resource{{ID: "device-1", Type: "device", Name: "one", Data: map[string]any{"hostname": "one"}}}}}
-	if _, err := st.applyBatch(ctx, generation, baseline, func([]model.Change) string { return "baseline" }); err != nil {
+	if _, err := testApplyBatch(st, ctx, generation, baseline, func([]model.Change) string { return "baseline" }); err != nil {
 		t.Fatal(err)
 	}
 	withNewResource := []model.Collected{{Collector: "devices", Resources: []model.Resource{

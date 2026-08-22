@@ -114,7 +114,11 @@ func TestPollPersistsBaselineAndCorrelatesTrigger(t *testing.T) {
 	if !engine.poll(ctx, client, settings, []string{"devices"}, true, trigger.ID) {
 		t.Fatal("successful poll returned false")
 	}
-	if err := st.CompleteWebhookTriggers(ctx, []int64{trigger.ID}); err != nil {
+	claim, claimed, err := st.ClaimWebhookTrigger(ctx, trigger.ID, time.Minute)
+	if err != nil || !claimed {
+		t.Fatalf("claim trigger after poll: claimed=%v err=%v", claimed, err)
+	}
+	if err := st.CompleteClaimedWebhookTriggers(ctx, []store.WebhookTrigger{claim}); err != nil {
 		t.Fatal(err)
 	}
 	completed, _, err := st.RecordWebhookTrigger(ctx, strings.Repeat("a", 64), nil, nil)
@@ -146,6 +150,13 @@ func TestPollHandlesUnsupportedFailureAndRecovery(t *testing.T) {
 	client := tailscale.New(api.URL+"/api/v2", api.URL+"/oauth/token", "test", tailscale.Credentials{Tailnet: "-", ClientID: "client", ClientSecret: "secret"})
 	engine := New(st, api.URL+"/api/v2", api.URL+"/oauth/token", "test", &scriptedSender{})
 
+	// Establish a real baseline first. A collector that has never produced a
+	// baseline should still be demoted immediately when its endpoint is absent;
+	// this test exercises the safer path for an established collector.
+	status.Store(http.StatusOK)
+	if !engine.poll(ctx, client, settings, []string{"users"}, true) {
+		t.Fatal("initial users baseline failed")
+	}
 	status.Store(http.StatusNotFound)
 	if !engine.poll(ctx, client, settings, []string{"users"}, true) {
 		t.Fatal("unsupported collector should not fail the poll")
@@ -155,8 +166,18 @@ func TestPollHandlesUnsupportedFailureAndRecovery(t *testing.T) {
 		t.Fatal(err)
 	}
 	unsupportedAt, err := time.Parse(time.RFC3339Nano, unsupportedNext)
+	if err != nil || time.Until(unsupportedAt) <= 0 || time.Until(unsupportedAt) > time.Hour {
+		t.Fatalf("baselined unsupported collector was not scheduled for confirmation: %q", unsupportedNext)
+	}
+	if !engine.poll(ctx, client, settings, []string{"users"}, true) {
+		t.Fatal("second unsupported response should not fail the poll")
+	}
+	if err := db.QueryRowContext(ctx, "SELECT next_poll FROM collector_state WHERE generation=? AND collector='users'", settings.Generation).Scan(&unsupportedNext); err != nil {
+		t.Fatal(err)
+	}
+	unsupportedAt, err = time.Parse(time.RFC3339Nano, unsupportedNext)
 	if err != nil || time.Until(unsupportedAt) < 5*time.Hour {
-		t.Fatalf("unsupported collector retry was scheduled too soon: %q", unsupportedNext)
+		t.Fatalf("confirmed unsupported collector retry was scheduled too soon: %q", unsupportedNext)
 	}
 	status.Store(http.StatusInternalServerError)
 	if engine.poll(ctx, client, settings, []string{"users"}, true) {
@@ -209,7 +230,7 @@ func TestPollHandlesUnsupportedFailureAndRecovery(t *testing.T) {
 	if current.Pending != 2 {
 		t.Fatalf("recovery notification was not queued: pending=%d", current.Pending)
 	}
-	items, err := st.DueOutbox(ctx, 10)
+	items, err := st.ClaimDueOutbox(ctx, 10, time.Minute)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -423,6 +444,40 @@ func TestDurableTriggersHaveIndependentCollectorOutcomes(t *testing.T) {
 	}
 }
 
+func TestPollOutcomesAreScopedToRequestedCollectors(t *testing.T) {
+	ctx := context.Background()
+	st, settings := monitorTestStore(t)
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/oauth/token" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"access_token":"access","expires_in":3600}`))
+			return
+		}
+		switch r.URL.Path {
+		case "/api/v2/tailnet/-/devices":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"devices":[{"id":"device-1","hostname":"server"}]}`))
+		case "/api/v2/tailnet/-/users":
+			w.WriteHeader(http.StatusBadGateway)
+			_, _ = w.Write([]byte("user provider unavailable"))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer api.Close()
+	client := tailscale.New(api.URL+"/api/v2", api.URL+"/oauth/token", "test", tailscale.Credentials{Tailnet: "-", ClientID: "client", ClientSecret: "secret"})
+	outcome := New(st, api.URL+"/api/v2", api.URL+"/oauth/token", "test", &scriptedSender{}).pollWithOutcomes(ctx, client, settings, []string{"devices", "users"}, true)
+	if !outcome.succeeds([]string{"devices"}) {
+		t.Fatalf("successful device collector was marked failed: %#v", outcome.collectors)
+	}
+	if outcome.succeeds([]string{"users"}) {
+		t.Fatalf("failed user collector was marked successful: %#v", outcome.collectors)
+	}
+	if outcome.succeeds(nil) {
+		t.Fatalf("aggregate outcome ignored failed collector: %#v", outcome.collectors)
+	}
+}
+
 func TestMonitorRequestHelpersAndWakeAreCoalesced(t *testing.T) {
 	engine := New(nil, "", "", "test", &scriptedSender{})
 	engine.Wake()
@@ -432,6 +487,12 @@ func TestMonitorRequestHelpersAndWakeAreCoalesced(t *testing.T) {
 	}
 	if got := normalizeCollectors([]string{" devices ", "", "devices", "users"}); strings.Join(got, ",") != "devices,users" {
 		t.Fatalf("normalized collectors=%v", got)
+	}
+	if got := normalizeCollectors([]string{"device_details", "devices"}); strings.Join(got, ",") != "devices,device_details" {
+		t.Fatalf("core collector was not prioritized for shared device polling: %v", got)
+	}
+	if got := normalizeCollectors([]string{"devices", "future_collector"}); got != nil {
+		t.Fatalf("unknown collector scope was not broadened: %v", got)
 	}
 	if got := requestTriggerIDs(ReconcileRequest{TriggerID: 4, TriggerIDs: []int64{-1, 7, 4, 0, 7}}); strings.Join(int64Strings(got), ",") != "4,7" {
 		t.Fatalf("trigger IDs=%v", got)
@@ -502,7 +563,7 @@ func TestMonitorDeliveryAndCleanupErrorBranches(t *testing.T) {
 		}
 	})
 
-	t.Run("dead letter logging", func(t *testing.T) {
+	t.Run("expired rows are dead-lettered before send", func(t *testing.T) {
 		st, _, db := monitorTestStoreWithDB(t)
 		if err := st.EnqueueSystem(ctx, "delivery dead letter"); err != nil {
 			t.Fatal(err)
@@ -522,9 +583,17 @@ func TestMonitorDeliveryAndCleanupErrorBranches(t *testing.T) {
 		}()
 		select {
 		case <-sender.calls:
+			t.Fatal("expired outbox row was sent after the retry horizon")
 		case <-time.After(time.Second):
-			cancel()
-			t.Fatal("delivery did not attempt the dead-letter notification")
+			var status, lastError string
+			if err := db.QueryRowContext(ctx, "SELECT status,last_error FROM outbox LIMIT 1").Scan(&status, &lastError); err != nil {
+				cancel()
+				t.Fatal(err)
+			}
+			if status != "dead" || lastError != "delivery retry window expired" {
+				cancel()
+				t.Fatalf("expired outbox row status=%q error=%q", status, lastError)
+			}
 		}
 		cancel()
 		select {
@@ -564,8 +633,9 @@ func TestMonitorDeliveryAndCleanupErrorBranches(t *testing.T) {
 			t.Fatal(err)
 		}
 		engine := New(st, "", "", "test", &scriptedSender{})
-		engine.finishTriggers(ctx, []int64{1}, true, 1)
-		engine.finishTriggers(ctx, []int64{1}, false, 2)
+		claim := []store.WebhookTrigger{{ID: 1, LeaseToken: "test-lease"}}
+		engine.finishClaimedTriggers(ctx, claim, true, 1)
+		engine.finishClaimedTriggers(ctx, claim, false, 2)
 	})
 }
 
@@ -709,20 +779,21 @@ func TestMonitorSchedulerWaitTimerAndDurableRetryAttempts(t *testing.T) {
 		}
 		client := tailscale.New(api.URL+"/api/v2", api.URL+"/oauth/token", "test", tailscale.Credentials{Tailnet: "-", ClientID: "client", ClientSecret: "secret"})
 		engine := New(st, api.URL+"/api/v2", api.URL+"/oauth/token", "test", &scriptedSender{})
-		if !engine.processDurableTriggers(ctx, client, settings) {
-			t.Fatal("durable retry trigger was not processed")
+		claim, claimed, err := st.ClaimWebhookTrigger(ctx, trigger.ID, time.Minute)
+		if err != nil || !claimed {
+			t.Fatalf("claim durable retry trigger: claimed=%v err=%v", claimed, err)
 		}
-		if err := st.RetryWebhookTriggers(ctx, []int64{trigger.ID}, time.Now().Add(-time.Minute), "previous failure"); err != nil {
+		if err := st.RetryClaimedWebhookTriggers(ctx, []store.WebhookTrigger{claim}, time.Now().Add(-time.Minute), "previous failure"); err != nil {
 			t.Fatal(err)
 		}
 		if !engine.processDurableTriggers(ctx, client, settings) {
-			t.Fatal("durable retry trigger was not processed a second time")
+			t.Fatal("durable retry trigger was not processed")
 		}
 	})
 
 	t.Run("empty finish ids", func(t *testing.T) {
 		engine := New(nil, "", "", "test", &scriptedSender{})
-		engine.finishTriggers(ctx, nil, true, 1)
+		engine.finishClaimedTriggers(ctx, nil, true, 1)
 	})
 }
 

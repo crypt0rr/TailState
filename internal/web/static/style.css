@@ -195,7 +195,7 @@ select { width: 100%; border: 1px solid var(--border); border-radius: 6px; backg
 .summary strong { display: block; margin-top: 8px; }
 .chips { display: flex; flex-wrap: wrap; gap: 8px; }
 .chips span { background: var(--bg); border: 1px solid var(--border); padding: 6px 10px; border-radius: 20px; }
-.row { display: grid; grid-template-columns: 1.1fr .8fr 1.2fr 2fr; gap: 14px; padding: 10px 0; border-top: 1px solid var(--border); overflow-wrap: anywhere; }
+.row { display: grid; grid-template-columns: 1.1fr .8fr 1.2fr .8fr 2fr; gap: 14px; padding: 10px 0; border-top: 1px solid var(--border); overflow-wrap: anywhere; }
 .heading { color: var(--muted); border-top: 0; font-weight: 700; }
 
 @media (max-width: 700px) {

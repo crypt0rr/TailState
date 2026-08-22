@@ -15,4 +15,10 @@ func TestTruncatePreservesUTF8(t *testing.T) {
 	if Truncate("short", 10) != "short" || Truncate("value", 0) != "" {
 		t.Fatal("unexpected short or zero-length truncation")
 	}
+	for _, limit := range []int{1, 2} {
+		got := Truncate("界", limit)
+		if !utf8.ValidString(got) || len(got) > limit {
+			t.Fatalf("small truncation exceeded UTF-8 bound: limit=%d value=%q", limit, got)
+		}
+	}
 }

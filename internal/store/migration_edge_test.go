@@ -59,6 +59,12 @@ CREATE TABLE outbox(id INTEGER PRIMARY KEY AUTOINCREMENT,payload TEXT NOT NULL,s
 				db.Close()
 				t.Fatal(err)
 			}
+			if !tt.withLegacyURL {
+				if _, err := db.Exec("INSERT INTO outbox(payload,status,next_attempt,first_attempt,created_at) VALUES('stale processing payload','processing','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')"); err != nil {
+					db.Close()
+					t.Fatal(err)
+				}
+			}
 			if err := db.Close(); err != nil {
 				t.Fatal(err)
 			}
@@ -111,12 +117,12 @@ CREATE TABLE outbox(id INTEGER PRIMARY KEY AUTOINCREMENT,payload TEXT NOT NULL,s
 				if destinationCount != 0 {
 					t.Fatalf("destination created without a legacy URL: %d", destinationCount)
 				}
-				var status, lastError string
-				if err := st.db.QueryRowContext(context.Background(), "SELECT status,last_error FROM outbox LIMIT 1").Scan(&status, &lastError); err != nil {
+				var orphanCount int
+				if err := st.db.QueryRowContext(context.Background(), "SELECT COUNT(*) FROM outbox WHERE status='dead' AND last_error='no notification destination configured'").Scan(&orphanCount); err != nil {
 					t.Fatal(err)
 				}
-				if status != "dead" || lastError != "no notification destination configured" {
-					t.Fatalf("orphaned outbox status = %q/%q, want dead-letter reason", status, lastError)
+				if orphanCount != 2 {
+					t.Fatalf("orphaned outbox rows dead-lettered = %d, want 2", orphanCount)
 				}
 			}
 		})

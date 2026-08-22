@@ -569,11 +569,11 @@ func TestDestinationTestAndUnknownMutationErrors(t *testing.T) {
 		t.Fatalf("successful destination test status=%d body=%s", tested.Code, tested.Body.String())
 	}
 	unknownToggle := coveragePost(t, server, "/settings/destinations/toggle", url.Values{"_csrf": {csrf}, "id": {"999999"}, "enabled": {"true"}}, cookies)
-	if unknownToggle.Code != http.StatusBadRequest || !strings.Contains(unknownToggle.Body.String(), "notification destination not found") {
+	if unknownToggle.Code != http.StatusBadRequest || !strings.Contains(unknownToggle.Body.String(), "Notification destination not found") {
 		t.Fatalf("unknown destination toggle status=%d body=%s", unknownToggle.Code, unknownToggle.Body.String())
 	}
 	unknownDelete := coveragePost(t, server, "/settings/destinations/remove", url.Values{"_csrf": {csrf}, "id": {"999999"}}, cookies)
-	if unknownDelete.Code != http.StatusBadRequest || !strings.Contains(unknownDelete.Body.String(), "notification destination not found") {
+	if unknownDelete.Code != http.StatusBadRequest || !strings.Contains(unknownDelete.Body.String(), "Notification destination not found") {
 		t.Fatalf("unknown destination delete status=%d body=%s", unknownDelete.Code, unknownDelete.Body.String())
 	}
 }
@@ -729,7 +729,7 @@ func TestSettingsAndWebhookDatabaseErrorResponses(t *testing.T) {
 			t.Fatal(err)
 		}
 		response := coveragePost(t, server, "/settings", settingsForm(coverageCSRF(t, cookies)), cookies)
-		if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "load notification destinations failed") {
+		if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "Notification destinations are temporarily unavailable") || strings.Contains(response.Body.String(), "no such table") {
 			t.Fatalf("destination list failure response=%d body=%s", response.Code, response.Body.String())
 		}
 	})
@@ -768,6 +768,27 @@ func TestSettingsAndWebhookDatabaseErrorResponses(t *testing.T) {
 		response := coveragePost(t, server, "/settings", settingsForm(coverageCSRF(t, cookies)), cookies)
 		if response.Code != http.StatusServiceUnavailable || strings.Contains(response.Body.String(), "no such table") {
 			t.Fatalf("settings save failure response=%d body=%s", response.Code, response.Body.String())
+		}
+	})
+
+	t.Run("settings write error is not reflected", func(t *testing.T) {
+		server, st, db, cookies := webServerWithDatabase(t)
+		if _, err := st.SaveDestination(ctx, store.NotificationDestination{
+			Name: "Primary", ServiceURL: "mattermost://TailState@example.invalid/token?disabletls=true", Enabled: true,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		api := newAPI(t)
+		defer api.Close()
+		server.config.TailscaleBase = api.URL + "/api/v2"
+		server.config.OAuthTokenURL = api.URL + "/oauth/token"
+		if _, err := db.ExecContext(ctx, `CREATE TRIGGER fail_settings_write BEFORE INSERT ON settings
+			BEGIN SELECT RAISE(ABORT,'settings write secret'); END`); err != nil {
+			t.Fatal(err)
+		}
+		response := coveragePost(t, server, "/settings", settingsForm(coverageCSRF(t, cookies)), cookies)
+		if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "Settings could not be saved") || strings.Contains(response.Body.String(), "settings write secret") {
+			t.Fatalf("settings write error response=%d body=%s", response.Code, response.Body.String())
 		}
 	})
 
@@ -829,6 +850,23 @@ func TestSettingsAndWebhookDatabaseErrorResponses(t *testing.T) {
 	})
 }
 
+func TestDestinationMutationMessageHidesStorageDetails(t *testing.T) {
+	storageErr := errors.New("no such table: notification_destinations")
+	for action, want := range map[string]string{
+		"save":   "Notification destination was not saved. Check the name and URL.",
+		"update": "Notification destination could not be updated.",
+		"remove": "Notification destination could not be removed.",
+		"other":  "Notification destination operation failed.",
+	} {
+		if got := destinationMutationMessage(action, storageErr); got != want || strings.Contains(got, "no such table") {
+			t.Fatalf("%s mutation message=%q, want %q", action, got, want)
+		}
+	}
+	if got := destinationMutationMessage("update", errors.New("notification destination not found")); got != "Notification destination not found." {
+		t.Fatalf("not-found mutation message=%q", got)
+	}
+}
+
 func TestWebCSRFAndFormBoundaryBranches(t *testing.T) {
 	server, _, db, cookies := webServerWithDatabase(t)
 	unauthSettings := httptest.NewRecorder()
@@ -860,7 +898,7 @@ func TestWebCSRFAndFormBoundaryBranches(t *testing.T) {
 	if _, err := db.ExecContext(context.Background(), `INSERT INTO settings(id,tailnet,oauth_client_id,oauth_secret_enc,mattermost_url_enc,webhook_secret_enc,device_interval_seconds,inventory_interval_seconds,generation,configured_at) VALUES(1,'-','client','','','',60,300,1,?)`, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.ExecContext(context.Background(), `INSERT INTO collector_state(generation,collector,supported,baseline,last_success,last_error,failure_count,partial,partial_error_count) VALUES(1,'device_details',1,1,?,'detail endpoint unavailable',1,1,2)`, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+	if _, err := db.ExecContext(context.Background(), `INSERT INTO collector_state(generation,collector,supported,baseline,last_success,last_error,failure_count,poll_duration_ms,partial,partial_error_count) VALUES(1,'device_details',1,1,?,'detail endpoint unavailable',1,123,1,2)`, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
 		t.Fatal(err)
 	}
 	authStatus := httptest.NewRecorder()
@@ -869,7 +907,7 @@ func TestWebCSRFAndFormBoundaryBranches(t *testing.T) {
 		authStatusRequest.AddCookie(cookie)
 	}
 	server.Handler().ServeHTTP(authStatus, authStatusRequest)
-	if authStatus.Code != http.StatusOK || !strings.Contains(authStatus.Body.String(), "2 related requests failed") {
+	if authStatus.Code != http.StatusOK || !strings.Contains(authStatus.Body.String(), "2 related requests failed") || !strings.Contains(authStatus.Body.String(), "123 ms") {
 		t.Fatalf("authenticated status did not explain partial collector errors: status=%d body=%s", authStatus.Code, authStatus.Body.String())
 	}
 	server.loginAttempts["stale"] = []time.Time{time.Now().Add(-16 * time.Minute)}

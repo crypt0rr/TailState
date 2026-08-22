@@ -161,6 +161,30 @@ func TestLoginAttemptTrackingIsBoundedAndPruned(t *testing.T) {
 	}
 }
 
+func TestSetupPasswordMismatchConsumesThrottleBudget(t *testing.T) {
+	server, _, token := testServer(t)
+	form := url.Values{"token": {token}, "password": {"a secure password"}, "confirm": {"different password"}}
+	for attempt := 0; attempt < 5; attempt++ {
+		request := httptest.NewRequest(http.MethodPost, "/setup/claim", strings.NewReader(form.Encode()))
+		request.RemoteAddr = "198.51.100.25:1234"
+		request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		response := httptest.NewRecorder()
+		server.Handler().ServeHTTP(response, request)
+		if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "Passwords do not match") {
+			t.Fatalf("mismatch attempt %d status=%d body=%s", attempt+1, response.Code, response.Body.String())
+		}
+	}
+
+	request := httptest.NewRequest(http.MethodPost, "/setup/claim", strings.NewReader(form.Encode()))
+	request.RemoteAddr = "198.51.100.25:1234"
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "Too many setup attempts") {
+		t.Fatalf("sixth mismatch was not throttled: status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
 func TestLoginRejectsCrossOriginRequests(t *testing.T) {
 	server, _, token := testServer(t)
 	claim := url.Values{"token": {token}, "password": {"a secure password"}, "confirm": {"a secure password"}}
@@ -180,6 +204,73 @@ func TestLoginRejectsCrossOriginRequests(t *testing.T) {
 	server.Handler().ServeHTTP(response, request)
 	if response.Code != http.StatusForbidden {
 		t.Fatalf("cross-origin login status %d: %s", response.Code, response.Body.String())
+	}
+}
+
+func TestLoginRejectsCrossOriginReferer(t *testing.T) {
+	server, _, token := testServer(t)
+	claim := url.Values{"token": {token}, "password": {"a secure password"}, "confirm": {"a secure password"}}
+	claimRequest := httptest.NewRequest(http.MethodPost, "/setup/claim", strings.NewReader(claim.Encode()))
+	claimRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	claimResponse := httptest.NewRecorder()
+	server.Handler().ServeHTTP(claimResponse, claimRequest)
+	if claimResponse.Code != http.StatusSeeOther {
+		t.Fatalf("claim status %d: %s", claimResponse.Code, claimResponse.Body.String())
+	}
+
+	login := url.Values{"password": {"a secure password"}}
+	request := httptest.NewRequest(http.MethodPost, "/login", strings.NewReader(login.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.Header.Set("Referer", "https://attacker.example/login")
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusForbidden {
+		t.Fatalf("cross-origin Referer login status %d: %s", response.Code, response.Body.String())
+	}
+}
+
+func TestLoginRejectsSameSiteFetchWithoutOrigin(t *testing.T) {
+	server, _, token := testServer(t)
+	claim := url.Values{"token": {token}, "password": {"a secure password"}, "confirm": {"a secure password"}}
+	claimRequest := httptest.NewRequest(http.MethodPost, "/setup/claim", strings.NewReader(claim.Encode()))
+	claimRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	claimResponse := httptest.NewRecorder()
+	server.Handler().ServeHTTP(claimResponse, claimRequest)
+	if claimResponse.Code != http.StatusSeeOther {
+		t.Fatalf("claim status %d: %s", claimResponse.Code, claimResponse.Body.String())
+	}
+
+	login := url.Values{"password": {"a secure password"}}
+	request := httptest.NewRequest(http.MethodPost, "/login", strings.NewReader(login.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.Header.Set("Sec-Fetch-Site", "same-site")
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusForbidden {
+		t.Fatalf("same-site login without Origin status %d: %s", response.Code, response.Body.String())
+	}
+}
+
+func TestLoginAcceptsExplicitSameOriginWithSameSiteMetadata(t *testing.T) {
+	server, _, token := testServer(t)
+	claim := url.Values{"token": {token}, "password": {"a secure password"}, "confirm": {"a secure password"}}
+	claimRequest := httptest.NewRequest(http.MethodPost, "/setup/claim", strings.NewReader(claim.Encode()))
+	claimRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	claimResponse := httptest.NewRecorder()
+	server.Handler().ServeHTTP(claimResponse, claimRequest)
+	if claimResponse.Code != http.StatusSeeOther {
+		t.Fatalf("claim status %d: %s", claimResponse.Code, claimResponse.Body.String())
+	}
+
+	login := url.Values{"password": {"a secure password"}}
+	request := httptest.NewRequest(http.MethodPost, "/login", strings.NewReader(login.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.Header.Set("Origin", "http://example.com")
+	request.Header.Set("Sec-Fetch-Site", "same-site")
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusSeeOther || response.Header().Get("Location") != "/" {
+		t.Fatalf("same-origin login status %d location=%q body=%s", response.Code, response.Header().Get("Location"), response.Body.String())
 	}
 }
 
@@ -206,6 +297,21 @@ func TestLoginAllowsSameOriginBehindTLSProxy(t *testing.T) {
 	server.Handler().ServeHTTP(response, request)
 	if response.Code != http.StatusSeeOther {
 		t.Fatalf("proxied same-origin login status %d: %s", response.Code, response.Body.String())
+	}
+}
+
+func TestSameOriginNormalizesDefaultPorts(t *testing.T) {
+	server, _, _ := testServer(t)
+	server.config.TrustedProxies = []netip.Prefix{netip.MustParsePrefix("192.0.2.0/24")}
+	request := httptest.NewRequest(http.MethodPost, "http://example.com/login", nil)
+	request.Host = "example.com:443"
+	request.RemoteAddr = "192.0.2.10:1234"
+	request.Header.Set("X-Forwarded-Proto", "https")
+	if !server.sameOriginURL(request, "https://example.com") {
+		t.Fatal("default HTTPS Origin port was rejected for an explicit proxy host port")
+	}
+	if server.sameOriginURL(request, "https://example.com:8443") {
+		t.Fatal("mismatched HTTPS Origin port was accepted")
 	}
 }
 
@@ -339,6 +445,27 @@ func TestMetricsWithoutTokenIsLoopbackOnly(t *testing.T) {
 	}
 }
 
+func TestReadinessCollectorReasonUsesBoundedVocabulary(t *testing.T) {
+	tests := []struct {
+		name     string
+		state    store.CollectorState
+		expected string
+	}{
+		{name: "unsupported", state: store.CollectorState{}, expected: "unsupported"},
+		{name: "partial", state: store.CollectorState{Supported: true, Partial: true, Baseline: true}, expected: "partial"},
+		{name: "retrying", state: store.CollectorState{Supported: true, FailureCount: 1}, expected: "retrying"},
+		{name: "baseline pending", state: store.CollectorState{Supported: true}, expected: "baseline pending"},
+		{name: "healthy", state: store.CollectorState{Supported: true, Baseline: true}, expected: "healthy"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := readinessCollectorReason(tt.state); got != tt.expected {
+				t.Fatalf("reason=%q, want %q", got, tt.expected)
+			}
+		})
+	}
+}
+
 func TestReadyReportsDegradedBaselineAfterGracePeriod(t *testing.T) {
 	box, err := secret.NewBox(make([]byte, 32))
 	if err != nil {
@@ -433,6 +560,30 @@ func TestReadyDegradesWhenASecondCollectorStaysUnbaselined(t *testing.T) {
 		t.Fatalf("partial baseline degraded response %d: %s", ready.Code, body)
 	}
 	if strings.Contains(body, "upstream unavailable") {
+		t.Fatalf("readiness exposed collector error: %s", body)
+	}
+}
+
+func TestReadyReportsPostBaselineCollectorDegradation(t *testing.T) {
+	server, st, _ := testServer(t)
+	ctx := context.Background()
+	generation, err := st.SaveSettings(ctx, store.Settings{Tailnet: "-", OAuthClientID: "client", OAuthClientSecret: "secret", MattermostURL: "https://mattermost.example/hooks/x", DeviceInterval: time.Minute, InventoryInterval: 5 * time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.ApplyBatchWithBatch(ctx, generation, []model.Collected{{Collector: "devices", Resources: []model.Resource{{ID: "device-1", Type: "device", Name: "server", Data: map[string]any{"hostname": "server"}}}}}, func([]model.Change) string { return "baseline" }); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := st.RecordCollectorFailure(ctx, generation, "devices", "provider secret must stay private"); err != nil {
+		t.Fatal(err)
+	}
+	ready := httptest.NewRecorder()
+	server.Handler().ServeHTTP(ready, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	body := ready.Body.String()
+	if ready.Code != http.StatusOK || !strings.Contains(body, `"status":"degraded"`) || !strings.Contains(body, `"baseline":true`) || !strings.Contains(body, `"degraded":true`) || !strings.Contains(body, `"name":"devices"`) {
+		t.Fatalf("post-baseline degradation was hidden: status=%d body=%s", ready.Code, body)
+	}
+	if strings.Contains(body, "provider secret") {
 		t.Fatalf("readiness exposed collector error: %s", body)
 	}
 }

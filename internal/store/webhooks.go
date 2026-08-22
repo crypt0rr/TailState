@@ -1,7 +1,9 @@
 package store
 
 import (
+	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
@@ -12,6 +14,8 @@ import (
 	"strings"
 	"time"
 	"unicode"
+
+	"github.com/crypt0rr/tailstate/internal/notify"
 )
 
 // WebhookSecret returns the decrypted Tailscale webhook secret only to the
@@ -38,15 +42,15 @@ func (s *Store) RecordWebhookTrigger(ctx context.Context, bodyHash string, event
 	if _, err := hex.DecodeString(bodyHash); err != nil {
 		return WebhookTrigger{}, false, errors.New("invalid webhook body hash")
 	}
-	eventTypes = sortedUnique(eventTypes)
-	collectors = sortedUnique(collectors)
-	if len(eventTypes) > 100 || len(collectors) > 32 {
-		return WebhookTrigger{}, false, errors.New("webhook metadata is too large")
-	}
 	for _, value := range append(append([]string(nil), eventTypes...), collectors...) {
-		if len(value) > 128 || strings.IndexFunc(value, unicode.IsControl) >= 0 {
+		if len(value) > maxWebhookMetadataValueSize || strings.IndexFunc(value, unicode.IsControl) >= 0 {
 			return WebhookTrigger{}, false, errors.New("webhook metadata contains an invalid value")
 		}
+	}
+	eventTypes = sortedUnique(eventTypes)
+	collectors = sortedUnique(collectors)
+	if len(eventTypes) > maxWebhookEventTypes || len(collectors) > maxWebhookCollectors {
+		return WebhookTrigger{}, false, errors.New("webhook metadata is too large")
 	}
 	eventJSON, err := json.Marshal(eventTypes)
 	if err != nil {
@@ -84,8 +88,12 @@ func (s *Store) RecordWebhookTrigger(ctx context.Context, bodyHash string, event
 }
 
 const (
-	sha256HexLength      = sha256.Size * 2
-	webhookTriggerSelect = `SELECT id,body_hash,received_at,event_types_json,collectors_json,status,attempts,next_attempt_at,COALESCE(lease_until,''),last_error,COALESCE(processed_at,'') FROM webhook_triggers`
+	sha256HexLength             = sha256.Size * 2
+	maxWebhookEventTypes        = 100
+	maxWebhookCollectors        = 32
+	maxWebhookMetadataValueSize = 128
+	maxWebhookMetadataJSONBytes = 16 << 10
+	webhookTriggerSelect        = `SELECT id,body_hash,received_at,event_types_json,collectors_json,status,attempts,next_attempt_at,COALESCE(lease_until,''),COALESCE(lease_token,''),last_error,COALESCE(processed_at,'') FROM webhook_triggers`
 )
 
 type webhookTriggerScanner interface {
@@ -96,8 +104,14 @@ func readWebhookTrigger(scanner webhookTriggerScanner) (WebhookTrigger, error) {
 	var trigger WebhookTrigger
 	var received, eventRaw, collectorRaw, nextAttempt, leaseUntil, processed string
 	var err error
-	if err := scanner.Scan(&trigger.ID, &trigger.BodyHash, &received, &eventRaw, &collectorRaw, &trigger.Status, &trigger.Attempts, &nextAttempt, &leaseUntil, &trigger.LastError, &processed); err != nil {
+	if err := scanner.Scan(&trigger.ID, &trigger.BodyHash, &received, &eventRaw, &collectorRaw, &trigger.Status, &trigger.Attempts, &nextAttempt, &leaseUntil, &trigger.LeaseToken, &trigger.LastError, &processed); err != nil {
 		return WebhookTrigger{}, err
+	}
+	if strings.TrimSpace(trigger.LastError) != "" {
+		// Legacy rows may predate the retry persistence boundary or have been
+		// edited outside the service. Keep arbitrary provider text out of every
+		// monitor/API projection as well as out of newly written rows.
+		trigger.LastError = notify.SafeDeliveryMessage(trigger.LastError)
 	}
 	trigger.ReceivedAt, err = parseWebhookTimestamp(received, "received_at")
 	if err != nil {
@@ -117,13 +131,48 @@ func readWebhookTrigger(scanner webhookTriggerScanner) (WebhookTrigger, error) {
 	} else {
 		trigger.ProcessedAt = value
 	}
-	if err := json.Unmarshal([]byte(eventRaw), &trigger.EventTypes); err != nil {
+	trigger.EventTypes, err = decodeWebhookMetadata([]byte(eventRaw), "event", maxWebhookEventTypes)
+	if err != nil {
 		return WebhookTrigger{}, fmt.Errorf("decode webhook event metadata: %w", err)
 	}
-	if err := json.Unmarshal([]byte(collectorRaw), &trigger.Collectors); err != nil {
+	trigger.Collectors, err = decodeWebhookMetadata([]byte(collectorRaw), "collector", maxWebhookCollectors)
+	if err != nil {
 		return WebhookTrigger{}, fmt.Errorf("decode webhook collector metadata: %w", err)
 	}
 	return trigger, nil
+}
+
+// decodeWebhookMetadata validates metadata read from SQLite before it enters
+// the monitor. Rows are normally produced by RecordWebhookTrigger, but a
+// damaged or hand-edited database must not be able to inject control characters,
+// oversized arrays, or an unexpectedly large JSON value into a reconciliation
+// request. The bounded byte check also keeps malformed rows from forcing a
+// large allocation during startup or queue recovery.
+func decodeWebhookMetadata(raw []byte, kind string, maxValues int) ([]string, error) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || len(trimmed) > maxWebhookMetadataJSONBytes {
+		return nil, fmt.Errorf("%s metadata JSON is empty or too large", kind)
+	}
+	if trimmed[0] != '[' {
+		return nil, fmt.Errorf("%s metadata must be a JSON array", kind)
+	}
+	var values []string
+	if err := json.Unmarshal(trimmed, &values); err != nil {
+		return nil, err
+	}
+	if values == nil {
+		return nil, fmt.Errorf("%s metadata must be a JSON array", kind)
+	}
+	for _, value := range values {
+		if len(value) > maxWebhookMetadataValueSize || strings.IndexFunc(value, unicode.IsControl) >= 0 {
+			return nil, fmt.Errorf("%s metadata contains an invalid value", kind)
+		}
+	}
+	values = sortedUnique(values)
+	if len(values) > maxValues {
+		return nil, fmt.Errorf("%s metadata contains too many values", kind)
+	}
+	return values, nil
 }
 
 func parseWebhookTimestamp(value, field string) (time.Time, error) {
@@ -160,25 +209,29 @@ func (s *Store) ClaimWebhookTrigger(ctx context.Context, id int64, lease time.Du
 	nowValue := now.Format(time.RFC3339Nano)
 	deadline := now.Add(-webhookTriggerRetryWindow).Format(time.RFC3339Nano)
 	leaseValue := now.Add(lease).Format(time.RFC3339Nano)
+	leaseToken, err := newWebhookLeaseToken()
+	if err != nil {
+		return WebhookTrigger{}, false, err
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return WebhookTrigger{}, false, err
 	}
 	defer tx.Rollback()
 	if _, err := tx.ExecContext(ctx, `UPDATE webhook_triggers
-		SET status='pending',lease_until=NULL
+		SET status='pending',lease_until=NULL,lease_token=''
 		WHERE id=? AND status='processing' AND (lease_until IS NULL OR lease_until<=?)`, id, nowValue); err != nil {
 		return WebhookTrigger{}, false, err
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE webhook_triggers
-		SET status='dead',lease_until=NULL,last_error='reconciliation retry window expired'
+		SET status='dead',lease_until=NULL,lease_token='',last_error='reconciliation retry window expired'
 		WHERE id=? AND status IN ('pending','processing') AND received_at<=?
 			AND (status='pending' OR lease_until IS NULL OR lease_until<=?)`, id, deadline, nowValue); err != nil {
 		return WebhookTrigger{}, false, err
 	}
 	result, err := tx.ExecContext(ctx, `UPDATE webhook_triggers
-		SET status='processing',attempts=attempts+1,lease_until=?
-		WHERE id=? AND status='pending' AND next_attempt_at<=?`, leaseValue, id, nowValue)
+		SET status='processing',attempts=attempts+1,lease_until=?,lease_token=?
+		WHERE id=? AND status='pending' AND next_attempt_at<=?`, leaseValue, leaseToken, id, nowValue)
 	if err != nil {
 		return WebhookTrigger{}, false, err
 	}
@@ -200,6 +253,7 @@ func (s *Store) ClaimWebhookTrigger(ctx context.Context, id int64, lease time.Du
 		return WebhookTrigger{}, false, err
 	}
 	trigger.Status = "processing"
+	trigger.LeaseToken = leaseToken
 	return trigger, true, nil
 }
 
@@ -225,10 +279,10 @@ func (s *Store) ClaimWebhookTriggers(ctx context.Context, limit int, lease time.
 		return nil, err
 	}
 	defer tx.Rollback()
-	if _, err := tx.ExecContext(ctx, `UPDATE webhook_triggers SET status='pending',lease_until=NULL WHERE status='processing' AND (lease_until IS NULL OR lease_until<=?)`, nowValue); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE webhook_triggers SET status='pending',lease_until=NULL,lease_token='' WHERE status='processing' AND (lease_until IS NULL OR lease_until<=?)`, nowValue); err != nil {
 		return nil, err
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE webhook_triggers SET status='dead',lease_until=NULL,last_error='reconciliation retry window expired' WHERE status IN ('pending','processing') AND received_at<=? AND (status='pending' OR lease_until IS NULL OR lease_until<=?)`, deadline, nowValue); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE webhook_triggers SET status='dead',lease_until=NULL,lease_token='',last_error='reconciliation retry window expired' WHERE status IN ('pending','processing') AND received_at<=? AND (status='pending' OR lease_until IS NULL OR lease_until<=?)`, deadline, nowValue); err != nil {
 		return nil, err
 	}
 	rows, err := tx.QueryContext(ctx, webhookTriggerSelect+` WHERE status='pending' AND next_attempt_at<=? ORDER BY id LIMIT ?`, nowValue, limit)
@@ -252,10 +306,15 @@ func (s *Store) ClaimWebhookTriggers(ctx context.Context, limit int, lease time.
 		return nil, err
 	}
 	for i := range triggers {
-		if _, err := tx.ExecContext(ctx, "UPDATE webhook_triggers SET status='processing',attempts=attempts+1,lease_until=? WHERE id=? AND status='pending'", leaseValue, triggers[i].ID); err != nil {
+		leaseToken, err := newWebhookLeaseToken()
+		if err != nil {
+			return nil, err
+		}
+		if _, err := tx.ExecContext(ctx, "UPDATE webhook_triggers SET status='processing',attempts=attempts+1,lease_until=?,lease_token=? WHERE id=? AND status='pending'", leaseValue, leaseToken, triggers[i].ID); err != nil {
 			return nil, err
 		}
 		triggers[i].Status = "processing"
+		triggers[i].LeaseToken = leaseToken
 		triggers[i].Attempts++
 		value := now.Add(lease)
 		triggers[i].LeaseUntil = &value
@@ -268,10 +327,13 @@ func (s *Store) ClaimWebhookTriggers(ctx context.Context, limit int, lease time.
 
 // HasDueWebhookTriggers is a read-only safety-net probe. It lets the monitor
 // avoid opening the claim transaction when no trigger can be progressed. The
-// received-at horizon is included so an old row with a future retry timestamp
-// is still noticed and dead-lettered by ClaimWebhookTriggers. This does not
-// depend on the current webhook secret: a trigger accepted before the secret
-// was cleared must remain durable and recoverable after a restart.
+// received-at horizon is included for pending rows so an old trigger with a
+// future retry timestamp is still noticed and dead-lettered by
+// ClaimWebhookTriggers. A processing row remains invisible while its lease is
+// active; reporting it as due would wake the durable worker repeatedly even
+// though lease fencing correctly prevents a claim. This does not depend on the
+// current webhook secret: a trigger accepted before the secret was cleared
+// must remain durable and recoverable after a restart.
 func (s *Store) HasDueWebhookTriggers(ctx context.Context, now time.Time) (bool, error) {
 	nowValue := now.UTC().Format(time.RFC3339Nano)
 	deadline := now.UTC().Add(-webhookTriggerRetryWindow).Format(time.RFC3339Nano)
@@ -279,16 +341,17 @@ func (s *Store) HasDueWebhookTriggers(ctx context.Context, now time.Time) (bool,
 	err := s.db.QueryRowContext(ctx, `SELECT EXISTS(
 		SELECT 1 FROM webhook_triggers
 		WHERE (status='pending' AND (next_attempt_at<=? OR received_at<=?))
-		   OR (status='processing' AND (lease_until IS NULL OR lease_until<=? OR received_at<=?))
-	)`, nowValue, deadline, nowValue, deadline).Scan(&due)
+		   OR (status='processing' AND (lease_until IS NULL OR lease_until<=?))
+	)`, nowValue, deadline, nowValue).Scan(&due)
 	return due == 1, err
 }
 
-// CompleteWebhookTriggers marks successfully reconciled triggers only after
-// the associated inventory transaction has committed.
-func (s *Store) CompleteWebhookTriggers(ctx context.Context, ids []int64) error {
-	ids = uniquePositiveIDs(ids)
-	if len(ids) == 0 {
+// CompleteClaimedWebhookTriggers finalizes only the exact processing claims
+// returned by ClaimWebhookTrigger(s). The lease token fences an expired worker
+// from completing a newer attempt for the same durable trigger.
+func (s *Store) CompleteClaimedWebhookTriggers(ctx context.Context, claims []WebhookTrigger) error {
+	claims = validWebhookClaims(claims)
+	if len(claims) == 0 {
 		return nil
 	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
@@ -297,31 +360,34 @@ func (s *Store) CompleteWebhookTriggers(ctx context.Context, ids []int64) error 
 		return err
 	}
 	defer tx.Rollback()
-	for _, id := range ids {
-		if _, err := tx.ExecContext(ctx, "UPDATE webhook_triggers SET status='processed',processed_at=?,lease_until=NULL,last_error='' WHERE id=? AND status IN ('pending','processing')", now, id); err != nil {
+	for _, claim := range claims {
+		if _, err := tx.ExecContext(ctx, "UPDATE webhook_triggers SET status='processed',processed_at=?,lease_until=NULL,lease_token='',last_error='' WHERE id=? AND status='processing' AND lease_token=?", now, claim.ID, claim.LeaseToken); err != nil {
 			return err
 		}
 	}
 	return tx.Commit()
 }
 
-// RetryWebhookTriggers returns failed triggers to the durable queue, or
-// dead-letters them once their 24-hour retry horizon has elapsed.
-func (s *Store) RetryWebhookTriggers(ctx context.Context, ids []int64, next time.Time, message string) error {
-	ids = uniquePositiveIDs(ids)
-	if len(ids) == 0 {
+// RetryClaimedWebhookTriggers requeues only the exact processing claims that
+// failed. A worker whose lease expired cannot move a newer attempt backward.
+func (s *Store) RetryClaimedWebhookTriggers(ctx context.Context, claims []WebhookTrigger, next time.Time, message string) error {
+	claims = validWebhookClaims(claims)
+	if len(claims) == 0 {
 		return nil
 	}
 	message = truncate(strings.TrimSpace(message), 500)
+	if message != "" {
+		message = notify.SafeDeliveryMessage(message)
+	}
 	now := time.Now().UTC()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	for _, id := range ids {
+	for _, claim := range claims {
 		var received string
-		if err := tx.QueryRowContext(ctx, "SELECT received_at FROM webhook_triggers WHERE id=?", id).Scan(&received); err != nil {
+		if err := tx.QueryRowContext(ctx, "SELECT received_at FROM webhook_triggers WHERE id=?", claim.ID).Scan(&received); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				continue
 			}
@@ -342,11 +408,35 @@ func (s *Store) RetryWebhookTriggers(ctx context.Context, ids []int64, next time
 				lastError = "reconciliation retry window expired"
 			}
 		}
-		if _, err := tx.ExecContext(ctx, "UPDATE webhook_triggers SET status=?,next_attempt_at=?,lease_until=NULL,last_error=? WHERE id=? AND status IN ('pending','processing')", status, attempt.Format(time.RFC3339Nano), lastError, id); err != nil {
+		if _, err := tx.ExecContext(ctx, "UPDATE webhook_triggers SET status=?,next_attempt_at=?,lease_until=NULL,lease_token='',last_error=? WHERE id=? AND status='processing' AND lease_token=?", status, attempt.Format(time.RFC3339Nano), lastError, claim.ID, claim.LeaseToken); err != nil {
 			return err
 		}
 	}
 	return tx.Commit()
+}
+
+func validWebhookClaims(claims []WebhookTrigger) []WebhookTrigger {
+	valid := make([]WebhookTrigger, 0, len(claims))
+	seen := make(map[int64]struct{}, len(claims))
+	for _, claim := range claims {
+		if claim.ID <= 0 || strings.TrimSpace(claim.LeaseToken) == "" {
+			continue
+		}
+		if _, exists := seen[claim.ID]; exists {
+			continue
+		}
+		seen[claim.ID] = struct{}{}
+		valid = append(valid, claim)
+	}
+	return valid
+}
+
+func newWebhookLeaseToken() (string, error) {
+	var token [16]byte
+	if _, err := rand.Read(token[:]); err != nil {
+		return "", fmt.Errorf("generate webhook lease token: %w", err)
+	}
+	return hex.EncodeToString(token[:]), nil
 }
 
 func uniquePositiveIDs(values []int64) []int64 {

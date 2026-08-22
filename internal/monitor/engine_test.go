@@ -157,7 +157,11 @@ func (s *cancellationAwareSender) Test(context.Context, string) error { return n
 
 func TestRestartMidDeliveryRecordsOutcome(t *testing.T) {
 	ctx := context.Background()
-	st, _ := monitorTestStore(t)
+	st, _, path := openMonitorTestStore(t)
+	box, err := secret.NewBox(make([]byte, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := st.EnqueueSystem(ctx, "delivery before restart"); err != nil {
 		t.Fatal(err)
 	}
@@ -184,12 +188,23 @@ func TestRestartMidDeliveryRecordsOutcome(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("delivery worker did not stop after restart")
 	}
-	status, err := st.Status(ctx)
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := store.Open(path, box)
+	if err != nil {
+		t.Fatalf("reopen after delivery shutdown: %v", err)
+	}
+	defer reopened.Close()
+	status, err := reopened.Status(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if status.Pending != 0 {
 		t.Fatalf("delivered notification remained pending after restart: %#v", status)
+	}
+	if status.Processing != 0 || status.Dead != 0 {
+		t.Fatalf("outbox outcome after restart was not delivered: %#v", status)
 	}
 }
 
@@ -200,9 +215,13 @@ func TestFinishTriggersOutlivesShutdownCancellation(t *testing.T) {
 	if err != nil || !created {
 		t.Fatalf("record trigger: %#v created=%v err=%v", trigger, created, err)
 	}
+	claim, claimed, err := st.ClaimWebhookTrigger(ctx, trigger.ID, time.Minute)
+	if err != nil || !claimed {
+		t.Fatalf("claim trigger: claimed=%v err=%v", claimed, err)
+	}
 	canceled, cancel := context.WithCancel(ctx)
 	cancel()
-	New(st, "", "", "test", &scriptedSender{}).finishTriggers(canceled, []int64{trigger.ID}, true, 1)
+	New(st, "", "", "test", &scriptedSender{}).finishClaimedTriggers(canceled, []store.WebhookTrigger{claim}, true, 1)
 	updated, _, err := st.RecordWebhookTrigger(ctx, strings.Repeat("b", 64), nil, nil)
 	if err != nil || updated.Status != "processed" {
 		t.Fatalf("canceled shutdown left trigger unfinished: %#v err=%v", updated, err)
@@ -217,21 +236,21 @@ func TestFastTriggerClaimOnlyOwnsPendingDurableRows(t *testing.T) {
 		t.Fatalf("record trigger: %#v created=%v err=%v", trigger, created, err)
 	}
 	engine := New(st, "", "", "test", &scriptedSender{})
-	claimed := engine.claimFastTriggers(ctx, []int64{trigger.ID, trigger.ID, 0, -1, 99999})
-	if len(claimed) != 1 || claimed[0] != trigger.ID {
-		t.Fatalf("claimed fast trigger IDs=%v, want [%d]", claimed, trigger.ID)
+	claims := engine.claimFastTriggerClaims(ctx, []int64{trigger.ID, trigger.ID, 0, -1, 99999})
+	if len(claims) != 1 || claims[0].ID != trigger.ID {
+		t.Fatalf("claimed fast trigger claims=%v, want trigger %d", claims, trigger.ID)
 	}
-	if claimed = engine.claimFastTriggers(ctx, []int64{trigger.ID}); len(claimed) != 0 {
-		t.Fatalf("processing trigger was claimed a second time: %v", claimed)
+	if second := engine.claimFastTriggerClaims(ctx, []int64{trigger.ID}); len(second) != 0 {
+		t.Fatalf("processing trigger was claimed a second time: %v", second)
 	}
-	if err := st.CompleteWebhookTriggers(ctx, []int64{trigger.ID}); err != nil {
+	if err := st.CompleteClaimedWebhookTriggers(ctx, claims); err != nil {
 		t.Fatal(err)
 	}
 	if err := st.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if claimed = engine.claimFastTriggers(ctx, []int64{trigger.ID}); len(claimed) != 0 {
-		t.Fatalf("closed-store fast claim returned IDs: %v", claimed)
+	if claims = engine.claimFastTriggerClaims(ctx, []int64{trigger.ID}); len(claims) != 0 {
+		t.Fatalf("closed-store fast claim returned claims: %v", claims)
 	}
 }
 
@@ -282,17 +301,63 @@ func TestFinishTriggersKeepsPendingWorkDurable(t *testing.T) {
 	if err != nil || !created {
 		t.Fatalf("record trigger: %#v created=%v err=%v", trigger, created, err)
 	}
+	claim, claimed, err := st.ClaimWebhookTrigger(ctx, trigger.ID, time.Minute)
+	if err != nil || !claimed {
+		t.Fatalf("claim trigger: claimed=%v err=%v", claimed, err)
+	}
 	engine := New(st, "", "", "test", &scriptedSender{})
-	engine.finishTriggers(ctx, []int64{trigger.ID}, false, 1)
+	engine.finishClaimedTriggers(ctx, []store.WebhookTrigger{claim}, false, 1)
 	retried, _, err := st.RecordWebhookTrigger(ctx, strings.Repeat("f", 64), nil, nil)
 	if err != nil || retried.Status != "pending" || retried.LastError == "" {
 		t.Fatalf("failed trigger was not retained for retry: %#v err=%v", retried, err)
 	}
-	if err := st.CompleteWebhookTriggers(ctx, []int64{trigger.ID}); err != nil {
+}
+
+func TestFinishTriggersCannotOverwriteRequeuedTrigger(t *testing.T) {
+	ctx := context.Background()
+	st, _ := monitorTestStore(t)
+	trigger, created, err := st.RecordWebhookTrigger(ctx, strings.Repeat("7", 64), nil, nil)
+	if err != nil || !created {
+		t.Fatalf("record trigger: %#v created=%v err=%v", trigger, created, err)
+	}
+	firstClaim, claimed, err := st.ClaimWebhookTrigger(ctx, trigger.ID, time.Minute)
+	if err != nil || !claimed {
+		t.Fatalf("claim trigger: claimed=%v err=%v", claimed, err)
+	}
+	// Simulate lease recovery returning the row to the durable queue while the
+	// original worker is still finishing its poll.
+	if err := st.RetryClaimedWebhookTriggers(ctx, []store.WebhookTrigger{firstClaim}, time.Now().Add(-time.Second), "reconciliation retry window expired"); err != nil {
 		t.Fatal(err)
 	}
-	completed, _, err := st.RecordWebhookTrigger(ctx, strings.Repeat("f", 64), nil, nil)
-	if err != nil || completed.Status != "processed" {
-		t.Fatalf("pending trigger could not be completed after retry: %#v err=%v", completed, err)
+	secondClaim, claimed, err := st.ClaimWebhookTrigger(ctx, trigger.ID, time.Minute)
+	if err != nil || !claimed {
+		t.Fatalf("reclaim trigger: claimed=%v err=%v", claimed, err)
+	}
+	if firstClaim.LeaseToken == "" || firstClaim.LeaseToken == secondClaim.LeaseToken {
+		t.Fatalf("lease token was not rotated: first=%q second=%q", firstClaim.LeaseToken, secondClaim.LeaseToken)
+	}
+	engine := New(st, "", "", "test", &scriptedSender{})
+	engine.finishClaimedTriggers(ctx, []store.WebhookTrigger{firstClaim}, true, 1)
+	updated, _, err := st.RecordWebhookTrigger(ctx, strings.Repeat("7", 64), nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Status != "processing" || updated.LeaseToken != secondClaim.LeaseToken || updated.LastError != "reconciliation retry window expired" {
+		t.Fatalf("late completion overwrote newer trigger attempt: %#v", updated)
+	}
+
+	engine.finishClaimedTriggers(ctx, []store.WebhookTrigger{firstClaim}, false, 1)
+	updated, _, err = st.RecordWebhookTrigger(ctx, strings.Repeat("7", 64), nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Status != "processing" || updated.LeaseToken != secondClaim.LeaseToken || updated.LastError != "reconciliation retry window expired" {
+		t.Fatalf("late retry overwrote newer trigger attempt: %#v", updated)
+	}
+
+	engine.finishClaimedTriggers(ctx, []store.WebhookTrigger{secondClaim}, true, 1)
+	updated, _, err = st.RecordWebhookTrigger(ctx, strings.Repeat("7", 64), nil, nil)
+	if err != nil || updated.Status != "processed" {
+		t.Fatalf("current claim could not be completed: %#v err=%v", updated, err)
 	}
 }

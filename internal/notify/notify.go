@@ -158,7 +158,7 @@ func SafeDeliveryError(err error) string {
 func SafeDeliveryMessage(message string) string {
 	message = strings.TrimSpace(message)
 	switch message {
-	case "destination disabled", "destination removed", "delivery retry window expired", "notification delivery failed", "notification delivery timed out", "notification delivery canceled":
+	case "destination disabled", "destination removed", "delivery retry window expired", "no notification destination configured", "monitoring identity changed", "collector reconciliation failed", "reconciliation retry window expired", "notification delivery failed", "notification delivery timed out", "notification delivery canceled":
 		return message
 	default:
 		return SafeDeliveryError(errors.New(message))
@@ -181,10 +181,27 @@ func SafeTestError(err error, serviceURLs ...string) string {
 	if errors.As(err, &delivery) {
 		return SafeDeliveryError(err)
 	}
-	if len(serviceURLs) > 0 && strings.TrimSpace(serviceURLs[0]) != "" {
-		return RedactError(err.Error(), serviceURLs[0])
+	if isValidationError(err) {
+		message := strings.TrimSpace(err.Error())
+		if len(serviceURLs) > 0 && strings.TrimSpace(serviceURLs[0]) != "" {
+			return RedactError(message, serviceURLs[0])
+		}
+		// The empty-URL validation error is already a fixed, non-sensitive
+		// message. Keep it actionable when a test request is missing its
+		// destination instead of collapsing it into a delivery failure.
+		if message == "notification URL is required" {
+			return message
+		}
+		// Other validation errors may contain provider parser details. Do not
+		// echo those when the caller did not supply the URL for redaction.
+		return "notification configuration is invalid"
 	}
 	return SafeDeliveryError(err)
+}
+
+func isValidationError(err error) bool {
+	message := strings.TrimSpace(err.Error())
+	return message == "notification URL is required" || strings.HasPrefix(message, "invalid notification URL") || strings.HasPrefix(message, "create notification sender")
 }
 
 var statusPattern = regexp.MustCompile(`\b([3-5][0-9]{2})\b`)
@@ -269,11 +286,18 @@ func sanitize(message, rawURL string) string {
 	if parsed, err := url.Parse(rawURL); err == nil {
 		add(parsed.String(), RedactURL(rawURL))
 		add(parsed.RawQuery, "<redacted>")
+		// URL parsing exposes a decoded Path/Fragment, but provider errors often
+		// echo the escaped spelling from the request line. Replace both forms so
+		// an encoded slash, space, or credential cannot bypass redaction.
+		add(parsed.EscapedPath(), "/<redacted>")
+		add(parsed.RawPath, "/<redacted>")
+		addEncodedVariants(add, parsed.Fragment)
+		addEncodedVariants(add, parsed.RawFragment)
 		if parsed.User != nil {
-			add(parsed.User.String(), "<redacted>")
-			add(parsed.User.Username(), "<redacted>")
+			addEncodedVariants(add, parsed.User.String())
+			addEncodedVariants(add, parsed.User.Username())
 			if password, ok := parsed.User.Password(); ok {
-				add(password, "<redacted>")
+				addEncodedVariants(add, password)
 			}
 		}
 		add(parsed.Host, "<redacted>")
@@ -281,9 +305,29 @@ func sanitize(message, rawURL string) string {
 		for _, segment := range strings.Split(strings.Trim(parsed.Path, "/"), "/") {
 			add(segment, "<redacted>")
 		}
+		for _, segment := range strings.Split(strings.Trim(parsed.EscapedPath(), "/"), "/") {
+			addEncodedVariants(add, segment)
+		}
+		// Errors do not consistently preserve URL formatting. Some providers
+		// include the complete RawQuery, while others echo only an encoded
+		// parameter value (for example, `token=secret%2Fpart`). Add both the
+		// raw and decoded forms of every query component so neither form can
+		// bypass the replacement set.
+		for _, component := range strings.FieldsFunc(parsed.RawQuery, func(r rune) bool { return r == '&' || r == ';' }) {
+			rawKey, rawValue, hasValue := strings.Cut(component, "=")
+			add(rawKey, "<redacted>")
+			if !hasValue {
+				add(component, "<redacted>")
+				continue
+			}
+			if rawValue == "" {
+				continue
+			}
+			addEncodedVariants(add, rawValue)
+		}
 		for _, values := range parsed.Query() {
 			for _, value := range values {
-				add(value, "<redacted>")
+				addEncodedVariants(add, value)
 			}
 		}
 	}
@@ -292,6 +336,40 @@ func sanitize(message, rawURL string) string {
 		message = strings.ReplaceAll(message, replacement.from, replacement.to)
 	}
 	return truncate(message, 500)
+}
+
+// addEncodedVariants adds bounded URL-encoding and decoding variants for an
+// untrusted credential. Providers do not agree on whether an echoed URL is
+// decoded once, repeatedly, or re-escaped with query/path rules. Covering a
+// small number of layers prevents a double-encoded token from reaching the
+// durable error boundary without turning sanitization into unbounded parsing.
+func addEncodedVariants(add func(string, string), value string) {
+	type candidate struct {
+		value string
+		depth int
+	}
+	queue := []candidate{{value: value}}
+	seen := map[string]struct{}{}
+	for len(queue) > 0 {
+		current := queue[0]
+		queue = queue[1:]
+		if current.value == "" || current.depth > 3 {
+			continue
+		}
+		if _, exists := seen[current.value]; exists {
+			continue
+		}
+		seen[current.value] = struct{}{}
+		add(current.value, "<redacted>")
+		add(url.QueryEscape(current.value), "<redacted>")
+		add(url.PathEscape(current.value), "<redacted>")
+		for _, decode := range []func(string) (string, error){url.QueryUnescape, url.PathUnescape} {
+			decoded, err := decode(current.value)
+			if err == nil && decoded != current.value {
+				queue = append(queue, candidate{value: decoded, depth: current.depth + 1})
+			}
+		}
+	}
 }
 
 // RedactError removes destination-specific credentials and routing details

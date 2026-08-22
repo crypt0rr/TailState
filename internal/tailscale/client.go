@@ -70,6 +70,11 @@ const (
 	maxAPIResponseBytes   = 16 << 20
 	maxOAuthResponseBytes = 1 << 20
 	maxRetryAfterDelay    = 5 * time.Minute
+	// A provider-controlled Retry-After value must not be able to keep one
+	// request occupied indefinitely when the caller uses a context without a
+	// deadline. Collectors add their own shorter poll deadline, but direct
+	// client users (including the setup test) still need a hard upper bound.
+	maxRequestRetryDuration = 30 * time.Second
 )
 
 var deviceDetailsPollTimeout = 2 * time.Minute
@@ -133,8 +138,8 @@ func IsUnsupported(err error) bool {
 // IsUnsupportedCollector applies plan-capability semantics only to optional
 // collectors. Core device inventory and its dependent details must surface a
 // 404 as an upstream failure; otherwise a transient endpoint disappearance
-// would be treated as a six-hour unsupported window and silently reset drift
-// detection.
+// could be mistaken for an unsupported plan capability. The store still
+// requires confirmation before demoting an established optional baseline.
 func IsUnsupportedCollector(collector string, err error) bool {
 	if collector == "devices" || collector == "device_details" {
 		return false
@@ -147,6 +152,12 @@ func New(base, tokenURL, version string, credentials Credentials) *Client {
 }
 
 func noRedirect(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }
+
+// BeginPoll invalidates the per-poll device-list cache. The monitor calls it
+// once before collecting a group so devices and device_details share one fresh
+// list within that poll without allowing a targeted reconciliation to reuse a
+// device identity from an earlier poll.
+func (c *Client) BeginPoll() { c.clearDeviceCache() }
 
 func (c *Client) Test(ctx context.Context) error { _, err := c.Collect(ctx, "devices"); return err }
 
@@ -437,7 +448,12 @@ func (c *Client) allPages(ctx context.Context, endpoint, arrayKey string) ([]map
 func (c *Client) allPagesWithOptions(ctx context.Context, endpoint, arrayKey string) ([]map[string]any, error) {
 	next := endpoint
 	var out []map[string]any
+	seen := make(map[string]struct{})
 	for page := 0; page < 100; page++ {
+		if _, repeated := seen[next]; repeated {
+			return nil, errors.New("tailscale pagination repeated the same page URL")
+		}
+		seen[next] = struct{}{}
 		value, err := c.get(ctx, next)
 		if err != nil {
 			return nil, err
@@ -447,22 +463,22 @@ func (c *Client) allPagesWithOptions(ctx context.Context, endpoint, arrayKey str
 		if objectOK {
 			raw, present := object[arrayKey]
 			if !present || raw == nil {
-				return nil, fmt.Errorf("%s response has no %s array", arrayKey, arrayKey)
+				return nil, fmt.Errorf("%s response has no %s array (an empty collection must be returned as [])", arrayKey, arrayKey)
 			}
 			var ok bool
 			items, ok = raw.([]any)
 			if !ok {
-				return nil, fmt.Errorf("%s response %s is not an array", arrayKey, arrayKey)
+				return nil, fmt.Errorf("%s response %s is not an array (an empty collection must be returned as [])", arrayKey, arrayKey)
 			}
 		} else {
 			var ok bool
 			items, ok = value.([]any)
 			if !ok {
-				return nil, fmt.Errorf("%s response has no %s array", arrayKey, arrayKey)
+				return nil, fmt.Errorf("%s response has no %s array (an empty collection must be returned as [])", arrayKey, arrayKey)
 			}
 		}
 		if items == nil {
-			return nil, fmt.Errorf("%s response has no %s array", arrayKey, arrayKey)
+			return nil, fmt.Errorf("%s response has no %s array (an empty collection must be returned as [])", arrayKey, arrayKey)
 		}
 		for _, item := range items {
 			obj, ok := item.(map[string]any)
@@ -532,12 +548,17 @@ func nextURL(object map[string]any) string {
 }
 
 func (c *Client) get(ctx context.Context, endpoint string) (any, error) {
+	// Bound the complete request, including token refreshes and all backoff
+	// sleeps. If the caller already supplied an earlier deadline,
+	// context.WithTimeout preserves that stricter limit.
+	retryCtx, cancel := context.WithTimeout(ctx, maxRequestRetryDuration)
+	defer cancel()
 	for attempt := 0; attempt < 4; attempt++ {
-		token, err := c.accessToken(ctx)
+		token, err := c.accessToken(retryCtx)
 		if err != nil {
 			return nil, err
 		}
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+		req, err := http.NewRequestWithContext(retryCtx, http.MethodGet, endpoint, nil)
 		if err != nil {
 			return nil, err
 		}
@@ -547,8 +568,8 @@ func (c *Client) get(ctx context.Context, endpoint string) (any, error) {
 		resp, err := c.http.Do(req)
 		if err != nil {
 			if attempt < 3 {
-				if !waitForRetry(ctx, time.Duration(1<<attempt)*time.Second) {
-					return nil, ctx.Err()
+				if !waitForRetry(retryCtx, time.Duration(1<<attempt)*time.Second) {
+					return nil, retryCtx.Err()
 				}
 				continue
 			}
@@ -570,8 +591,8 @@ func (c *Client) get(ctx context.Context, endpoint string) (any, error) {
 		}
 		if resp.StatusCode == 429 && attempt < 3 {
 			delay := retryAfter(resp.Header.Get("Retry-After"), time.Duration(1<<attempt)*time.Second)
-			if !waitForRetry(ctx, delay) {
-				return nil, ctx.Err()
+			if !waitForRetry(retryCtx, delay) {
+				return nil, retryCtx.Err()
 			}
 			continue
 		}
@@ -664,8 +685,19 @@ func nameFor(value map[string]any, fallback string) string {
 	return fallback
 }
 func retryAfter(value string, fallback time.Duration) time.Duration {
-	if seconds, err := strconv.Atoi(value); err == nil && seconds >= 0 {
-		return min(time.Duration(seconds)*time.Second, maxRetryAfterDelay)
+	raw := strings.TrimSpace(value)
+	if seconds, err := strconv.ParseInt(raw, 10, 64); err == nil && seconds >= 0 {
+		maxSeconds := int64(maxRetryAfterDelay / time.Second)
+		if seconds >= maxSeconds {
+			return maxRetryAfterDelay
+		}
+		return time.Duration(seconds) * time.Second
+	}
+	// Treat an otherwise-valid non-negative integer that exceeds int64 as an
+	// already-capped delay instead of allowing it to fall through to fallback.
+	numeric := strings.TrimPrefix(raw, "+")
+	if numeric != "" && strings.Trim(numeric, "0123456789") == "" {
+		return maxRetryAfterDelay
 	}
 	if when, err := http.ParseTime(value); err == nil {
 		return min(max(time.Until(when), 0), maxRetryAfterDelay)

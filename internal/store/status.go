@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/crypt0rr/tailstate/internal/textutil"
 )
 
 func (s *Store) Status(ctx context.Context) (Status, error) {
@@ -120,11 +122,13 @@ func (s *Store) Status(ctx context.Context) (Status, error) {
 	}
 	if out.BaselineAt != nil {
 		out.BaselineReady = true
-		out.BaselineDegraded = false
-		out.BaselineReason = ""
 		out.BaselineGraceUntil = nil
+		out.BaselineDegraded, out.BaselineReason = postBaselineDegradation(out.Collectors)
 	}
 	if err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM outbox WHERE status='pending'").Scan(&out.Pending); err != nil {
+		return out, err
+	}
+	if err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM outbox WHERE status='processing'").Scan(&out.Processing); err != nil {
 		return out, err
 	}
 	if err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM outbox WHERE status='dead'").Scan(&out.Dead); err != nil {
@@ -146,6 +150,31 @@ func (s *Store) Status(ctx context.Context) (Status, error) {
 		return out, err
 	}
 	return out, nil
+}
+
+// postBaselineDegradation keeps a historical baseline usable while making
+// current collector health visible. A baseline timestamp is a statement about
+// the first complete observation; it must not hide a later supported collector
+// failure, partial response, or newly added collector waiting for its first
+// observation. Confirmed unsupported collectors are intentionally excluded:
+// those are plan-capability states, not transient monitoring failures.
+func postBaselineDegradation(collectors []CollectorState) (bool, string) {
+	degraded := make([]string, 0)
+	for _, collector := range collectors {
+		if !collector.Supported || (collector.Baseline && !collector.Partial && collector.FailureCount == 0) {
+			continue
+		}
+		if strings.TrimSpace(collector.Name) == "" {
+			degraded = append(degraded, "unknown")
+			continue
+		}
+		degraded = append(degraded, collector.Name)
+	}
+	if len(degraded) == 0 {
+		return false, ""
+	}
+	reason := "collector health degraded: " + strings.Join(degraded, ", ")
+	return true, textutil.Truncate(reason, 200)
 }
 
 func (s *Store) currentGeneration(ctx context.Context) (int64, error) {
@@ -212,6 +241,54 @@ func (s *Store) SetNextPollErr(ctx context.Context, generation int64, collectors
 	return tx.Commit()
 }
 
+// EarliestCollectorDue returns the soonest persisted poll deadline for the
+// supplied collectors. A zero time with found=true means at least one
+// collector is due immediately (its next_poll column is empty). The monitor
+// uses this to wake for short confirmation/retry windows even when the normal
+// inventory interval is much longer.
+func (s *Store) EarliestCollectorDue(ctx context.Context, generation int64, collectors []string) (deadline time.Time, found bool, err error) {
+	ordered := sortedUnique(collectors)
+	if len(ordered) == 0 {
+		return time.Time{}, false, nil
+	}
+	placeholders := make([]string, 0, len(ordered))
+	args := make([]any, 0, len(ordered)+1)
+	args = append(args, generation)
+	for _, collector := range ordered {
+		placeholders = append(placeholders, "?")
+		args = append(args, collector)
+	}
+	rows, err := s.db.QueryContext(ctx, "SELECT COALESCE(next_poll,'') FROM collector_state WHERE generation=? AND collector IN ("+strings.Join(placeholders, ",")+")", args...)
+	if err != nil {
+		return time.Time{}, false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var raw string
+		if err := rows.Scan(&raw); err != nil {
+			return time.Time{}, false, err
+		}
+		if raw == "" {
+			return time.Time{}, true, nil
+		}
+		value, err := time.Parse(time.RFC3339Nano, raw)
+		if err != nil {
+			return time.Time{}, false, fmt.Errorf("parse collector next poll timestamp: %w", err)
+		}
+		if !found || value.Before(deadline) {
+			deadline = value
+			found = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return time.Time{}, false, err
+	}
+	if err := rows.Close(); err != nil {
+		return time.Time{}, false, err
+	}
+	return deadline, found, nil
+}
+
 // CollectorDueWithError reports whether a collector is due and preserves
 // database errors for callers that need to surface a degraded scheduler.
 func (s *Store) CollectorDueWithError(ctx context.Context, generation int64, collector string) (bool, error) {
@@ -261,8 +338,16 @@ func (s *Store) Cleanup(ctx context.Context, retention time.Duration) error {
 	}
 	retryCutoff := now.Add(-outboxRetryWindow).Format(time.RFC3339Nano)
 	if _, err := s.db.ExecContext(ctx, `UPDATE outbox
-		SET status='dead',next_attempt=?,last_error=CASE WHEN TRIM(last_error)='' THEN 'delivery retry window expired' ELSE last_error END
-		WHERE status='pending' AND first_attempt<=?`, now.Format(time.RFC3339Nano), retryCutoff); err != nil {
+		SET status='dead',next_attempt=?,lease_until=NULL,lease_token='',last_error=CASE WHEN TRIM(last_error)='' THEN 'delivery retry window expired' ELSE last_error END
+		WHERE status IN ('pending','processing') AND first_attempt<=?
+		  AND (status='pending' OR lease_until IS NULL OR lease_until<=?)`, now.Format(time.RFC3339Nano), retryCutoff, now.Format(time.RFC3339Nano)); err != nil {
+		return err
+	}
+	webhookRetryCutoff := now.Add(-webhookTriggerRetryWindow).Format(time.RFC3339Nano)
+	if _, err := s.db.ExecContext(ctx, `UPDATE webhook_triggers
+		SET status='dead',next_attempt_at=?,lease_until=NULL,lease_token='',last_error=CASE WHEN TRIM(last_error)='' THEN 'reconciliation retry window expired' ELSE last_error END
+		WHERE status IN ('pending','processing') AND received_at<=?
+		  AND (status='pending' OR lease_until IS NULL OR lease_until<=?)`, now.Format(time.RFC3339Nano), webhookRetryCutoff, now.Format(time.RFC3339Nano)); err != nil {
 		return err
 	}
 	cutoff := now.Add(-retention).Format(time.RFC3339Nano)
@@ -278,7 +363,7 @@ func (s *Store) Cleanup(ctx context.Context, retention time.Duration) error {
 	}
 	// Ledger entries are retained beyond event snapshots so the hash chain
 	// remains a durable audit trail after the 30-day history retention sweep.
-	if _, err := s.db.ExecContext(ctx, "DELETE FROM webhook_triggers WHERE received_at<?", cutoff); err != nil {
+	if _, err := s.db.ExecContext(ctx, "DELETE FROM webhook_triggers WHERE received_at<? AND status IN ('processed','dead')", cutoff); err != nil {
 		return err
 	}
 	if _, err := s.db.ExecContext(ctx, "DELETE FROM outbox WHERE status='delivered' AND delivered_at<?", cutoff); err != nil {

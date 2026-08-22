@@ -277,7 +277,8 @@ in a disposable project before relying on the procedure for an outage.
 - A single 403/404 from an optional plan-specific endpoint is marked unsupported
   and retried every six hours; an established baseline and snapshots remain
   intact across that interval, so recovery reports drift instead of silently
-  rebasing.
+  rebasing. A later non-403/404 failure is recorded as a transient supported
+  collector failure rather than retaining the unsupported label.
 - Starting a different TailState release queues one durable notification containing the previous and current versions.
 
 Version tracking is introduced in v0.3.0. Its first startup records the release silently because earlier releases did not persist their version; subsequent upgrades include both exact versions in the notification.

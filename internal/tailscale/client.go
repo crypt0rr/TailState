@@ -360,7 +360,7 @@ func (c *Client) policy(ctx context.Context) ([]model.Resource, error) {
 	sections := map[string]any{}
 	if object, ok := value.(map[string]any); ok {
 		for key, section := range object {
-			raw, _, _ := model.CanonicalFor("policy", section)
+			raw, _, _ := model.CanonicalForSection("policy", key, section)
 			sum := sha256.Sum256(raw)
 			sections[key] = hex.EncodeToString(sum[:])
 		}

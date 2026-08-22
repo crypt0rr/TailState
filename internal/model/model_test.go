@@ -99,6 +99,71 @@ func TestAllTenantKeyedPolicyAndDNSMapsRetainSecretNamedKeys(t *testing.T) {
 	}
 }
 
+func TestCanonicalForSectionNeverTreatsTenantKeysAsSecretFields(t *testing.T) {
+	cases := []struct {
+		name      string
+		collector string
+		section   string
+		key       string
+		before    any
+		after     any
+	}{
+		{
+			name:      "policy groups",
+			collector: "policy",
+			section:   "groups",
+			key:       "secret",
+			before:    []any{"alice@corp"},
+			after:     []any{"alice@corp", "mallory@corp"},
+		},
+		{
+			name:      "policy tag owners",
+			collector: "policy",
+			section:   "tagOwners",
+			key:       "token",
+			before:    []any{"alice@corp"},
+			after:     []any{"alice@corp", "mallory@corp"},
+		},
+		{
+			name:      "policy hosts",
+			collector: "policy",
+			section:   "hosts",
+			key:       "password",
+			before:    "100.64.0.1",
+			after:     "100.64.0.2",
+		},
+		{
+			name:      "dns split dns",
+			collector: "dns",
+			section:   "split-dns",
+			key:       "secret",
+			before:    []any{"100.64.0.1"},
+			after:     []any{"100.64.0.1", "100.64.0.2"},
+		},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			before := map[string]any{testCase.key: testCase.before}
+			after := map[string]any{testCase.key: testCase.after}
+			raw, beforeHash, err := CanonicalForSection(testCase.collector, testCase.section, before)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, afterHash, err := CanonicalForSection(testCase.collector, testCase.section, after)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(string(raw), `"`+testCase.key+`"`) {
+				t.Fatalf("tenant key %q was redacted: %s", testCase.key, raw)
+			}
+			if beforeHash == afterHash {
+				t.Fatalf("change under tenant key %q was invisible", testCase.key)
+			}
+		})
+	}
+}
+
 func TestDNSCanonicalizationPreservesResolverOrder(t *testing.T) {
 	first := map[string]any{"nameservers": map[string]any{"dns": []any{"1.1.1.1", "9.9.9.9"}}, "searchpaths": map[string]any{"dns": []any{"corp.example", "lab.example"}}}
 	second := map[string]any{"nameservers": map[string]any{"dns": []any{"9.9.9.9", "1.1.1.1"}}, "searchpaths": map[string]any{"dns": []any{"lab.example", "corp.example"}}}

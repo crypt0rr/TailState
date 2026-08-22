@@ -260,7 +260,21 @@ func Canonical(value any) ([]byte, string, error) {
 }
 
 func CanonicalFor(collector string, value any) ([]byte, string, error) {
-	raw, err := json.Marshal(NormalizeFor(collector, value))
+	return canonical(normalizeFor(collector, value, true, false, ""))
+}
+
+// CanonicalForSection canonicalizes a collector section while retaining the
+// section's schema identity. This matters for open-ended sections such as
+// policy groups and DNS split-dns maps: their keys are tenant-controlled
+// names, not secret field names, even when a key happens to be "secret" or
+// "token".
+func CanonicalForSection(collector, section string, value any) ([]byte, string, error) {
+	compactSection := strings.ToLower(strings.ReplaceAll(strings.ReplaceAll(section, "_", ""), "-", ""))
+	return canonical(normalizeFor(collector, value, true, tenantKeySection(collector, compactSection), section))
+}
+
+func canonical(value any) ([]byte, string, error) {
+	raw, err := json.Marshal(value)
 	if err != nil {
 		return nil, "", err
 	}

@@ -2,6 +2,8 @@ package tailscale
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net/http"
@@ -10,6 +12,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/crypt0rr/tailstate/internal/model"
 )
 
 func TestPolicyAdditionalCollectorsAndClientTest(t *testing.T) {
@@ -20,7 +24,7 @@ func TestPolicyAdditionalCollectorsAndClientTest(t *testing.T) {
 		}
 		switch r.URL.Path {
 		case "/api/v2/tailnet/-/acl":
-			_, _ = w.Write([]byte(`{"acls":[{"action":"accept"}],"tests":[{"src":"*"}]}`))
+			_, _ = w.Write([]byte(`{"acls":[{"action":"accept"}],"tests":[{"src":"*"}],"groups":{"secret":["alice@corp"]}}`))
 		case "/api/v2/tailnet/-/devices":
 			_, _ = w.Write([]byte(`{"devices":[]}`))
 		case "/api/v2/tailnet/-/users":
@@ -42,8 +46,16 @@ func TestPolicyAdditionalCollectorsAndClientTest(t *testing.T) {
 		t.Fatalf("policy collection=%#v err=%v", policy, err)
 	}
 	sections, ok := policy[0].Data.(map[string]any)
-	if !ok || len(sections) != 2 || len(fmt.Sprint(sections["acls"])) != 64 || len(fmt.Sprint(sections["tests"])) != 64 {
+	if !ok || len(sections) != 3 || len(fmt.Sprint(sections["acls"])) != 64 || len(fmt.Sprint(sections["tests"])) != 64 {
 		t.Fatalf("policy sections were not hashed: %#v", policy[0].Data)
+	}
+	groupsRaw, _, err := model.CanonicalForSection("policy", "groups", map[string]any{"secret": []any{"alice@corp"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	groupsHash := sha256.Sum256(groupsRaw)
+	if got, want := fmt.Sprint(sections["groups"]), hex.EncodeToString(groupsHash[:]); got != want {
+		t.Fatalf("tenant-controlled policy key was normalized incorrectly: got %s want %s", got, want)
 	}
 	for _, collector := range []string{"users", "keys", "posture", "settings"} {
 		resources, collectErr := client.Collect(context.Background(), collector)

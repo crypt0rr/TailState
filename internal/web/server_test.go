@@ -69,7 +69,7 @@ func TestClaimLoginSurfaceAndSecurityHeaders(t *testing.T) {
 	}
 	settingsResponse := httptest.NewRecorder()
 	server.Handler().ServeHTTP(settingsResponse, settingsRequest)
-	if settingsResponse.Code != http.StatusOK || !strings.Contains(settingsResponse.Body.String(), "Monitoring settings") {
+	if settingsResponse.Code != http.StatusOK || !strings.Contains(settingsResponse.Body.String(), "Monitoring settings") || !strings.Contains(settingsResponse.Body.String(), "Deployment diagnostics") {
 		t.Fatalf("settings status %d: %s", settingsResponse.Code, settingsResponse.Body.String())
 	}
 }
@@ -204,6 +204,12 @@ func TestLoginRejectsCrossOriginRequests(t *testing.T) {
 	server.Handler().ServeHTTP(response, request)
 	if response.Code != http.StatusForbidden {
 		t.Fatalf("cross-origin login status %d: %s", response.Code, response.Body.String())
+	}
+	if !strings.Contains(response.Body.String(), "public URL") || !strings.Contains(response.Body.String(), "X-Forwarded-Proto") {
+		t.Fatalf("cross-origin login response did not include safe deployment guidance: %s", response.Body.String())
+	}
+	if ok, reason := server.sameOriginRequestReason(request); ok || reason != "host_mismatch" {
+		t.Fatalf("origin result=(%v,%q), want (false,host_mismatch)", ok, reason)
 	}
 }
 

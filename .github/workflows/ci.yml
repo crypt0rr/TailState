@@ -98,6 +98,10 @@ jobs:
           grep -q 'published: "80"' /tmp/tailstate-remote-compose.yaml
           grep -q 'published: "443"' /tmp/tailstate-remote-compose.yaml
           ! grep -q 'published: "8080"' /tmp/tailstate-remote-compose.yaml
+      - name: HTTPS reverse-proxy runtime smoke test
+        env:
+          TAILSTATE_BACKUP_IMAGE: tailstate:backup-sidecar
+        run: bash scripts/proxy-smoke.sh tailstate:ci 18084
       - name: Backup and restore smoke test
         env:
           TAILSTATE_BACKUP_IMAGE: tailstate:backup-sidecar

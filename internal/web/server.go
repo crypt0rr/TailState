@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/crypt0rr/tailstate/internal/boot"
+	"github.com/crypt0rr/tailstate/internal/diagnostics"
 	"github.com/crypt0rr/tailstate/internal/monitor"
 	"github.com/crypt0rr/tailstate/internal/notify"
 	"github.com/crypt0rr/tailstate/internal/store"
@@ -59,6 +60,7 @@ type pageData struct {
 	EvidenceSigningKeyID            string
 	Destinations                    []destinationPage
 	NotificationsPaused             bool
+	Diagnostics                     diagnostics.Report
 }
 
 type destinationPage struct {
@@ -204,8 +206,9 @@ func (s *Server) setup(w http.ResponseWriter, r *http.Request) {
 	s.render(w, "setup", pageData{})
 }
 func (s *Server) claim(w http.ResponseWriter, r *http.Request) {
-	if !s.sameOriginRequest(r) {
-		http.Error(w, "cross-origin setup rejected", http.StatusForbidden)
+	if ok, reason := s.sameOriginRequestReason(r); !ok {
+		slog.Debug("cross-origin setup rejected", "reason", reason)
+		http.Error(w, "setup request did not match this site's origin; check the public URL and reverse-proxy Host/X-Forwarded-Proto settings", http.StatusForbidden)
 		return
 	}
 	exists, ok := s.adminExists(w, r)
@@ -281,8 +284,9 @@ func (s *Server) adminExists(w http.ResponseWriter, r *http.Request) (bool, bool
 }
 
 func (s *Server) loginPost(w http.ResponseWriter, r *http.Request) {
-	if !s.sameOriginRequest(r) {
-		http.Error(w, "cross-origin login rejected", http.StatusForbidden)
+	if ok, reason := s.sameOriginRequestReason(r); !ok {
+		slog.Debug("cross-origin login rejected", "reason", reason)
+		http.Error(w, "login request did not match this site's origin; check the public URL and reverse-proxy Host/X-Forwarded-Proto settings", http.StatusForbidden)
 		return
 	}
 	ip := s.clientIP(r)
@@ -310,34 +314,39 @@ func (s *Server) loginPost(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 
-func (s *Server) sameOriginRequest(r *http.Request) bool {
+func (s *Server) sameOriginRequestReason(r *http.Request) (bool, string) {
 	origin := strings.TrimSpace(r.Header.Get("Origin"))
 	if origin != "" {
 		// An explicit Origin is the strongest browser signal. Do not let a
 		// proxy or user agent that reports a broad Fetch Metadata value turn a
 		// valid same-origin form into a false CSRF rejection.
-		return s.sameOriginURL(r, origin)
+		return s.sameOriginURLReason(r, origin)
 	}
 	fetchSite := strings.ToLower(strings.TrimSpace(r.Header.Get("Sec-Fetch-Site")))
 	if fetchSite == "cross-site" || fetchSite == "same-site" {
 		// same-site is still potentially cross-origin. A sibling subdomain can
 		// submit a form without an Origin header, so it must not be treated as
 		// safe.
-		return false
+		return false, "cross_site_fetch"
 	}
 	// Some browsers omit Origin on form submissions but still send a Referer.
 	// Treat a cross-origin Referer as CSRF evidence instead of relying solely
 	// on the Fetch Metadata header.
 	if referer := strings.TrimSpace(r.Header.Get("Referer")); referer != "" {
-		return s.sameOriginURL(r, referer)
+		return s.sameOriginURLReason(r, referer)
 	}
-	return true
+	return true, "no_origin_metadata"
 }
 
 func (s *Server) sameOriginURL(r *http.Request, raw string) bool {
+	ok, _ := s.sameOriginURLReason(r, raw)
+	return ok
+}
+
+func (s *Server) sameOriginURLReason(r *http.Request, raw string) (bool, string) {
 	parsed, err := url.Parse(raw)
 	if err != nil || parsed.Host == "" || parsed.User != nil || parsed.Fragment != "" {
-		return false
+		return false, "invalid_origin"
 	}
 	host := strings.TrimSpace(r.Host)
 	if host == "" {
@@ -345,16 +354,19 @@ func (s *Server) sameOriginURL(r *http.Request, raw string) bool {
 	}
 	requestURL, err := url.Parse("//" + host)
 	if err != nil || requestURL.Host == "" || !strings.EqualFold(parsed.Hostname(), requestURL.Hostname()) {
-		return false
+		return false, "host_mismatch"
 	}
 	scheme := "http"
 	if r.TLS != nil || (s.isTrustedProxy(remoteIP(r)) && strings.EqualFold(strings.TrimSpace(strings.Split(r.Header.Get("X-Forwarded-Proto"), ",")[0]), "https")) {
 		scheme = "https"
 	}
 	if !strings.EqualFold(parsed.Scheme, scheme) {
-		return false
+		return false, "scheme_mismatch"
 	}
-	return effectiveOriginPort(parsed.Port(), scheme) == effectiveOriginPort(requestURL.Port(), scheme)
+	if effectiveOriginPort(parsed.Port(), scheme) != effectiveOriginPort(requestURL.Port(), scheme) {
+		return false, "port_mismatch"
+	}
+	return true, "same_origin"
 }
 
 func effectiveOriginPort(port, scheme string) string {
@@ -379,8 +391,9 @@ func (s *Server) logout(w http.ResponseWriter, r *http.Request) {
 }
 func (s *Server) reset(w http.ResponseWriter, r *http.Request) { s.render(w, "reset", pageData{}) }
 func (s *Server) resetPost(w http.ResponseWriter, r *http.Request) {
-	if !s.sameOriginRequest(r) {
-		http.Error(w, "cross-origin reset rejected", http.StatusForbidden)
+	if ok, reason := s.sameOriginRequestReason(r); !ok {
+		slog.Debug("cross-origin password reset rejected", "reason", reason)
+		http.Error(w, "reset request did not match this site's origin; check the public URL and reverse-proxy Host/X-Forwarded-Proto settings", http.StatusForbidden)
 		return
 	}
 	ip := "reset:" + s.clientIP(r)
@@ -556,7 +569,7 @@ func (s *Server) settings(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "settings temporarily unavailable", http.StatusServiceUnavailable)
 		return
 	}
-	data := s.settingsData(r.Context(), csrf, configured, current)
+	data := s.settingsData(r.Context(), csrf, configured, current, r)
 	s.render(w, "settings", data)
 }
 func (s *Server) settingsPost(w http.ResponseWriter, r *http.Request) {
@@ -587,7 +600,7 @@ func (s *Server) settingsPost(w http.ResponseWriter, r *http.Request) {
 			input.WebhookSecret = current.WebhookSecret
 		}
 	}
-	data := s.settingsData(r.Context(), csrf, configured, input)
+	data := s.settingsData(r.Context(), csrf, configured, input, r)
 	data.DeviceSeconds, data.InventorySeconds = device, inventory
 	if err1 != nil || err2 != nil {
 		data.Error = "Poll intervals must be whole seconds."
@@ -634,8 +647,8 @@ func (s *Server) settingsPost(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/status", http.StatusSeeOther)
 }
 
-func (s *Server) settingsData(ctx context.Context, csrf string, configured bool, settings store.Settings) pageData {
-	data := pageData{CSRF: csrf, Configured: configured, Settings: settings, DeviceSeconds: int64(settings.DeviceInterval.Seconds()), InventorySeconds: int64(settings.InventoryInterval.Seconds())}
+func (s *Server) settingsData(ctx context.Context, csrf string, configured bool, settings store.Settings, request *http.Request) pageData {
+	data := pageData{CSRF: csrf, Configured: configured, Settings: settings, DeviceSeconds: int64(settings.DeviceInterval.Seconds()), InventorySeconds: int64(settings.InventoryInterval.Seconds()), Diagnostics: s.diagnosticReport(ctx, request)}
 	destinations, err := s.store.ListDestinations(ctx)
 	if err == nil {
 		data.Destinations = make([]destinationPage, 0, len(destinations))
@@ -653,13 +666,30 @@ func (s *Server) settingsData(ctx context.Context, csrf string, configured bool,
 	return data
 }
 
-func (s *Server) currentSettingsData(ctx context.Context, csrf string) pageData {
+func (s *Server) currentSettingsData(ctx context.Context, csrf string, requests ...*http.Request) pageData {
+	var request *http.Request
+	if len(requests) > 0 {
+		request = requests[0]
+	}
 	settings, err := s.store.Settings(ctx)
 	if err != nil {
 		settings = store.Settings{Tailnet: "-", DeviceInterval: time.Minute, InventoryInterval: 5 * time.Minute}
-		return s.settingsData(ctx, csrf, false, settings)
+		return s.settingsData(ctx, csrf, false, settings, request)
 	}
-	return s.settingsData(ctx, csrf, true, settings)
+	return s.settingsData(ctx, csrf, true, settings, request)
+}
+
+func (s *Server) diagnosticReport(ctx context.Context, request *http.Request) diagnostics.Report {
+	runtime := diagnostics.Runtime{}
+	if status, err := s.store.Status(ctx); err == nil {
+		runtime.Configured = status.Configured
+		runtime.BaselineReady = status.BaselineReady
+		runtime.BaselineDegraded = status.BaselineDegraded
+		runtime.BaselineReason = status.BaselineReason
+		runtime.Destinations = status.Destinations
+		runtime.EnabledDestinations = status.EnabledDestinations
+	}
+	return diagnostics.Build(s.config, runtime, request)
 }
 
 func (s *Server) destinationPost(w http.ResponseWriter, r *http.Request) {
@@ -702,7 +732,7 @@ func (s *Server) destinationPost(w http.ResponseWriter, r *http.Request) {
 		enabled := r.FormValue("enabled") == "on" || r.FormValue("enabled") == "true"
 		if _, err := s.store.SaveDestination(ctx, store.NotificationDestination{ID: id, Name: r.FormValue("name"), ServiceURL: serviceURL, Enabled: enabled}); err != nil {
 			slog.Error("save notification destination", "error", err)
-			data := s.currentSettingsData(ctx, csrf)
+			data := s.currentSettingsData(ctx, csrf, r)
 			data.Error = destinationMutationMessage("save", err)
 			s.render(w, "settings", data)
 			return
@@ -723,7 +753,7 @@ func (s *Server) destinationPost(w http.ResponseWriter, r *http.Request) {
 		}
 		testCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 		defer cancel()
-		data := s.currentSettingsData(ctx, csrf)
+		data := s.currentSettingsData(ctx, csrf, r)
 		if err := notify.New().Test(testCtx, serviceURL); err != nil {
 			data.Error = "Notification test failed: " + notify.SafeTestError(err, serviceURL)
 		} else {

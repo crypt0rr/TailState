@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -16,6 +17,7 @@ import (
 	"time"
 
 	"github.com/crypt0rr/tailstate/internal/boot"
+	"github.com/crypt0rr/tailstate/internal/diagnostics"
 	"github.com/crypt0rr/tailstate/internal/monitor"
 	"github.com/crypt0rr/tailstate/internal/notify"
 	"github.com/crypt0rr/tailstate/internal/secret"
@@ -42,6 +44,8 @@ func run() error {
 		return serve()
 	case "healthcheck":
 		return healthcheck(os.Args[2:])
+	case "doctor":
+		return doctor(os.Args[2:])
 	case "admin":
 		if len(os.Args) > 2 {
 			switch os.Args[2] {
@@ -66,7 +70,7 @@ func run() error {
 		fmt.Printf("tailstate %s\n", version)
 		return nil
 	default:
-		return fmt.Errorf("unknown command %q (use serve, healthcheck, admin reset, admin rekey, evidence verify, evidence public-key, or version)", command)
+		return fmt.Errorf("unknown command %q (use serve, healthcheck, doctor, admin reset, admin rekey, evidence verify, evidence public-key, or version)", command)
 	}
 }
 
@@ -167,6 +171,64 @@ func healthcheck(args []string) error {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("health endpoint returned %d", resp.StatusCode)
+	}
+	return nil
+}
+
+func doctor(args []string) error {
+	flags := flag.NewFlagSet("doctor", flag.ContinueOnError)
+	jsonOutput := flags.Bool("json", false, "write the report as JSON")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	config, err := boot.Load(version)
+	if err != nil {
+		return fmt.Errorf("doctor configuration: %w", err)
+	}
+	key, err := config.MasterKey()
+	if err != nil {
+		return fmt.Errorf("doctor master key: %w", err)
+	}
+	box, err := secret.NewBox(key)
+	if err != nil {
+		return fmt.Errorf("doctor master key: %w", err)
+	}
+	st, err := store.Open(config.DatabasePath(), box)
+	if err != nil {
+		return fmt.Errorf("doctor database: %w", err)
+	}
+	defer st.Close()
+
+	runtime := diagnostics.Runtime{}
+	status, err := st.Status(context.Background())
+	if err != nil {
+		return fmt.Errorf("doctor status: %w", err)
+	}
+	runtime.Configured = status.Configured
+	runtime.BaselineReady = status.BaselineReady
+	runtime.BaselineDegraded = status.BaselineDegraded
+	runtime.BaselineReason = status.BaselineReason
+	runtime.Destinations = status.Destinations
+	runtime.EnabledDestinations = status.EnabledDestinations
+	report := diagnostics.Build(config, runtime, nil)
+	if *jsonOutput {
+		if err := json.NewEncoder(os.Stdout).Encode(report); err != nil {
+			return fmt.Errorf("write doctor report: %w", err)
+		}
+	} else {
+		fmt.Fprintf(os.Stdout, "TailState deployment doctor: %s\n", report.State)
+		fmt.Fprintf(os.Stdout, "Listener: %s\n", report.Listener)
+		fmt.Fprintf(os.Stdout, "Secure cookies: %t\n", report.CookieSecure)
+		fmt.Fprintf(os.Stdout, "Trusted proxies: %d\n", report.TrustedProxyCount)
+		for _, finding := range report.Findings {
+			fmt.Fprintf(os.Stdout, "%s [%s] %s\n  %s\n", strings.ToUpper(string(finding.Severity)), finding.Code, finding.Summary, finding.Remediation)
+		}
+		if len(report.Findings) == 0 {
+			fmt.Fprintln(os.Stdout, "No deployment findings.")
+		}
+	}
+	if report.HasErrors() {
+		return errors.New("doctor found blocking deployment issues")
 	}
 	return nil
 }

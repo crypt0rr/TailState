@@ -63,7 +63,7 @@ docker compose logs tailstate
 
 The logs contain a one-time setup token. Open [http://127.0.0.1:8080/setup](http://127.0.0.1:8080/setup), enter that token, and create the administrator password. Setup tokens expire after 30 minutes; restart the service to issue a fresh token if needed.
 
-The setup interface then asks for:
+After claiming the installation, the authenticated Settings page asks for:
 
 1. Tailnet (`-` uses the OAuth credential's tailnet).
 2. OAuth client ID and secret with `all:read`.
@@ -185,6 +185,24 @@ startup because this binary serves plain HTTP and must receive the proxy's
 authenticated HTTPS indication.
 
 Do not expose the setup interface directly to the internet.
+
+### Deployment diagnostics
+
+When a deployment cannot log in or reports an unexpected origin, run the
+doctor command in the same container or environment as TailState:
+
+```console
+docker compose exec tailstate /tailstate doctor
+docker compose exec tailstate /tailstate doctor -json
+```
+
+The report checks the effective listener, secure-cookie and trusted-proxy
+pairing, setup/baseline state, and whether notifications are paused. The
+authenticated Settings page shows the same checks plus the sanitized origin
+seen for the current request. Login origin failures remain blocked, but now
+include safe guidance to verify the public URL, preserved `Host`, and trusted
+`X-Forwarded-Proto` header. Raw headers, credentials, and destination URLs are
+never included in reports.
 
 ### Password reset
 
@@ -403,6 +421,7 @@ smoke test used by CI:
 
 ```console
 bash scripts/compose-smoke.sh tailstate:dev
+bash scripts/proxy-smoke.sh tailstate:dev
 ```
 
 Contributor workflow, security boundaries, and the complete validation matrix

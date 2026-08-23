@@ -40,6 +40,7 @@ For container or Compose changes, also run:
 docker build --build-arg VERSION=dev -t tailstate:dev .
 bash scripts/container-smoke.sh tailstate:dev
 bash scripts/compose-smoke.sh tailstate:dev
+bash scripts/proxy-smoke.sh tailstate:dev
 bash scripts/container-backup-restore-smoke.sh tailstate:dev
 ```
 

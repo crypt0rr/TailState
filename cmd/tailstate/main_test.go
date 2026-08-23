@@ -91,6 +91,14 @@ func TestRunCommandDispatchAndHealthcheck(t *testing.T) {
 	if err := healthcheck([]string{"-bad-flag"}); err == nil {
 		t.Fatal("invalid healthcheck flag was accepted")
 	}
+	dataDir := t.TempDir()
+	configureCommandEnvironment(t, dataDir)
+	if err := doctor([]string{"-json"}); err != nil {
+		t.Fatalf("doctor returned error: %v", err)
+	}
+	if err := doctor([]string{"-bad-flag"}); err == nil {
+		t.Fatal("invalid doctor flag was accepted")
+	}
 }
 
 func TestMainAndServeRejectInvalidConfiguration(t *testing.T) {

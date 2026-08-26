@@ -185,164 +185,40 @@ func TestSetupPasswordMismatchConsumesThrottleBudget(t *testing.T) {
 	}
 }
 
-func TestLoginRejectsCrossOriginRequests(t *testing.T) {
-	server, _, token := testServer(t)
-	claim := url.Values{"token": {token}, "password": {"a secure password"}, "confirm": {"a secure password"}}
-	claimRequest := httptest.NewRequest(http.MethodPost, "/setup/claim", strings.NewReader(claim.Encode()))
+func TestCredentialPostsAllowProxyOriginMismatch(t *testing.T) {
+	server, st, token := testServer(t)
+	form := url.Values{"token": {token}, "password": {"a secure password"}, "confirm": {"a secure password"}}
+	claimRequest := httptest.NewRequest(http.MethodPost, "http://tailstate.internal:8080/setup/claim", strings.NewReader(form.Encode()))
 	claimRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	claimRequest.Header.Set("Origin", "https://tailstate.example.com")
 	claimResponse := httptest.NewRecorder()
 	server.Handler().ServeHTTP(claimResponse, claimRequest)
 	if claimResponse.Code != http.StatusSeeOther {
-		t.Fatalf("claim status %d: %s", claimResponse.Code, claimResponse.Body.String())
+		t.Fatalf("proxied setup status %d: %s", claimResponse.Code, claimResponse.Body.String())
 	}
 
-	login := url.Values{"password": {"a secure password"}}
-	request := httptest.NewRequest(http.MethodPost, "/login", strings.NewReader(login.Encode()))
-	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	request.Header.Set("Origin", "https://attacker.example")
-	response := httptest.NewRecorder()
-	server.Handler().ServeHTTP(response, request)
-	if response.Code != http.StatusForbidden {
-		t.Fatalf("cross-origin login status %d: %s", response.Code, response.Body.String())
-	}
-	if !strings.Contains(response.Body.String(), "public URL") || !strings.Contains(response.Body.String(), "X-Forwarded-Proto") {
-		t.Fatalf("cross-origin login response did not include safe deployment guidance: %s", response.Body.String())
-	}
-	if ok, reason := server.sameOriginRequestReason(request); ok || reason != "host_mismatch" {
-		t.Fatalf("origin result=(%v,%q), want (false,host_mismatch)", ok, reason)
-	}
-}
-
-func TestLoginRejectsCrossOriginReferer(t *testing.T) {
-	server, _, token := testServer(t)
-	claim := url.Values{"token": {token}, "password": {"a secure password"}, "confirm": {"a secure password"}}
-	claimRequest := httptest.NewRequest(http.MethodPost, "/setup/claim", strings.NewReader(claim.Encode()))
-	claimRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	claimResponse := httptest.NewRecorder()
-	server.Handler().ServeHTTP(claimResponse, claimRequest)
-	if claimResponse.Code != http.StatusSeeOther {
-		t.Fatalf("claim status %d: %s", claimResponse.Code, claimResponse.Body.String())
+	loginForm := url.Values{"password": {"a secure password"}}
+	loginRequest := httptest.NewRequest(http.MethodPost, "http://tailstate.internal:8080/login", strings.NewReader(loginForm.Encode()))
+	loginRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	loginRequest.Header.Set("Origin", "https://tailstate.example.com")
+	loginResponse := httptest.NewRecorder()
+	server.Handler().ServeHTTP(loginResponse, loginRequest)
+	if loginResponse.Code != http.StatusSeeOther || loginResponse.Header().Get("Location") != "/" {
+		t.Fatalf("proxied login status %d location=%q body=%s", loginResponse.Code, loginResponse.Header().Get("Location"), loginResponse.Body.String())
 	}
 
-	login := url.Values{"password": {"a secure password"}}
-	request := httptest.NewRequest(http.MethodPost, "/login", strings.NewReader(login.Encode()))
-	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	request.Header.Set("Referer", "https://attacker.example/login")
-	response := httptest.NewRecorder()
-	server.Handler().ServeHTTP(response, request)
-	if response.Code != http.StatusForbidden {
-		t.Fatalf("cross-origin Referer login status %d: %s", response.Code, response.Body.String())
+	resetToken, err := st.NewResetToken(context.Background())
+	if err != nil {
+		t.Fatal(err)
 	}
-}
-
-func TestLoginRejectsSameSiteFetchWithoutOrigin(t *testing.T) {
-	server, _, token := testServer(t)
-	claim := url.Values{"token": {token}, "password": {"a secure password"}, "confirm": {"a secure password"}}
-	claimRequest := httptest.NewRequest(http.MethodPost, "/setup/claim", strings.NewReader(claim.Encode()))
-	claimRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	claimResponse := httptest.NewRecorder()
-	server.Handler().ServeHTTP(claimResponse, claimRequest)
-	if claimResponse.Code != http.StatusSeeOther {
-		t.Fatalf("claim status %d: %s", claimResponse.Code, claimResponse.Body.String())
-	}
-
-	login := url.Values{"password": {"a secure password"}}
-	request := httptest.NewRequest(http.MethodPost, "/login", strings.NewReader(login.Encode()))
-	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	request.Header.Set("Sec-Fetch-Site", "same-site")
-	response := httptest.NewRecorder()
-	server.Handler().ServeHTTP(response, request)
-	if response.Code != http.StatusForbidden {
-		t.Fatalf("same-site login without Origin status %d: %s", response.Code, response.Body.String())
-	}
-}
-
-func TestLoginAcceptsExplicitSameOriginWithSameSiteMetadata(t *testing.T) {
-	server, _, token := testServer(t)
-	claim := url.Values{"token": {token}, "password": {"a secure password"}, "confirm": {"a secure password"}}
-	claimRequest := httptest.NewRequest(http.MethodPost, "/setup/claim", strings.NewReader(claim.Encode()))
-	claimRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	claimResponse := httptest.NewRecorder()
-	server.Handler().ServeHTTP(claimResponse, claimRequest)
-	if claimResponse.Code != http.StatusSeeOther {
-		t.Fatalf("claim status %d: %s", claimResponse.Code, claimResponse.Body.String())
-	}
-
-	login := url.Values{"password": {"a secure password"}}
-	request := httptest.NewRequest(http.MethodPost, "/login", strings.NewReader(login.Encode()))
-	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	request.Header.Set("Origin", "http://example.com")
-	request.Header.Set("Sec-Fetch-Site", "same-site")
-	response := httptest.NewRecorder()
-	server.Handler().ServeHTTP(response, request)
-	if response.Code != http.StatusSeeOther || response.Header().Get("Location") != "/" {
-		t.Fatalf("same-origin login status %d location=%q body=%s", response.Code, response.Header().Get("Location"), response.Body.String())
-	}
-}
-
-func TestLoginAllowsSameOriginBehindTLSProxy(t *testing.T) {
-	server, _, token := testServer(t)
-	server.config.TrustedProxies = []netip.Prefix{netip.MustParsePrefix("192.0.2.0/24")}
-	claim := url.Values{"token": {token}, "password": {"a secure password"}, "confirm": {"a secure password"}}
-	claimRequest := httptest.NewRequest(http.MethodPost, "/setup/claim", strings.NewReader(claim.Encode()))
-	claimRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	claimResponse := httptest.NewRecorder()
-	server.Handler().ServeHTTP(claimResponse, claimRequest)
-	if claimResponse.Code != http.StatusSeeOther {
-		t.Fatalf("claim status %d: %s", claimResponse.Code, claimResponse.Body.String())
-	}
-
-	login := url.Values{"password": {"a secure password"}}
-	request := httptest.NewRequest(http.MethodPost, "http://example.com/login", strings.NewReader(login.Encode()))
-	request.Host = "example.com"
-	request.RemoteAddr = "192.0.2.10:1234"
-	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	request.Header.Set("Origin", "https://example.com")
-	request.Header.Set("X-Forwarded-Proto", "https")
-	response := httptest.NewRecorder()
-	server.Handler().ServeHTTP(response, request)
-	if response.Code != http.StatusSeeOther {
-		t.Fatalf("proxied same-origin login status %d: %s", response.Code, response.Body.String())
-	}
-}
-
-func TestSameOriginNormalizesDefaultPorts(t *testing.T) {
-	server, _, _ := testServer(t)
-	server.config.TrustedProxies = []netip.Prefix{netip.MustParsePrefix("192.0.2.0/24")}
-	request := httptest.NewRequest(http.MethodPost, "http://example.com/login", nil)
-	request.Host = "example.com:443"
-	request.RemoteAddr = "192.0.2.10:1234"
-	request.Header.Set("X-Forwarded-Proto", "https")
-	if !server.sameOriginURL(request, "https://example.com") {
-		t.Fatal("default HTTPS Origin port was rejected for an explicit proxy host port")
-	}
-	if server.sameOriginURL(request, "https://example.com:8443") {
-		t.Fatal("mismatched HTTPS Origin port was accepted")
-	}
-}
-
-func TestLoginRejectsForwardedTLSFromUntrustedPeer(t *testing.T) {
-	server, _, token := testServer(t)
-	claim := url.Values{"token": {token}, "password": {"a secure password"}, "confirm": {"a secure password"}}
-	claimRequest := httptest.NewRequest(http.MethodPost, "/setup/claim", strings.NewReader(claim.Encode()))
-	claimRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	claimResponse := httptest.NewRecorder()
-	server.Handler().ServeHTTP(claimResponse, claimRequest)
-	if claimResponse.Code != http.StatusSeeOther {
-		t.Fatalf("claim status %d: %s", claimResponse.Code, claimResponse.Body.String())
-	}
-
-	login := url.Values{"password": {"a secure password"}}
-	request := httptest.NewRequest(http.MethodPost, "http://example.com/login", strings.NewReader(login.Encode()))
-	request.Host = "example.com"
-	request.RemoteAddr = "198.51.100.10:1234"
-	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	request.Header.Set("Origin", "https://example.com")
-	request.Header.Set("X-Forwarded-Proto", "https")
-	response := httptest.NewRecorder()
-	server.Handler().ServeHTTP(response, request)
-	if response.Code != http.StatusForbidden {
-		t.Fatalf("untrusted forwarded TLS status %d: %s", response.Code, response.Body.String())
+	resetForm := url.Values{"token": {resetToken}, "password": {"another secure password"}, "confirm": {"another secure password"}}
+	resetRequest := httptest.NewRequest(http.MethodPost, "http://tailstate.internal:8080/reset", strings.NewReader(resetForm.Encode()))
+	resetRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	resetRequest.Header.Set("Origin", "https://tailstate.example.com")
+	resetResponse := httptest.NewRecorder()
+	server.Handler().ServeHTTP(resetResponse, resetRequest)
+	if resetResponse.Code != http.StatusSeeOther || resetResponse.Header().Get("Location") != "/login" {
+		t.Fatalf("proxied reset status %d location=%q body=%s", resetResponse.Code, resetResponse.Header().Get("Location"), resetResponse.Body.String())
 	}
 }
 

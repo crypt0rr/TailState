@@ -206,11 +206,6 @@ func (s *Server) setup(w http.ResponseWriter, r *http.Request) {
 	s.render(w, "setup", pageData{})
 }
 func (s *Server) claim(w http.ResponseWriter, r *http.Request) {
-	if ok, reason := s.sameOriginRequestReason(r); !ok {
-		slog.Debug("cross-origin setup rejected", "reason", reason)
-		http.Error(w, "setup request did not match this site's origin; check the public URL and reverse-proxy Host/X-Forwarded-Proto settings", http.StatusForbidden)
-		return
-	}
 	exists, ok := s.adminExists(w, r)
 	if !ok {
 		return
@@ -284,11 +279,6 @@ func (s *Server) adminExists(w http.ResponseWriter, r *http.Request) (bool, bool
 }
 
 func (s *Server) loginPost(w http.ResponseWriter, r *http.Request) {
-	if ok, reason := s.sameOriginRequestReason(r); !ok {
-		slog.Debug("cross-origin login rejected", "reason", reason)
-		http.Error(w, "login request did not match this site's origin; check the public URL and reverse-proxy Host/X-Forwarded-Proto settings", http.StatusForbidden)
-		return
-	}
 	ip := s.clientIP(r)
 	if s.rateLimited(ip) {
 		s.render(w, "login", pageData{Error: "Too many login attempts. Try again later."})
@@ -314,70 +304,6 @@ func (s *Server) loginPost(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 
-func (s *Server) sameOriginRequestReason(r *http.Request) (bool, string) {
-	origin := strings.TrimSpace(r.Header.Get("Origin"))
-	if origin != "" {
-		// An explicit Origin is the strongest browser signal. Do not let a
-		// proxy or user agent that reports a broad Fetch Metadata value turn a
-		// valid same-origin form into a false CSRF rejection.
-		return s.sameOriginURLReason(r, origin)
-	}
-	fetchSite := strings.ToLower(strings.TrimSpace(r.Header.Get("Sec-Fetch-Site")))
-	if fetchSite == "cross-site" || fetchSite == "same-site" {
-		// same-site is still potentially cross-origin. A sibling subdomain can
-		// submit a form without an Origin header, so it must not be treated as
-		// safe.
-		return false, "cross_site_fetch"
-	}
-	// Some browsers omit Origin on form submissions but still send a Referer.
-	// Treat a cross-origin Referer as CSRF evidence instead of relying solely
-	// on the Fetch Metadata header.
-	if referer := strings.TrimSpace(r.Header.Get("Referer")); referer != "" {
-		return s.sameOriginURLReason(r, referer)
-	}
-	return true, "no_origin_metadata"
-}
-
-func (s *Server) sameOriginURL(r *http.Request, raw string) bool {
-	ok, _ := s.sameOriginURLReason(r, raw)
-	return ok
-}
-
-func (s *Server) sameOriginURLReason(r *http.Request, raw string) (bool, string) {
-	parsed, err := url.Parse(raw)
-	if err != nil || parsed.Host == "" || parsed.User != nil || parsed.Fragment != "" {
-		return false, "invalid_origin"
-	}
-	host := strings.TrimSpace(r.Host)
-	if host == "" {
-		host = strings.TrimSpace(r.URL.Host)
-	}
-	requestURL, err := url.Parse("//" + host)
-	if err != nil || requestURL.Host == "" || !strings.EqualFold(parsed.Hostname(), requestURL.Hostname()) {
-		return false, "host_mismatch"
-	}
-	scheme := "http"
-	if r.TLS != nil || (s.isTrustedProxy(remoteIP(r)) && strings.EqualFold(strings.TrimSpace(strings.Split(r.Header.Get("X-Forwarded-Proto"), ",")[0]), "https")) {
-		scheme = "https"
-	}
-	if !strings.EqualFold(parsed.Scheme, scheme) {
-		return false, "scheme_mismatch"
-	}
-	if effectiveOriginPort(parsed.Port(), scheme) != effectiveOriginPort(requestURL.Port(), scheme) {
-		return false, "port_mismatch"
-	}
-	return true, "same_origin"
-}
-
-func effectiveOriginPort(port, scheme string) string {
-	if port != "" {
-		return port
-	}
-	if scheme == "https" {
-		return "443"
-	}
-	return "80"
-}
 func (s *Server) logout(w http.ResponseWriter, r *http.Request) {
 	if !s.authenticated(r, true) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
@@ -391,11 +317,6 @@ func (s *Server) logout(w http.ResponseWriter, r *http.Request) {
 }
 func (s *Server) reset(w http.ResponseWriter, r *http.Request) { s.render(w, "reset", pageData{}) }
 func (s *Server) resetPost(w http.ResponseWriter, r *http.Request) {
-	if ok, reason := s.sameOriginRequestReason(r); !ok {
-		slog.Debug("cross-origin password reset rejected", "reason", reason)
-		http.Error(w, "reset request did not match this site's origin; check the public URL and reverse-proxy Host/X-Forwarded-Proto settings", http.StatusForbidden)
-		return
-	}
 	ip := "reset:" + s.clientIP(r)
 	if s.rateLimited(ip) {
 		s.render(w, "reset", pageData{Error: "Too many reset attempts. Try again later."})

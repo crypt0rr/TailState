@@ -171,10 +171,16 @@ docker compose -f compose.yaml -f compose.remote.yaml up -d
 For a host-installed Caddy or nginx, point the proxy at `http://127.0.0.1:8080`
 and expose only the proxy's HTTPS listener. `TAILSTATE_BIND_ADDRESS` controls only the host-side Compose
 port publish; it does not change the in-container `TAILSTATE_LISTEN_ADDR`.
-The proxy must preserve the public `Host` and set
-`X-Forwarded-Proto: https` so same-origin form protection and secure cookies
-work as intended. Do not set `TAILSTATE_BIND_ADDRESS=0.0.0.0` unless a firewall
-and TLS-terminating proxy already restrict access to the host port.
+If the proxy terminates TLS, set `TAILSTATE_COOKIE_SECURE=true` and configure
+the proxy's actual source address in `TAILSTATE_TRUSTED_PROXIES`. Preserving the
+public `Host` and setting `X-Forwarded-Proto: https` keeps deployment
+diagnostics accurate. Do not set `TAILSTATE_BIND_ADDRESS=0.0.0.0` unless a
+firewall and TLS-terminating proxy already restrict access to the host port.
+
+Setup, login, and password-reset forms do not reject requests based on
+`Origin`, `Referer`, or Fetch Metadata headers because reverse proxies can
+rewrite those values. Setup and reset still require one-time tokens, login is
+rate limited, and authenticated state-changing forms require CSRF tokens.
 
 If the proxy forwards the original client address or terminates TLS, configure
 only its actual source address as trusted, for example
@@ -188,8 +194,8 @@ Do not expose the setup interface directly to the internet.
 
 ### Deployment diagnostics
 
-When a deployment cannot log in or reports an unexpected origin, run the
-doctor command in the same container or environment as TailState:
+When a deployment reports a proxy or readiness issue, run the doctor command in
+the same container or environment as TailState:
 
 ```console
 docker compose exec tailstate /tailstate doctor
@@ -199,10 +205,8 @@ docker compose exec tailstate /tailstate doctor -json
 The report checks the effective listener, secure-cookie and trusted-proxy
 pairing, setup/baseline state, and whether notifications are paused. The
 authenticated Settings page shows the same checks plus the sanitized origin
-seen for the current request. Login origin failures remain blocked, but now
-include safe guidance to verify the public URL, preserved `Host`, and trusted
-`X-Forwarded-Proto` header. Raw headers, credentials, and destination URLs are
-never included in reports.
+seen for the current request. Raw headers, credentials, and destination URLs
+are never included in reports.
 
 ### Password reset
 

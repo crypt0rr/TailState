@@ -253,6 +253,7 @@ func TestCredentialChallengeBoundsAndUnsupportedActions(t *testing.T) {
 
 	now := time.Now().UTC().Add(time.Hour)
 	server.challengeMu.Lock()
+	server.challenges["expired"] = credentialChallengeRecord{action: credentialActionLogin, expiresAt: time.Now().UTC().Add(-time.Second)}
 	for i := 0; i < maxCredentialChallenges; i++ {
 		server.challenges["filled-"+url.QueryEscape(string(rune(i)))] = credentialChallengeRecord{action: credentialActionLogin, expiresAt: now}
 	}
@@ -266,4 +267,65 @@ func TestCredentialChallengeBoundsAndUnsupportedActions(t *testing.T) {
 	if count != maxCredentialChallenges {
 		t.Fatalf("challenge map size=%d, want %d", count, maxCredentialChallenges)
 	}
+}
+
+func TestCredentialChallengeRejectsMalformedValues(t *testing.T) {
+	server, _, _ := testServer(t)
+	future := time.Now().UTC().Add(10 * time.Minute).Unix()
+	nonce, err := secret.Token(32)
+	if err != nil {
+		t.Fatal(err)
+	}
+	valid := signedCredentialChallenge(server, credentialActionLogin, nonce, future)
+	cases := []struct {
+		name      string
+		challenge string
+		cookie    string
+		record    *credentialChallengeRecord
+	}{
+		{name: "oversized", challenge: strings.Repeat("x", maxCredentialChallengeBytes+1), cookie: nonce},
+		{name: "missing separator", challenge: "not-a-challenge", cookie: nonce},
+		{name: "invalid base64", challenge: "!.c2hvcnQ", cookie: nonce},
+		{name: "short signature", challenge: base64.RawURLEncoding.EncodeToString([]byte(strings.Join([]string{"login", nonce, strconv.FormatInt(future, 10)}, "."))) + ".c2hvcnQ", cookie: nonce},
+		{name: "malformed payload", challenge: signedCredentialPayload(server, "login."+nonce), cookie: nonce},
+		{name: "invalid expiry", challenge: signedCredentialPayload(server, "login."+nonce+".not-a-number"), cookie: nonce},
+		{name: "missing record", challenge: valid, cookie: nonce},
+		{name: "record action mismatch", challenge: valid, cookie: nonce, record: &credentialChallengeRecord{action: credentialActionSetup, expiresAt: time.Unix(future, 0).UTC()}},
+		{name: "record expiry mismatch", challenge: valid, cookie: nonce, record: &credentialChallengeRecord{action: credentialActionLogin, expiresAt: time.Unix(future+1, 0).UTC()}},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			if test.record != nil {
+				server.challengeMu.Lock()
+				server.challenges[nonce] = *test.record
+				server.challengeMu.Unlock()
+			}
+			request := credentialChallengeRequest("/login", test.challenge, credentialActionLogin.cookieName(), test.cookie)
+			if server.validateCredentialChallenge(request, credentialActionLogin) {
+				t.Fatal("malformed challenge was accepted")
+			}
+		})
+	}
+
+	server.challengeKey = nil
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/reset", nil))
+	if response.Code != http.StatusServiceUnavailable || !strings.Contains(response.Body.String(), "temporarily unavailable") {
+		t.Fatalf("unavailable challenge status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func signedCredentialPayload(server *Server, payload string) string {
+	return base64.RawURLEncoding.EncodeToString([]byte(payload)) + "." + base64.RawURLEncoding.EncodeToString(server.signCredentialChallenge([]byte(payload)))
+}
+
+func signedCredentialChallenge(server *Server, action credentialAction, nonce string, expiresUnix int64) string {
+	return signedCredentialPayload(server, strings.Join([]string{string(action), nonce, strconv.FormatInt(expiresUnix, 10)}, "."))
+}
+
+func credentialChallengeRequest(path, challenge, cookieName, cookieValue string) *http.Request {
+	request := httptest.NewRequest(http.MethodPost, path, strings.NewReader(url.Values{"_challenge": {challenge}}.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.AddCookie(&http.Cookie{Name: cookieName, Value: cookieValue})
+	return request
 }

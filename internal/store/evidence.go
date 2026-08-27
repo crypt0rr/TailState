@@ -111,6 +111,12 @@ type EvidenceEvent struct {
 	TotalFields     int             `json:"total_fields,omitempty"`
 	Before          json.RawMessage `json:"before,omitempty"`
 	After           json.RawMessage `json:"after,omitempty"`
+	BeforeHash      string          `json:"before_sha256,omitempty"`
+	AfterHash       string          `json:"after_sha256,omitempty"`
+	BeforeBytes     int64           `json:"before_bytes,omitempty"`
+	AfterBytes      int64           `json:"after_bytes,omitempty"`
+	BeforeTruncated bool            `json:"before_truncated,omitempty"`
+	AfterTruncated  bool            `json:"after_truncated,omitempty"`
 }
 
 // EvidenceField is a machine-readable field-level diff. Missing old or new
@@ -153,9 +159,12 @@ type evidenceContent struct {
 // process while being downloaded.
 func (s *Store) ExportEvidencePack(ctx context.Context, filter HistoryFilter) ([]byte, error) {
 	filter.Limit = maxEvidenceBatches
-	page, err := s.ListHistory(ctx, filter)
+	page, err := s.listHistory(ctx, filter, maxEvidenceBytes)
 	if err != nil {
 		return nil, err
+	}
+	if page.Truncated {
+		return nil, ErrEvidencePackTooLarge
 	}
 	pack := EvidencePack{
 		Format:      evidencePackFormat,
@@ -383,6 +392,33 @@ func verifyLedgerEventBinding(event EvidenceEvent, ledgerEvent evidenceLedgerEve
 	}
 	if !equalEvidenceJSON(evidenceJSON(prettyJSON([]byte(ledgerEvent.Before))), event.Before) || !equalEvidenceJSON(evidenceJSON(prettyJSON([]byte(ledgerEvent.After))), event.After) {
 		return fmt.Errorf("ledger payload event snapshot mismatch for event %d in batch %d", event.ID, batchID)
+	}
+	if err := verifyEvidenceSnapshotMetadata(event.BeforeHash, event.BeforeBytes, event.BeforeTruncated, ledgerEvent.Before, "before", event.ID, batchID); err != nil {
+		return err
+	}
+	if err := verifyEvidenceSnapshotMetadata(event.AfterHash, event.AfterBytes, event.AfterTruncated, ledgerEvent.After, "after", event.ID, batchID); err != nil {
+		return err
+	}
+	return nil
+}
+
+func verifyEvidenceSnapshotMetadata(hash string, bytes int64, truncated bool, raw, label string, eventID, batchID int64) error {
+	// Packs created before schema v12 do not carry size metadata. Continue to
+	// verify their signed raw snapshot while accepting those legacy omissions.
+	if hash == "" && bytes == 0 && !truncated {
+		return nil
+	}
+	if raw == "" {
+		return fmt.Errorf("evidence %s snapshot metadata is present for empty event %d in batch %d", label, eventID, batchID)
+	}
+	if marker, ok := parseTruncationMarker([]byte(raw)); ok {
+		if !truncated || hash != marker.TailState.SHA256 || bytes != marker.TailState.Bytes {
+			return fmt.Errorf("evidence %s snapshot truncation metadata mismatch for event %d in batch %d", label, eventID, batchID)
+		}
+		return nil
+	}
+	if truncated || hash != valueHash([]byte(raw)) || bytes != int64(len(raw)) {
+		return fmt.Errorf("evidence %s snapshot metadata mismatch for event %d in batch %d", label, eventID, batchID)
 	}
 	return nil
 }
@@ -675,6 +711,12 @@ func evidenceBatch(batch HistoryBatch) EvidenceBatch {
 			TotalFields:     event.TotalFields,
 			Before:          evidenceJSON(event.BeforeJSON),
 			After:           evidenceJSON(event.AfterJSON),
+			BeforeHash:      event.BeforeHash,
+			AfterHash:       event.AfterHash,
+			BeforeBytes:     event.BeforeBytes,
+			AfterBytes:      event.AfterBytes,
+			BeforeTruncated: event.BeforeTruncated,
+			AfterTruncated:  event.AfterTruncated,
 			Fields:          make([]EvidenceField, 0, len(event.Fields)),
 		}
 		for _, field := range event.Fields {

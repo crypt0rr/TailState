@@ -53,16 +53,35 @@ type Runtime struct {
 	BaselineReason      string
 	Destinations        int
 	EnabledDestinations int
+	Storage             StorageRuntime
+}
+
+// StorageRuntime is a safe, low-cardinality view of the persistence
+// guardrails. It contains sizes and counters only; provider payloads and
+// destination credentials are intentionally absent.
+type StorageRuntime struct {
+	SnapshotLimitBytes      int64
+	EventValueLimitBytes    int64
+	HistoryPageLimitBytes   int64
+	RejectLimitBytes        int64
+	DatabaseLimitBytes      int64
+	DatabaseBytes           int64
+	StoragePressure         float64
+	SnapshotTruncations     uint64
+	EventValueTruncations   uint64
+	HistoryPageTruncations  uint64
+	OversizedWritesRejected uint64
 }
 
 // Report is the complete safe deployment report.
 type Report struct {
-	State             string      `json:"state"`
-	Listener          string      `json:"listener"`
-	CookieSecure      bool        `json:"cookie_secure"`
-	TrustedProxyCount int         `json:"trusted_proxy_count"`
-	Request           RequestInfo `json:"request"`
-	Findings          []Finding   `json:"findings"`
+	State             string         `json:"state"`
+	Listener          string         `json:"listener"`
+	CookieSecure      bool           `json:"cookie_secure"`
+	TrustedProxyCount int            `json:"trusted_proxy_count"`
+	Request           RequestInfo    `json:"request"`
+	Findings          []Finding      `json:"findings"`
+	Storage           StorageRuntime `json:"storage"`
 }
 
 // Build evaluates static configuration, optional runtime state, and (when
@@ -75,6 +94,7 @@ func Build(config boot.Config, runtime Runtime, request *http.Request) Report {
 		CookieSecure:      config.CookieSecure,
 		TrustedProxyCount: len(config.TrustedProxies),
 		Findings:          make([]Finding, 0, 8),
+		Storage:           runtime.Storage,
 	}
 
 	add := func(f Finding) {
@@ -144,6 +164,17 @@ func Build(config boot.Config, runtime Runtime, request *http.Request) Report {
 				Remediation: "Enable at least one destination in Settings; monitoring and history continue while delivery is paused.",
 			})
 		}
+	}
+	if runtime.Storage.DatabaseLimitBytes > 0 && runtime.Storage.StoragePressure >= 0.9 {
+		severity := SeverityWarning
+		summary := "TailState storage is approaching its configured database budget."
+		remediation := "Review retention and history exports, then increase the database budget or move the data directory before writes are rejected."
+		if runtime.Storage.StoragePressure >= 1 {
+			severity = SeverityError
+			summary = "TailState storage is at or above its configured database budget."
+			remediation = "Increase the database budget or reclaim retained history before collecting more data."
+		}
+		add(Finding{Code: "storage_pressure", Severity: severity, Summary: summary, Remediation: remediation})
 	}
 
 	if request != nil {

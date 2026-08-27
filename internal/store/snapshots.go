@@ -14,8 +14,17 @@ import (
 
 type recordedChange struct {
 	Change model.Change
-	Before []byte
-	After  []byte
+	Before storedValue
+	After  storedValue
+}
+
+type truncationLog struct {
+	collector string
+	resource  string
+	valueHash string
+	observed  int64
+	limit     int64
+	reason    string
 }
 
 type persistedFields struct {
@@ -52,9 +61,26 @@ func (s *Store) ApplyBatchWithBatch(ctx context.Context, generation int64, resul
 	observedAt := now.Format(time.RFC3339Nano)
 	var changes []model.Change
 	var recorded []recordedChange
-	record := func(change model.Change, before, after []byte) {
+	var truncations []truncationLog
+	var snapshotTruncations, eventTruncations, oversizedWrites uint64
+	record := func(change model.Change, before, after storedValue) {
 		changes = append(changes, change)
-		recorded = append(recorded, recordedChange{Change: change, Before: append([]byte(nil), before...), After: append([]byte(nil), after...)})
+		recorded = append(recorded, recordedChange{Change: change, Before: before, After: after})
+	}
+	limits := s.StorageLimits()
+	noteTruncation := func(collector, resource string, value storedValue, limit int64, snapshot bool) {
+		if !value.truncated {
+			return
+		}
+		if snapshot {
+			snapshotTruncations++
+		} else {
+			eventTruncations++
+		}
+		if value.rejected {
+			oversizedWrites++
+		}
+		truncations = append(truncations, truncationLog{collector: collector, resource: resource, valueHash: value.hash, observed: value.bytes, limit: limit, reason: value.reason})
 	}
 	for _, result := range results {
 		if result.Error != nil {
@@ -98,35 +124,42 @@ func (s *Store) ApplyBatchWithBatch(ctx context.Context, generation int64, resul
 			}
 			var oldRaw []byte
 			var oldHash, oldType, oldName string
-			var missing int
-			err = tx.QueryRowContext(ctx, "SELECT canonical_json,content_hash,resource_type,name,missing_count FROM snapshots WHERE generation=? AND collector=? AND resource_id=?", generation, result.Collector, resource.ID).Scan(&oldRaw, &oldHash, &oldType, &oldName, &missing)
+			var missing, oldBytes, oldTruncated int64
+			err = tx.QueryRowContext(ctx, "SELECT canonical_json,content_hash,resource_type,name,missing_count,content_bytes,content_truncated FROM snapshots WHERE generation=? AND collector=? AND resource_id=?", generation, result.Collector, resource.ID).Scan(&oldRaw, &oldHash, &oldType, &oldName, &missing, &oldBytes, &oldTruncated)
+			oldValue := existingStoredValue(oldRaw, oldHash, oldBytes, oldTruncated == 1)
 			if err == nil && oldHash != hash {
-				var oldValue any
-				if json.Unmarshal(oldRaw, &oldValue) == nil {
-					normalizedOldRaw, normalizedOldHash, normalizeErr := model.CanonicalFor(result.Collector, oldValue)
+				var previous any
+				if !oldValue.truncated && json.Unmarshal(oldRaw, &previous) == nil {
+					normalizedOldRaw, normalizedOldHash, normalizeErr := model.CanonicalFor(result.Collector, previous)
 					if normalizeErr != nil {
 						return ChangeBatchResult{}, normalizeErr
 					}
 					oldRaw = normalizedOldRaw
 					oldHash = normalizedOldHash
+					oldValue = existingStoredValue(oldRaw, oldHash, int64(len(oldRaw)), false)
 				}
 			}
+			storedSnapshot := boundedValue(raw, hash, limits.SnapshotBytes, limits.RejectBytes)
+			noteTruncation(result.Collector, resource.ID, storedSnapshot, limits.SnapshotBytes, true)
 			switch {
 			case errors.Is(err, sql.ErrNoRows):
 				if baseline == 1 {
-					record(model.Change{Kind: "created", Collector: result.Collector, ResourceID: resource.ID, Type: resource.Type, Name: resource.Name}, nil, raw)
+					record(model.Change{Kind: "created", Collector: result.Collector, ResourceID: resource.ID, Type: resource.Type, Name: resource.Name}, storedValue{}, existingStoredValue(raw, hash, int64(len(raw)), false))
 				}
-				_, err = tx.ExecContext(ctx, `INSERT INTO snapshots(generation,collector,resource_id,resource_type,name,canonical_json,content_hash,missing_count,updated_at) VALUES(?,?,?,?,?,?,?,?,?)`, generation, result.Collector, resource.ID, resource.Type, resource.Name, raw, hash, 0, now.Format(time.RFC3339Nano))
+				_, err = tx.ExecContext(ctx, `INSERT INTO snapshots(generation,collector,resource_id,resource_type,name,canonical_json,content_hash,content_bytes,content_truncated,missing_count,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)`, generation, result.Collector, resource.ID, resource.Type, resource.Name, storedSnapshot.raw, hash, storedSnapshot.bytes, boolInt(storedSnapshot.truncated), 0, now.Format(time.RFC3339Nano))
 			case err != nil:
 				return ChangeBatchResult{}, err
 			case oldHash != hash:
 				if baseline == 1 {
-					diff := model.DiffDetailed(oldRaw, raw)
-					record(model.Change{Kind: "changed", Collector: result.Collector, ResourceID: resource.ID, Type: resource.Type, Name: resource.Name, Fields: diff.Fields, FieldsTruncated: diff.FieldsTruncated, TotalFields: diff.TotalFields}, oldRaw, raw)
+					diff := model.DiffResult{}
+					if !oldValue.truncated {
+						diff = model.DiffDetailed(oldRaw, raw)
+					}
+					record(model.Change{Kind: "changed", Collector: result.Collector, ResourceID: resource.ID, Type: resource.Type, Name: resource.Name, Fields: diff.Fields, FieldsTruncated: diff.FieldsTruncated, TotalFields: diff.TotalFields}, oldValue, existingStoredValue(raw, hash, int64(len(raw)), false))
 				}
-				_, err = tx.ExecContext(ctx, "UPDATE snapshots SET resource_type=?,name=?,canonical_json=?,content_hash=?,missing_count=0,updated_at=? WHERE generation=? AND collector=? AND resource_id=?", resource.Type, resource.Name, raw, hash, now.Format(time.RFC3339Nano), generation, result.Collector, resource.ID)
+				_, err = tx.ExecContext(ctx, "UPDATE snapshots SET resource_type=?,name=?,canonical_json=?,content_hash=?,content_bytes=?,content_truncated=?,missing_count=0,updated_at=? WHERE generation=? AND collector=? AND resource_id=?", resource.Type, resource.Name, storedSnapshot.raw, hash, storedSnapshot.bytes, boolInt(storedSnapshot.truncated), now.Format(time.RFC3339Nano), generation, result.Collector, resource.ID)
 			default:
-				_, err = tx.ExecContext(ctx, "UPDATE snapshots SET resource_type=?,name=?,canonical_json=?,content_hash=?,missing_count=0,updated_at=? WHERE generation=? AND collector=? AND resource_id=?", resource.Type, resource.Name, raw, hash, now.Format(time.RFC3339Nano), generation, result.Collector, resource.ID)
+				_, err = tx.ExecContext(ctx, "UPDATE snapshots SET resource_type=?,name=?,canonical_json=?,content_hash=?,content_bytes=?,content_truncated=?,missing_count=0,updated_at=? WHERE generation=? AND collector=? AND resource_id=?", resource.Type, resource.Name, storedSnapshot.raw, hash, storedSnapshot.bytes, boolInt(storedSnapshot.truncated), now.Format(time.RFC3339Nano), generation, result.Collector, resource.ID)
 			}
 			if err != nil {
 				return ChangeBatchResult{}, err
@@ -135,21 +168,26 @@ func (s *Store) ApplyBatchWithBatch(ctx context.Context, generation int64, resul
 		type absent struct {
 			id, typ, name string
 			raw           []byte
+			hash          string
+			bytes         int64
+			truncated     bool
 			missing       int
 		}
 		var missingRows []absent
 		massRemovalGuarded := result.Partial
 		if !result.Partial {
-			rows, queryErr := tx.QueryContext(ctx, "SELECT resource_id,resource_type,name,canonical_json,missing_count FROM snapshots WHERE generation=? AND collector=?", generation, result.Collector)
+			rows, queryErr := tx.QueryContext(ctx, "SELECT resource_id,resource_type,name,canonical_json,content_hash,content_bytes,content_truncated,missing_count FROM snapshots WHERE generation=? AND collector=?", generation, result.Collector)
 			if queryErr != nil {
 				return ChangeBatchResult{}, queryErr
 			}
 			for rows.Next() {
 				var a absent
-				if scanErr := rows.Scan(&a.id, &a.typ, &a.name, &a.raw, &a.missing); scanErr != nil {
+				var truncated int
+				if scanErr := rows.Scan(&a.id, &a.typ, &a.name, &a.raw, &a.hash, &a.bytes, &truncated, &a.missing); scanErr != nil {
 					rows.Close()
 					return ChangeBatchResult{}, scanErr
 				}
+				a.truncated = truncated == 1
 				if _, ok := seen[a.id]; !ok {
 					missingRows = append(missingRows, a)
 				}
@@ -192,7 +230,7 @@ func (s *Store) ApplyBatchWithBatch(ctx context.Context, generation int64, resul
 			for _, a := range missingRows {
 				if a.missing+1 >= 2 {
 					if baseline == 1 {
-						record(model.Change{Kind: "removed", Collector: result.Collector, ResourceID: a.id, Type: a.typ, Name: a.name}, a.raw, nil)
+						record(model.Change{Kind: "removed", Collector: result.Collector, ResourceID: a.id, Type: a.typ, Name: a.name}, existingStoredValue(a.raw, a.hash, a.bytes, a.truncated), storedValue{})
 					}
 					_, err = tx.ExecContext(ctx, "DELETE FROM snapshots WHERE generation=? AND collector=? AND resource_id=?", generation, result.Collector, a.id)
 				} else {
@@ -265,7 +303,11 @@ func (s *Store) ApplyBatchWithBatch(ctx context.Context, generation int64, resul
 			if marshalErr != nil {
 				return ChangeBatchResult{}, marshalErr
 			}
-			_, err = tx.ExecContext(ctx, "INSERT INTO events(batch_id,generation,observed_at,collector,event_type,resource_id,name,changes_json,before_json,after_json) VALUES(?,?,?,?,?,?,?,?,?,?)", batchID, generation, observedAt, entry.Change.Collector, entry.Change.Kind, entry.Change.ResourceID, entry.Change.Name, fields, nullableJSON(entry.Before), nullableJSON(entry.After))
+			before := boundedValue(entry.Before.raw, entry.Before.hash, limits.EventValueBytes, limits.RejectBytes)
+			after := boundedValue(entry.After.raw, entry.After.hash, limits.EventValueBytes, limits.RejectBytes)
+			noteTruncation(entry.Change.Collector, entry.Change.ResourceID, before, limits.EventValueBytes, false)
+			noteTruncation(entry.Change.Collector, entry.Change.ResourceID, after, limits.EventValueBytes, false)
+			_, err = tx.ExecContext(ctx, `INSERT INTO events(batch_id,generation,observed_at,collector,event_type,resource_id,name,changes_json,before_json,after_json,before_hash,after_hash,before_bytes,after_bytes,before_truncated,after_truncated) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, batchID, generation, observedAt, entry.Change.Collector, entry.Change.Kind, entry.Change.ResourceID, entry.Change.Name, fields, nullableJSON(before.raw), nullableJSON(after.raw), before.hash, after.hash, before.bytes, after.bytes, boolInt(before.truncated), boolInt(after.truncated))
 			if err != nil {
 				return ChangeBatchResult{}, err
 			}
@@ -295,6 +337,18 @@ func (s *Store) ApplyBatchWithBatch(ctx context.Context, generation int64, resul
 	}
 	if err := tx.Commit(); err != nil {
 		return ChangeBatchResult{}, err
+	}
+	if snapshotTruncations > 0 {
+		s.counters.snapshotTruncations.Add(snapshotTruncations)
+	}
+	if eventTruncations > 0 {
+		s.counters.eventTruncations.Add(eventTruncations)
+	}
+	if oversizedWrites > 0 {
+		s.counters.oversizedWriteRejects.Add(oversizedWrites)
+	}
+	for _, item := range truncations {
+		logStorageTruncation(item.collector, item.resource, item.valueHash, item.observed, item.limit, item.reason)
 	}
 	return result, nil
 }

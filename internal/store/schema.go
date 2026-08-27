@@ -3,7 +3,7 @@ package store
 const schema = `
 PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);
-INSERT INTO schema_version(version) SELECT 11 WHERE NOT EXISTS (SELECT 1 FROM schema_version);
+INSERT INTO schema_version(version) SELECT 12 WHERE NOT EXISTS (SELECT 1 FROM schema_version);
 
 CREATE TABLE IF NOT EXISTS meta (
   key TEXT PRIMARY KEY,
@@ -103,6 +103,8 @@ CREATE TABLE IF NOT EXISTS snapshots (
   name TEXT NOT NULL,
   canonical_json BLOB NOT NULL,
   content_hash TEXT NOT NULL,
+  content_bytes INTEGER NOT NULL DEFAULT 0,
+  content_truncated INTEGER NOT NULL DEFAULT 0,
   missing_count INTEGER NOT NULL DEFAULT 0,
   updated_at TEXT NOT NULL,
   PRIMARY KEY(generation, collector, resource_id)
@@ -148,7 +150,13 @@ CREATE TABLE IF NOT EXISTS events (
   name TEXT NOT NULL,
   changes_json BLOB NOT NULL,
   before_json BLOB,
-  after_json BLOB
+  after_json BLOB,
+  before_hash TEXT NOT NULL DEFAULT '',
+  after_hash TEXT NOT NULL DEFAULT '',
+  before_bytes INTEGER NOT NULL DEFAULT 0,
+  after_bytes INTEGER NOT NULL DEFAULT 0,
+  before_truncated INTEGER NOT NULL DEFAULT 0,
+  after_truncated INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS events_observed_at ON events(observed_at);
 CREATE TABLE IF NOT EXISTS evidence_ledger (

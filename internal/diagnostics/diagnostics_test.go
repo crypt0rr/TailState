@@ -100,3 +100,31 @@ func TestBuildReportsUnclaimedInstallation(t *testing.T) {
 		t.Fatal("unclaimed installation finding missing")
 	}
 }
+
+func TestBuildReportsStoragePressureWithoutPayloads(t *testing.T) {
+	report := Build(boot.Config{ListenAddr: "127.0.0.1:8080"}, Runtime{
+		Configured: true,
+		Storage: StorageRuntime{
+			SnapshotLimitBytes:    1024,
+			EventValueLimitBytes:  1024,
+			HistoryPageLimitBytes: 4096,
+			DatabaseLimitBytes:    100,
+			DatabaseBytes:         95,
+			StoragePressure:       0.95,
+		},
+	}, nil)
+	if _, ok := finding(report, "storage_pressure"); !ok || report.State != "warning" {
+		t.Fatalf("storage pressure finding missing: %#v", report)
+	}
+	encoded, err := json.Marshal(report)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encoded), "provider") || strings.Contains(string(encoded), "secret") {
+		t.Fatalf("storage diagnostics contain payload material: %s", encoded)
+	}
+	errorReport := Build(boot.Config{ListenAddr: "127.0.0.1:8080"}, Runtime{Configured: true, Storage: StorageRuntime{DatabaseLimitBytes: 100, DatabaseBytes: 100, StoragePressure: 1}}, nil)
+	if finding, ok := finding(errorReport, "storage_pressure"); !ok || finding.Severity != SeverityError || errorReport.State != "error" {
+		t.Fatalf("storage pressure error finding missing: %#v", errorReport)
+	}
+}

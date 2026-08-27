@@ -236,6 +236,12 @@ func migrateSchema(db *sql.DB, box *secret.Box) error {
 		}
 		return migrateSchema(db, box)
 	}
+	if version == 11 {
+		if err := migrateSchemaV11ToV12(db); err != nil {
+			return err
+		}
+		return migrateSchema(db, box)
+	}
 	if version != 1 {
 		return fmt.Errorf("database schema version %d requires a newer migration path", version)
 	}
@@ -649,6 +655,124 @@ func migrateSchemaV10ToV11(db *sql.DB) error {
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit outbox lease fencing migration: %w", err)
+	}
+	return nil
+}
+
+func migrateSchemaV11ToV12(db *sql.DB) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin bounded history migration: %w", err)
+	}
+	defer tx.Rollback()
+	for _, column := range []struct {
+		table, name, definition string
+	}{
+		{table: "snapshots", name: "content_bytes", definition: "INTEGER NOT NULL DEFAULT 0"},
+		{table: "snapshots", name: "content_truncated", definition: "INTEGER NOT NULL DEFAULT 0"},
+		{table: "events", name: "before_hash", definition: "TEXT NOT NULL DEFAULT ''"},
+		{table: "events", name: "after_hash", definition: "TEXT NOT NULL DEFAULT ''"},
+		{table: "events", name: "before_bytes", definition: "INTEGER NOT NULL DEFAULT 0"},
+		{table: "events", name: "after_bytes", definition: "INTEGER NOT NULL DEFAULT 0"},
+		{table: "events", name: "before_truncated", definition: "INTEGER NOT NULL DEFAULT 0"},
+		{table: "events", name: "after_truncated", definition: "INTEGER NOT NULL DEFAULT 0"},
+	} {
+		if err := addColumnIfMissing(tx, column.table, column.name, column.definition); err != nil {
+			return err
+		}
+	}
+	rows, err := tx.Query("SELECT generation,collector,resource_id,canonical_json,content_hash FROM snapshots")
+	if err != nil {
+		return fmt.Errorf("read snapshot size metadata: %w", err)
+	}
+	type snapshotMetadata struct {
+		generation, collector, resourceID, contentHash string
+		canonical                                      []byte
+		bytes                                          int64
+		truncated                                      int
+	}
+	var snapshots []snapshotMetadata
+	for rows.Next() {
+		var item snapshotMetadata
+		if err := rows.Scan(&item.generation, &item.collector, &item.resourceID, &item.canonical, &item.contentHash); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan snapshot size metadata: %w", err)
+		}
+		item.bytes = int64(len(item.canonical))
+		if marker, ok := parseTruncationMarker(item.canonical); ok {
+			item.contentHash = marker.TailState.SHA256
+			item.bytes = marker.TailState.Bytes
+			item.truncated = 1
+		}
+		snapshots = append(snapshots, item)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("read snapshot size metadata rows: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("close snapshot size metadata: %w", err)
+	}
+	for _, item := range snapshots {
+		if _, err := tx.Exec(`UPDATE snapshots SET content_hash=?,content_bytes=?,content_truncated=? WHERE generation=? AND collector=? AND resource_id=?`, item.contentHash, item.bytes, item.truncated, item.generation, item.collector, item.resourceID); err != nil {
+			return fmt.Errorf("backfill snapshot size metadata: %w", err)
+		}
+	}
+	rows, err = tx.Query("SELECT id,before_json,after_json FROM events")
+	if err != nil {
+		return fmt.Errorf("read event snapshot metadata: %w", err)
+	}
+	type eventMetadata struct {
+		id                              int64
+		before, after                   []byte
+		beforeHash, afterHash           string
+		beforeBytes, afterBytes         int64
+		beforeTruncated, afterTruncated int
+	}
+	var metadata []eventMetadata
+	for rows.Next() {
+		var item eventMetadata
+		if err := rows.Scan(&item.id, &item.before, &item.after); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan event snapshot metadata: %w", err)
+		}
+		if len(item.before) > 0 {
+			item.beforeHash = valueHash(item.before)
+			item.beforeBytes = int64(len(item.before))
+			if marker, ok := parseTruncationMarker(item.before); ok {
+				item.beforeHash = marker.TailState.SHA256
+				item.beforeBytes = marker.TailState.Bytes
+				item.beforeTruncated = 1
+			}
+		}
+		if len(item.after) > 0 {
+			item.afterHash = valueHash(item.after)
+			item.afterBytes = int64(len(item.after))
+			if marker, ok := parseTruncationMarker(item.after); ok {
+				item.afterHash = marker.TailState.SHA256
+				item.afterBytes = marker.TailState.Bytes
+				item.afterTruncated = 1
+			}
+		}
+		metadata = append(metadata, item)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("read event snapshot metadata rows: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("close event snapshot metadata: %w", err)
+	}
+	for _, item := range metadata {
+		if _, err := tx.Exec(`UPDATE events SET before_hash=?,after_hash=?,before_bytes=?,after_bytes=?,before_truncated=?,after_truncated=? WHERE id=?`, item.beforeHash, item.afterHash, item.beforeBytes, item.afterBytes, item.beforeTruncated, item.afterTruncated, item.id); err != nil {
+			return fmt.Errorf("backfill event snapshot metadata: %w", err)
+		}
+	}
+	if _, err := tx.Exec("UPDATE schema_version SET version=12"); err != nil {
+		return fmt.Errorf("record bounded history migration: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit bounded history migration: %w", err)
 	}
 	return nil
 }

@@ -17,6 +17,7 @@ gofmt -w cmd internal
 go mod tidy -diff
 go vet ./...
 go test -race -covermode=atomic -coverpkg=./... -coverprofile=coverage.out ./...
+bash scripts/invariant-suite.sh
 go tool staticcheck ./...
 go tool govulncheck ./...
 git diff --check
@@ -44,10 +45,12 @@ bash scripts/proxy-smoke.sh tailstate:dev
 bash scripts/container-backup-restore-smoke.sh tailstate:dev
 ```
 
-The invariant tests in `.github/workflows/ci.yml` are intentionally named and
-should be extended when a change affects security, drift detection, delivery,
-or evidence verification. Add a regression test that expresses the operator
-guarantee, not only a branch-coverage test.
+The invariant tests listed in `.github/invariant-tests.txt` are intentionally
+named and should be extended when a change affects security, drift detection,
+delivery, persistence, or evidence verification. Keep one exact top-level Go
+test name per line; CI rejects malformed or duplicate entries and reports a
+stale or failing entry with its manifest line. Add a regression test that
+expresses the operator guarantee, not only a branch-coverage test.
 
 The persistence package is split by responsibility: `auth.go` owns setup,
 password, session, and token state; `settings.go` owns encrypted application

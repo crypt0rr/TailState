@@ -310,6 +310,33 @@ func TestHistoryPageReportsUnrenderableBatch(t *testing.T) {
 	}
 }
 
+func TestHistoryLoadsLegacySnapshotMetadataFallbacks(t *testing.T) {
+	ctx := context.Background()
+	st, generation := configuredCoverageStore(t)
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	result, err := st.db.ExecContext(ctx, "INSERT INTO event_batches(generation,observed_at,change_count,created_at) VALUES(?,?,?,?)", generation, now, 1, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	batchID, err := result.LastInsertId()
+	if err != nil {
+		t.Fatal(err)
+	}
+	marker := truncationJSON("legacy-hash", 1234, 256, "byte limit")
+	if _, err := st.db.ExecContext(ctx, `INSERT INTO events(batch_id,generation,observed_at,collector,event_type,resource_id,name,changes_json,before_json,after_json)
+VALUES(?,?,?,?,?,?,?,?,?,?)`, batchID, generation, now, "devices", "changed", "device-1", "server", `[]`, marker, `{"hostname":"server"}`); err != nil {
+		t.Fatal(err)
+	}
+	page, err := st.ListHistory(ctx, HistoryFilter{Limit: 1})
+	if err != nil || len(page.Batches) != 1 || len(page.Batches[0].Events) != 1 {
+		t.Fatalf("legacy metadata history=%#v err=%v", page, err)
+	}
+	event := page.Batches[0].Events[0]
+	if !event.BeforeTruncated || event.BeforeHash != "legacy-hash" || event.BeforeBytes != 1234 || event.AfterHash != valueHash([]byte(`{"hostname":"server"}`)) || event.AfterBytes != int64(len(`{"hostname":"server"}`)) {
+		t.Fatalf("legacy metadata fallback=%#v", event)
+	}
+}
+
 func TestStorageLimitValidationAndMetricEdges(t *testing.T) {
 	invalid := []StorageLimits{
 		{SnapshotBytes: 512},

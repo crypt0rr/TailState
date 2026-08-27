@@ -204,26 +204,79 @@ func enqueueOutboxTx(ctx context.Context, tx *sql.Tx, payload, now string, batch
 // ClaimDueOutbox. A worker whose lease expired cannot complete a newer attempt
 // for the same row.
 func (s *Store) DeliveredClaimed(ctx context.Context, item OutboxItem) error {
-	if item.ID <= 0 || strings.TrimSpace(item.LeaseToken) == "" {
-		return nil
-	}
-	_, err := s.db.ExecContext(ctx, "UPDATE outbox SET status='delivered',delivered_at=?,last_error='',lease_until=NULL,lease_token='' WHERE id=? AND status='processing' AND lease_token=?", time.Now().UTC().Format(time.RFC3339Nano), item.ID, item.LeaseToken)
+	_, err := s.DeliveredClaimedResult(ctx, item)
 	return err
+}
+
+// DeliveredClaimedResult completes only the exact delivery attempt returned
+// by ClaimDueOutbox and reports whether the lease token still owned the row.
+// A false result means another worker reclaimed or finalized the row while the
+// sender was in flight.
+func (s *Store) DeliveredClaimedResult(ctx context.Context, item OutboxItem) (bool, error) {
+	if item.ID <= 0 || strings.TrimSpace(item.LeaseToken) == "" {
+		return false, nil
+	}
+	result, err := s.db.ExecContext(ctx, "UPDATE outbox SET status='delivered',delivered_at=?,last_error='',lease_until=NULL,lease_token='' WHERE id=? AND status='processing' AND lease_token=?", time.Now().UTC().Format(time.RFC3339Nano), item.ID, item.LeaseToken)
+	if err != nil {
+		return false, err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return changed == 1, nil
 }
 
 // RetryClaimed requeues or dead-letters only the exact delivery attempt that
 // failed. The attempt counter was incremented when the row was claimed.
 func (s *Store) RetryClaimed(ctx context.Context, item OutboxItem, next time.Time, message string, dead bool) error {
+	_, err := s.RetryClaimedResult(ctx, item, next, message, dead)
+	return err
+}
+
+// RetryClaimedResult requeues or dead-letters only the exact delivery attempt
+// that failed and reports whether the lease token still owned the row.
+func (s *Store) RetryClaimedResult(ctx context.Context, item OutboxItem, next time.Time, message string, dead bool) (bool, error) {
 	if item.ID <= 0 || strings.TrimSpace(item.LeaseToken) == "" {
-		return nil
+		return false, nil
 	}
 	message = notify.SafeDeliveryMessage(message)
 	status := "pending"
 	if dead {
 		status = "dead"
 	}
-	_, err := s.db.ExecContext(ctx, "UPDATE outbox SET status=?,next_attempt=?,last_error=?,lease_until=NULL,lease_token='' WHERE id=? AND status='processing' AND lease_token=?", status, next.UTC().Format(time.RFC3339Nano), truncate(message, 500), item.ID, item.LeaseToken)
-	return err
+	result, err := s.db.ExecContext(ctx, "UPDATE outbox SET status=?,next_attempt=?,last_error=?,lease_until=NULL,lease_token='' WHERE id=? AND status='processing' AND lease_token=?", status, next.UTC().Format(time.RFC3339Nano), truncate(message, 500), item.ID, item.LeaseToken)
+	if err != nil {
+		return false, err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return changed == 1, nil
+}
+
+// RenewClaimed extends the lease for an in-flight delivery when the caller
+// still owns the lease token. It returns false when another worker has already
+// reclaimed or finalized the row.
+func (s *Store) RenewClaimed(ctx context.Context, item OutboxItem, leases ...time.Duration) (bool, error) {
+	if item.ID <= 0 || strings.TrimSpace(item.LeaseToken) == "" {
+		return false, nil
+	}
+	lease := outboxLease
+	if len(leases) > 0 && leases[0] >= time.Second {
+		lease = leases[0]
+	}
+	leaseUntil := time.Now().UTC().Add(lease).Format(time.RFC3339Nano)
+	result, err := s.db.ExecContext(ctx, "UPDATE outbox SET lease_until=? WHERE id=? AND status='processing' AND lease_token=?", leaseUntil, item.ID, item.LeaseToken)
+	if err != nil {
+		return false, err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return changed == 1, nil
 }
 
 func newOutboxLeaseToken() (string, error) {

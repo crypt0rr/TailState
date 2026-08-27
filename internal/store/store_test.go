@@ -516,6 +516,9 @@ func TestOutboxClaimLeaseFencingAndExpiredRetry(t *testing.T) {
 	if err := st.RetryClaimed(ctx, OutboxItem{}, time.Now(), "ignored", false); err != nil {
 		t.Fatal(err)
 	}
+	if renewed, err := st.RenewClaimed(ctx, OutboxItem{}); err != nil || renewed {
+		t.Fatalf("invalid outbox lease was renewed: renewed=%v err=%v", renewed, err)
+	}
 	if err := st.EnqueueSystem(ctx, "lease-fenced delivery"); err != nil {
 		t.Fatal(err)
 	}
@@ -526,6 +529,22 @@ func TestOutboxClaimLeaseFencingAndExpiredRetry(t *testing.T) {
 	statusSnapshot, err := st.Status(ctx)
 	if err != nil || statusSnapshot.Pending != 0 || statusSnapshot.Processing != 1 {
 		t.Fatalf("processing outbox state was not visible: %#v err=%v", statusSnapshot, err)
+	}
+	initialLease := firstClaims[0].LeaseUntil
+	renewed, err := st.RenewClaimed(ctx, firstClaims[0], 2*time.Minute)
+	if err != nil || !renewed {
+		t.Fatalf("active outbox lease was not renewed: renewed=%v err=%v", renewed, err)
+	}
+	var renewedLease string
+	if err := st.db.QueryRowContext(ctx, "SELECT lease_until FROM outbox WHERE id=?", firstClaims[0].ID).Scan(&renewedLease); err != nil {
+		t.Fatal(err)
+	}
+	renewedUntil, err := time.Parse(time.RFC3339Nano, renewedLease)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if initialLease == nil || !renewedUntil.After(*initialLease) {
+		t.Fatalf("renewed lease=%s did not extend initial lease=%v", renewedLease, initialLease)
 	}
 	if secondClaims, err := st.ClaimDueOutbox(ctx, 10, time.Minute); err != nil || len(secondClaims) != 0 {
 		t.Fatalf("active outbox lease was claimed twice: %#v err=%v", secondClaims, err)
@@ -538,11 +557,14 @@ func TestOutboxClaimLeaseFencingAndExpiredRetry(t *testing.T) {
 	if err != nil || len(secondClaims) != 1 || secondClaims[0].LeaseToken == firstClaims[0].LeaseToken {
 		t.Fatalf("expired outbox lease was not rotated: %#v err=%v", secondClaims, err)
 	}
-	if err := st.DeliveredClaimed(ctx, firstClaims[0]); err != nil {
-		t.Fatal(err)
+	if renewed, err := st.RenewClaimed(ctx, firstClaims[0], time.Minute); err != nil || renewed {
+		t.Fatalf("stale outbox lease was renewed: renewed=%v err=%v", renewed, err)
 	}
-	if err := st.RetryClaimed(ctx, firstClaims[0], time.Now().UTC(), "stale delivery failure", false); err != nil {
-		t.Fatal(err)
+	if completed, err := st.DeliveredClaimedResult(ctx, firstClaims[0]); err != nil || completed {
+		t.Fatalf("stale outbox delivery completion was accepted: completed=%v err=%v", completed, err)
+	}
+	if retried, err := st.RetryClaimedResult(ctx, firstClaims[0], time.Now().UTC(), "stale delivery failure", false); err != nil || retried {
+		t.Fatalf("stale outbox delivery retry was accepted: retried=%v err=%v", retried, err)
 	}
 	var status, token string
 	var attempts int

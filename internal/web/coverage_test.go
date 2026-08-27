@@ -30,10 +30,7 @@ func (webFailingBody) Close() error             { return nil }
 func claimCoverageAdmin(t *testing.T, server *Server, token string) []*http.Cookie {
 	t.Helper()
 	form := url.Values{"token": {token}, "password": {"a secure password"}, "confirm": {"a secure password"}}
-	request := httptest.NewRequest(http.MethodPost, "/setup/claim", strings.NewReader(form.Encode()))
-	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	response := httptest.NewRecorder()
-	server.Handler().ServeHTTP(response, request)
+	response := coveragePost(t, server, "/setup/claim", form, nil)
 	if response.Code != http.StatusSeeOther {
 		t.Fatalf("claim status %d: %s", response.Code, response.Body.String())
 	}
@@ -52,15 +49,102 @@ func coverageCSRF(t *testing.T, cookies []*http.Cookie) string {
 }
 
 func coveragePost(t *testing.T, server *Server, path string, form url.Values, cookies []*http.Cookie) *httptest.ResponseRecorder {
+	if action, ok := credentialActionForPostPath(path); ok && form.Get("_challenge") == "" {
+		if challenge, cookie, available := coverageCredentialChallenge(t, server, action); available {
+			form = cloneForm(form)
+			form.Set("_challenge", challenge)
+			cookies = append(append([]*http.Cookie(nil), cookies...), cookie)
+		}
+	}
+	return coveragePostWithRequest(t, server, path, form, cookies, "", "", nil)
+}
+
+func coverageCredentialPost(t *testing.T, server *Server, path string, form url.Values, cookies []*http.Cookie, targetURL, remoteAddr string, headers http.Header) *httptest.ResponseRecorder {
 	t.Helper()
-	request := httptest.NewRequest(http.MethodPost, path, strings.NewReader(form.Encode()))
+	action, ok := credentialActionForPostPath(path)
+	if !ok {
+		t.Fatalf("path %q is not a credential form", path)
+	}
+	challenge, cookie, available := coverageCredentialChallenge(t, server, action)
+	if !available {
+		t.Fatalf("credential page %q was not available", action.pagePath())
+	}
+	form = cloneForm(form)
+	form.Set("_challenge", challenge)
+	cookies = append(append([]*http.Cookie(nil), cookies...), cookie)
+	return coveragePostWithRequest(t, server, path, form, cookies, targetURL, remoteAddr, headers)
+}
+
+func coveragePostWithRequest(t *testing.T, server *Server, path string, form url.Values, cookies []*http.Cookie, targetURL, remoteAddr string, headers http.Header) *httptest.ResponseRecorder {
+	t.Helper()
+	if targetURL == "" {
+		targetURL = path
+	}
+	request := httptest.NewRequest(http.MethodPost, targetURL, strings.NewReader(form.Encode()))
+	if remoteAddr != "" {
+		request.RemoteAddr = remoteAddr
+	}
 	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	for key, values := range headers {
+		for _, value := range values {
+			request.Header.Add(key, value)
+		}
+	}
 	for _, cookie := range cookies {
 		request.AddCookie(cookie)
 	}
 	response := httptest.NewRecorder()
 	server.Handler().ServeHTTP(response, request)
 	return response
+}
+
+func credentialActionForPostPath(path string) (credentialAction, bool) {
+	switch path {
+	case "/setup/claim":
+		return credentialActionSetup, true
+	case "/login":
+		return credentialActionLogin, true
+	case "/reset":
+		return credentialActionReset, true
+	default:
+		return "", false
+	}
+}
+
+func cloneForm(form url.Values) url.Values {
+	clone := make(url.Values, len(form))
+	for key, values := range form {
+		clone[key] = append([]string(nil), values...)
+	}
+	return clone
+}
+
+func coverageCredentialChallenge(t *testing.T, server *Server, action credentialAction) (string, *http.Cookie, bool) {
+	t.Helper()
+	page := httptest.NewRecorder()
+	server.Handler().ServeHTTP(page, httptest.NewRequest(http.MethodGet, action.pagePath(), nil))
+	if page.Code != http.StatusOK {
+		return "", nil, false
+	}
+	const marker = `name="_challenge" value="`
+	body := page.Body.String()
+	start := strings.Index(body, marker)
+	if start < 0 {
+		t.Fatalf("%s page did not contain challenge field", action.pagePath())
+	}
+	start += len(marker)
+	end := strings.IndexByte(body[start:], '"')
+	if end < 0 {
+		t.Fatalf("%s page contained malformed challenge field", action.pagePath())
+	}
+	challenge := body[start : start+end]
+	for _, cookie := range page.Result().Cookies() {
+		if cookie.Name == action.cookieName() {
+			return challenge, cookie, true
+		}
+	}
+	t.Fatalf("%s page did not set challenge cookie", action.pagePath())
+	return "", nil, false
 }
 
 func webServerWithDatabase(t *testing.T) (*Server, *store.Store, *sql.DB, []*http.Cookie) {

@@ -406,7 +406,10 @@ file mount. They are not read as application settings by a standalone binary.
 
 ## Local development
 
-TailState uses Go 1.26.6.
+TailState uses Go 1.26.6. CI reads this version from `go.mod`, and the
+release container is built with the same digest-pinned Go builder. Run
+`bash scripts/check-go-toolchain.sh` to verify that the tested and published
+toolchains remain aligned before changing either declaration.
 
 ```console
 gofmt -w cmd internal
@@ -450,7 +453,7 @@ The workflow also creates the matching GitHub Release with generated notes. Use 
 TAILSTATE_IMAGE=ghcr.io/crypt0rr/tailstate@sha256:<known-good-digest>
 ```
 
-The builder and runtime base images are pinned by digest and updated by Renovate, so a release is reproducible until an explicit dependency update changes those pins.
+The builder and runtime base images are pinned by digest and updated by Renovate, so a release is reproducible until an explicit dependency update changes those pins. Release images carry OCI labels for the compiler version, base-image digest, target platform, source commit, and release version; BuildKit's max-level provenance and the SBOM provide the corresponding attestation metadata.
 
 ## License
 

@@ -1,6 +1,10 @@
 # syntax=docker/dockerfile:1.26.0
-FROM golang:1.27.0-alpine3.24@sha256:4c9fe60190a2a3350ddc51de80d0224b8a6698d12bdfc999fee45ea9d6c46dbc AS builder
+# Keep this compiler aligned with the `go` directive in go.mod. CI checks the
+# two declarations so the tested and published binaries use the same toolchain.
+FROM golang:1.26.6-alpine3.24@sha256:3889b425f035be855a72fb4755265311293b6d414521f0a519d819df32222d83 AS builder
 ARG VERSION=dev
+ARG GO_VERSION=1.26.6
+ARG BUILD_COMMIT=unknown
 WORKDIR /source
 COPY go.mod go.sum ./
 RUN go mod download
@@ -13,6 +17,21 @@ RUN mkdir -p /data \
     && chown 10001:10001 /data
 
 FROM scratch
+ARG VERSION=dev
+ARG GO_VERSION=1.26.6
+ARG BUILD_COMMIT=unknown
+ARG TARGETOS
+ARG TARGETARCH
+ARG TARGETVARIANT
+LABEL org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.revision="${BUILD_COMMIT}" \
+      org.opencontainers.image.source="https://github.com/crypt0rr/tailstate" \
+      org.opencontainers.image.build.go="${GO_VERSION}" \
+      org.opencontainers.image.base.name="golang:1.26.6-alpine3.24" \
+      org.opencontainers.image.base.digest="sha256:3889b425f035be855a72fb4755265311293b6d414521f0a519d819df32222d83" \
+      org.opencontainers.image.build.target.os="${TARGETOS}" \
+      org.opencontainers.image.build.target.architecture="${TARGETARCH}" \
+      org.opencontainers.image.build.target.variant="${TARGETVARIANT}"
 COPY --from=runtime-files /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY --from=runtime-files --chown=10001:10001 /data /data
 COPY --from=builder /out/tailstate /tailstate

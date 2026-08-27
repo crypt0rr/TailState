@@ -18,6 +18,10 @@ import (
 // query orchestration lives in this file so the persistence and reconciliation
 // code can evolve independently from the audit presentation path.
 func (s *Store) ListHistory(ctx context.Context, filter HistoryFilter) (HistoryPage, error) {
+	return s.listHistory(ctx, filter, s.StorageLimits().HistoryPageBytes)
+}
+
+func (s *Store) listHistory(ctx context.Context, filter HistoryFilter, byteLimit int64) (HistoryPage, error) {
 	limit := filter.Limit
 	if limit <= 0 {
 		limit = 20
@@ -51,7 +55,8 @@ func (s *Store) ListHistory(ctx context.Context, filter HistoryFilter) (HistoryP
 		return HistoryPage{}, err
 	}
 	defer rows.Close()
-	page := HistoryPage{Batches: make([]HistoryBatch, 0, limit)}
+	page := HistoryPage{Batches: make([]HistoryBatch, 0, limit), ByteLimit: byteLimit}
+	candidates := make([]HistoryBatch, 0, limit+1)
 	for rows.Next() {
 		var batch HistoryBatch
 		var observed string
@@ -62,7 +67,7 @@ func (s *Store) ListHistory(ctx context.Context, filter HistoryFilter) (HistoryP
 		if err != nil {
 			return HistoryPage{}, fmt.Errorf("parse history batch timestamp: %w", err)
 		}
-		page.Batches = append(page.Batches, batch)
+		candidates = append(candidates, batch)
 	}
 	if err := rows.Err(); err != nil {
 		return HistoryPage{}, err
@@ -70,13 +75,21 @@ func (s *Store) ListHistory(ctx context.Context, filter HistoryFilter) (HistoryP
 	if err := rows.Close(); err != nil {
 		return HistoryPage{}, err
 	}
-	if len(page.Batches) > limit {
-		page.HasNext = true
-		page.NextCursor = page.Batches[limit-1].ID
-		page.Batches = page.Batches[:limit]
+	hasMoreByCount := len(candidates) > limit
+	if hasMoreByCount {
+		candidates = candidates[:limit]
 	}
-	loadedBatches := make([]HistoryBatch, 0, len(page.Batches))
-	for _, batch := range page.Batches {
+	loadedBatches := make([]HistoryBatch, 0, len(candidates))
+	for _, batch := range candidates {
+		estimate, estimateErr := s.historyBatchByteEstimate(ctx, batch.ID, filter)
+		if estimateErr != nil {
+			return HistoryPage{}, estimateErr
+		}
+		if byteLimit > 0 && estimate > byteLimit-page.BytesRead {
+			page.Truncated = true
+			page.TruncationReason = "history page byte budget reached"
+			break
+		}
 		loaded, err := s.loadHistoryBatch(ctx, batch, filter)
 		if err != nil {
 			return HistoryPage{}, err
@@ -86,10 +99,62 @@ func (s *Store) ListHistory(ctx context.Context, filter HistoryFilter) (HistoryP
 				loaded.ChangeCount = len(loaded.Events)
 			}
 			loadedBatches = append(loadedBatches, loaded)
+			page.BytesRead += estimate
 		}
 	}
 	page.Batches = loadedBatches
+	page.HasNext = hasMoreByCount || page.Truncated
+	if page.HasNext && len(page.Batches) > 0 {
+		page.NextCursor = page.Batches[len(page.Batches)-1].ID
+	} else if page.Truncated && len(candidates) > 0 {
+		// The first batch can be larger than the entire page budget. Leave a
+		// cursor just above it so the caller can retry after narrowing the
+		// filter or increasing the configured budget; the explicit reason makes
+		// that remediation visible instead of silently dropping the batch.
+		page.NextCursor = candidates[0].ID + 1
+	}
+	if page.Truncated {
+		s.counters.historyTruncations.Add(1)
+	}
 	return page, nil
+}
+
+// historyBatchByteEstimate reads only SQLite length metadata before loading a
+// batch. Stored snapshots and event values are already bounded at write time,
+// so this keeps normal history reads within a predictable aggregate budget
+// without pulling an unbounded provider body into memory first.
+func (s *Store) historyBatchByteEstimate(ctx context.Context, batchID int64, filter HistoryFilter) (int64, error) {
+	eventWhere := []string{"batch_id=?"}
+	eventArgs := []any{batchID}
+	if filter.Collector != "" {
+		eventWhere = append(eventWhere, "collector=?")
+		eventArgs = append(eventArgs, filter.Collector)
+	}
+	if filter.EventType != "" {
+		eventWhere = append(eventWhere, "event_type=?")
+		eventArgs = append(eventArgs, filter.EventType)
+	}
+	if filter.ResourceID != "" {
+		eventWhere = append(eventWhere, "(resource_id LIKE ? ESCAPE '\\' OR name LIKE ? ESCAPE '\\')")
+		term := "%" + escapeLike(filter.ResourceID) + "%"
+		eventArgs = append(eventArgs, term, term)
+	}
+	var eventBytes int64
+	if err := s.db.QueryRowContext(ctx, `SELECT COALESCE(SUM(
+		length(COALESCE(changes_json,'')) + length(COALESCE(before_json,'')) + length(COALESCE(after_json,'')) +
+		length(collector) + length(event_type) + length(resource_id) + length(name) + 128),0)
+		FROM events WHERE `+strings.Join(eventWhere, " AND "), eventArgs...).Scan(&eventBytes); err != nil {
+		return 0, err
+	}
+	var deliveryBytes int64
+	if err := s.db.QueryRowContext(ctx, `SELECT COALESCE(SUM(length(COALESCE(o.last_error,'')) + length(COALESCE(o.status,'')) + length(COALESCE(d.name,'')) + 128),0)
+		FROM outbox o LEFT JOIN notification_destinations d ON d.id=o.destination_id WHERE o.batch_id=?`, batchID).Scan(&deliveryBytes); err != nil {
+		return 0, err
+	}
+	// Include fixed batch/ledger metadata and a small allowance for JSON
+	// indentation used by the authenticated history renderer.
+	estimate := eventBytes + deliveryBytes + 1024
+	return estimate, nil
 }
 
 func (s *Store) loadHistoryBatch(ctx context.Context, batch HistoryBatch, filter HistoryFilter) (HistoryBatch, error) {
@@ -142,7 +207,7 @@ func (s *Store) loadHistoryBatch(ctx context.Context, batch HistoryBatch, filter
 		term := "%" + escapeLike(filter.ResourceID) + "%"
 		eventArgs = append(eventArgs, term, term)
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT id,batch_id,generation,observed_at,collector,event_type,resource_id,name,changes_json,before_json,after_json
+	rows, err := s.db.QueryContext(ctx, `SELECT id,batch_id,generation,observed_at,collector,event_type,resource_id,name,changes_json,before_json,after_json,before_hash,after_hash,before_bytes,after_bytes,before_truncated,after_truncated
 		FROM events WHERE `+strings.Join(eventWhere, " AND ")+` ORDER BY id`, eventArgs...)
 	if err != nil {
 		return HistoryBatch{}, err
@@ -153,8 +218,41 @@ func (s *Store) loadHistoryBatch(ctx context.Context, batch HistoryBatch, filter
 		var event HistoryEvent
 		var observed string
 		var fieldsRaw, beforeRaw, afterRaw []byte
-		if err := rows.Scan(&event.ID, &event.BatchID, &event.Generation, &observed, &event.Collector, &event.EventType, &event.ResourceID, &event.Name, &fieldsRaw, &beforeRaw, &afterRaw); err != nil {
+		var beforeTruncated, afterTruncated int
+		if err := rows.Scan(&event.ID, &event.BatchID, &event.Generation, &observed, &event.Collector, &event.EventType, &event.ResourceID, &event.Name, &fieldsRaw, &beforeRaw, &afterRaw, &event.BeforeHash, &event.AfterHash, &event.BeforeBytes, &event.AfterBytes, &beforeTruncated, &afterTruncated); err != nil {
 			return HistoryBatch{}, err
+		}
+		event.BeforeTruncated = beforeTruncated == 1
+		event.AfterTruncated = afterTruncated == 1
+		if marker, ok := parseTruncationMarker(beforeRaw); ok {
+			event.BeforeTruncated = true
+			if event.BeforeHash == "" {
+				event.BeforeHash = marker.TailState.SHA256
+			}
+			if event.BeforeBytes == 0 {
+				event.BeforeBytes = marker.TailState.Bytes
+			}
+		}
+		if marker, ok := parseTruncationMarker(afterRaw); ok {
+			event.AfterTruncated = true
+			if event.AfterHash == "" {
+				event.AfterHash = marker.TailState.SHA256
+			}
+			if event.AfterBytes == 0 {
+				event.AfterBytes = marker.TailState.Bytes
+			}
+		}
+		if event.BeforeBytes == 0 && len(beforeRaw) > 0 {
+			event.BeforeBytes = int64(len(beforeRaw))
+		}
+		if event.AfterBytes == 0 && len(afterRaw) > 0 {
+			event.AfterBytes = int64(len(afterRaw))
+		}
+		if event.BeforeHash == "" && len(beforeRaw) > 0 && !event.BeforeTruncated {
+			event.BeforeHash = valueHash(beforeRaw)
+		}
+		if event.AfterHash == "" && len(afterRaw) > 0 && !event.AfterTruncated {
+			event.AfterHash = valueHash(afterRaw)
 		}
 		event.ObservedAt, err = time.Parse(time.RFC3339Nano, observed)
 		if err != nil {

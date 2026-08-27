@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -20,6 +21,8 @@ type Store struct {
 	db          *sql.DB
 	box         *secret.Box
 	evidenceKey evidenceSigningKey
+	limits      atomic.Value // stores StorageLimits
+	counters    storageCounters
 }
 
 type Settings struct {
@@ -139,6 +142,12 @@ type HistoryEvent struct {
 	TotalFields     int
 	BeforeJSON      string
 	AfterJSON       string
+	BeforeHash      string
+	AfterHash       string
+	BeforeBytes     int64
+	AfterBytes      int64
+	BeforeTruncated bool
+	AfterTruncated  bool
 }
 
 type HistoryDelivery struct {
@@ -173,12 +182,16 @@ type HistoryFilter struct {
 }
 
 type HistoryPage struct {
-	Batches    []HistoryBatch
-	NextCursor int64
-	HasNext    bool
+	Batches          []HistoryBatch
+	NextCursor       int64
+	HasNext          bool
+	Truncated        bool
+	BytesRead        int64
+	ByteLimit        int64
+	TruncationReason string
 }
 
-const currentSchemaVersion = 11
+const currentSchemaVersion = 12
 
 const (
 	webhookTriggerRetryWindow = 24 * time.Hour
@@ -255,6 +268,7 @@ func Open(path string, box *secret.Box) (*Store, error) {
 		return nil, fmt.Errorf("database migration failed while creating outbox history index; stop TailState and restore the verified pre-upgrade backup before retrying: %w", err)
 	}
 	st := &Store{db: db, box: box}
+	st.limits.Store(DefaultStorageLimits())
 	present, err = verifyExistingMasterKey(db, box)
 	if err != nil {
 		db.Close()

@@ -610,6 +610,22 @@ func (s *Server) diagnosticReport(ctx context.Context, request *http.Request) di
 		runtime.Destinations = status.Destinations
 		runtime.EnabledDestinations = status.EnabledDestinations
 	}
+	if metrics, err := s.store.StorageMetrics(ctx); err == nil {
+		limits := s.store.StorageLimits()
+		runtime.Storage = diagnostics.StorageRuntime{
+			SnapshotLimitBytes:      limits.SnapshotBytes,
+			EventValueLimitBytes:    limits.EventValueBytes,
+			HistoryPageLimitBytes:   limits.HistoryPageBytes,
+			RejectLimitBytes:        limits.RejectBytes,
+			DatabaseLimitBytes:      metrics.DatabaseLimitBytes,
+			DatabaseBytes:           metrics.DatabaseBytes,
+			StoragePressure:         metrics.PressureRatio(),
+			SnapshotTruncations:     metrics.SnapshotTruncations,
+			EventValueTruncations:   metrics.EventValueTruncations,
+			HistoryPageTruncations:  metrics.HistoryPageTruncations,
+			OversizedWritesRejected: metrics.OversizedWritesRejected,
+		}
+	}
 	return diagnostics.Build(s.config, runtime, request)
 }
 
@@ -874,6 +890,14 @@ func (s *Server) metrics(w http.ResponseWriter, r *http.Request) {
 		}
 		fmt.Fprintf(w, "tailstate_outbox_delivery_duration_seconds_bucket{le=\"+Inf\"} %d\ntailstate_outbox_delivery_duration_seconds_sum %.6f\ntailstate_outbox_delivery_duration_seconds_count %d\n", delivery.DurationCount, delivery.DurationSeconds, delivery.DurationCount)
 	}
+	storage, err := s.store.StorageMetrics(r.Context())
+	if err != nil {
+		http.Error(w, "metrics unavailable", http.StatusInternalServerError)
+		return
+	}
+	limits := s.store.StorageLimits()
+	fmt.Fprintf(w, "# TYPE tailstate_storage_bytes gauge\ntailstate_storage_bytes %d\n# TYPE tailstate_storage_limit_bytes gauge\ntailstate_storage_limit_bytes %d\n# TYPE tailstate_storage_pressure_ratio gauge\ntailstate_storage_pressure_ratio %.6f\n# TYPE tailstate_snapshot_truncations_total counter\ntailstate_snapshot_truncations_total %d\n# TYPE tailstate_event_value_truncations_total counter\ntailstate_event_value_truncations_total %d\n# TYPE tailstate_history_page_truncations_total counter\ntailstate_history_page_truncations_total %d\n# TYPE tailstate_oversized_writes_rejected_total counter\ntailstate_oversized_writes_rejected_total %d\n", storage.DatabaseBytes, storage.DatabaseLimitBytes, storage.PressureRatio(), storage.SnapshotTruncations, storage.EventValueTruncations, storage.HistoryPageTruncations, storage.OversizedWritesRejected)
+	fmt.Fprintf(w, "# TYPE tailstate_snapshot_limit_bytes gauge\ntailstate_snapshot_limit_bytes %d\n# TYPE tailstate_event_value_limit_bytes gauge\ntailstate_event_value_limit_bytes %d\n# TYPE tailstate_history_page_limit_bytes gauge\ntailstate_history_page_limit_bytes %d\n# TYPE tailstate_reject_limit_bytes gauge\ntailstate_reject_limit_bytes %d\n", limits.SnapshotBytes, limits.EventValueBytes, limits.HistoryPageBytes, limits.RejectBytes)
 	fmt.Fprintf(w, "# TYPE tailstate_webhook_triggers_pending gauge\ntailstate_webhook_triggers_pending %d\n# TYPE tailstate_webhook_triggers_processing gauge\ntailstate_webhook_triggers_processing %d\n# TYPE tailstate_webhook_triggers_dead gauge\ntailstate_webhook_triggers_dead %d\n", status.WebhookPending, status.WebhookProcessing, status.WebhookDead)
 	paused := 0
 	if status.Configured && status.EnabledDestinations == 0 {

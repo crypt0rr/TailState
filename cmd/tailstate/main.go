@@ -210,6 +210,22 @@ func doctor(args []string) error {
 	runtime.BaselineReason = status.BaselineReason
 	runtime.Destinations = status.Destinations
 	runtime.EnabledDestinations = status.EnabledDestinations
+	if storage, storageErr := st.StorageMetrics(context.Background()); storageErr == nil {
+		limits := st.StorageLimits()
+		runtime.Storage = diagnostics.StorageRuntime{
+			SnapshotLimitBytes:      limits.SnapshotBytes,
+			EventValueLimitBytes:    limits.EventValueBytes,
+			HistoryPageLimitBytes:   limits.HistoryPageBytes,
+			RejectLimitBytes:        limits.RejectBytes,
+			DatabaseLimitBytes:      storage.DatabaseLimitBytes,
+			DatabaseBytes:           storage.DatabaseBytes,
+			StoragePressure:         storage.PressureRatio(),
+			SnapshotTruncations:     storage.SnapshotTruncations,
+			EventValueTruncations:   storage.EventValueTruncations,
+			HistoryPageTruncations:  storage.HistoryPageTruncations,
+			OversizedWritesRejected: storage.OversizedWritesRejected,
+		}
+	}
 	report := diagnostics.Build(config, runtime, nil)
 	if *jsonOutput {
 		if err := json.NewEncoder(os.Stdout).Encode(report); err != nil {
@@ -220,6 +236,7 @@ func doctor(args []string) error {
 		fmt.Fprintf(os.Stdout, "Listener: %s\n", report.Listener)
 		fmt.Fprintf(os.Stdout, "Secure cookies: %t\n", report.CookieSecure)
 		fmt.Fprintf(os.Stdout, "Trusted proxies: %d\n", report.TrustedProxyCount)
+		fmt.Fprintf(os.Stdout, "Storage: %d/%d bytes (snapshot limit %d, event limit %d, history page limit %d)\n", report.Storage.DatabaseBytes, report.Storage.DatabaseLimitBytes, report.Storage.SnapshotLimitBytes, report.Storage.EventValueLimitBytes, report.Storage.HistoryPageLimitBytes)
 		for _, finding := range report.Findings {
 			fmt.Fprintf(os.Stdout, "%s [%s] %s\n  %s\n", strings.ToUpper(string(finding.Severity)), finding.Code, finding.Summary, finding.Remediation)
 		}

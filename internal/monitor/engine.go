@@ -21,12 +21,71 @@ type Engine struct {
 	store                      *store.Store
 	baseURL, tokenURL, version string
 	sender                     notify.Sender
+	deliveryLease              time.Duration
 	wake                       chan struct{}
 	trigger                    chan ReconcileRequest
 	triggerOverflowMu          sync.Mutex
 	triggerOverflow            []ReconcileRequest
 	wg                         sync.WaitGroup
 	dueErrors                  atomic.Uint64
+	deliveryStats              deliveryStats
+}
+
+const (
+	deliveryBatchSize               = 10
+	deliveryLeaseRenewalFraction    = 3
+	minDeliveryLeaseRenewalInterval = 100 * time.Millisecond
+	deliveryDurationBucketCount     = 9
+)
+
+var deliveryDurationBucketBounds = [deliveryDurationBucketCount]float64{0.1, 0.5, 1, 5, 15, 30, 60, 120, 300}
+
+type deliveryStats struct {
+	attempts             atomic.Uint64
+	successes            atomic.Uint64
+	failures             atomic.Uint64
+	leaseRenewals        atomic.Uint64
+	leaseRenewalFailures atomic.Uint64
+	leaseLosses          atomic.Uint64
+	durationCount        atomic.Uint64
+	durationNanos        atomic.Uint64
+	durationBuckets      [deliveryDurationBucketCount]atomic.Uint64
+}
+
+// DeliveryMetrics is a point-in-time snapshot of delivery worker telemetry.
+// DurationBuckets are cumulative histogram buckets whose bounds are returned
+// by DeliveryDurationBucketBounds.
+type DeliveryMetrics struct {
+	Attempts             uint64
+	Successes            uint64
+	Failures             uint64
+	LeaseRenewals        uint64
+	LeaseRenewalFailures uint64
+	LeaseLosses          uint64
+	DurationCount        uint64
+	DurationSeconds      float64
+	DurationBuckets      [deliveryDurationBucketCount]uint64
+}
+
+type deliveryLeaseState struct {
+	lost atomic.Bool
+}
+
+type deliveryLease struct {
+	cancel  context.CancelFunc
+	done    chan struct{}
+	state   *deliveryLeaseState
+	stopOne sync.Once
+}
+
+func (l *deliveryLease) stop() {
+	if l == nil {
+		return
+	}
+	l.stopOne.Do(func() {
+		l.cancel()
+		<-l.done
+	})
 }
 
 // ReconcileRequest asks the scheduler to poll a set of collectors immediately.
@@ -121,6 +180,31 @@ func (e *Engine) Wait() { e.wg.Wait() }
 // CollectorDueErrors reports scheduler/database failures for the metrics
 // endpoint without adding collector names or other high-cardinality labels.
 func (e *Engine) CollectorDueErrors() uint64 { return e.dueErrors.Load() }
+
+// DeliveryMetrics reports delivery and lease telemetry without exposing
+// destination names, URLs, payloads, or provider error text.
+func (e *Engine) DeliveryMetrics() DeliveryMetrics {
+	metrics := DeliveryMetrics{
+		Attempts:             e.deliveryStats.attempts.Load(),
+		Successes:            e.deliveryStats.successes.Load(),
+		Failures:             e.deliveryStats.failures.Load(),
+		LeaseRenewals:        e.deliveryStats.leaseRenewals.Load(),
+		LeaseRenewalFailures: e.deliveryStats.leaseRenewalFailures.Load(),
+		LeaseLosses:          e.deliveryStats.leaseLosses.Load(),
+		DurationCount:        e.deliveryStats.durationCount.Load(),
+	}
+	metrics.DurationSeconds = float64(e.deliveryStats.durationNanos.Load()) / float64(time.Second)
+	for i := range metrics.DurationBuckets {
+		metrics.DurationBuckets[i] = e.deliveryStats.durationBuckets[i].Load()
+	}
+	return metrics
+}
+
+// DeliveryDurationBucketBounds returns the cumulative delivery histogram
+// bounds in seconds.
+func DeliveryDurationBucketBounds() [deliveryDurationBucketCount]float64 {
+	return deliveryDurationBucketBounds
+}
 
 // schedulerSettings avoids decrypting credentials on every idle scheduler
 // iteration while still noticing writes that preserve the inventory
@@ -674,42 +758,149 @@ func (e *Engine) delivery(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			items, err := e.store.ClaimDueOutbox(ctx, 10)
+			var (
+				items []store.OutboxItem
+				err   error
+			)
+			if e.deliveryLease > 0 {
+				items, err = e.store.ClaimDueOutbox(ctx, deliveryBatchSize, e.deliveryLease)
+			} else {
+				items, err = e.store.ClaimDueOutbox(ctx, deliveryBatchSize)
+			}
 			if err != nil {
 				slog.Error("load outbox", "error", err)
 				continue
 			}
+			leases := make(map[int64]*deliveryLease, len(items))
 			for _, item := range items {
-				err = e.sender.Send(ctx, item.Destination.ServiceURL, item.Payload)
-				bookkeepingCtx, cancelBookkeeping := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-				if err == nil {
-					if deliveredErr := e.store.DeliveredClaimed(bookkeepingCtx, item); deliveredErr != nil {
-						slog.Error("mark notification delivery complete", "outbox_id", item.ID, "destination_id", item.DestinationID, "error", deliveredErr)
-					}
-					cancelBookkeeping()
-					continue
-				}
-				// Senders are injectable for tests and future transports. Apply the
-				// same destination-aware redaction at this boundary so an upstream
-				// provider error cannot reach logs or durable outbox history even if
-				// the sender did not sanitize it itself.
-				safeMessage := notify.SafeDeliveryError(err)
-				dead := time.Since(item.FirstAttempt) >= 24*time.Hour
-				var delivery *notify.DeliveryError
-				delay := retryDelay(item.Attempts)
-				if errors.As(err, &delivery) && delivery.RetryAfter > 0 {
-					delay = delivery.RetryAfter
-				}
-				if retryErr := e.store.RetryClaimed(bookkeepingCtx, item, time.Now().Add(delay), safeMessage, dead); retryErr != nil {
-					slog.Error("record notification delivery failure", "outbox_id", item.ID, "destination_id", item.DestinationID, "error", retryErr)
-				}
-				cancelBookkeeping()
-				if dead {
-					slog.Error("notification delivery dead-lettered", "outbox_id", item.ID, "destination_id", item.DestinationID, "error", safeMessage)
-				} else {
-					slog.Warn("notification delivery failed", "outbox_id", item.ID, "destination_id", item.DestinationID, "error", safeMessage)
-				}
+				leases[item.ID] = e.startOutboxLease(ctx, item)
 			}
+			for _, item := range items {
+				e.deliverItemWithLease(ctx, item, leases[item.ID])
+			}
+			for _, lease := range leases {
+				lease.stop()
+			}
+		}
+	}
+}
+
+func (e *Engine) startOutboxLease(ctx context.Context, item store.OutboxItem) *deliveryLease {
+	renewCtx, cancelRenew := context.WithCancel(ctx)
+	lease := &deliveryLease{cancel: cancelRenew, done: make(chan struct{}), state: &deliveryLeaseState{}}
+	go e.renewOutboxLease(renewCtx, item, lease.state, lease.done)
+	return lease
+}
+
+func (e *Engine) deliverItemWithLease(ctx context.Context, item store.OutboxItem, lease *deliveryLease) {
+	e.deliveryStats.attempts.Add(1)
+	started := time.Now()
+	if lease == nil {
+		lease = e.startOutboxLease(ctx, item)
+	}
+	sendErr := e.sender.Send(ctx, item.Destination.ServiceURL, item.Payload)
+	lease.stop()
+	elapsed := time.Since(started)
+	e.recordDeliveryDuration(elapsed)
+	leaseLost := lease.state.lost.Load()
+
+	bookkeepingCtx, cancelBookkeeping := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancelBookkeeping()
+	if sendErr == nil {
+		e.deliveryStats.successes.Add(1)
+		completed, deliveredErr := e.store.DeliveredClaimedResult(bookkeepingCtx, item)
+		if deliveredErr != nil {
+			slog.Error("mark notification delivery complete", "outbox_id", item.ID, "destination_id", item.DestinationID, "attempt", item.Attempts, "elapsed_ms", elapsed.Milliseconds(), "error", deliveredErr)
+		} else if !completed {
+			e.noteDeliveryLeaseLost(lease.state)
+			leaseLost = true
+			slog.Warn("notification delivery completion fenced", "outbox_id", item.ID, "destination_id", item.DestinationID, "attempt", item.Attempts, "elapsed_ms", elapsed.Milliseconds())
+		}
+		slog.Debug("notification delivery completed", "outbox_id", item.ID, "destination_id", item.DestinationID, "attempt", item.Attempts, "elapsed_ms", elapsed.Milliseconds(), "lease_lost", leaseLost)
+		return
+	}
+	e.deliveryStats.failures.Add(1)
+	// Senders are injectable for tests and future transports. Apply the same
+	// destination-aware redaction at this boundary so an upstream provider
+	// error cannot reach logs or durable outbox history even if the sender did
+	// not sanitize it itself.
+	safeMessage := notify.SafeDeliveryError(sendErr)
+	dead := time.Since(item.FirstAttempt) >= 24*time.Hour
+	var delivery *notify.DeliveryError
+	delay := retryDelay(item.Attempts)
+	if errors.As(sendErr, &delivery) && delivery.RetryAfter > 0 {
+		delay = delivery.RetryAfter
+	}
+	requeued, retryErr := e.store.RetryClaimedResult(bookkeepingCtx, item, time.Now().Add(delay), safeMessage, dead)
+	if retryErr != nil {
+		slog.Error("record notification delivery failure", "outbox_id", item.ID, "destination_id", item.DestinationID, "attempt", item.Attempts, "elapsed_ms", elapsed.Milliseconds(), "error", retryErr)
+	} else if !requeued {
+		e.noteDeliveryLeaseLost(lease.state)
+		leaseLost = true
+		slog.Warn("notification delivery retry fenced", "outbox_id", item.ID, "destination_id", item.DestinationID, "attempt", item.Attempts, "elapsed_ms", elapsed.Milliseconds())
+	}
+	if dead {
+		slog.Error("notification delivery dead-lettered", "outbox_id", item.ID, "destination_id", item.DestinationID, "attempt", item.Attempts, "elapsed_ms", elapsed.Milliseconds(), "lease_lost", leaseLost, "error", safeMessage)
+	} else {
+		slog.Warn("notification delivery failed", "outbox_id", item.ID, "destination_id", item.DestinationID, "attempt", item.Attempts, "elapsed_ms", elapsed.Milliseconds(), "lease_lost", leaseLost, "error", safeMessage)
+	}
+}
+
+func (e *Engine) renewOutboxLease(ctx context.Context, item store.OutboxItem, state *deliveryLeaseState, done chan<- struct{}) {
+	defer close(done)
+	lease := time.Minute
+	if item.LeaseUntil != nil {
+		lease = time.Until(*item.LeaseUntil)
+	}
+	if lease < time.Second {
+		lease = time.Second
+	}
+	interval := lease / deliveryLeaseRenewalFraction
+	if interval < minDeliveryLeaseRenewalInterval {
+		interval = minDeliveryLeaseRenewalInterval
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			renewed, err := e.store.RenewClaimed(ctx, item, lease)
+			if err != nil {
+				if ctx.Err() != nil {
+					return
+				}
+				e.deliveryStats.leaseRenewalFailures.Add(1)
+				slog.Warn("notification delivery lease renewal failed", "outbox_id", item.ID, "destination_id", item.DestinationID, "error", err)
+				continue
+			}
+			if !renewed {
+				e.noteDeliveryLeaseLost(state)
+				slog.Warn("notification delivery lease lost", "outbox_id", item.ID, "destination_id", item.DestinationID)
+				return
+			}
+			e.deliveryStats.leaseRenewals.Add(1)
+		}
+	}
+}
+
+func (e *Engine) noteDeliveryLeaseLost(state *deliveryLeaseState) {
+	if state.lost.CompareAndSwap(false, true) {
+		e.deliveryStats.leaseLosses.Add(1)
+	}
+}
+
+func (e *Engine) recordDeliveryDuration(elapsed time.Duration) {
+	if elapsed < 0 {
+		elapsed = 0
+	}
+	e.deliveryStats.durationCount.Add(1)
+	e.deliveryStats.durationNanos.Add(uint64(elapsed))
+	seconds := elapsed.Seconds()
+	for i, bound := range deliveryDurationBucketBounds {
+		if seconds <= bound {
+			e.deliveryStats.durationBuckets[i].Add(1)
 		}
 	}
 }

@@ -102,6 +102,227 @@ func TestDeliveryKeepsDestinationFailuresIndependent(t *testing.T) {
 	t.Fatalf("destinations did not settle independently; sender calls=%d", sender.callCount())
 }
 
+type slowCountingSender struct {
+	mu      sync.Mutex
+	calls   map[string]int
+	delay   time.Duration
+	started chan struct{}
+	once    sync.Once
+}
+
+func (s *slowCountingSender) Send(_ context.Context, serviceURL, _ string) error {
+	s.mu.Lock()
+	if s.calls == nil {
+		s.calls = map[string]int{}
+	}
+	s.calls[serviceURL]++
+	s.mu.Unlock()
+	s.once.Do(func() { close(s.started) })
+	time.Sleep(s.delay)
+	return nil
+}
+
+func (s *slowCountingSender) Test(context.Context, string) error { return nil }
+
+func (s *slowCountingSender) callCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	total := 0
+	for _, count := range s.calls {
+		total += count
+	}
+	return total
+}
+
+func TestDeliveryRenewsLeasesForSlowBatch(t *testing.T) {
+	ctx := context.Background()
+	st, _, _ := openMonitorTestStore(t)
+	for i := 1; i < deliveryBatchSize; i++ {
+		if _, err := st.SaveDestination(ctx, store.NotificationDestination{
+			Name:       fmt.Sprintf("Slow %d", i),
+			ServiceURL: fmt.Sprintf("generic://slow-%d.example/path", i),
+			Enabled:    true,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := st.EnqueueSystem(ctx, "slow delivery batch"); err != nil {
+		t.Fatal(err)
+	}
+	previousInterval := deliveryPollInterval
+	deliveryPollInterval = 5 * time.Millisecond
+	t.Cleanup(func() { deliveryPollInterval = previousInterval })
+	sender := &slowCountingSender{delay: 300 * time.Millisecond, started: make(chan struct{})}
+	first := New(st, "", "", "test", sender)
+	second := New(st, "", "", "test", sender)
+	first.deliveryLease = 2 * time.Second
+	second.deliveryLease = 2 * time.Second
+	deliveryCtx, cancel := context.WithCancel(ctx)
+	firstDone := make(chan struct{})
+	secondDone := make(chan struct{})
+	go func() {
+		first.delivery(deliveryCtx)
+		close(firstDone)
+	}()
+	go func() {
+		second.delivery(deliveryCtx)
+		close(secondDone)
+	}()
+	select {
+	case <-sender.started:
+	case <-time.After(time.Second):
+		cancel()
+		t.Fatal("slow delivery did not start")
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		status, err := st.Status(ctx)
+		if err != nil {
+			cancel()
+			t.Fatal(err)
+		}
+		if status.Pending == 0 && status.Processing == 0 && status.Dead == 0 {
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	cancel()
+	select {
+	case <-firstDone:
+	case <-time.After(time.Second):
+		t.Fatal("primary delivery worker did not stop")
+	}
+	select {
+	case <-secondDone:
+	case <-time.After(time.Second):
+		t.Fatal("secondary delivery worker did not stop")
+	}
+	if calls := sender.callCount(); calls != deliveryBatchSize {
+		t.Fatalf("slow batch was delivered %d times, want exactly %d", calls, deliveryBatchSize)
+	}
+	firstMetrics := first.DeliveryMetrics()
+	secondMetrics := second.DeliveryMetrics()
+	if attempts := firstMetrics.Attempts + secondMetrics.Attempts; attempts != deliveryBatchSize {
+		t.Fatalf("delivery metrics attempts=%d (first=%+v second=%+v), want %d", attempts, firstMetrics, secondMetrics, deliveryBatchSize)
+	}
+	if successes := firstMetrics.Successes + secondMetrics.Successes; successes != deliveryBatchSize {
+		t.Fatalf("delivery metrics successes=%d (first=%+v second=%+v), want %d", successes, firstMetrics, secondMetrics, deliveryBatchSize)
+	}
+	if renewals := firstMetrics.LeaseRenewals + secondMetrics.LeaseRenewals; renewals == 0 {
+		t.Fatalf("slow batch did not renew any leases: first=%+v second=%+v", firstMetrics, secondMetrics)
+	}
+	if losses := firstMetrics.LeaseLosses + secondMetrics.LeaseLosses; losses != 0 {
+		t.Fatalf("slow batch lost a lease: first=%+v second=%+v", firstMetrics, secondMetrics)
+	}
+}
+
+func TestDeliveryMetricsRecordDurationBuckets(t *testing.T) {
+	engine := &Engine{}
+	for _, elapsed := range []time.Duration{
+		-1,
+		50 * time.Millisecond,
+		100 * time.Millisecond,
+		500 * time.Millisecond,
+		1 * time.Second,
+		5 * time.Second,
+		15 * time.Second,
+		30 * time.Second,
+		60 * time.Second,
+		120 * time.Second,
+		300 * time.Second,
+		301 * time.Second,
+	} {
+		engine.recordDeliveryDuration(elapsed)
+	}
+
+	metrics := engine.DeliveryMetrics()
+	if metrics.DurationCount != 12 {
+		t.Fatalf("duration count=%d, want 12", metrics.DurationCount)
+	}
+	if metrics.DurationSeconds <= 0 {
+		t.Fatalf("duration sum was not recorded: %+v", metrics)
+	}
+	wantBuckets := [deliveryDurationBucketCount]uint64{3, 4, 5, 6, 7, 8, 9, 10, 11}
+	if metrics.DurationBuckets != wantBuckets {
+		t.Fatalf("duration buckets=%v, want %v", metrics.DurationBuckets, wantBuckets)
+	}
+	bounds := DeliveryDurationBucketBounds()
+	if bounds[0] != 0.1 || bounds[len(bounds)-1] != 300 {
+		t.Fatalf("unexpected duration bucket bounds: %v", bounds)
+	}
+}
+
+func TestDeliveryLeaseRenewalRecordsLeaseLoss(t *testing.T) {
+	ctx := context.Background()
+	st, _, _ := openMonitorTestStore(t)
+	if err := st.EnqueueSystem(ctx, "lease loss"); err != nil {
+		t.Fatal(err)
+	}
+	items, err := st.ClaimDueOutbox(ctx, 1, time.Minute)
+	if err != nil || len(items) != 1 {
+		t.Fatalf("claim outbox item: %#v err=%v", items, err)
+	}
+	item := items[0]
+	if err := st.DeliveredClaimed(ctx, item); err != nil {
+		t.Fatal(err)
+	}
+	leaseUntil := time.Now().UTC().Add(time.Second)
+	item.LeaseUntil = &leaseUntil
+	engine := New(st, "", "", "test", &scriptedSender{})
+	state := &deliveryLeaseState{}
+	done := make(chan struct{})
+	go engine.renewOutboxLease(ctx, item, state, done)
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("lease renewer did not stop after losing its claim")
+	}
+	if !state.lost.Load() {
+		t.Fatal("lease loss was not recorded in the claim state")
+	}
+	if metrics := engine.DeliveryMetrics(); metrics.LeaseLosses != 1 {
+		t.Fatalf("lease loss metrics=%+v, want one loss", metrics)
+	}
+}
+
+func TestDeliveryLeaseRenewalErrorsAreCounted(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	st, _, _ := openMonitorTestStore(t)
+	if err := st.EnqueueSystem(context.Background(), "lease renewal error"); err != nil {
+		t.Fatal(err)
+	}
+	items, err := st.ClaimDueOutbox(context.Background(), 1, time.Minute)
+	if err != nil || len(items) != 1 {
+		t.Fatalf("claim outbox item: %#v err=%v", items, err)
+	}
+	item := items[0]
+	leaseUntil := time.Now().UTC().Add(time.Second)
+	item.LeaseUntil = &leaseUntil
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	engine := New(st, "", "", "test", &scriptedSender{})
+	done := make(chan struct{})
+	go engine.renewOutboxLease(ctx, item, &deliveryLeaseState{}, done)
+	deadline := time.After(2 * time.Second)
+	for engine.DeliveryMetrics().LeaseRenewalFailures == 0 {
+		select {
+		case <-deadline:
+			cancel()
+			<-done
+			t.Fatal("lease renewal error was not observed")
+		default:
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("lease renewer did not stop after cancellation")
+	}
+}
+
 func TestDeliveryRedactsInjectedSenderErrors(t *testing.T) {
 	ctx := context.Background()
 	st, _, db := monitorTestStoreWithDB(t)

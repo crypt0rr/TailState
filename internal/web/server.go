@@ -865,6 +865,15 @@ func (s *Server) metrics(w http.ResponseWriter, r *http.Request) {
 	}
 	fmt.Fprintf(w, "# TYPE tailstate_collector_due_errors_total counter\ntailstate_collector_due_errors_total %d\n", dueErrors)
 	fmt.Fprintf(w, "# TYPE tailstate_outbox_pending gauge\ntailstate_outbox_pending %d\n# TYPE tailstate_outbox_processing gauge\ntailstate_outbox_processing %d\n# TYPE tailstate_outbox_dead gauge\ntailstate_outbox_dead %d\n", status.Pending, status.Processing, status.Dead)
+	if s.engine != nil {
+		delivery := s.engine.DeliveryMetrics()
+		fmt.Fprintf(w, "# TYPE tailstate_outbox_delivery_attempts_total counter\ntailstate_outbox_delivery_attempts_total %d\n# TYPE tailstate_outbox_delivery_success_total counter\ntailstate_outbox_delivery_success_total %d\n# TYPE tailstate_outbox_delivery_failure_total counter\ntailstate_outbox_delivery_failure_total %d\n# TYPE tailstate_outbox_lease_renewals_total counter\ntailstate_outbox_lease_renewals_total %d\n# TYPE tailstate_outbox_lease_renewal_failures_total counter\ntailstate_outbox_lease_renewal_failures_total %d\n# TYPE tailstate_outbox_lease_losses_total counter\ntailstate_outbox_lease_losses_total %d\n", delivery.Attempts, delivery.Successes, delivery.Failures, delivery.LeaseRenewals, delivery.LeaseRenewalFailures, delivery.LeaseLosses)
+		fmt.Fprintln(w, "# TYPE tailstate_outbox_delivery_duration_seconds histogram")
+		for i, bound := range monitor.DeliveryDurationBucketBounds() {
+			fmt.Fprintf(w, "tailstate_outbox_delivery_duration_seconds_bucket{le=\"%.3g\"} %d\n", bound, delivery.DurationBuckets[i])
+		}
+		fmt.Fprintf(w, "tailstate_outbox_delivery_duration_seconds_bucket{le=\"+Inf\"} %d\ntailstate_outbox_delivery_duration_seconds_sum %.6f\ntailstate_outbox_delivery_duration_seconds_count %d\n", delivery.DurationCount, delivery.DurationSeconds, delivery.DurationCount)
+	}
 	fmt.Fprintf(w, "# TYPE tailstate_webhook_triggers_pending gauge\ntailstate_webhook_triggers_pending %d\n# TYPE tailstate_webhook_triggers_processing gauge\ntailstate_webhook_triggers_processing %d\n# TYPE tailstate_webhook_triggers_dead gauge\ntailstate_webhook_triggers_dead %d\n", status.WebhookPending, status.WebhookProcessing, status.WebhookDead)
 	paused := 0
 	if status.Configured && status.EnabledDestinations == 0 {

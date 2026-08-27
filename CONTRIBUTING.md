@@ -6,7 +6,9 @@ explainable history guarantees described in [README.md](README.md).
 
 ## Before opening a change
 
-Use Go 1.26.6 (the version in `go.mod`) and keep changes focused. Do not add
+Use Go 1.26.6 (the version in `go.mod`) and keep changes focused. CI and the
+release container use this same compiler; verify the two pins with
+`bash scripts/check-go-toolchain.sh`. Do not add
 credentials, database files, backup archives, generated coverage output, or
 local Compose state to a commit.
 
@@ -17,6 +19,7 @@ gofmt -w cmd internal
 go mod tidy -diff
 go vet ./...
 go test -race -covermode=atomic -coverpkg=./... -coverprofile=coverage.out ./...
+bash scripts/check-go-toolchain.sh
 bash scripts/invariant-suite.sh
 go tool staticcheck ./...
 go tool govulncheck ./...

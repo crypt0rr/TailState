@@ -30,6 +30,13 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
       - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+      - name: Verify release toolchain and record provenance
+        run: |
+          set -euo pipefail
+          bash scripts/check-go-toolchain.sh
+          go_version="$(awk '$1 == "go" { print $2; exit }' go.mod)"
+          printf 'release compiler: go%s\nrelease targets: linux/amd64,linux/arm64\nsource commit: %s\n' \
+            "$go_version" "$GITHUB_SHA"
       - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
@@ -47,6 +54,9 @@ jobs:
             org.opencontainers.image.title=TailState
             org.opencontainers.image.description=Read-only Tailscale inventory drift monitoring with signed evidence
             org.opencontainers.image.licenses=MIT
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.build.targets=linux/amd64,linux/arm64
       - name: Build and push immutable release candidate
         id: candidate
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
@@ -58,7 +68,9 @@ jobs:
           # github.repository preserves the mixed-case GitHub repository name.
           tags: ghcr.io/crypt0rr/tailstate:release-candidate-${{ github.sha }}
           labels: ${{ steps.meta.outputs.labels }}
-          build-args: VERSION=${{ steps.meta.outputs.version }}
+          build-args: |
+            VERSION=${{ steps.meta.outputs.version }}
+            BUILD_COMMIT=${{ github.sha }}
           provenance: mode=max
           sbom: true
       - name: Verify release candidate manifest

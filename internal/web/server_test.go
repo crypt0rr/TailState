@@ -48,10 +48,7 @@ func testServer(t *testing.T) (*Server, *store.Store, string) {
 func TestClaimLoginSurfaceAndSecurityHeaders(t *testing.T) {
 	server, st, token := testServer(t)
 	form := url.Values{"token": {token}, "password": {"a secure password"}, "confirm": {"a secure password"}}
-	request := httptest.NewRequest(http.MethodPost, "/setup/claim", strings.NewReader(form.Encode()))
-	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	response := httptest.NewRecorder()
-	server.Handler().ServeHTTP(response, request)
+	response := coveragePost(t, server, "/setup/claim", form, nil)
 	if response.Code != http.StatusSeeOther {
 		t.Fatalf("claim status %d: %s", response.Code, response.Body.String())
 	}
@@ -165,21 +162,13 @@ func TestSetupPasswordMismatchConsumesThrottleBudget(t *testing.T) {
 	server, _, token := testServer(t)
 	form := url.Values{"token": {token}, "password": {"a secure password"}, "confirm": {"different password"}}
 	for attempt := 0; attempt < 5; attempt++ {
-		request := httptest.NewRequest(http.MethodPost, "/setup/claim", strings.NewReader(form.Encode()))
-		request.RemoteAddr = "198.51.100.25:1234"
-		request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-		response := httptest.NewRecorder()
-		server.Handler().ServeHTTP(response, request)
+		response := coverageCredentialPost(t, server, "/setup/claim", form, nil, "", "198.51.100.25:1234", nil)
 		if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "Passwords do not match") {
 			t.Fatalf("mismatch attempt %d status=%d body=%s", attempt+1, response.Code, response.Body.String())
 		}
 	}
 
-	request := httptest.NewRequest(http.MethodPost, "/setup/claim", strings.NewReader(form.Encode()))
-	request.RemoteAddr = "198.51.100.25:1234"
-	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	response := httptest.NewRecorder()
-	server.Handler().ServeHTTP(response, request)
+	response := coverageCredentialPost(t, server, "/setup/claim", form, nil, "", "198.51.100.25:1234", nil)
 	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "Too many setup attempts") {
 		t.Fatalf("sixth mismatch was not throttled: status=%d body=%s", response.Code, response.Body.String())
 	}
@@ -187,22 +176,21 @@ func TestSetupPasswordMismatchConsumesThrottleBudget(t *testing.T) {
 
 func TestCredentialPostsAllowProxyOriginMismatch(t *testing.T) {
 	server, st, token := testServer(t)
+	server.config.CookieSecure = true
+	server.config.TrustedProxies = []netip.Prefix{netip.MustParsePrefix("192.0.2.0/24")}
+	proxyHeaders := http.Header{
+		"Origin":            {"https://tailstate.example.com"},
+		"X-Forwarded-For":   {"198.51.100.8"},
+		"X-Forwarded-Proto": {"https"},
+	}
 	form := url.Values{"token": {token}, "password": {"a secure password"}, "confirm": {"a secure password"}}
-	claimRequest := httptest.NewRequest(http.MethodPost, "http://tailstate.internal:8080/setup/claim", strings.NewReader(form.Encode()))
-	claimRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	claimRequest.Header.Set("Origin", "https://tailstate.example.com")
-	claimResponse := httptest.NewRecorder()
-	server.Handler().ServeHTTP(claimResponse, claimRequest)
+	claimResponse := coverageCredentialPost(t, server, "/setup/claim", form, nil, "https://tailstate.example.com/setup/claim", "192.0.2.10:1234", proxyHeaders)
 	if claimResponse.Code != http.StatusSeeOther {
 		t.Fatalf("proxied setup status %d: %s", claimResponse.Code, claimResponse.Body.String())
 	}
 
 	loginForm := url.Values{"password": {"a secure password"}}
-	loginRequest := httptest.NewRequest(http.MethodPost, "http://tailstate.internal:8080/login", strings.NewReader(loginForm.Encode()))
-	loginRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	loginRequest.Header.Set("Origin", "https://tailstate.example.com")
-	loginResponse := httptest.NewRecorder()
-	server.Handler().ServeHTTP(loginResponse, loginRequest)
+	loginResponse := coverageCredentialPost(t, server, "/login", loginForm, nil, "https://tailstate.example.com/login", "192.0.2.10:1234", proxyHeaders)
 	if loginResponse.Code != http.StatusSeeOther || loginResponse.Header().Get("Location") != "/" {
 		t.Fatalf("proxied login status %d location=%q body=%s", loginResponse.Code, loginResponse.Header().Get("Location"), loginResponse.Body.String())
 	}
@@ -212,11 +200,7 @@ func TestCredentialPostsAllowProxyOriginMismatch(t *testing.T) {
 		t.Fatal(err)
 	}
 	resetForm := url.Values{"token": {resetToken}, "password": {"another secure password"}, "confirm": {"another secure password"}}
-	resetRequest := httptest.NewRequest(http.MethodPost, "http://tailstate.internal:8080/reset", strings.NewReader(resetForm.Encode()))
-	resetRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	resetRequest.Header.Set("Origin", "https://tailstate.example.com")
-	resetResponse := httptest.NewRecorder()
-	server.Handler().ServeHTTP(resetResponse, resetRequest)
+	resetResponse := coverageCredentialPost(t, server, "/reset", resetForm, nil, "https://tailstate.example.com/reset", "192.0.2.10:1234", proxyHeaders)
 	if resetResponse.Code != http.StatusSeeOther || resetResponse.Header().Get("Location") != "/login" {
 		t.Fatalf("proxied reset status %d location=%q body=%s", resetResponse.Code, resetResponse.Header().Get("Location"), resetResponse.Body.String())
 	}
@@ -240,10 +224,7 @@ func TestForwardedClientAddressRequiresTrustedProxy(t *testing.T) {
 func TestLoginRejectsWhenAuthenticationCapacityIsExhausted(t *testing.T) {
 	server, _, token := testServer(t)
 	claim := url.Values{"token": {token}, "password": {"a secure password"}, "confirm": {"a secure password"}}
-	claimRequest := httptest.NewRequest(http.MethodPost, "/setup/claim", strings.NewReader(claim.Encode()))
-	claimRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	claimResponse := httptest.NewRecorder()
-	server.Handler().ServeHTTP(claimResponse, claimRequest)
+	claimResponse := coveragePost(t, server, "/setup/claim", claim, nil)
 	if claimResponse.Code != http.StatusSeeOther {
 		t.Fatalf("claim status %d: %s", claimResponse.Code, claimResponse.Body.String())
 	}
@@ -255,10 +236,7 @@ func TestLoginRejectsWhenAuthenticationCapacityIsExhausted(t *testing.T) {
 		<-server.authWork
 	}()
 	login := url.Values{"password": {"a secure password"}}
-	request := httptest.NewRequest(http.MethodPost, "/login", strings.NewReader(login.Encode()))
-	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	response := httptest.NewRecorder()
-	server.Handler().ServeHTTP(response, request)
+	response := coverageCredentialPost(t, server, "/login", login, nil, "", "", nil)
 	if response.Code != http.StatusServiceUnavailable {
 		t.Fatalf("busy login status %d: %s", response.Code, response.Body.String())
 	}
@@ -473,10 +451,7 @@ func TestReadyReportsPostBaselineCollectorDegradation(t *testing.T) {
 func TestSettingsRedactsDestinationCredentials(t *testing.T) {
 	server, st, token := testServer(t)
 	claim := url.Values{"token": {token}, "password": {"a secure password"}, "confirm": {"a secure password"}}
-	request := httptest.NewRequest(http.MethodPost, "/setup/claim", strings.NewReader(claim.Encode()))
-	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	response := httptest.NewRecorder()
-	server.Handler().ServeHTTP(response, request)
+	response := coveragePost(t, server, "/setup/claim", claim, nil)
 	cookies := response.Result().Cookies()
 	if _, err := st.SaveSettings(context.Background(), store.Settings{Tailnet: "-", OAuthClientID: "client", OAuthClientSecret: "secret", WebhookSecret: "webhook-super-secret", MattermostURL: "https://mattermost.example/hooks/super-secret-token", DeviceInterval: time.Minute, InventoryInterval: 5 * time.Minute}); err != nil {
 		t.Fatal(err)
@@ -500,10 +475,7 @@ func TestHistoryRequiresAuthenticationAndShowsExplainableChanges(t *testing.T) {
 	server, st, setupToken := testServer(t)
 	ctx := context.Background()
 	claim := url.Values{"token": {setupToken}, "password": {"a secure password"}, "confirm": {"a secure password"}}
-	claimRequest := httptest.NewRequest(http.MethodPost, "/setup/claim", strings.NewReader(claim.Encode()))
-	claimRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	claimResponse := httptest.NewRecorder()
-	server.Handler().ServeHTTP(claimResponse, claimRequest)
+	claimResponse := coveragePost(t, server, "/setup/claim", claim, nil)
 	if claimResponse.Code != http.StatusSeeOther {
 		t.Fatalf("claim status %d: %s", claimResponse.Code, claimResponse.Body.String())
 	}

@@ -14,6 +14,8 @@ caddy_name="tailstate-caddy-${run_id}"
 data_volume="tailstate-proxy-data-${run_id}"
 key_file="$(mktemp)"
 caddyfile="$(mktemp)"
+setup_page="$(mktemp)"
+cookie_jar="$(mktemp)"
 
 cleanup() {
 	set +e
@@ -27,7 +29,7 @@ cleanup() {
 			sh -ec 'chown "$1:$2" /run/secrets/cleanup-key && chmod 0600 /run/secrets/cleanup-key' \
 			-- "$(id -u)" "$(id -g)" >/dev/null 2>&1
 	fi
-	rm -f "$key_file" "$caddyfile"
+	rm -f "$key_file" "$caddyfile" "$setup_page" "$cookie_jar"
 }
 trap cleanup EXIT
 
@@ -98,8 +100,31 @@ if [[ -z "$setup_token" ]]; then
 fi
 
 status="$(curl --insecure --silent --show-error --max-time 5 \
+	--cookie-jar "$cookie_jar" \
+	--output "$setup_page" \
+	--write-out '%{http_code}' \
+	-H "Origin: https://localhost:${port}" \
+	"https://localhost:${port}/setup")"
+if [[ "$status" != "200" ]]; then
+	docker logs "$tailstate_name" >&2 || true
+	docker logs "$caddy_name" >&2 || true
+	echo "HTTPS proxy setup page returned HTTP ${status}, expected 200" >&2
+	exit 1
+fi
+
+challenge="$(sed -n 's/.*name="_challenge" value="\([^"]*\)".*/\1/p' "$setup_page" | head -n 1)"
+if [[ -z "$challenge" ]]; then
+	docker logs "$tailstate_name" >&2 || true
+	docker logs "$caddy_name" >&2 || true
+	echo "HTTPS proxy setup page did not contain a credential challenge" >&2
+	exit 1
+fi
+
+status="$(curl --insecure --silent --show-error --max-time 5 \
+	--cookie "$cookie_jar" \
 	--output /dev/null --write-out '%{http_code}' \
 	-H "Origin: https://localhost:${port}" \
+	--data-urlencode "_challenge=${challenge}" \
 	--data-urlencode "token=${setup_token}" \
 	--data-urlencode 'password=a secure password' \
 	--data-urlencode 'confirm=a secure password' \

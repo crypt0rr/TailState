@@ -205,6 +205,14 @@ const (
 )
 
 func Open(path string, box *secret.Box) (*Store, error) {
+	return OpenWithLimits(path, box, StorageLimits{})
+}
+
+// OpenWithLimits opens a store and applies the operator-selected storage
+// profile before bootstrap DDL or migrations can grow the database. The
+// logical SQLite page ceiling is persisted by SQLite and is also reapplied on
+// every restart, so a configured budget cannot silently become advisory.
+func OpenWithLimits(path string, box *secret.Box, configuredLimits StorageLimits) (*Store, error) {
 	if box == nil {
 		return nil, errors.New("master key is required")
 	}
@@ -217,6 +225,24 @@ func Open(path string, box *secret.Box) (*Store, error) {
 		return nil, err
 	}
 	db.SetMaxOpenConns(1)
+	limits := configuredLimits
+	if limits == (StorageLimits{}) {
+		if persisted, found, loadErr := loadPersistedStorageLimits(db); loadErr != nil {
+			db.Close()
+			return nil, loadErr
+		} else if found {
+			limits = persisted
+		}
+	}
+	limits, err = normalizeStorageLimits(limits)
+	if err != nil {
+		db.Close()
+		return nil, fmt.Errorf("storage limits: %w", err)
+	}
+	if err := configureDatabasePageLimit(db, limits.DatabaseBytes); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("database storage limit setup failed: %w", err)
+	}
 	present, err := verifyExistingMasterKey(db, box)
 	if err != nil {
 		db.Close()
@@ -268,7 +294,7 @@ func Open(path string, box *secret.Box) (*Store, error) {
 		return nil, fmt.Errorf("database migration failed while creating outbox history index; stop TailState and restore the verified pre-upgrade backup before retrying: %w", err)
 	}
 	st := &Store{db: db, box: box}
-	st.limits.Store(DefaultStorageLimits())
+	st.limits.Store(limits)
 	present, err = verifyExistingMasterKey(db, box)
 	if err != nil {
 		db.Close()
@@ -293,6 +319,10 @@ func Open(path string, box *secret.Box) (*Store, error) {
 	if err := st.backfillEvidenceLedgerOnStartup(context.Background()); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("backfill evidence ledger: %w", err)
+	}
+	if err := persistStorageLimits(context.Background(), db, limits); err != nil {
+		db.Close()
+		return nil, err
 	}
 	if err := os.Chmod(path, 0o600); err != nil {
 		db.Close()

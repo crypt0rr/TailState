@@ -374,7 +374,10 @@ Schema v11 adds the same lease and fencing state to notification outbox rows,
 preventing duplicate claims during overlapping workers and stale delivery
 bookkeeping after a restart. Schema v12 adds byte and truncation metadata to
 snapshots and event values, backfills hashes and observed sizes for existing
-history, and enables bounded history reads. Existing normalized values are
+history in resumable 64-row transactions, and enables bounded history reads.
+The startup evidence-ledger backfill uses the same bounded transactions and a
+durable cursor, so an interrupted upgrade resumes without duplicate entries or
+a broken hash chain. Existing normalized values are
 retained unchanged; only values written after the upgrade are replaced by a
 marker when they exceed the configured budget. The authenticated Settings
 diagnostics and `doctor -json` report the active limits and database pressure.
@@ -398,6 +401,11 @@ the optional webhook secret are entered in the authenticated UI.
 | `TAILSTATE_METRICS_TOKEN` | empty | Loopback-only `/metrics` when empty; bearer token for remote scrapes |
 | `TAILSTATE_TRUSTED_PROXIES` | empty | Comma-separated proxy IPs/CIDRs allowed to supply `X-Forwarded-For` and `X-Forwarded-Proto` |
 | `TAILSTATE_LOG_LEVEL` | `info` | `info` or `debug` structured logging |
+| `TAILSTATE_SNAPSHOT_LIMIT_BYTES` | `1048576` | Maximum normalized snapshot value retained per resource; `0` uses the default |
+| `TAILSTATE_EVENT_VALUE_LIMIT_BYTES` | `524288` | Maximum before/after value retained per history event; `0` uses the default |
+| `TAILSTATE_HISTORY_PAGE_LIMIT_BYTES` | `2097152` | Maximum stored event data read for one History page; `0` uses the default |
+| `TAILSTATE_REJECT_LIMIT_BYTES` | `4194304` | Hard raw-value write ceiling; `0` uses the default |
+| `TAILSTATE_DATABASE_LIMIT_BYTES` | `536870912` | SQLite logical database byte ceiling enforced with SQLite's page limit; `0` uses the default |
 
 The test-only `TAILSTATE_TS_API_URL` and `TAILSTATE_TS_OAUTH_URL` variables allow local mock servers; production deployments should leave them unset.
 
@@ -411,6 +419,14 @@ network and publishes it on loopback by default.
 `TAILSTATE_PORT`, `TAILSTATE_MASTER_KEY_FILE`, and `TAILSTATE_MEMORY_LIMIT` are Compose-file variables;
 they select the container name/image, host publishing address/port, and secret
 file mount. They are not read as application settings by a standalone binary.
+
+Storage limits are read by both the standalone binary and Compose. The database
+limit is a real SQLite page ceiling: writes that reach it fail atomically, and
+TailState reports the condition through diagnostics and metrics. Set the limit
+above the current database size before lowering it; a restart refuses to open a
+database that already exceeds the configured ceiling. The limit covers the
+logical SQLite database, while the signed evidence ledger remains retained for
+audit and is never silently deleted to make room.
 
 ## Local development
 

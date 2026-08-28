@@ -84,6 +84,36 @@ func TestLoadRejectsCookieAndEndpointEdgeCases(t *testing.T) {
 	}
 }
 
+func TestLoadParsesStorageLimits(t *testing.T) {
+	values := map[string]string{
+		"TAILSTATE_SNAPSHOT_LIMIT_BYTES":     "8192",
+		"TAILSTATE_EVENT_VALUE_LIMIT_BYTES":  "16384",
+		"TAILSTATE_HISTORY_PAGE_LIMIT_BYTES": "32768",
+		"TAILSTATE_REJECT_LIMIT_BYTES":       "65536",
+		"TAILSTATE_DATABASE_LIMIT_BYTES":     "1048576",
+	}
+	for name, value := range values {
+		t.Setenv(name, value)
+	}
+	config, err := Load("test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.StorageLimits.SnapshotBytes != 8192 || config.StorageLimits.EventValueBytes != 16384 || config.StorageLimits.HistoryPageBytes != 32768 || config.StorageLimits.RejectBytes != 65536 || config.StorageLimits.DatabaseBytes != 1048576 {
+		t.Fatalf("storage limits=%#v", config.StorageLimits)
+	}
+	for name, value := range map[string]string{
+		"TAILSTATE_SNAPSHOT_LIMIT_BYTES": "not-a-number",
+		"TAILSTATE_DATABASE_LIMIT_BYTES": "-1",
+	} {
+		t.Setenv(name, value)
+		if _, err := Load("test"); err == nil || !strings.Contains(err.Error(), name) {
+			t.Fatalf("invalid %s value was accepted: %v", name, err)
+		}
+		t.Setenv(name, "0")
+	}
+}
+
 func TestInsecureHTTPListenerDiagnostic(t *testing.T) {
 	cases := []struct {
 		name   string

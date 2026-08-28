@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strconv"
 	"strings"
 	"time"
@@ -26,8 +27,11 @@ const (
 	evidenceLedgerHeadMeta        = "evidence_ledger_head"
 	evidenceLedgerBackfillCutoff  = "evidence_ledger_backfill_cutoff"
 	evidenceLedgerBackfilledMeta  = "evidence_ledger_backfilled_at"
+	evidenceLedgerBackfillCursor  = "evidence_ledger_backfill_cursor"
 	evidenceLedgerDomain          = "tailstate-evidence-ledger-v1\n"
 )
+
+const evidenceLedgerBackfillChunkSize = 64
 
 type evidenceSigningKey struct {
 	private ed25519.PrivateKey
@@ -251,51 +255,102 @@ func (s *Store) backfillEvidenceLedger(ctx context.Context) error {
 // missing migration marker can never promote live rows into historical
 // evidence.
 func (s *Store) backfillEvidenceLedgerUpTo(ctx context.Context, cutoff int64) error {
-	tx, err := s.db.BeginTx(ctx, nil)
+	cursor, err := s.evidenceLedgerBackfillCursor(ctx)
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
-	// Only batches with a complete event set are eligible for migration
-	// backfill. ApplyBatch writes event_batches and events in one transaction;
-	// an empty or mismatched row is not a valid historical batch and must not be
-	// granted a signed ledger position merely because it exists in SQLite.
-	query := `SELECT b.id
-		FROM event_batches b
-		WHERE b.change_count > 0
-		  AND b.change_count = (SELECT COUNT(*) FROM events e WHERE e.batch_id=b.id)`
-	args := []any{}
-	if cutoff > 0 {
-		query += "\n  AND b.id <= ?"
-		args = append(args, cutoff)
-	}
-	query += "\n ORDER BY b.id"
-	rows, err := tx.QueryContext(ctx, query, args...)
-	if err != nil {
-		return err
-	}
-	var batchIDs []int64
-	for rows.Next() {
-		var batchID int64
-		if err := rows.Scan(&batchID); err != nil {
+	for {
+		tx, beginErr := s.db.BeginTx(ctx, nil)
+		if beginErr != nil {
+			return beginErr
+		}
+		// Only batches with a complete event set are eligible for migration
+		// backfill. ApplyBatch writes event_batches and events in one transaction;
+		// an empty or mismatched row is not a valid historical batch and must not be
+		// granted a signed ledger position merely because it exists in SQLite.
+		query := `SELECT b.id
+			FROM event_batches b
+			WHERE b.id > ?
+			  AND b.change_count > 0
+			  AND b.change_count = (SELECT COUNT(*) FROM events e WHERE e.batch_id=b.id)`
+		args := []any{cursor}
+		if cutoff > 0 {
+			query += "\n  AND b.id <= ?"
+			args = append(args, cutoff)
+		}
+		query += "\n ORDER BY b.id LIMIT ?"
+		args = append(args, evidenceLedgerBackfillChunkSize)
+		rows, queryErr := tx.QueryContext(ctx, query, args...)
+		if queryErr != nil {
+			tx.Rollback()
+			return queryErr
+		}
+		batchIDs := make([]int64, 0, evidenceLedgerBackfillChunkSize)
+		for rows.Next() {
+			var batchID int64
+			if scanErr := rows.Scan(&batchID); scanErr != nil {
+				rows.Close()
+				tx.Rollback()
+				return scanErr
+			}
+			batchIDs = append(batchIDs, batchID)
+		}
+		if rowsErr := rows.Err(); rowsErr != nil {
 			rows.Close()
-			return err
+			tx.Rollback()
+			return rowsErr
 		}
-		batchIDs = append(batchIDs, batchID)
-	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		return err
-	}
-	if err := rows.Close(); err != nil {
-		return err
-	}
-	for _, batchID := range batchIDs {
-		if err := s.appendEvidenceLedgerTx(ctx, tx, batchID); err != nil {
-			return err
+		if closeErr := rows.Close(); closeErr != nil {
+			tx.Rollback()
+			return closeErr
 		}
+		if len(batchIDs) == 0 {
+			tx.Rollback()
+			if err := s.clearEvidenceLedgerBackfillCursor(ctx); err != nil {
+				return err
+			}
+			return nil
+		}
+		for _, batchID := range batchIDs {
+			if err := s.appendEvidenceLedgerTx(ctx, tx, batchID); err != nil {
+				tx.Rollback()
+				return err
+			}
+		}
+		cursor = batchIDs[len(batchIDs)-1]
+		if _, execErr := tx.ExecContext(ctx, `INSERT INTO meta(key,value) VALUES(?,?)
+			ON CONFLICT(key) DO UPDATE SET value=excluded.value`, evidenceLedgerBackfillCursor, strconv.FormatInt(cursor, 10)); execErr != nil {
+			tx.Rollback()
+			return fmt.Errorf("update evidence ledger backfill progress: %w", execErr)
+		}
+		if commitErr := tx.Commit(); commitErr != nil {
+			return commitErr
+		}
+		slog.Info("evidence ledger backfill chunk completed", "rows", len(batchIDs), "cursor", cursor, "cutoff", cutoff)
 	}
-	return tx.Commit()
+}
+
+func (s *Store) evidenceLedgerBackfillCursor(ctx context.Context) (int64, error) {
+	var encoded string
+	err := s.db.QueryRowContext(ctx, "SELECT value FROM meta WHERE key=?", evidenceLedgerBackfillCursor).Scan(&encoded)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, fmt.Errorf("read evidence ledger backfill progress: %w", err)
+	}
+	cursor, parseErr := strconv.ParseInt(strings.TrimSpace(encoded), 10, 64)
+	if parseErr != nil || cursor < 0 {
+		return 0, fmt.Errorf("invalid evidence ledger backfill cursor %q", encoded)
+	}
+	return cursor, nil
+}
+
+func (s *Store) clearEvidenceLedgerBackfillCursor(ctx context.Context) error {
+	if _, err := s.db.ExecContext(ctx, "DELETE FROM meta WHERE key=?", evidenceLedgerBackfillCursor); err != nil {
+		return fmt.Errorf("clear evidence ledger backfill progress: %w", err)
+	}
+	return nil
 }
 
 func (s *Store) backfillEvidenceLedgerOnStartup(ctx context.Context) error {

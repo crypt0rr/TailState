@@ -4,12 +4,15 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/crypt0rr/tailstate/internal/model"
+	"github.com/crypt0rr/tailstate/internal/secret"
 )
 
 func TestSchemaV11ToV12BackfillsSnapshotMetadata(t *testing.T) {
@@ -163,6 +166,51 @@ INSERT INTO events(id,before_json,after_json) VALUES('not-an-integer','{}',NULL)
 				t.Fatalf("migration error=%v, want substring %q", err, tt.want)
 			}
 		})
+	}
+}
+
+func TestSchemaV11ToV12ResumesAfterAChunkFailure(t *testing.T) {
+	db := currentSchemaMigrationDB(t, 11)
+	for i := 0; i < migrationChunkSize+1; i++ {
+		if _, err := db.Exec("INSERT INTO snapshots(generation,collector,resource_id,resource_type,name,canonical_json,content_hash,updated_at) VALUES(1,'devices',?,?,?,?,?,?)", "device-"+strconv.Itoa(i), "device", "server", `{"hostname":"server"}`, "hash", "2026-01-01T00:00:00Z"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := db.Exec("CREATE TRIGGER fail_second_snapshot_chunk BEFORE UPDATE ON snapshots WHEN NEW.resource_id='device-" + strconv.Itoa(migrationChunkSize) + "' BEGIN SELECT RAISE(ABORT,'pause bounded migration'); END"); err != nil {
+		t.Fatal(err)
+	}
+	if err := migrateSchemaV11ToV12(db); err == nil || !strings.Contains(err.Error(), "backfill snapshot size metadata") {
+		t.Fatalf("first migration error=%v", err)
+	}
+	var migrated int
+	if err := db.QueryRow("SELECT COUNT(*) FROM snapshots WHERE content_bytes > 0").Scan(&migrated); err != nil {
+		t.Fatal(err)
+	}
+	if migrated != migrationChunkSize {
+		t.Fatalf("completed snapshot rows=%d, want %d", migrated, migrationChunkSize)
+	}
+	var cursor int64
+	if err := db.QueryRow("SELECT cursor FROM schema_migration_progress WHERE migration=?", boundedHistoryMigration).Scan(&cursor); err != nil {
+		t.Fatal(err)
+	}
+	if cursor != migrationChunkSize {
+		t.Fatalf("migration cursor=%d, want %d", cursor, migrationChunkSize)
+	}
+	if _, err := db.Exec("DROP TRIGGER fail_second_snapshot_chunk"); err != nil {
+		t.Fatal(err)
+	}
+	if err := migrateSchemaV11ToV12(db); err != nil {
+		t.Fatal(err)
+	}
+	var version int
+	if err := db.QueryRow("SELECT version FROM schema_version").Scan(&version); err != nil || version != 12 {
+		t.Fatalf("schema version=%d err=%v", version, err)
+	}
+	if err := db.QueryRow("SELECT COUNT(*) FROM snapshots WHERE content_bytes > 0").Scan(&migrated); err != nil {
+		t.Fatal(err)
+	}
+	if migrated != migrationChunkSize+1 {
+		t.Fatalf("resumed snapshot rows=%d, want %d", migrated, migrationChunkSize+1)
 	}
 }
 
@@ -378,6 +426,81 @@ func TestStorageLimitValidationAndMetricEdges(t *testing.T) {
 	}
 }
 
+func TestDatabaseStorageLimitIsEnforcedAndSurvivesRestart(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "tailstate.db")
+	box, err := secret.NewBox(make([]byte, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	initial, err := Open(path, box)
+	if err != nil {
+		t.Fatal(err)
+	}
+	metrics, err := initial.StorageMetrics(ctx)
+	if err != nil {
+		initial.Close()
+		t.Fatal(err)
+	}
+	var pageSize int64
+	if err := initial.db.QueryRowContext(ctx, "PRAGMA page_size").Scan(&pageSize); err != nil {
+		initial.Close()
+		t.Fatal(err)
+	}
+	if err := initial.Close(); err != nil {
+		t.Fatal(err)
+	}
+	limit := metrics.DatabaseBytes + 2*pageSize
+	limits := StorageLimits{DatabaseBytes: limit}
+	st, err := OpenWithLimits(path, box, limits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var writeErr error
+	for i := 0; i < 32; i++ {
+		_, writeErr = st.db.ExecContext(ctx, "INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)", "storage-filler-"+strconv.Itoa(i), strings.Repeat("x", 16<<10))
+		if writeErr != nil {
+			break
+		}
+	}
+	if writeErr == nil || !errors.Is(storageWriteError(writeErr), ErrStorageBudgetExceeded) {
+		st.Close()
+		t.Fatalf("database limit write error=%v", writeErr)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := OpenWithLimits(path, box, limits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if got := reopened.StorageLimits().DatabaseBytes; got != limit {
+		t.Fatalf("reopened database limit=%d, want %d", got, limit)
+	}
+	current, err := reopened.StorageMetrics(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.DatabaseBytes > limit {
+		t.Fatalf("database exceeded configured limit: %d > %d", current.DatabaseBytes, limit)
+	}
+	if err := reopened.SetStorageLimits(StorageLimits{DatabaseBytes: current.DatabaseBytes - 1}); err == nil {
+		t.Fatal("lowering database limit below current size succeeded")
+	}
+	if err := reopened.Close(); err != nil {
+		t.Fatal(err)
+	}
+	persisted, err := Open(path, box)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer persisted.Close()
+	if got := persisted.StorageLimits().DatabaseBytes; got != limit {
+		t.Fatalf("persisted database limit=%d, want %d", got, limit)
+	}
+}
+
 func TestEvidenceSnapshotMetadataValidation(t *testing.T) {
 	marker := string(truncationJSON("hash", 99, 10, "byte limit"))
 	valid := []struct {
@@ -419,5 +542,158 @@ func TestStorageMetricClosedDatabaseAndStoredValueEdges(t *testing.T) {
 	}
 	if _, err := st.StorageMetrics(context.Background()); err == nil {
 		t.Fatal("closed database returned storage metrics")
+	}
+	open := testStore(t)
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := open.StorageMetrics(canceled); err == nil {
+		t.Fatal("canceled metrics query unexpectedly succeeded")
+	}
+}
+
+func TestStorageLimitPersistenceAndErrorEdges(t *testing.T) {
+	ctx := context.Background()
+	var nilDB *sql.DB
+	if _, found, err := loadPersistedStorageLimits(nilDB); err == nil || found {
+		t.Fatalf("nil database persistence lookup = found=%t err=%v", found, err)
+	}
+
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.SetMaxOpenConns(1)
+	defer db.Close()
+	if limits, found, err := loadPersistedStorageLimits(db); err != nil || found || limits != (StorageLimits{}) {
+		t.Fatalf("database without meta table = %#v found=%t err=%v", limits, found, err)
+	}
+	if _, err := db.Exec("CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT NOT NULL)"); err != nil {
+		t.Fatal(err)
+	}
+	if limits, found, err := loadPersistedStorageLimits(db); err != nil || found || limits != (StorageLimits{}) {
+		t.Fatalf("database without persisted limits = %#v found=%t err=%v", limits, found, err)
+	}
+	if _, err := db.Exec("INSERT INTO meta(key,value) VALUES(?,?)", storageLimitsMeta, "not-json"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := loadPersistedStorageLimits(db); err == nil || !strings.Contains(err.Error(), "decode persisted storage limits") {
+		t.Fatalf("malformed persisted limits error=%v", err)
+	}
+	if _, err := db.Exec("UPDATE meta SET value=? WHERE key=?", `{"SnapshotBytes":1}`, storageLimitsMeta); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := loadPersistedStorageLimits(db); err == nil || !strings.Contains(err.Error(), "persisted storage limits") {
+		t.Fatalf("invalid persisted limits error=%v", err)
+	}
+	valid := DefaultStorageLimits()
+	if err := persistStorageLimits(ctx, db, valid); err != nil {
+		t.Fatal(err)
+	}
+	if got, found, err := loadPersistedStorageLimits(db); err != nil || !found || got != valid {
+		t.Fatalf("persisted limits = %#v found=%t err=%v, want %#v", got, found, err, valid)
+	}
+
+	if err := configureDatabasePageLimit(nil, valid.DatabaseBytes); err == nil {
+		t.Fatal("nil database limit configuration unexpectedly succeeded")
+	}
+	if err := configureDatabasePageLimit(db, 0); err == nil {
+		t.Fatal("zero database limit configuration unexpectedly succeeded")
+	}
+	if err := storageWriteError(nil); err != nil {
+		t.Fatalf("storageWriteError(nil) = %v", err)
+	}
+	if err := storageWriteError(ErrStorageBudgetExceeded); !errors.Is(err, ErrStorageBudgetExceeded) {
+		t.Fatalf("existing storage budget error = %v", err)
+	}
+	for _, raw := range []string{"database or disk is full", "database full", "SQLITE_FULL"} {
+		if err := storageWriteError(errors.New(raw)); !errors.Is(err, ErrStorageBudgetExceeded) {
+			t.Fatalf("storageWriteError(%q) = %v", raw, err)
+		}
+	}
+	ordinary := errors.New("ordinary write failure")
+	if err := storageWriteError(ordinary); !errors.Is(err, ordinary) {
+		t.Fatalf("ordinary storage error = %v", err)
+	}
+
+	var closed *sql.DB
+	closed, err = sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := closed.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := persistStorageLimits(ctx, closed, valid); err == nil {
+		t.Fatal("persisting limits to closed database unexpectedly succeeded")
+	}
+	if err := configureDatabasePageLimit(closed, valid.DatabaseBytes); err == nil {
+		t.Fatal("configuring closed database limit unexpectedly succeeded")
+	}
+	if _, _, err := loadPersistedStorageLimits(closed); err == nil {
+		t.Fatal("loading limits from closed database unexpectedly succeeded")
+	}
+	if err := configureDatabasePageLimit(db, 1); err == nil {
+		t.Fatal("database limit below the existing page count unexpectedly succeeded")
+	}
+
+	var nilStore *Store
+	if err := nilStore.SetStorageLimits(valid); err == nil {
+		t.Fatal("nil store accepted storage limits")
+	}
+	st := testStore(t)
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetStorageLimits(valid); err == nil {
+		t.Fatal("closed store accepted storage limits")
+	}
+	st = testStore(t)
+	if _, err := st.db.Exec("DROP TABLE meta"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetStorageLimits(valid); err == nil || !strings.Contains(err.Error(), "persist storage limits") {
+		t.Fatalf("storage limit persistence failure=%v", err)
+	}
+}
+
+func TestBoundedHistoryMigrationProgressValidation(t *testing.T) {
+	db := migrationErrorDB(t)
+	if _, err := db.Exec(`CREATE TABLE schema_migration_progress (
+		migration TEXT PRIMARY KEY,
+		phase TEXT NOT NULL,
+		cursor INTEGER NOT NULL DEFAULT 0
+	)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec("INSERT INTO schema_migration_progress(migration,phase,cursor) VALUES(?,?,?)", boundedHistoryMigration, "invalid", 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := readBoundedHistoryMigrationProgress(db); err == nil || !strings.Contains(err.Error(), "invalid bounded history migration progress") {
+		t.Fatalf("invalid migration phase error=%v", err)
+	}
+	if _, err := db.Exec("UPDATE schema_migration_progress SET phase='events',cursor=-1 WHERE migration=?", boundedHistoryMigration); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := readBoundedHistoryMigrationProgress(db); err == nil || !strings.Contains(err.Error(), "invalid bounded history migration progress") {
+		t.Fatalf("negative migration cursor error=%v", err)
+	}
+	if err := updateBoundedHistoryMigrationProgress(db, "events", 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := updateBoundedHistoryMigrationProgress(db, "events", 0); err == nil {
+		t.Fatal("progress update on closed database unexpectedly succeeded")
+	}
+}
+
+func TestBoundedHistoryMigrationChunkReadErrors(t *testing.T) {
+	db := migrationErrorDB(t)
+	if _, _, err := migrateSnapshotMetadataChunk(db, 0); err == nil || !strings.Contains(err.Error(), "read snapshot size metadata") {
+		t.Fatalf("snapshot chunk read error=%v", err)
+	}
+	if _, _, err := migrateEventMetadataChunk(db, 0); err == nil || !strings.Contains(err.Error(), "read event snapshot metadata") {
+		t.Fatalf("event chunk read error=%v", err)
 	}
 }

@@ -3,10 +3,14 @@ package store
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
+	"strconv"
+	"strings"
 	"sync/atomic"
 )
 
@@ -23,6 +27,8 @@ type StorageLimits struct {
 	RejectBytes      int64
 	DatabaseBytes    int64
 }
+
+const storageLimitsMeta = "storage_limits"
 
 const (
 	defaultSnapshotBytes    int64 = 1 << 20
@@ -41,6 +47,48 @@ func DefaultStorageLimits() StorageLimits {
 		RejectBytes:      defaultRejectBytes,
 		DatabaseBytes:    defaultDatabaseBytes,
 	}
+}
+
+func loadPersistedStorageLimits(db *sql.DB) (StorageLimits, bool, error) {
+	if db == nil {
+		return StorageLimits{}, false, errors.New("database is unavailable")
+	}
+	var present int
+	if err := db.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='meta'").Scan(&present); err != nil {
+		return StorageLimits{}, false, fmt.Errorf("inspect persisted storage limits: %w", err)
+	}
+	if present == 0 {
+		return StorageLimits{}, false, nil
+	}
+	var encoded string
+	err := db.QueryRow("SELECT value FROM meta WHERE key=?", storageLimitsMeta).Scan(&encoded)
+	if errors.Is(err, sql.ErrNoRows) {
+		return StorageLimits{}, false, nil
+	}
+	if err != nil {
+		return StorageLimits{}, false, fmt.Errorf("read persisted storage limits: %w", err)
+	}
+	var limits StorageLimits
+	if err := json.Unmarshal([]byte(encoded), &limits); err != nil {
+		return StorageLimits{}, false, fmt.Errorf("decode persisted storage limits: %w", err)
+	}
+	normalized, err := normalizeStorageLimits(limits)
+	if err != nil {
+		return StorageLimits{}, false, fmt.Errorf("persisted storage limits: %w", err)
+	}
+	return normalized, true, nil
+}
+
+func persistStorageLimits(ctx context.Context, db *sql.DB, limits StorageLimits) error {
+	encoded, err := json.Marshal(limits)
+	if err != nil {
+		return fmt.Errorf("encode storage limits: %w", err)
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO meta(key,value) VALUES(?,?)
+		ON CONFLICT(key) DO UPDATE SET value=excluded.value`, storageLimitsMeta, string(encoded)); err != nil {
+		return fmt.Errorf("persist storage limits: %w", err)
+	}
+	return nil
 }
 
 func normalizeStorageLimits(limits StorageLimits) (StorageLimits, error) {
@@ -156,6 +204,10 @@ type StorageMetrics struct {
 	DatabaseLimitBytes      int64
 }
 
+// ErrStorageBudgetExceeded indicates that SQLite rejected a write because the
+// configured logical database page budget has been reached.
+var ErrStorageBudgetExceeded = errors.New("database storage budget exceeded")
+
 func (s *Store) StorageLimits() StorageLimits {
 	if s == nil {
 		return DefaultStorageLimits()
@@ -170,12 +222,69 @@ func (s *Store) StorageLimits() StorageLimits {
 // profile and for low-budget integration tests. Existing rows are not
 // rewritten; new writes and reads use the new limits.
 func (s *Store) SetStorageLimits(limits StorageLimits) error {
+	previous := s.StorageLimits()
 	normalized, err := normalizeStorageLimits(limits)
 	if err != nil {
 		return err
 	}
+	if s == nil || s.db == nil {
+		return errors.New("storage limits unavailable")
+	}
+	if err := configureDatabasePageLimit(s.db, normalized.DatabaseBytes); err != nil {
+		return err
+	}
+	if err := persistStorageLimits(context.Background(), s.db, normalized); err != nil {
+		_ = configureDatabasePageLimit(s.db, previous.DatabaseBytes)
+		return err
+	}
 	s.limits.Store(normalized)
 	return nil
+}
+
+func configureDatabasePageLimit(db *sql.DB, limit int64) error {
+	if db == nil || limit < 1 {
+		return errors.New("database storage limit is invalid")
+	}
+	var pageSize int64
+	if err := db.QueryRow("PRAGMA page_size").Scan(&pageSize); err != nil {
+		return fmt.Errorf("read database page size: %w", err)
+	}
+	if pageSize < 1 {
+		return errors.New("database page size is invalid")
+	}
+	// SQLite limits whole pages. Use the largest page count that cannot exceed
+	// the configured byte ceiling; a sub-page budget necessarily rounds up to
+	// one page because SQLite cannot allocate a fraction of a page.
+	maxPages := limit / pageSize
+	if maxPages < 1 {
+		maxPages = 1
+	}
+	var appliedPages int64
+	if err := db.QueryRow("PRAGMA max_page_count = " + strconv.FormatInt(maxPages, 10)).Scan(&appliedPages); err != nil {
+		return fmt.Errorf("set database page limit: %w", err)
+	}
+	var pageCount int64
+	if err := db.QueryRow("PRAGMA page_count").Scan(&pageCount); err != nil {
+		return fmt.Errorf("read database page count: %w", err)
+	}
+	if pageCount > appliedPages || (pageSize > 0 && pageCount > limit/pageSize) {
+		return fmt.Errorf("database uses %d bytes, above configured limit %d", pageCount*pageSize, limit)
+	}
+	return nil
+}
+
+func storageWriteError(err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, ErrStorageBudgetExceeded) {
+		return err
+	}
+	lower := strings.ToLower(err.Error())
+	if strings.Contains(lower, "database or disk is full") || strings.Contains(lower, "database full") || strings.Contains(lower, "sqlite_full") {
+		return fmt.Errorf("%w: %v", ErrStorageBudgetExceeded, err)
+	}
+	return err
 }
 
 // StorageMetrics returns a safe snapshot of storage pressure and guardrail

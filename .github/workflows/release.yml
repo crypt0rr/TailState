@@ -114,19 +114,19 @@ jobs:
           docker pull "$backup_image"
           docker tag "$backup_image" tailstate:backup-sidecar
       - name: Scan backup sidecar
-        uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7.4.0
+        uses: anchore/scan-action@8964e60c6fabdb85fdbbbfd9834d8f19c97a3086 # v7.4.1
         with:
           image: tailstate:backup-sidecar
           fail-build: true
           severity-cutoff: high
       - name: Scan amd64 release candidate
-        uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7.4.0
+        uses: anchore/scan-action@8964e60c6fabdb85fdbbbfd9834d8f19c97a3086 # v7.4.1
         with:
           image: tailstate:release-candidate-amd64
           fail-build: true
           severity-cutoff: high
       - name: Scan arm64 release candidate
-        uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7.4.0
+        uses: anchore/scan-action@8964e60c6fabdb85fdbbbfd9834d8f19c97a3086 # v7.4.1
         with:
           image: tailstate:release-candidate-arm64
           fail-build: true

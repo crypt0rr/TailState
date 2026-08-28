@@ -228,6 +228,9 @@ func (s *Store) EvidenceSigningPublicKey(context.Context) ([]byte, error) {
 // ParseEvidencePublicKey accepts a raw, base64, or hexadecimal Ed25519 public
 // key. Text formats may contain surrounding whitespace or a trailing newline.
 func ParseEvidencePublicKey(raw []byte) ([]byte, error) {
+	if len(raw) > maxEvidencePublicKeyBytes {
+		return nil, fmt.Errorf("evidence public key exceeds %d bytes", maxEvidencePublicKeyBytes)
+	}
 	if len(raw) == ed25519.PublicKeySize {
 		return append([]byte(nil), raw...), nil
 	}

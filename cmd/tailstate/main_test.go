@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/base64"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -437,6 +438,29 @@ func TestEvidenceVerifyReadsStandardInputAndReportsReadErrors(t *testing.T) {
 	}
 	if err := evidenceVerify([]string{"-file", packPath, "-public-key", badKey}); err == nil || !strings.Contains(err.Error(), "parse evidence public key") {
 		t.Fatalf("bad public key error = %v", err)
+	}
+}
+
+func TestEvidenceVerifyRejectsOversizedInputs(t *testing.T) {
+	dataDir := t.TempDir()
+	configureCommandEnvironment(t, dataDir)
+	oversizedPack := filepath.Join(dataDir, "oversized.json")
+	if err := os.WriteFile(oversizedPack, make([]byte, store.EvidencePackLimitBytes+1), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := evidenceVerify([]string{"-file", oversizedPack}); !errors.Is(err, store.ErrEvidencePackTooLarge) {
+		t.Fatalf("oversized evidence pack error=%v", err)
+	}
+	smallPack := filepath.Join(dataDir, "small.json")
+	if err := os.WriteFile(smallPack, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	oversizedKey := filepath.Join(dataDir, "oversized.key")
+	if err := os.WriteFile(oversizedKey, make([]byte, store.EvidencePublicKeyLimitBytes+1), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := evidenceVerify([]string{"-file", smallPack, "-public-key", oversizedKey}); err == nil || !strings.Contains(err.Error(), "evidence public key exceeds") {
+		t.Fatalf("oversized evidence public key error=%v", err)
 	}
 }
 

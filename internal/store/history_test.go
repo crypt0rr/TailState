@@ -106,6 +106,9 @@ func TestHistoryPersistsExplainableChangesAndDeliveryState(t *testing.T) {
 		t.Fatalf("unexpected history page: %#v", page)
 	}
 	history := page.Batches[0]
+	if len(history.ledgerPayload) != 0 {
+		t.Fatalf("normal history page unexpectedly loaded signed ledger payload: %d bytes", len(history.ledgerPayload))
+	}
 	if history.TriggerID != 12 {
 		t.Fatalf("history did not retain webhook trigger correlation: %#v", history)
 	}

@@ -173,23 +173,30 @@ func (s *Store) ApplyBatchWithBatch(ctx context.Context, generation int64, resul
 			truncated     bool
 			missing       int
 		}
-		var missingRows []absent
 		massRemovalGuarded := result.Partial
+		var missingCount int
+		confirmedMissing := true
 		if !result.Partial {
-			rows, queryErr := tx.QueryContext(ctx, "SELECT resource_id,resource_type,name,canonical_json,content_hash,content_bytes,content_truncated,missing_count FROM snapshots WHERE generation=? AND collector=?", generation, result.Collector)
+			// First inspect only identifiers and missing counters. Keeping raw
+			// snapshot values out of this pass is important because a guarded
+			// response must not retain one potentially large blob per omitted
+			// resource just to decide whether removals are safe.
+			rows, queryErr := tx.QueryContext(ctx, "SELECT resource_id,missing_count FROM snapshots WHERE generation=? AND collector=?", generation, result.Collector)
 			if queryErr != nil {
 				return ChangeBatchResult{}, queryErr
 			}
 			for rows.Next() {
-				var a absent
-				var truncated int
-				if scanErr := rows.Scan(&a.id, &a.typ, &a.name, &a.raw, &a.hash, &a.bytes, &truncated, &a.missing); scanErr != nil {
+				var id string
+				var missing int
+				if scanErr := rows.Scan(&id, &missing); scanErr != nil {
 					rows.Close()
 					return ChangeBatchResult{}, scanErr
 				}
-				a.truncated = truncated == 1
-				if _, ok := seen[a.id]; !ok {
-					missingRows = append(missingRows, a)
+				if _, ok := seen[id]; !ok {
+					missingCount++
+					if missing == 0 {
+						confirmedMissing = false
+					}
 				}
 			}
 			if rowsErr := rows.Err(); rowsErr != nil {
@@ -199,21 +206,15 @@ func (s *Store) ApplyBatchWithBatch(ctx context.Context, generation int64, resul
 			if closeErr := rows.Close(); closeErr != nil {
 				return ChangeBatchResult{}, closeErr
 			}
-		}
-		if !result.Partial {
 			// Treat a sudden majority disappearance as degraded data, but do not
 			// suppress removals forever if the upstream keeps returning the same
 			// shape. Two consecutive guarded responses are enough to establish
 			// that the new population is stable; the following poll resumes the
 			// normal two-poll removal confirmation path.
-			suspicious := len(missingRows) >= 3 && len(missingRows) > len(seen)
-			confirmedMissing := len(missingRows) > 0
-			for _, missing := range missingRows {
-				if missing.missing == 0 {
-					confirmedMissing = false
-					break
-				}
+			if missingCount == 0 {
+				confirmedMissing = false
 			}
+			suspicious := missingCount >= 3 && missingCount > len(seen)
 			if suspicious && !confirmedMissing {
 				var previousFailures int
 				var previousError string
@@ -227,6 +228,35 @@ func (s *Store) ApplyBatchWithBatch(ctx context.Context, generation int64, resul
 			}
 		}
 		if !massRemovalGuarded {
+			// Only load the full rows after the guard decision. This second pass
+			// preserves the existing removal event data without retaining raw
+			// values when the response is guarded.
+			var missingRows []absent
+			if !result.Partial && missingCount > 0 {
+				rows, queryErr := tx.QueryContext(ctx, "SELECT resource_id,resource_type,name,canonical_json,content_hash,content_bytes,content_truncated,missing_count FROM snapshots WHERE generation=? AND collector=?", generation, result.Collector)
+				if queryErr != nil {
+					return ChangeBatchResult{}, queryErr
+				}
+				for rows.Next() {
+					var a absent
+					var truncated int
+					if scanErr := rows.Scan(&a.id, &a.typ, &a.name, &a.raw, &a.hash, &a.bytes, &truncated, &a.missing); scanErr != nil {
+						rows.Close()
+						return ChangeBatchResult{}, scanErr
+					}
+					a.truncated = truncated == 1
+					if _, ok := seen[a.id]; !ok {
+						missingRows = append(missingRows, a)
+					}
+				}
+				if rowsErr := rows.Err(); rowsErr != nil {
+					rows.Close()
+					return ChangeBatchResult{}, rowsErr
+				}
+				if closeErr := rows.Close(); closeErr != nil {
+					return ChangeBatchResult{}, closeErr
+				}
+			}
 			for _, a := range missingRows {
 				if a.missing+1 >= 2 {
 					if baseline == 1 {
@@ -262,7 +292,7 @@ func (s *Store) ApplyBatchWithBatch(ctx context.Context, generation int64, resul
 			// upstream degradation than a real mass removal. Keep the snapshots
 			// intact and surface the guard in collector health instead of creating
 			// a removal storm.
-			_, err = tx.ExecContext(ctx, `INSERT INTO collector_state(generation,collector,supported,baseline,last_success,last_error,failure_count,unhealthy_notified,partial,partial_error_count) VALUES(?,?,1,?,?,?,1,0,0,0) ON CONFLICT(generation,collector) DO UPDATE SET supported=1,last_success=excluded.last_success,last_error=excluded.last_error,failure_count=collector_state.failure_count+1,unhealthy_notified=0,partial=0,partial_error_count=0`, generation, result.Collector, baseline, observedAt, fmt.Sprintf("possible mass removal guarded (%d missing, %d present)", len(missingRows), len(seen)))
+			_, err = tx.ExecContext(ctx, `INSERT INTO collector_state(generation,collector,supported,baseline,last_success,last_error,failure_count,unhealthy_notified,partial,partial_error_count) VALUES(?,?,1,?,?,?,1,0,0,0) ON CONFLICT(generation,collector) DO UPDATE SET supported=1,last_success=excluded.last_success,last_error=excluded.last_error,failure_count=collector_state.failure_count+1,unhealthy_notified=0,partial=0,partial_error_count=0`, generation, result.Collector, baseline, observedAt, fmt.Sprintf("possible mass removal guarded (%d missing, %d present)", missingCount, len(seen)))
 			if err != nil {
 				return ChangeBatchResult{}, err
 			}

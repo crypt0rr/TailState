@@ -162,10 +162,10 @@ func TestCredentialChallengeIsOneUseAndRejectsTampering(t *testing.T) {
 		t.Fatal("login page did not issue a second challenge")
 	}
 	tamperedBytes := []byte(tampered)
-	if tamperedBytes[len(tamperedBytes)-1] == 'A' {
-		tamperedBytes[len(tamperedBytes)-1] = 'B'
+	if tamperedBytes[0] == 'A' {
+		tamperedBytes[0] = 'B'
 	} else {
-		tamperedBytes[len(tamperedBytes)-1] = 'A'
+		tamperedBytes[0] = 'A'
 	}
 	form.Set("_challenge", string(tamperedBytes))
 	response := coveragePostWithRequest(t, server, "/login", form, []*http.Cookie{tamperedCookie}, "", "", nil)

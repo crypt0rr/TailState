@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -85,5 +86,14 @@ func TestExportEvidencePackLedgerAndDecodeErrors(t *testing.T) {
 	}
 	if err := VerifyEvidencePack([]byte("{")); err == nil || !strings.Contains(err.Error(), "decode evidence pack") {
 		t.Fatalf("malformed evidence pack error=%v", err)
+	}
+}
+
+func TestVerifyEvidencePackRejectsOversizedInput(t *testing.T) {
+	if err := VerifyEvidencePack(make([]byte, EvidencePackLimitBytes+1)); !errors.Is(err, ErrEvidencePackTooLarge) {
+		t.Fatalf("oversized evidence input error=%v", err)
+	}
+	if _, err := ParseEvidencePublicKey(make([]byte, EvidencePublicKeyLimitBytes+1)); err == nil || !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("oversized public key error=%v", err)
 	}
 }

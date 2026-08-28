@@ -64,6 +64,70 @@ func TestSetupSessionAndSettingsEncryption(t *testing.T) {
 	}
 }
 
+func TestOpenWithLimitsRejectsInvalidProfiles(t *testing.T) {
+	box, err := secret.NewBox(make([]byte, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "tailstate.db")
+	if _, err := OpenWithLimits(path, box, StorageLimits{DatabaseBytes: -1}); err == nil {
+		t.Fatal("invalid storage profile was accepted")
+	}
+	st, err := Open(path, box)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := OpenWithLimits(path, box, StorageLimits{DatabaseBytes: 1}); err == nil || !strings.Contains(err.Error(), "database storage limit setup failed") {
+		t.Fatalf("database limit below current size error=%v", err)
+	}
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec("UPDATE meta SET value=? WHERE key=?", "not-json", storageLimitsMeta); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(path, box); err == nil || !strings.Contains(err.Error(), "decode persisted storage limits") {
+		t.Fatalf("malformed persisted profile error=%v", err)
+	}
+}
+
+func TestOpenWithLimitsReportsPersistenceFailure(t *testing.T) {
+	box, err := secret.NewBox(make([]byte, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "tailstate.db")
+	st, err := Open(path, box)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec("CREATE TRIGGER fail_storage_limits_persist BEFORE INSERT ON meta WHEN NEW.key='storage_limits' BEGIN SELECT RAISE(ABORT,'storage limits persistence failed'); END"); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(path, box); err == nil || !strings.Contains(err.Error(), "storage limits persistence failed") {
+		t.Fatalf("storage limits persistence error=%v", err)
+	}
+}
+
 func TestSaveSettingsReusesUnchangedEncryptedValues(t *testing.T) {
 	ctx := context.Background()
 	st := testStore(t)

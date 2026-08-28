@@ -452,6 +452,32 @@ func TestEvidenceLedgerBackfillIsStartupOnly(t *testing.T) {
 	}
 }
 
+func TestEvidenceLedgerBackfillCursorValidation(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	if _, err := st.db.ExecContext(ctx, "INSERT INTO meta(key,value) VALUES(?,?)", evidenceLedgerBackfillCursor, "not-a-number"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.evidenceLedgerBackfillCursor(ctx); err == nil || !strings.Contains(err.Error(), "invalid evidence ledger backfill cursor") {
+		t.Fatalf("invalid ledger cursor error=%v", err)
+	}
+	if _, err := st.db.ExecContext(ctx, "DELETE FROM meta WHERE key=?", evidenceLedgerBackfillCursor); err != nil {
+		t.Fatal(err)
+	}
+	if cursor, err := st.evidenceLedgerBackfillCursor(ctx); err != nil || cursor != 0 {
+		t.Fatalf("missing ledger cursor=%d err=%v", cursor, err)
+	}
+	if err := st.clearEvidenceLedgerBackfillCursor(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.clearEvidenceLedgerBackfillCursor(ctx); err == nil {
+		t.Fatal("clearing cursor on closed store unexpectedly succeeded")
+	}
+}
+
 func TestEvidenceLedgerBackfillResumesAfterAChunkFailure(t *testing.T) {
 	ctx := context.Background()
 	st := testStore(t)

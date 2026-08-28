@@ -43,7 +43,8 @@ const (
 	unsupportedDemotionInterval    = 6 * time.Hour
 )
 
-func (s *Store) ApplyBatchWithBatch(ctx context.Context, generation int64, results []model.Collected, digest func([]model.Change) string, triggerIDs ...int64) (ChangeBatchResult, error) {
+func (s *Store) ApplyBatchWithBatch(ctx context.Context, generation int64, results []model.Collected, digest func([]model.Change) string, triggerIDs ...int64) (batchResult ChangeBatchResult, err error) {
+	defer func() { err = storageWriteError(err) }()
 	triggerIDs = uniquePositiveIDs(triggerIDs)
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {

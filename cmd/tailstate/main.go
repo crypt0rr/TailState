@@ -87,7 +87,13 @@ func load() (boot.Config, *store.Store, error) {
 	if err != nil {
 		return boot.Config{}, nil, err
 	}
-	st, err := store.Open(config.DatabasePath(), box)
+	st, err := store.OpenWithLimits(config.DatabasePath(), box, store.StorageLimits{
+		SnapshotBytes:    config.StorageLimits.SnapshotBytes,
+		EventValueBytes:  config.StorageLimits.EventValueBytes,
+		HistoryPageBytes: config.StorageLimits.HistoryPageBytes,
+		RejectBytes:      config.StorageLimits.RejectBytes,
+		DatabaseBytes:    config.StorageLimits.DatabaseBytes,
+	})
 	return config, st, err
 }
 

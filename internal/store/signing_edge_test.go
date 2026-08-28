@@ -452,6 +452,52 @@ func TestEvidenceLedgerBackfillIsStartupOnly(t *testing.T) {
 	}
 }
 
+func TestEvidenceLedgerBackfillResumesAfterAChunkFailure(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	for i := 0; i < evidenceLedgerBackfillChunkSize+1; i++ {
+		insertCompleteSigningBatch(t, st)
+	}
+	if _, err := st.db.ExecContext(ctx, "CREATE TRIGGER fail_second_ledger_chunk BEFORE INSERT ON evidence_ledger WHEN NEW.batch_id>"+strconv.Itoa(evidenceLedgerBackfillChunkSize)+" BEGIN SELECT RAISE(ABORT,'pause ledger backfill'); END"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.backfillEvidenceLedger(ctx); err == nil || !strings.Contains(err.Error(), "append evidence ledger") {
+		t.Fatalf("first ledger backfill error=%v", err)
+	}
+	var count int
+	if err := st.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM evidence_ledger").Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != evidenceLedgerBackfillChunkSize {
+		t.Fatalf("completed ledger rows=%d, want %d", count, evidenceLedgerBackfillChunkSize)
+	}
+	var cursor string
+	if err := st.db.QueryRowContext(ctx, "SELECT value FROM meta WHERE key=?", evidenceLedgerBackfillCursor).Scan(&cursor); err != nil {
+		t.Fatal(err)
+	}
+	if cursor != strconv.Itoa(evidenceLedgerBackfillChunkSize) {
+		t.Fatalf("ledger cursor=%q, want %d", cursor, evidenceLedgerBackfillChunkSize)
+	}
+	if _, err := st.db.ExecContext(ctx, "DROP TRIGGER fail_second_ledger_chunk"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.backfillEvidenceLedger(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM evidence_ledger").Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != evidenceLedgerBackfillChunkSize+1 {
+		t.Fatalf("resumed ledger rows=%d, want %d", count, evidenceLedgerBackfillChunkSize+1)
+	}
+	if err := st.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM meta WHERE key=?", evidenceLedgerBackfillCursor).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatal("ledger progress cursor was not cleared")
+	}
+}
+
 func TestEvidenceLedgerStartupDoesNotInferMissingCutoffFromRows(t *testing.T) {
 	ctx := context.Background()
 	st := testStore(t)

@@ -4,11 +4,17 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
 	"github.com/crypt0rr/tailstate/internal/notify"
 	"github.com/crypt0rr/tailstate/internal/secret"
+)
+
+const (
+	boundedHistoryMigration = "v11_to_v12"
+	migrationChunkSize      = 64
 )
 
 // verifyLegacyMasterKey checks the encrypted columns present in schema v1
@@ -665,6 +671,13 @@ func migrateSchemaV11ToV12(db *sql.DB) error {
 		return fmt.Errorf("begin bounded history migration: %w", err)
 	}
 	defer tx.Rollback()
+	if _, err := tx.Exec(`CREATE TABLE IF NOT EXISTS schema_migration_progress (
+		migration TEXT PRIMARY KEY,
+		phase TEXT NOT NULL,
+		cursor INTEGER NOT NULL DEFAULT 0
+	)`); err != nil {
+		return fmt.Errorf("create bounded history migration progress: %w", err)
+	}
 	for _, column := range []struct {
 		table, name, definition string
 	}{
@@ -681,60 +694,172 @@ func migrateSchemaV11ToV12(db *sql.DB) error {
 			return err
 		}
 	}
-	rows, err := tx.Query("SELECT generation,collector,resource_id,canonical_json,content_hash FROM snapshots")
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit bounded history migration setup: %w", err)
+	}
+
+	phase, cursor, err := readBoundedHistoryMigrationProgress(db)
 	if err != nil {
-		return fmt.Errorf("read snapshot size metadata: %w", err)
+		return err
 	}
-	type snapshotMetadata struct {
-		generation, collector, resourceID, contentHash string
-		canonical                                      []byte
-		bytes                                          int64
-		truncated                                      int
+	for {
+		switch phase {
+		case "snapshots":
+			next, done, chunkErr := migrateSnapshotMetadataChunk(db, cursor)
+			if chunkErr != nil {
+				return chunkErr
+			}
+			if !done {
+				cursor = next
+				continue
+			}
+			if err := updateBoundedHistoryMigrationProgress(db, "events", 0); err != nil {
+				return err
+			}
+			phase, cursor = "events", 0
+		case "events":
+			next, done, chunkErr := migrateEventMetadataChunk(db, cursor)
+			if chunkErr != nil {
+				return chunkErr
+			}
+			if !done {
+				cursor = next
+				continue
+			}
+			finalTx, beginErr := db.Begin()
+			if beginErr != nil {
+				return fmt.Errorf("begin bounded history migration completion: %w", beginErr)
+			}
+			if _, execErr := finalTx.Exec("UPDATE schema_version SET version=12"); execErr != nil {
+				finalTx.Rollback()
+				return fmt.Errorf("record bounded history migration: %w", execErr)
+			}
+			if _, execErr := finalTx.Exec("DROP TABLE schema_migration_progress"); execErr != nil {
+				finalTx.Rollback()
+				return fmt.Errorf("remove bounded history migration progress: %w", execErr)
+			}
+			if commitErr := finalTx.Commit(); commitErr != nil {
+				return fmt.Errorf("commit bounded history migration: %w", commitErr)
+			}
+			return nil
+		default:
+			return fmt.Errorf("invalid bounded history migration phase %q", phase)
+		}
 	}
-	var snapshots []snapshotMetadata
+}
+
+type snapshotMetadataMigrationRow struct {
+	rowID       int64
+	contentHash string
+	canonical   []byte
+	bytes       int64
+	truncated   int
+}
+
+func readBoundedHistoryMigrationProgress(db *sql.DB) (string, int64, error) {
+	var phase string
+	var cursor int64
+	err := db.QueryRow("SELECT phase,cursor FROM schema_migration_progress WHERE migration=?", boundedHistoryMigration).Scan(&phase, &cursor)
+	if errors.Is(err, sql.ErrNoRows) {
+		if _, insertErr := db.Exec("INSERT INTO schema_migration_progress(migration,phase,cursor) VALUES(?,?,0)", boundedHistoryMigration, "snapshots"); insertErr != nil {
+			return "", 0, fmt.Errorf("initialize bounded history migration progress: %w", insertErr)
+		}
+		return "snapshots", 0, nil
+	}
+	if err != nil {
+		return "", 0, fmt.Errorf("read bounded history migration progress: %w", err)
+	}
+	if phase != "snapshots" && phase != "events" || cursor < 0 {
+		return "", 0, fmt.Errorf("invalid bounded history migration progress phase=%q cursor=%d", phase, cursor)
+	}
+	return phase, cursor, nil
+}
+
+func updateBoundedHistoryMigrationProgress(db *sql.DB, phase string, cursor int64) error {
+	if _, err := db.Exec("UPDATE schema_migration_progress SET phase=?,cursor=? WHERE migration=?", phase, cursor, boundedHistoryMigration); err != nil {
+		return fmt.Errorf("update bounded history migration progress: %w", err)
+	}
+	return nil
+}
+
+func migrateSnapshotMetadataChunk(db *sql.DB, cursor int64) (int64, bool, error) {
+	tx, err := db.Begin()
+	if err != nil {
+		return cursor, false, fmt.Errorf("begin snapshot metadata backfill: %w", err)
+	}
+	defer tx.Rollback()
+	rows, err := tx.Query("SELECT rowid,generation,collector,resource_id,canonical_json,content_hash FROM snapshots WHERE rowid>? ORDER BY rowid LIMIT ?", cursor, migrationChunkSize)
+	if err != nil {
+		return cursor, false, fmt.Errorf("read snapshot size metadata: %w", err)
+	}
+	items := make([]snapshotMetadataMigrationRow, 0, migrationChunkSize)
+	var next int64
 	for rows.Next() {
-		var item snapshotMetadata
-		if err := rows.Scan(&item.generation, &item.collector, &item.resourceID, &item.canonical, &item.contentHash); err != nil {
+		var row snapshotMetadataMigrationRow
+		var generation, collector, resourceID string
+		if err := rows.Scan(&row.rowID, &generation, &collector, &resourceID, &row.canonical, &row.contentHash); err != nil {
 			rows.Close()
-			return fmt.Errorf("scan snapshot size metadata: %w", err)
+			return cursor, false, fmt.Errorf("scan snapshot size metadata: %w", err)
 		}
-		item.bytes = int64(len(item.canonical))
-		if marker, ok := parseTruncationMarker(item.canonical); ok {
-			item.contentHash = marker.TailState.SHA256
-			item.bytes = marker.TailState.Bytes
-			item.truncated = 1
+		row.bytes = int64(len(row.canonical))
+		if marker, ok := parseTruncationMarker(row.canonical); ok {
+			row.contentHash = marker.TailState.SHA256
+			row.bytes = marker.TailState.Bytes
+			row.truncated = 1
 		}
-		snapshots = append(snapshots, item)
+		items = append(items, row)
+		next = row.rowID
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
-		return fmt.Errorf("read snapshot size metadata rows: %w", err)
+		return cursor, false, fmt.Errorf("read snapshot size metadata rows: %w", err)
 	}
 	if err := rows.Close(); err != nil {
-		return fmt.Errorf("close snapshot size metadata: %w", err)
+		return cursor, false, fmt.Errorf("close snapshot size metadata: %w", err)
 	}
-	for _, item := range snapshots {
-		if _, err := tx.Exec(`UPDATE snapshots SET content_hash=?,content_bytes=?,content_truncated=? WHERE generation=? AND collector=? AND resource_id=?`, item.contentHash, item.bytes, item.truncated, item.generation, item.collector, item.resourceID); err != nil {
-			return fmt.Errorf("backfill snapshot size metadata: %w", err)
+	if len(items) == 0 {
+		return cursor, true, nil
+	}
+	for _, item := range items {
+		if _, err := tx.Exec(`UPDATE snapshots SET content_hash=?,content_bytes=?,content_truncated=? WHERE rowid=?`, item.contentHash, item.bytes, item.truncated, item.rowID); err != nil {
+			return cursor, false, fmt.Errorf("backfill snapshot size metadata: %w", err)
 		}
 	}
-	rows, err = tx.Query("SELECT id,before_json,after_json FROM events")
+	if _, err := tx.Exec("UPDATE schema_migration_progress SET cursor=? WHERE migration=? AND phase='snapshots'", next, boundedHistoryMigration); err != nil {
+		return cursor, false, fmt.Errorf("update snapshot metadata progress: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return cursor, false, fmt.Errorf("commit snapshot metadata backfill: %w", err)
+	}
+	slog.Info("database history migration chunk completed", "migration", boundedHistoryMigration, "phase", "snapshots", "rows", len(items), "cursor", next)
+	return next, false, nil
+}
+
+type eventMetadataMigrationRow struct {
+	id                              int64
+	before, after                   []byte
+	beforeHash, afterHash           string
+	beforeBytes, afterBytes         int64
+	beforeTruncated, afterTruncated int
+}
+
+func migrateEventMetadataChunk(db *sql.DB, cursor int64) (int64, bool, error) {
+	tx, err := db.Begin()
 	if err != nil {
-		return fmt.Errorf("read event snapshot metadata: %w", err)
+		return cursor, false, fmt.Errorf("begin event metadata backfill: %w", err)
 	}
-	type eventMetadata struct {
-		id                              int64
-		before, after                   []byte
-		beforeHash, afterHash           string
-		beforeBytes, afterBytes         int64
-		beforeTruncated, afterTruncated int
+	defer tx.Rollback()
+	rows, err := tx.Query("SELECT id,before_json,after_json FROM events WHERE id>? ORDER BY id LIMIT ?", cursor, migrationChunkSize)
+	if err != nil {
+		return cursor, false, fmt.Errorf("read event snapshot metadata: %w", err)
 	}
-	var metadata []eventMetadata
+	items := make([]eventMetadataMigrationRow, 0, migrationChunkSize)
+	var next int64
 	for rows.Next() {
-		var item eventMetadata
+		var item eventMetadataMigrationRow
 		if err := rows.Scan(&item.id, &item.before, &item.after); err != nil {
 			rows.Close()
-			return fmt.Errorf("scan event snapshot metadata: %w", err)
+			return cursor, false, fmt.Errorf("scan event snapshot metadata: %w", err)
 		}
 		if len(item.before) > 0 {
 			item.beforeHash = valueHash(item.before)
@@ -754,27 +879,32 @@ func migrateSchemaV11ToV12(db *sql.DB) error {
 				item.afterTruncated = 1
 			}
 		}
-		metadata = append(metadata, item)
+		items = append(items, item)
+		next = item.id
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
-		return fmt.Errorf("read event snapshot metadata rows: %w", err)
+		return cursor, false, fmt.Errorf("read event snapshot metadata rows: %w", err)
 	}
 	if err := rows.Close(); err != nil {
-		return fmt.Errorf("close event snapshot metadata: %w", err)
+		return cursor, false, fmt.Errorf("close event snapshot metadata: %w", err)
 	}
-	for _, item := range metadata {
+	if len(items) == 0 {
+		return cursor, true, nil
+	}
+	for _, item := range items {
 		if _, err := tx.Exec(`UPDATE events SET before_hash=?,after_hash=?,before_bytes=?,after_bytes=?,before_truncated=?,after_truncated=? WHERE id=?`, item.beforeHash, item.afterHash, item.beforeBytes, item.afterBytes, item.beforeTruncated, item.afterTruncated, item.id); err != nil {
-			return fmt.Errorf("backfill event snapshot metadata: %w", err)
+			return cursor, false, fmt.Errorf("backfill event snapshot metadata: %w", err)
 		}
 	}
-	if _, err := tx.Exec("UPDATE schema_version SET version=12"); err != nil {
-		return fmt.Errorf("record bounded history migration: %w", err)
+	if _, err := tx.Exec("UPDATE schema_migration_progress SET cursor=? WHERE migration=? AND phase='events'", next, boundedHistoryMigration); err != nil {
+		return cursor, false, fmt.Errorf("update event metadata progress: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit bounded history migration: %w", err)
+		return cursor, false, fmt.Errorf("commit event metadata backfill: %w", err)
 	}
-	return nil
+	slog.Info("database history migration chunk completed", "migration", boundedHistoryMigration, "phase", "events", "rows", len(items), "cursor", next)
+	return next, false, nil
 }
 
 func addColumnIfMissing(tx *sql.Tx, table, column, definition string) error {

@@ -24,9 +24,25 @@ type Config struct {
 	TailscaleBase  string
 	OAuthTokenURL  string
 	Version        string
+	StorageLimits  StorageLimits
+}
+
+// StorageLimits contains operator-selected byte ceilings. A zero field keeps
+// the corresponding store default; the store performs the cross-field
+// validation before opening the database.
+type StorageLimits struct {
+	SnapshotBytes    int64
+	EventValueBytes  int64
+	HistoryPageBytes int64
+	RejectBytes      int64
+	DatabaseBytes    int64
 }
 
 func Load(version string) (Config, error) {
+	storageLimits, err := loadStorageLimits()
+	if err != nil {
+		return Config{}, err
+	}
 	c := Config{
 		// Standalone binaries should not expose the authenticated UI beyond the
 		// local machine by default. The container image and Compose file set an
@@ -40,6 +56,7 @@ func Load(version string) (Config, error) {
 		TailscaleBase: strings.TrimRight(env("TAILSTATE_TS_API_URL", "https://api.tailscale.com/api/v2"), "/"),
 		OAuthTokenURL: env("TAILSTATE_TS_OAUTH_URL", "https://api.tailscale.com/api/v2/oauth/token"),
 		Version:       version,
+		StorageLimits: storageLimits,
 	}
 	secure, err := strconv.ParseBool(env("TAILSTATE_COOKIE_SECURE", "false"))
 	if err != nil {
@@ -73,6 +90,31 @@ func Load(version string) (Config, error) {
 		return Config{}, err
 	}
 	return c, nil
+}
+
+func loadStorageLimits() (StorageLimits, error) {
+	var limits StorageLimits
+	for _, item := range []struct {
+		name  string
+		value *int64
+	}{
+		{name: "TAILSTATE_SNAPSHOT_LIMIT_BYTES", value: &limits.SnapshotBytes},
+		{name: "TAILSTATE_EVENT_VALUE_LIMIT_BYTES", value: &limits.EventValueBytes},
+		{name: "TAILSTATE_HISTORY_PAGE_LIMIT_BYTES", value: &limits.HistoryPageBytes},
+		{name: "TAILSTATE_REJECT_LIMIT_BYTES", value: &limits.RejectBytes},
+		{name: "TAILSTATE_DATABASE_LIMIT_BYTES", value: &limits.DatabaseBytes},
+	} {
+		raw, ok := os.LookupEnv(item.name)
+		if !ok {
+			continue
+		}
+		value, err := strconv.ParseInt(strings.TrimSpace(raw), 10, 64)
+		if err != nil || value < 0 {
+			return StorageLimits{}, fmt.Errorf("%s must be a non-negative integer byte limit", item.name)
+		}
+		*item.value = value
+	}
+	return limits, nil
 }
 
 func parseTrustedProxies(raw string) ([]netip.Prefix, error) {

@@ -19,13 +19,21 @@ import (
 )
 
 const (
-	evidencePackFormat     = "tailstate-drift-evidence"
-	evidencePackVersion    = 3
-	maxEvidenceBatches     = 100
-	maxEvidenceEvents      = 2000
-	maxEvidenceBytes       = 5 << 20
-	maxEvidenceLedgerLinks = 10000
+	evidencePackFormat        = "tailstate-drift-evidence"
+	evidencePackVersion       = 3
+	maxEvidenceBatches        = 100
+	maxEvidenceEvents         = 2000
+	maxEvidenceBytes          = 5 << 20
+	maxEvidenceLedgerLinks    = 10000
+	maxEvidencePublicKeyBytes = 4 << 10
 )
+
+// EvidencePackLimitBytes is the maximum serialized evidence pack accepted by
+// both exporters and verifiers.
+const EvidencePackLimitBytes = maxEvidenceBytes
+
+// EvidencePublicKeyLimitBytes bounds textual key material before decoding.
+const EvidencePublicKeyLimitBytes = maxEvidencePublicKeyBytes
 
 // ErrEvidencePackTooLarge indicates that the selected history cannot be
 // exported within the bounded response size.
@@ -159,7 +167,7 @@ type evidenceContent struct {
 // process while being downloaded.
 func (s *Store) ExportEvidencePack(ctx context.Context, filter HistoryFilter) ([]byte, error) {
 	filter.Limit = maxEvidenceBatches
-	page, err := s.listHistory(ctx, filter, maxEvidenceBytes)
+	page, err := s.listHistory(ctx, filter, maxEvidenceBytes, true)
 	if err != nil {
 		return nil, err
 	}
@@ -234,6 +242,9 @@ func VerifyEvidencePackWithKey(data, trustedPublic []byte) error {
 }
 
 func verifyEvidencePack(data, trustedPublic []byte) error {
+	if len(data) > maxEvidenceBytes {
+		return ErrEvidencePackTooLarge
+	}
 	var pack EvidencePack
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.DisallowUnknownFields()

@@ -303,15 +303,15 @@ func evidenceVerify(args []string) error {
 	var data []byte
 	var err error
 	if *file == "-" {
-		data, err = io.ReadAll(os.Stdin)
+		data, err = readEvidenceInput(os.Stdin, store.EvidencePackLimitBytes, store.ErrEvidencePackTooLarge)
 	} else {
-		data, err = os.ReadFile(*file)
+		data, err = readEvidenceFile(*file, store.EvidencePackLimitBytes, store.ErrEvidencePackTooLarge)
 	}
 	if err != nil {
 		return fmt.Errorf("read evidence pack: %w", err)
 	}
 	if *publicKeyPath != "" {
-		keyData, err := os.ReadFile(*publicKeyPath)
+		keyData, err := readEvidenceFile(*publicKeyPath, store.EvidencePublicKeyLimitBytes, fmt.Errorf("evidence public key exceeds %d bytes", store.EvidencePublicKeyLimitBytes))
 		if err != nil {
 			return fmt.Errorf("read evidence public key: %w", err)
 		}
@@ -330,6 +330,26 @@ func evidenceVerify(args []string) error {
 	// legacy export (which this command deliberately rejects).
 	fmt.Println("signed evidence pack verified")
 	return nil
+}
+
+func readEvidenceFile(path string, limit int64, tooLarge error) ([]byte, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	return readEvidenceInput(file, limit, tooLarge)
+}
+
+func readEvidenceInput(input io.Reader, limit int64, tooLarge error) ([]byte, error) {
+	data, err := io.ReadAll(io.LimitReader(input, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > limit {
+		return nil, tooLarge
+	}
+	return data, nil
 }
 
 func evidencePublicKey() error {

@@ -18,10 +18,10 @@ import (
 // query orchestration lives in this file so the persistence and reconciliation
 // code can evolve independently from the audit presentation path.
 func (s *Store) ListHistory(ctx context.Context, filter HistoryFilter) (HistoryPage, error) {
-	return s.listHistory(ctx, filter, s.StorageLimits().HistoryPageBytes)
+	return s.listHistory(ctx, filter, s.StorageLimits().HistoryPageBytes, false)
 }
 
-func (s *Store) listHistory(ctx context.Context, filter HistoryFilter, byteLimit int64) (HistoryPage, error) {
+func (s *Store) listHistory(ctx context.Context, filter HistoryFilter, byteLimit int64, includeLedgerPayload bool) (HistoryPage, error) {
 	limit := filter.Limit
 	if limit <= 0 {
 		limit = 20
@@ -81,7 +81,7 @@ func (s *Store) listHistory(ctx context.Context, filter HistoryFilter, byteLimit
 	}
 	loadedBatches := make([]HistoryBatch, 0, len(candidates))
 	for _, batch := range candidates {
-		estimate, estimateErr := s.historyBatchByteEstimate(ctx, batch.ID, filter)
+		estimate, estimateErr := s.historyBatchByteEstimate(ctx, batch.ID, filter, includeLedgerPayload)
 		if estimateErr != nil {
 			return HistoryPage{}, estimateErr
 		}
@@ -90,7 +90,7 @@ func (s *Store) listHistory(ctx context.Context, filter HistoryFilter, byteLimit
 			page.TruncationReason = "history page byte budget reached"
 			break
 		}
-		loaded, err := s.loadHistoryBatch(ctx, batch, filter)
+		loaded, err := s.loadHistoryBatch(ctx, batch, filter, includeLedgerPayload)
 		if err != nil {
 			return HistoryPage{}, err
 		}
@@ -123,7 +123,7 @@ func (s *Store) listHistory(ctx context.Context, filter HistoryFilter, byteLimit
 // batch. Stored snapshots and event values are already bounded at write time,
 // so this keeps normal history reads within a predictable aggregate budget
 // without pulling an unbounded provider body into memory first.
-func (s *Store) historyBatchByteEstimate(ctx context.Context, batchID int64, filter HistoryFilter) (int64, error) {
+func (s *Store) historyBatchByteEstimate(ctx context.Context, batchID int64, filter HistoryFilter, includeLedgerPayload bool) (int64, error) {
 	eventWhere := []string{"batch_id=?"}
 	eventArgs := []any{batchID}
 	if filter.Collector != "" {
@@ -151,13 +151,29 @@ func (s *Store) historyBatchByteEstimate(ctx context.Context, batchID int64, fil
 		FROM outbox o LEFT JOIN notification_destinations d ON d.id=o.destination_id WHERE o.batch_id=?`, batchID).Scan(&deliveryBytes); err != nil {
 		return 0, err
 	}
+	var ledgerBytes int64
+	if includeLedgerPayload {
+		// The signed payload contains every event in the batch, not only the
+		// events selected by the display filter. Include conservative framing
+		// and base64/marshal overhead before loading it so the export budget
+		// cannot be bypassed by a narrow filter.
+		if err := s.db.QueryRowContext(ctx, `SELECT COALESCE(SUM(
+			length(COALESCE(changes_json,'')) + length(COALESCE(before_json,'')) + length(COALESCE(after_json,'')) +
+			length(collector) + length(event_type) + length(resource_id) + length(name) + 256),0)
+			FROM events WHERE batch_id=?`, batchID).Scan(&ledgerBytes); err != nil {
+			return 0, err
+		}
+		// LedgerPayload is base64 encoded in evidence exports. Add a
+		// conservative factor for that encoding and the surrounding JSON.
+		ledgerBytes = ledgerBytes*2 + 2048
+	}
 	// Include fixed batch/ledger metadata and a small allowance for JSON
 	// indentation used by the authenticated history renderer.
-	estimate := eventBytes + deliveryBytes + 1024
+	estimate := eventBytes + deliveryBytes + ledgerBytes + 1024
 	return estimate, nil
 }
 
-func (s *Store) loadHistoryBatch(ctx context.Context, batch HistoryBatch, filter HistoryFilter) (HistoryBatch, error) {
+func (s *Store) loadHistoryBatch(ctx context.Context, batch HistoryBatch, filter HistoryFilter, includeLedgerPayload bool) (HistoryBatch, error) {
 	triggerRows, err := s.db.QueryContext(ctx, "SELECT trigger_id FROM event_batch_triggers WHERE batch_id=? ORDER BY trigger_id", batch.ID)
 	if err != nil {
 		return HistoryBatch{}, err
@@ -185,7 +201,7 @@ func (s *Store) loadHistoryBatch(ctx context.Context, batch HistoryBatch, filter
 	if err := s.db.QueryRowContext(ctx, "SELECT sequence,prev_hash,entry_hash,signature,key_id FROM evidence_ledger WHERE batch_id=?", batch.ID).Scan(&batch.LedgerSequence, &batch.LedgerPrevHash, &batch.LedgerHash, &batch.LedgerSignature, &batch.LedgerKeyID); err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return HistoryBatch{}, err
 	}
-	if batch.LedgerSequence > 0 {
+	if includeLedgerPayload && batch.LedgerSequence > 0 {
 		payload, _, payloadErr := evidenceLedgerPayload(ctx, s.db, batch.ID)
 		if payloadErr != nil {
 			return HistoryBatch{}, fmt.Errorf("load evidence ledger payload: %w", payloadErr)

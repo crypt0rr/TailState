@@ -1456,6 +1456,52 @@ func TestMassRemovalGuardPreservesSnapshots(t *testing.T) {
 	}
 }
 
+func TestMassRemovalGuardDoesNotLoadSnapshotValuesBeforeGuardDecision(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	generation, err := st.SaveSettings(ctx, settings())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := testApplyBatch(st, ctx, generation, []model.Collected{{Collector: "devices", Resources: []model.Resource{{
+		ID: "device-1", Type: "device", Name: "server", Data: map[string]any{"hostname": "server"},
+	}}}}, func([]model.Change) string { return "baseline" }); err != nil {
+		t.Fatal(err)
+	}
+	// A guarded response only needs identifiers and missing counters. Recreate
+	// the table without the value columns so this test fails if the guard pass
+	// regresses to selecting raw snapshot data before deciding to preserve it.
+	if _, err := st.db.ExecContext(ctx, `DROP TABLE snapshots;
+CREATE TABLE snapshots(
+  generation INTEGER NOT NULL,
+  collector TEXT NOT NULL,
+  resource_id TEXT NOT NULL,
+  missing_count INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY(generation,collector,resource_id)
+);`); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 4; i++ {
+		if _, err := st.db.ExecContext(ctx, "INSERT INTO snapshots(generation,collector,resource_id,missing_count) VALUES(?,?,?,0)", generation, "devices", fmt.Sprintf("device-%d", i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	changes, err := st.ApplyBatchWithBatch(ctx, generation, []model.Collected{{Collector: "devices"}}, func([]model.Change) string { return "degraded" })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(changes.Changes) != 0 {
+		t.Fatalf("guarded response emitted changes: %#v", changes.Changes)
+	}
+	var count int
+	if err := st.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM snapshots WHERE generation=? AND collector='devices'", generation).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 4 {
+		t.Fatalf("guarded response changed snapshots: %d", count)
+	}
+}
+
 func TestMassRemovalGuardProtectsMajorityDisappearance(t *testing.T) {
 	ctx := context.Background()
 	st := testStore(t)

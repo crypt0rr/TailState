@@ -26,10 +26,32 @@ var InventoryCollectors = []string{"device_details", "users", "user_invites", "d
 
 type Credentials struct{ Tailnet, ClientID, ClientSecret string }
 
+// CollectionLimits bound the aggregate amount of data retained while a
+// paginated collection is assembled. The per-response limit in get is still
+// applied independently; these limits protect the process from a sequence of
+// individually valid but collectively oversized pages.
+type CollectionLimits struct {
+	MaxItems int
+	MaxBytes int64
+}
+
+const (
+	defaultCollectionItems = 10_000
+	defaultCollectionBytes = 64 << 20
+	deviceDetailWorkers    = 8
+)
+
+// DefaultCollectionLimits returns the aggregate collection guardrails used by
+// newly created clients.
+func DefaultCollectionLimits() CollectionLimits {
+	return CollectionLimits{MaxItems: defaultCollectionItems, MaxBytes: defaultCollectionBytes}
+}
+
 type Client struct {
 	base, tokenURL, version string
 	credentials             Credentials
 	http                    *http.Client
+	collectionLimits        CollectionLimits
 	mu                      sync.Mutex
 	deviceCacheMu           sync.RWMutex
 	deviceCache             []map[string]any
@@ -148,7 +170,7 @@ func IsUnsupportedCollector(collector string, err error) bool {
 }
 
 func New(base, tokenURL, version string, credentials Credentials) *Client {
-	return &Client{base: strings.TrimRight(base, "/"), tokenURL: tokenURL, version: version, credentials: credentials, http: &http.Client{Timeout: 20 * time.Second, CheckRedirect: noRedirect}}
+	return &Client{base: strings.TrimRight(base, "/"), tokenURL: tokenURL, version: version, credentials: credentials, collectionLimits: DefaultCollectionLimits(), http: &http.Client{Timeout: 20 * time.Second, CheckRedirect: noRedirect}}
 }
 
 func noRedirect(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }
@@ -224,9 +246,32 @@ func (c *Client) deviceDetailsFromDevices(ctx context.Context, devices []map[str
 		err      error
 		hasValue bool
 	}
-	jobs := make(chan detailJob, len(devices))
-	results := make(chan detailResult, len(devices))
-	workers := min(8, len(devices))
+	if len(devices) == 0 {
+		return nil, nil
+	}
+	detailCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	limits := c.collectionLimitsOrDefault()
+	var budgetMu sync.Mutex
+	var aggregateBytes int64
+	var aggregateErr error
+	accountResponse := func(responseBytes int64) error {
+		budgetMu.Lock()
+		defer budgetMu.Unlock()
+		if aggregateErr != nil {
+			return aggregateErr
+		}
+		if responseBytes > limits.MaxBytes-aggregateBytes {
+			aggregateErr = fmt.Errorf("device_details collection exceeds aggregate response limit of %d bytes", limits.MaxBytes)
+			cancel()
+			return aggregateErr
+		}
+		aggregateBytes += responseBytes
+		return nil
+	}
+	jobs := make(chan detailJob)
+	workers := min(deviceDetailWorkers, len(devices))
+	results := make(chan detailResult, max(1, workers))
 	var wg sync.WaitGroup
 	for i := 0; i < workers; i++ {
 		wg.Add(1)
@@ -249,8 +294,15 @@ func (c *Client) deviceDetailsFromDevices(ctx context.Context, devices []map[str
 					{key: "deviceInvites", path: "device-invites"},
 				} {
 					key, path := detail.key, detail.path
-					value, err := c.get(ctx, c.global("device/"+url.PathEscape(id)+"/"+path))
+					value, responseBytes, err := c.getWithBytes(detailCtx, c.global("device/"+url.PathEscape(id)+"/"+path))
 					if err != nil {
+						budgetMu.Lock()
+						budgetErr := aggregateErr
+						budgetMu.Unlock()
+						if budgetErr != nil {
+							detailErr = budgetErr
+							break
+						}
 						// A missing per-device detail endpoint is an incomplete
 						// response, not proof that the whole subresource is
 						// unsupported. Preserve that distinction so the monitor does
@@ -268,6 +320,10 @@ func (c *Client) deviceDetailsFromDevices(ctx context.Context, devices []map[str
 						detailErr = err
 						break
 					}
+					if budgetErr := accountResponse(responseBytes); budgetErr != nil {
+						detailErr = budgetErr
+						break
+					}
 					combined[key] = value
 				}
 				if detailErr != nil {
@@ -278,12 +334,20 @@ func (c *Client) deviceDetailsFromDevices(ctx context.Context, devices []map[str
 			}
 		}()
 	}
-	for index, device := range devices {
-		jobs <- detailJob{index: index, device: device}
-	}
-	close(jobs)
-	wg.Wait()
-	close(results)
+	go func() {
+		defer close(jobs)
+		for index, device := range devices {
+			select {
+			case jobs <- detailJob{index: index, device: device}:
+			case <-detailCtx.Done():
+				return
+			}
+		}
+	}()
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
 	ordered := make([]detailResult, 0, len(devices))
 	var partialErr error
 	partialCount := 0
@@ -298,6 +362,12 @@ func (c *Client) deviceDetailsFromDevices(ctx context.Context, devices []map[str
 		if result.hasValue {
 			ordered = append(ordered, result)
 		}
+	}
+	budgetMu.Lock()
+	budgetErr := aggregateErr
+	budgetMu.Unlock()
+	if budgetErr != nil {
+		return nil, budgetErr
 	}
 	sort.SliceStable(ordered, func(i, j int) bool { return ordered[i].index < ordered[j].index })
 	out := make([]model.Resource, 0, len(ordered))
@@ -445,19 +515,37 @@ func (c *Client) allPages(ctx context.Context, endpoint, arrayKey string) ([]map
 	return c.allPagesWithOptions(ctx, endpoint, arrayKey)
 }
 
+func (c *Client) collectionLimitsOrDefault() CollectionLimits {
+	limits := c.collectionLimits
+	defaults := DefaultCollectionLimits()
+	if limits.MaxItems <= 0 {
+		limits.MaxItems = defaults.MaxItems
+	}
+	if limits.MaxBytes <= 0 {
+		limits.MaxBytes = defaults.MaxBytes
+	}
+	return limits
+}
+
 func (c *Client) allPagesWithOptions(ctx context.Context, endpoint, arrayKey string) ([]map[string]any, error) {
 	next := endpoint
 	var out []map[string]any
 	seen := make(map[string]struct{})
+	limits := c.collectionLimitsOrDefault()
+	var aggregateBytes int64
 	for page := 0; page < 100; page++ {
 		if _, repeated := seen[next]; repeated {
 			return nil, errors.New("tailscale pagination repeated the same page URL")
 		}
 		seen[next] = struct{}{}
-		value, err := c.get(ctx, next)
+		value, responseBytes, err := c.getWithBytes(ctx, next)
 		if err != nil {
 			return nil, err
 		}
+		if responseBytes > limits.MaxBytes-aggregateBytes {
+			return nil, fmt.Errorf("%s collection exceeds aggregate response limit of %d bytes", arrayKey, limits.MaxBytes)
+		}
+		aggregateBytes += responseBytes
 		object, objectOK := value.(map[string]any)
 		var items []any
 		if objectOK {
@@ -479,6 +567,9 @@ func (c *Client) allPagesWithOptions(ctx context.Context, endpoint, arrayKey str
 		}
 		if items == nil {
 			return nil, fmt.Errorf("%s response has no %s array (an empty collection must be returned as [])", arrayKey, arrayKey)
+		}
+		if len(items) > limits.MaxItems-len(out) {
+			return nil, fmt.Errorf("%s collection exceeds aggregate item limit of %d", arrayKey, limits.MaxItems)
 		}
 		for _, item := range items {
 			obj, ok := item.(map[string]any)
@@ -548,6 +639,11 @@ func nextURL(object map[string]any) string {
 }
 
 func (c *Client) get(ctx context.Context, endpoint string) (any, error) {
+	value, _, err := c.getWithBytes(ctx, endpoint)
+	return value, err
+}
+
+func (c *Client) getWithBytes(ctx context.Context, endpoint string) (any, int64, error) {
 	// Bound the complete request, including token refreshes and all backoff
 	// sleeps. If the caller already supplied an earlier deadline,
 	// context.WithTimeout preserves that stricter limit.
@@ -556,11 +652,11 @@ func (c *Client) get(ctx context.Context, endpoint string) (any, error) {
 	for attempt := 0; attempt < 4; attempt++ {
 		token, err := c.accessToken(retryCtx)
 		if err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 		req, err := http.NewRequestWithContext(retryCtx, http.MethodGet, endpoint, nil)
 		if err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 		req.Header.Set("Authorization", "Bearer "+token)
 		req.Header.Set("Accept", "application/json")
@@ -569,19 +665,19 @@ func (c *Client) get(ctx context.Context, endpoint string) (any, error) {
 		if err != nil {
 			if attempt < 3 {
 				if !waitForRetry(retryCtx, time.Duration(1<<attempt)*time.Second) {
-					return nil, retryCtx.Err()
+					return nil, 0, retryCtx.Err()
 				}
 				continue
 			}
-			return nil, err
+			return nil, 0, err
 		}
 		body, readErr := io.ReadAll(io.LimitReader(resp.Body, maxAPIResponseBytes+1))
 		resp.Body.Close()
 		if readErr != nil {
-			return nil, readErr
+			return nil, 0, readErr
 		}
 		if len(body) > maxAPIResponseBytes {
-			return nil, fmt.Errorf("tailscale response exceeds %d bytes", maxAPIResponseBytes)
+			return nil, int64(len(body)), fmt.Errorf("tailscale response exceeds %d bytes", maxAPIResponseBytes)
 		}
 		if resp.StatusCode == 401 && attempt == 0 {
 			c.mu.Lock()
@@ -592,23 +688,23 @@ func (c *Client) get(ctx context.Context, endpoint string) (any, error) {
 		if resp.StatusCode == 429 && attempt < 3 {
 			delay := retryAfter(resp.Header.Get("Retry-After"), time.Duration(1<<attempt)*time.Second)
 			if !waitForRetry(retryCtx, delay) {
-				return nil, retryCtx.Err()
+				return nil, int64(len(body)), retryCtx.Err()
 			}
 			continue
 		}
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			return nil, &HTTPError{Status: resp.StatusCode, URL: endpoint, Body: safeBody(body)}
+			return nil, int64(len(body)), &HTTPError{Status: resp.StatusCode, URL: endpoint, Body: safeBody(body)}
 		}
 		if len(bytes.TrimSpace(body)) == 0 {
-			return nil, nil
+			return nil, int64(len(body)), nil
 		}
 		var value any
 		if err := json.Unmarshal(body, &value); err != nil {
-			return nil, fmt.Errorf("tailscale response was not valid JSON: %w", err)
+			return nil, int64(len(body)), fmt.Errorf("tailscale response was not valid JSON: %w", err)
 		}
-		return value, nil
+		return value, int64(len(body)), nil
 	}
-	return nil, errors.New("tailscale request retries exhausted")
+	return nil, 0, errors.New("tailscale request retries exhausted")
 }
 
 func (c *Client) accessToken(ctx context.Context) (string, error) {

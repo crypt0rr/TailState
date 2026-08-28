@@ -52,6 +52,55 @@ func TestOAuthPaginationAndCollection(t *testing.T) {
 	}
 }
 
+func TestPaginationEnforcesAggregateCollectionLimits(t *testing.T) {
+	pageOne := `{"devices":[{"id":"1"}],"next":"?cursor=2"}`
+	pageTwo := `{"devices":[{"id":"2"}]}`
+	tests := []struct {
+		name         string
+		limits       CollectionLimits
+		wantMatch    string
+		wantRequests int
+	}{
+		{name: "items", limits: CollectionLimits{MaxItems: 1, MaxBytes: 1 << 20}, wantMatch: "aggregate item limit", wantRequests: 2},
+		{name: "bytes", limits: CollectionLimits{MaxItems: 10, MaxBytes: int64(len(pageOne) + len(pageTwo) - 1)}, wantMatch: "aggregate response limit", wantRequests: 2},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			requests := 0
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/oauth/token":
+					_, _ = w.Write([]byte(`{"access_token":"access","expires_in":3600}`))
+				case "/api/v2/tailnet/-/devices":
+					requests++
+					w.Header().Set("Content-Type", "application/json")
+					if r.URL.Query().Get("cursor") == "2" {
+						_, _ = w.Write([]byte(pageTwo))
+						return
+					}
+					_, _ = w.Write([]byte(pageOne))
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer server.Close()
+
+			client := New(server.URL+"/api/v2", server.URL+"/oauth/token", "test", Credentials{ClientID: "id", ClientSecret: "secret"})
+			client.collectionLimits = tt.limits
+			resources, err := client.Collect(context.Background(), "devices")
+			if err == nil || !strings.Contains(err.Error(), tt.wantMatch) {
+				t.Fatalf("aggregate limit error=%v resources=%#v", err, resources)
+			}
+			if len(resources) != 0 {
+				t.Fatalf("aggregate limit returned partial resources: %#v", resources)
+			}
+			if requests != tt.wantRequests {
+				t.Fatalf("requests=%d, want %d", requests, tt.wantRequests)
+			}
+		})
+	}
+}
+
 func TestEmptyCollectionResponses(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -240,6 +289,37 @@ func TestDeviceDetailsDoNotRefetchCoreDevice(t *testing.T) {
 	data, ok := resources[0].Data.(map[string]any)
 	if !ok || data["routes"] == nil || data["postureAttributes"] == nil || data["deviceInvites"] == nil {
 		t.Fatalf("secondary details missing: %#v", resources[0].Data)
+	}
+}
+
+func TestDeviceDetailsEnforcesAggregateResponseLimit(t *testing.T) {
+	var detailCalls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/oauth/token":
+			_, _ = w.Write([]byte(`{"access_token":"access","expires_in":3600}`))
+		case "/api/v2/tailnet/-/devices":
+			_, _ = w.Write([]byte(`{"devices":[{"id":"1","hostname":"server"}]}`))
+		case "/api/v2/device/1/routes", "/api/v2/device/1/attributes", "/api/v2/device/1/device-invites":
+			detailCalls++
+			_, _ = w.Write([]byte(`{"value":"1234567890123456789012345678901234567890"}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	client := New(server.URL+"/api/v2", server.URL+"/oauth/token", "test", Credentials{ClientID: "id", ClientSecret: "secret"})
+	client.collectionLimits = CollectionLimits{MaxItems: 10, MaxBytes: 80}
+	resources, err := client.Collect(context.Background(), "device_details")
+	if err == nil || !strings.Contains(err.Error(), "aggregate response limit") {
+		t.Fatalf("device detail aggregate limit error=%v resources=%#v", err, resources)
+	}
+	if len(resources) != 0 {
+		t.Fatalf("device detail aggregate limit returned partial resources: %#v", resources)
+	}
+	if detailCalls >= 3 {
+		t.Fatalf("detail calls=%d, want cancellation before all detail requests", detailCalls)
 	}
 }
 

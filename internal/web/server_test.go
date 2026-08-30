@@ -305,6 +305,49 @@ func TestMetricsWithoutTokenIsLoopbackOnly(t *testing.T) {
 	}
 }
 
+func TestTokenlessMetricsFailClosedForProxyProvenance(t *testing.T) {
+	server, _, _ := testServer(t)
+	tests := []struct {
+		name       string
+		remoteAddr string
+		trusted    []netip.Prefix
+		headers    map[string]string
+		allowed    bool
+	}{
+		{name: "direct loopback", remoteAddr: "127.0.0.1:1234", allowed: true},
+		{name: "trusted loopback proxy", remoteAddr: "127.0.0.1:1234", trusted: []netip.Prefix{netip.MustParsePrefix("127.0.0.1/32")}},
+		{name: "forwarded address", remoteAddr: "127.0.0.1:1234", headers: map[string]string{"X-Forwarded-For": "198.51.100.8"}},
+		{name: "forwarded proto", remoteAddr: "127.0.0.1:1234", headers: map[string]string{"X-Forwarded-Proto": "https"}},
+		{name: "malformed peer", remoteAddr: "not-an-address"},
+		{name: "public peer", remoteAddr: "203.0.113.10:1234"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server.config.TrustedProxies = tt.trusted
+			request := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+			request.RemoteAddr = tt.remoteAddr
+			for key, value := range tt.headers {
+				request.Header.Set(key, value)
+			}
+			if got := server.metricsAuthorized(request); got != tt.allowed {
+				t.Fatalf("tokenless authorization=%v, want %v", got, tt.allowed)
+			}
+		})
+	}
+}
+
+func TestMetricsBearerTokenWorksThroughProxy(t *testing.T) {
+	server, _, _ := testServer(t)
+	server.config.MetricsToken = "metrics-secret"
+	request := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	request.RemoteAddr = "127.0.0.1:1234"
+	request.Header.Set("X-Forwarded-For", "198.51.100.8")
+	request.Header.Set("Authorization", "Bearer metrics-secret")
+	if !server.metricsAuthorized(request) {
+		t.Fatal("valid bearer token was rejected through proxy")
+	}
+}
+
 func TestReadinessCollectorReasonUsesBoundedVocabulary(t *testing.T) {
 	tests := []struct {
 		name     string

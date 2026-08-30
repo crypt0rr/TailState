@@ -213,7 +213,13 @@ The report checks the effective listener, secure-cookie and trusted-proxy
 pairing, setup/baseline state, and whether notifications are paused. The
 authenticated Settings page shows the same checks plus the sanitized origin
 seen for the current request. Raw headers, credentials, and destination URLs
-are never included in reports.
+are never included in reports. `doctor` is strictly read-only: it does not
+create a missing database, run schema migrations, backfill the evidence ledger,
+create signing metadata, or persist storage limits. If a supported older schema
+is found, the report marks migration as pending and asks you to stop the service
+and make a verified backup before restarting the current release. The report
+shows configured and persisted storage profiles separately so a changed
+environment cannot be mistaken for the currently persisted profile.
 
 ### Password reset
 

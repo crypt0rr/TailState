@@ -47,13 +47,26 @@ type RequestInfo struct {
 
 // Runtime describes the non-secret state needed for operator diagnostics.
 type Runtime struct {
-	Configured          bool
-	BaselineReady       bool
-	BaselineDegraded    bool
-	BaselineReason      string
-	Destinations        int
-	EnabledDestinations int
-	Storage             StorageRuntime
+	Configured             bool
+	BaselineReady          bool
+	BaselineDegraded       bool
+	BaselineReason         string
+	Destinations           int
+	EnabledDestinations    int
+	DatabaseMissing        bool
+	SchemaVersion          int
+	SchemaMigrationPending bool
+	Storage                StorageRuntime
+}
+
+// StorageProfile is a safe, comparable view of the configured persistence
+// ceilings. It contains limits only; no provider payloads or credentials.
+type StorageProfile struct {
+	SnapshotLimitBytes    int64 `json:"snapshot_limit_bytes"`
+	EventValueLimitBytes  int64 `json:"event_value_limit_bytes"`
+	HistoryPageLimitBytes int64 `json:"history_page_limit_bytes"`
+	RejectLimitBytes      int64 `json:"reject_limit_bytes"`
+	DatabaseLimitBytes    int64 `json:"database_limit_bytes"`
 }
 
 // StorageRuntime is a safe, low-cardinality view of the persistence
@@ -71,6 +84,8 @@ type StorageRuntime struct {
 	EventValueTruncations   uint64
 	HistoryPageTruncations  uint64
 	OversizedWritesRejected uint64
+	ConfiguredProfile       *StorageProfile `json:"configured_profile,omitempty"`
+	PersistedProfile        *StorageProfile `json:"persisted_profile,omitempty"`
 }
 
 // Report is the complete safe deployment report.
@@ -79,6 +94,8 @@ type Report struct {
 	Listener          string         `json:"listener"`
 	CookieSecure      bool           `json:"cookie_secure"`
 	TrustedProxyCount int            `json:"trusted_proxy_count"`
+	DatabaseMissing   bool           `json:"database_missing,omitempty"`
+	SchemaVersion     int            `json:"schema_version,omitempty"`
 	Request           RequestInfo    `json:"request"`
 	Findings          []Finding      `json:"findings"`
 	Storage           StorageRuntime `json:"storage"`
@@ -93,6 +110,8 @@ func Build(config boot.Config, runtime Runtime, request *http.Request) Report {
 		Listener:          config.ListenAddr,
 		CookieSecure:      config.CookieSecure,
 		TrustedProxyCount: len(config.TrustedProxies),
+		DatabaseMissing:   runtime.DatabaseMissing,
+		SchemaVersion:     runtime.SchemaVersion,
 		Findings:          make([]Finding, 0, 8),
 		Storage:           runtime.Storage,
 	}
@@ -129,6 +148,22 @@ func Build(config boot.Config, runtime Runtime, request *http.Request) Report {
 			Severity:    SeverityInfo,
 			Summary:     "TAILSTATE_BIND_ADDRESS controls the Compose host port, not the process listener.",
 			Remediation: "Use TAILSTATE_LISTEN_ADDR to change the address served by the TailState process.",
+		})
+	}
+	if runtime.DatabaseMissing {
+		add(Finding{
+			Code:        "database_missing",
+			Severity:    SeverityInfo,
+			Summary:     "The TailState database has not been initialized.",
+			Remediation: "Start TailState once to initialize its database, then complete the setup flow at /setup.",
+		})
+	}
+	if runtime.SchemaMigrationPending {
+		add(Finding{
+			Code:        "database_migration_pending",
+			Severity:    SeverityWarning,
+			Summary:     "The database uses an older supported schema and needs a service migration.",
+			Remediation: "Stop TailState, create a verified database backup, then start the current release to run its migration.",
 		})
 	}
 

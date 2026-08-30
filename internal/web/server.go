@@ -950,6 +950,13 @@ func (s *Server) metrics(w http.ResponseWriter, r *http.Request) {
 			fmt.Fprintf(w, "tailstate_outbox_delivery_duration_seconds_bucket{le=\"%.3g\"} %d\n", bound, delivery.DurationBuckets[i])
 		}
 		fmt.Fprintf(w, "tailstate_outbox_delivery_duration_seconds_bucket{le=\"+Inf\"} %d\ntailstate_outbox_delivery_duration_seconds_sum %.6f\ntailstate_outbox_delivery_duration_seconds_count %d\n", delivery.DurationCount, delivery.DurationSeconds, delivery.DurationCount)
+		cleanup := s.engine.CleanupMetrics()
+		remaining := 0
+		if cleanup.Remaining {
+			remaining = 1
+		}
+		fmt.Fprintf(w, "# TYPE tailstate_cleanup_runs_total counter\ntailstate_cleanup_runs_total %d\n# TYPE tailstate_cleanup_failures_total counter\ntailstate_cleanup_failures_total %d\n# TYPE tailstate_cleanup_remaining gauge\ntailstate_cleanup_remaining %d\n# TYPE tailstate_cleanup_remaining_passes_total counter\ntailstate_cleanup_remaining_passes_total %d\n# TYPE tailstate_cleanup_transactions_total counter\ntailstate_cleanup_transactions_total %d\n# TYPE tailstate_cleanup_duration_seconds_sum counter\ntailstate_cleanup_duration_seconds_sum %.6f\n# TYPE tailstate_cleanup_duration_seconds_count counter\ntailstate_cleanup_duration_seconds_count %d\n", cleanup.Runs, cleanup.Failures, remaining, cleanup.RemainingPasses, cleanup.Transactions, cleanup.DurationSeconds, cleanup.Runs)
+		fmt.Fprintf(w, "# TYPE tailstate_cleanup_rows_total counter\ntailstate_cleanup_rows_total{table=\"sessions\"} %d\ntailstate_cleanup_rows_total{table=\"auth_tokens\"} %d\ntailstate_cleanup_rows_total{table=\"meta\"} %d\ntailstate_cleanup_rows_total{table=\"outbox_dead_letter\"} %d\ntailstate_cleanup_rows_total{table=\"webhook_dead_letter\"} %d\ntailstate_cleanup_rows_total{table=\"events\"} %d\ntailstate_cleanup_rows_total{table=\"event_batches\"} %d\ntailstate_cleanup_rows_total{table=\"event_batch_triggers\"} %d\ntailstate_cleanup_rows_total{table=\"webhook_triggers\"} %d\ntailstate_cleanup_rows_total{table=\"delivered_outbox\"} %d\ntailstate_cleanup_rows_total{table=\"dead_outbox\"} %d\n", cleanup.SessionsDeleted, cleanup.AuthTokensDeleted, cleanup.MetaDeleted, cleanup.OutboxDeadLettered, cleanup.WebhookDeadLettered, cleanup.EventsDeleted, cleanup.EventBatchesDeleted, cleanup.EventBatchTriggersDeleted, cleanup.WebhookTriggersDeleted, cleanup.DeliveredOutboxDeleted, cleanup.DeadOutboxDeleted)
 	}
 	storage, err := s.store.StorageMetrics(r.Context())
 	if err != nil {

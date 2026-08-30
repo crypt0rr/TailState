@@ -28,6 +28,7 @@ CREATE TABLE IF NOT EXISTS sessions (
   expires_at TEXT NOT NULL,
   created_at TEXT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS sessions_expires_at ON sessions(expires_at);
 CREATE TABLE IF NOT EXISTS settings (
   id INTEGER PRIMARY KEY CHECK(id = 1),
   tailnet TEXT NOT NULL,

@@ -29,6 +29,7 @@ type Engine struct {
 	wg                         sync.WaitGroup
 	dueErrors                  atomic.Uint64
 	deliveryStats              deliveryStats
+	cleanupStats               cleanupTelemetry
 }
 
 const (
@@ -36,6 +37,7 @@ const (
 	deliveryLeaseRenewalFraction    = 3
 	minDeliveryLeaseRenewalInterval = 100 * time.Millisecond
 	deliveryDurationBucketCount     = 9
+	cleanupContinuationInterval     = time.Second
 )
 
 var deliveryDurationBucketBounds = [deliveryDurationBucketCount]float64{0.1, 0.5, 1, 5, 15, 30, 60, 120, 300}
@@ -65,6 +67,38 @@ type DeliveryMetrics struct {
 	DurationCount        uint64
 	DurationSeconds      float64
 	DurationBuckets      [deliveryDurationBucketCount]uint64
+}
+
+// CleanupMetrics is a cumulative snapshot of retention-worker telemetry.
+// Row counters use stable table names in the Prometheus endpoint and never
+// include payloads, destination URLs, or provider data.
+type CleanupMetrics struct {
+	Runs                      uint64
+	Failures                  uint64
+	RemainingPasses           uint64
+	Remaining                 bool
+	Transactions              uint64
+	DurationSeconds           float64
+	SessionsDeleted           uint64
+	AuthTokensDeleted         uint64
+	MetaDeleted               uint64
+	OutboxDeadLettered        uint64
+	WebhookDeadLettered       uint64
+	EventsDeleted             uint64
+	EventBatchesDeleted       uint64
+	EventBatchTriggersDeleted uint64
+	WebhookTriggersDeleted    uint64
+	DeliveredOutboxDeleted    uint64
+	DeadOutboxDeleted         uint64
+}
+
+type cleanupTelemetry struct {
+	runs, failures, remainingPasses, transactions, durationNanos, remaining atomic.Uint64
+	sessionsDeleted, authTokensDeleted, metaDeleted                         atomic.Uint64
+	outboxDeadLettered, webhookDeadLettered                                 atomic.Uint64
+	eventsDeleted, eventBatchesDeleted                                      atomic.Uint64
+	eventBatchTriggersDeleted, webhookTriggersDeleted                       atomic.Uint64
+	deliveredOutboxDeleted, deadOutboxDeleted                               atomic.Uint64
 }
 
 type deliveryLeaseState struct {
@@ -198,6 +232,32 @@ func (e *Engine) DeliveryMetrics() DeliveryMetrics {
 		metrics.DurationBuckets[i] = e.deliveryStats.durationBuckets[i].Load()
 	}
 	return metrics
+}
+
+// CleanupMetrics reports retention progress without exposing row contents or
+// error details. RemainingPasses is a counter of bounded passes that stopped
+// with work still queued; the current remaining state is exported separately
+// by the metrics handler as a gauge.
+func (e *Engine) CleanupMetrics() CleanupMetrics {
+	return CleanupMetrics{
+		Runs:                      e.cleanupStats.runs.Load(),
+		Failures:                  e.cleanupStats.failures.Load(),
+		RemainingPasses:           e.cleanupStats.remainingPasses.Load(),
+		Remaining:                 e.cleanupStats.remaining.Load() == 1,
+		Transactions:              e.cleanupStats.transactions.Load(),
+		DurationSeconds:           float64(e.cleanupStats.durationNanos.Load()) / float64(time.Second),
+		SessionsDeleted:           e.cleanupStats.sessionsDeleted.Load(),
+		AuthTokensDeleted:         e.cleanupStats.authTokensDeleted.Load(),
+		MetaDeleted:               e.cleanupStats.metaDeleted.Load(),
+		OutboxDeadLettered:        e.cleanupStats.outboxDeadLettered.Load(),
+		WebhookDeadLettered:       e.cleanupStats.webhookDeadLettered.Load(),
+		EventsDeleted:             e.cleanupStats.eventsDeleted.Load(),
+		EventBatchesDeleted:       e.cleanupStats.eventBatchesDeleted.Load(),
+		EventBatchTriggersDeleted: e.cleanupStats.eventBatchTriggersDeleted.Load(),
+		WebhookTriggersDeleted:    e.cleanupStats.webhookTriggersDeleted.Load(),
+		DeliveredOutboxDeleted:    e.cleanupStats.deliveredOutboxDeleted.Load(),
+		DeadOutboxDeleted:         e.cleanupStats.deadOutboxDeleted.Load(),
+	}
 }
 
 // DeliveryDurationBucketBounds returns the cumulative delivery histogram
@@ -905,20 +965,70 @@ func (e *Engine) recordDeliveryDuration(elapsed time.Duration) {
 	}
 }
 
-func (e *Engine) cleanup(ctx context.Context) {
-	if err := e.store.Cleanup(ctx, 30*24*time.Hour); err != nil && !errors.Is(err, context.Canceled) {
-		slog.Error("initial retention cleanup failed", "error", err)
+func (e *Engine) recordCleanup(stats store.CleanupStats, err error) {
+	e.cleanupStats.runs.Add(1)
+	e.cleanupStats.transactions.Add(uint64(stats.Transactions))
+	e.cleanupStats.durationNanos.Add(uint64(max(stats.Duration, 0)))
+	if stats.Remaining {
+		e.cleanupStats.remainingPasses.Add(1)
+		e.cleanupStats.remaining.Store(1)
+	} else {
+		e.cleanupStats.remaining.Store(0)
 	}
-	ticker := time.NewTicker(cleanupPollInterval)
-	defer ticker.Stop()
+	if err != nil {
+		e.cleanupStats.failures.Add(1)
+	}
+	e.cleanupStats.sessionsDeleted.Add(uint64(max(stats.SessionsDeleted, 0)))
+	e.cleanupStats.authTokensDeleted.Add(uint64(max(stats.AuthTokensDeleted, 0)))
+	e.cleanupStats.metaDeleted.Add(uint64(max(stats.MetaDeleted, 0)))
+	e.cleanupStats.outboxDeadLettered.Add(uint64(max(stats.OutboxDeadLettered, 0)))
+	e.cleanupStats.webhookDeadLettered.Add(uint64(max(stats.WebhookDeadLettered, 0)))
+	e.cleanupStats.eventsDeleted.Add(uint64(max(stats.EventsDeleted, 0)))
+	e.cleanupStats.eventBatchesDeleted.Add(uint64(max(stats.EventBatchesDeleted, 0)))
+	e.cleanupStats.eventBatchTriggersDeleted.Add(uint64(max(stats.EventBatchTriggersDeleted, 0)))
+	e.cleanupStats.webhookTriggersDeleted.Add(uint64(max(stats.WebhookTriggersDeleted, 0)))
+	e.cleanupStats.deliveredOutboxDeleted.Add(uint64(max(stats.DeliveredOutboxDeleted, 0)))
+	e.cleanupStats.deadOutboxDeleted.Add(uint64(max(stats.DeadOutboxDeleted, 0)))
+}
+
+func (e *Engine) cleanup(ctx context.Context) {
+	run := func(initial bool) bool {
+		stats, err := e.store.CleanupWithOptions(ctx, store.CleanupOptions{Retention: 30 * 24 * time.Hour})
+		e.recordCleanup(stats, err)
+		if err != nil {
+			if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
+				if initial {
+					slog.Error("initial retention cleanup failed", "phase", stats.FailedPhase, "error", err)
+				} else {
+					slog.Error("retention cleanup failed", "phase", stats.FailedPhase, "error", err)
+				}
+			}
+			// A transient lock or I/O error should be retried on the early
+			// continuation schedule instead of waiting a full hour.
+			return true
+		}
+		slog.Info("retention cleanup completed", "duration_ms", stats.Duration.Milliseconds(), "transactions", stats.Transactions, "sessions_deleted", stats.SessionsDeleted, "auth_tokens_deleted", stats.AuthTokensDeleted, "meta_deleted", stats.MetaDeleted, "outbox_dead_lettered", stats.OutboxDeadLettered, "webhook_dead_lettered", stats.WebhookDeadLettered, "events_deleted", stats.EventsDeleted, "event_batches_deleted", stats.EventBatchesDeleted, "event_batch_triggers_deleted", stats.EventBatchTriggersDeleted, "webhook_triggers_deleted", stats.WebhookTriggersDeleted, "delivered_outbox_deleted", stats.DeliveredOutboxDeleted, "dead_outbox_deleted", stats.DeadOutboxDeleted, "remaining", stats.Remaining)
+		return stats.Remaining
+	}
+
+	remaining := run(true)
+	wait := cleanupPollInterval
+	if remaining && wait > cleanupContinuationInterval {
+		wait = cleanupContinuationInterval
+	}
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
-			if err := e.store.Cleanup(ctx, 30*24*time.Hour); err != nil {
-				slog.Error("retention cleanup failed", "error", err)
+		case <-timer.C:
+			remaining = run(false)
+			wait := cleanupPollInterval
+			if remaining && wait > cleanupContinuationInterval {
+				wait = cleanupContinuationInterval
 			}
+			timer.Reset(wait)
 		}
 	}
 }

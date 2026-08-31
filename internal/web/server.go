@@ -1011,10 +1011,16 @@ func (s *Server) metricsAuthorized(r *http.Request) bool {
 		}
 		return subtle.ConstantTimeCompare([]byte(provided), []byte(s.config.MetricsToken)) == 1
 	}
-	// A blank token is useful for local Compose development, but must not turn
-	// an accidentally public listener into an unauthenticated inventory API.
-	addr, err := netip.ParseAddr(strings.TrimSpace(s.clientIP(r)))
-	return err == nil && addr.IsLoopback()
+	// A blank token is useful for local development, but is only valid on a
+	// direct loopback connection. A reverse proxy is never a safe substitute:
+	// forwarded headers can be omitted, malformed, or supplied by an untrusted
+	// peer, so tokenless metrics fail closed whenever proxy provenance exists.
+	remote := strings.TrimSpace(remoteIP(r))
+	addr, err := netip.ParseAddr(remote)
+	if err != nil || !addr.IsLoopback() || s.isTrustedProxy(remote) {
+		return false
+	}
+	return strings.TrimSpace(r.Header.Get("X-Forwarded-For")) == "" && strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")) == ""
 }
 
 func (s *Server) startSession(w http.ResponseWriter, r *http.Request) bool {

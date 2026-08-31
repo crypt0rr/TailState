@@ -18,6 +18,7 @@ import (
 
 	"github.com/crypt0rr/tailstate/internal/boot"
 	"github.com/crypt0rr/tailstate/internal/diagnostics"
+	"github.com/crypt0rr/tailstate/internal/model"
 	"github.com/crypt0rr/tailstate/internal/secret"
 	"github.com/crypt0rr/tailstate/internal/store"
 )
@@ -130,6 +131,9 @@ func TestRunCommandDispatchAndHealthcheck(t *testing.T) {
 	}
 	if err := doctor([]string{"-bad-flag"}); err == nil {
 		t.Fatal("invalid doctor flag was accepted")
+	}
+	if err := evidenceAudit([]string{"-batch-size", "1"}); err != nil {
+		t.Fatalf("read-only evidence audit returned error: %v", err)
 	}
 }
 
@@ -463,6 +467,84 @@ func TestEvidenceVerifyCommand(t *testing.T) {
 	}
 	if err := evidenceVerify([]string{"-file", packPath, "-public-key", keyPath}); err != nil {
 		t.Fatalf("trusted-key verification failed: %v", err)
+	}
+}
+
+func TestEvidenceAuditCommandUsesReadOnlyDatabaseAndTrustedKey(t *testing.T) {
+	dataDir := t.TempDir()
+	configureCommandEnvironment(t, dataDir)
+	if err := evidenceAudit([]string{"-bad-flag"}); err == nil {
+		t.Fatal("evidence audit accepted an unknown flag")
+	}
+	_, st, err := load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	generation, err := st.SaveSettings(context.Background(), store.Settings{Tailnet: "-", OAuthClientID: "client", OAuthClientSecret: "secret", MattermostURL: "https://mattermost.example/hooks/x", DeviceInterval: time.Minute, InventoryInterval: 5 * time.Minute})
+	if err != nil {
+		st.Close()
+		t.Fatal(err)
+	}
+	baseline := []model.Collected{{Collector: "devices", Resources: []model.Resource{{ID: "device-1", Type: "device", Name: "server", Data: map[string]any{"hostname": "server"}}}}}
+	changed := []model.Collected{{Collector: "devices", Resources: []model.Resource{{ID: "device-1", Type: "device", Name: "server-new", Data: map[string]any{"hostname": "server-new"}}}}}
+	if _, err := st.ApplyBatchWithBatch(context.Background(), generation, baseline, func([]model.Change) string { return "baseline" }); err != nil {
+		st.Close()
+		t.Fatal(err)
+	}
+	if _, err := st.ApplyBatchWithBatch(context.Background(), generation, changed, func([]model.Change) string { return "changed" }); err != nil {
+		st.Close()
+		t.Fatal(err)
+	}
+	public, err := st.EvidenceSigningPublicKey(context.Background())
+	if err != nil {
+		st.Close()
+		t.Fatal(err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	databasePath := filepath.Join(dataDir, "tailstate.db")
+	before, err := os.ReadFile(databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := evidenceAudit([]string{"-batch-size", "1"}); err != nil {
+		t.Fatalf("embedded-key audit failed: %v", err)
+	}
+	if err := evidenceAudit([]string{"-public-key", filepath.Join(dataDir, "missing.key")}); err == nil || !strings.Contains(err.Error(), "read evidence audit public key") {
+		t.Fatalf("missing trusted audit key error=%v", err)
+	}
+	keyPath := filepath.Join(dataDir, "trusted.key")
+	if err := os.WriteFile(keyPath, []byte(base64.RawStdEncoding.EncodeToString(public)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := evidenceAudit([]string{"-batch-size", "1", "-public-key", keyPath}); err != nil {
+		t.Fatalf("trusted-key audit failed: %v", err)
+	}
+	after, err := os.ReadFile(databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatal("evidence audit changed the database")
+	}
+	badKeyPath := filepath.Join(dataDir, "bad.key")
+	if err := os.WriteFile(badKeyPath, []byte("not-a-public-key"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := evidenceAudit([]string{"-public-key", badKeyPath}); err == nil || !strings.Contains(err.Error(), "parse evidence audit public key") {
+		t.Fatalf("invalid trusted audit key error=%v", err)
+	}
+	db := commandDB(t, dataDir)
+	if _, err := db.Exec("UPDATE events SET name='tampered' WHERE id=(SELECT MIN(id) FROM events)"); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := evidenceAudit(nil); err == nil || !strings.Contains(err.Error(), "evidence ledger audit") {
+		t.Fatalf("tampered evidence audit error=%v", err)
 	}
 }
 

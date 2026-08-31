@@ -61,16 +61,18 @@ func run() error {
 			switch os.Args[2] {
 			case "verify":
 				return evidenceVerify(os.Args[3:])
+			case "audit":
+				return evidenceAudit(os.Args[3:])
 			case "public-key":
 				return evidencePublicKey()
 			}
 		}
-		return errors.New("usage: tailstate evidence verify [-file evidence.json] [-public-key public.key] or tailstate evidence public-key")
+		return errors.New("usage: tailstate evidence audit [-public-key public.key] [-batch-size N], evidence verify [-file evidence.json] [-public-key public.key], or tailstate evidence public-key")
 	case "version", "--version", "-version":
 		fmt.Printf("tailstate %s\n", version)
 		return nil
 	default:
-		return fmt.Errorf("unknown command %q (use serve, healthcheck, doctor, admin reset, admin rekey, evidence verify, evidence public-key, or version)", command)
+		return fmt.Errorf("unknown command %q (use serve, healthcheck, doctor, admin reset, admin rekey, evidence audit, evidence verify, evidence public-key, or version)", command)
 	}
 }
 
@@ -394,6 +396,66 @@ func evidenceVerify(args []string) error {
 	// legacy export (which this command deliberately rejects).
 	fmt.Println("signed evidence pack verified")
 	return nil
+}
+
+func evidenceAudit(args []string) error {
+	flags := flag.NewFlagSet("evidence audit", flag.ContinueOnError)
+	publicKeyPath := flags.String("public-key", "", "trusted Ed25519 public key path (base64, hexadecimal, or raw)")
+	batchSize := flags.Int("batch-size", 128, "maximum ledger entries read per page")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	config, err := boot.Load(version)
+	if err != nil {
+		return fmt.Errorf("evidence audit configuration: %w", err)
+	}
+	key, err := config.MasterKey()
+	if err != nil {
+		return fmt.Errorf("evidence audit master key: %w", err)
+	}
+	box, err := secret.NewBox(key)
+	if err != nil {
+		return fmt.Errorf("evidence audit master key: %w", err)
+	}
+	st, err := store.OpenEvidenceReadOnly(config.DatabasePath(), box)
+	if err != nil {
+		return fmt.Errorf("evidence audit database: %w", err)
+	}
+	defer st.Close()
+	var trustedKey []byte
+	if strings.TrimSpace(*publicKeyPath) != "" {
+		keyData, err := readEvidenceFile(*publicKeyPath, store.EvidencePublicKeyLimitBytes, fmt.Errorf("evidence public key exceeds %d bytes", store.EvidencePublicKeyLimitBytes))
+		if err != nil {
+			return fmt.Errorf("read evidence audit public key: %w", err)
+		}
+		trustedKey, err = store.ParseEvidencePublicKey(keyData)
+		if err != nil {
+			return fmt.Errorf("parse evidence audit public key: %w", err)
+		}
+	}
+	var cursor, entries, verified, unverifiable int64
+	var keyID string
+	trusted := len(trustedKey) > 0
+	for {
+		result, err := st.AuditEvidenceLedger(context.Background(), store.EvidenceAuditOptions{Cursor: cursor, Limit: *batchSize, TrustedPublicKey: trustedKey})
+		if err != nil {
+			return fmt.Errorf("evidence ledger audit: %w", err)
+		}
+		entries += result.Entries
+		verified += result.VerifiedEntries
+		unverifiable += result.UnverifiableEntries
+		if keyID == "" {
+			keyID = result.SigningKeyID
+		}
+		if result.Complete {
+			fmt.Printf("evidence ledger audit verified: entries=%d verified=%d unverifiable_payloads=%d key=%s trusted_key=%t\n", entries, verified, unverifiable, keyID, trusted)
+			return nil
+		}
+		if result.NextCursor <= cursor {
+			return errors.New("evidence ledger audit did not advance its cursor")
+		}
+		cursor = result.NextCursor
+	}
 }
 
 func readEvidenceFile(path string, limit int64, tooLarge error) ([]byte, error) {

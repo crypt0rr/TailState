@@ -252,6 +252,47 @@ func TestDeliveryMetricsRecordDurationBuckets(t *testing.T) {
 	}
 }
 
+func TestCleanupMetricsRecordBoundedPass(t *testing.T) {
+	engine := &Engine{}
+	engine.recordCleanup(store.CleanupStats{SessionsDeleted: 2, EventsDeleted: 3, Transactions: 4, Duration: 25 * time.Millisecond, Remaining: true}, nil)
+	engine.recordCleanup(store.CleanupStats{OutboxDeadLettered: 1, Duration: time.Millisecond}, errors.New("cleanup failed"))
+	metrics := engine.CleanupMetrics()
+	if metrics.Runs != 2 || metrics.Failures != 1 || metrics.RemainingPasses != 1 || metrics.Remaining || metrics.Transactions != 4 || metrics.SessionsDeleted != 2 || metrics.EventsDeleted != 3 || metrics.OutboxDeadLettered != 1 || metrics.DurationSeconds <= 0 {
+		t.Fatalf("cleanup metrics=%+v", metrics)
+	}
+}
+
+func TestCleanupRunsBoundedPassAndStops(t *testing.T) {
+	st, _, _ := openMonitorTestStore(t)
+	engine := New(st, "", "", "test", &scriptedSender{})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		engine.cleanup(ctx)
+		close(done)
+	}()
+	deadline := time.After(time.Second)
+	for engine.CleanupMetrics().Runs == 0 {
+		select {
+		case <-deadline:
+			cancel()
+			<-done
+			t.Fatal("cleanup did not run")
+		case <-time.After(time.Millisecond):
+		}
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("cleanup did not stop after cancellation")
+	}
+	metrics := engine.CleanupMetrics()
+	if metrics.Failures != 0 || metrics.Remaining {
+		t.Fatalf("successful cleanup metrics=%+v", metrics)
+	}
+}
+
 func TestDeliveryLeaseRenewalRecordsLeaseLoss(t *testing.T) {
 	ctx := context.Background()
 	st, _, _ := openMonitorTestStore(t)

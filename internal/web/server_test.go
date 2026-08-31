@@ -279,7 +279,7 @@ func TestMetricsTokenProtectsMetricsWhenConfigured(t *testing.T) {
 	authorizedRequest.Header.Set("Authorization", "Bearer metrics-secret")
 	authorized := httptest.NewRecorder()
 	server.Handler().ServeHTTP(authorized, authorizedRequest)
-	if authorized.Code != http.StatusOK || !strings.Contains(authorized.Body.String(), "tailstate_ready") || !strings.Contains(authorized.Body.String(), "tailstate_collector_poll_duration_seconds") || !strings.Contains(authorized.Body.String(), "tailstate_collector_partial") || !strings.Contains(authorized.Body.String(), "tailstate_collector_partial_errors") || !strings.Contains(authorized.Body.String(), "tailstate_collector_due_errors_total") || !strings.Contains(authorized.Body.String(), "tailstate_outbox_delivery_duration_seconds") || !strings.Contains(authorized.Body.String(), "tailstate_outbox_lease_renewals_total") {
+	if authorized.Code != http.StatusOK || !strings.Contains(authorized.Body.String(), "tailstate_ready") || !strings.Contains(authorized.Body.String(), "tailstate_collector_poll_duration_seconds") || !strings.Contains(authorized.Body.String(), "tailstate_collector_partial") || !strings.Contains(authorized.Body.String(), "tailstate_collector_partial_errors") || !strings.Contains(authorized.Body.String(), "tailstate_collector_due_errors_total") || !strings.Contains(authorized.Body.String(), "tailstate_outbox_delivery_duration_seconds") || !strings.Contains(authorized.Body.String(), "tailstate_outbox_lease_renewals_total") || !strings.Contains(authorized.Body.String(), "tailstate_cleanup_runs_total") || !strings.Contains(authorized.Body.String(), "tailstate_cleanup_rows_total{table=\"events\"}") {
 		t.Fatalf("authorized metrics status=%d body=%s", authorized.Code, authorized.Body.String())
 	}
 }

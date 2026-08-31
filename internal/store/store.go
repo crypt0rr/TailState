@@ -293,6 +293,18 @@ func OpenWithLimits(path string, box *secret.Box, configuredLimits StorageLimits
 		db.Close()
 		return nil, fmt.Errorf("database migration failed while creating outbox history index; stop TailState and restore the verified pre-upgrade backup before retrying: %w", err)
 	}
+	if _, err := db.Exec("CREATE INDEX IF NOT EXISTS events_retention ON events(observed_at, id)"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("database migration failed while creating event retention index; stop TailState and restore the verified pre-upgrade backup before retrying: %w", err)
+	}
+	if _, err := db.Exec("CREATE INDEX IF NOT EXISTS outbox_retry_retention ON outbox(status, first_attempt, lease_until, id)"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("database migration failed while creating outbox retry index; stop TailState and restore the verified pre-upgrade backup before retrying: %w", err)
+	}
+	if _, err := db.Exec("CREATE INDEX IF NOT EXISTS outbox_delivered_retention ON outbox(status, delivered_at, created_at, id)"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("database migration failed while creating outbox retention index; stop TailState and restore the verified pre-upgrade backup before retrying: %w", err)
+	}
 	st := &Store{db: db, box: box}
 	st.limits.Store(limits)
 	present, err = verifyExistingMasterKey(db, box)

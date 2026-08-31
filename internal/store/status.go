@@ -321,54 +321,163 @@ func (s *Store) RecordCollectorPoll(ctx context.Context, generation int64, colle
 	return err
 }
 
+const (
+	// Cleanup batches are deliberately small because SQLite has one writer in
+	// the service. Each statement below is one autocommit transaction, so a
+	// large backlog cannot hold the writer for longer than one bounded batch.
+	defaultCleanupBatchSize         = 128
+	defaultCleanupTransactionBudget = 250 * time.Millisecond
+	defaultCleanupPassBudget        = 2 * time.Second
+)
+
+// CleanupOptions controls one resumable retention pass. Zero values select
+// the production budgets; callers may use smaller values in tests or during
+// an operator-driven maintenance pass.
+type CleanupOptions struct {
+	Retention         time.Duration
+	BatchSize         int
+	TransactionBudget time.Duration
+	PassBudget        time.Duration
+}
+
+// CleanupStats describes the work completed by one retention pass. Counts
+// are rows changed by the pass, not estimates of the remaining backlog.
+type CleanupStats struct {
+	SessionsDeleted           int64
+	AuthTokensDeleted         int64
+	MetaDeleted               int64
+	OutboxDeadLettered        int64
+	WebhookDeadLettered       int64
+	EventsDeleted             int64
+	EventBatchesDeleted       int64
+	EventBatchTriggersDeleted int64
+	WebhookTriggersDeleted    int64
+	DeliveredOutboxDeleted    int64
+	DeadOutboxDeleted         int64
+	Transactions              int
+	Duration                  time.Duration
+	Remaining                 bool
+	FailedPhase               string
+}
+
+// TotalRowsChanged returns the total number of rows changed by the pass.
+func (c CleanupStats) TotalRowsChanged() int64 {
+	return c.SessionsDeleted + c.AuthTokensDeleted + c.MetaDeleted + c.OutboxDeadLettered + c.WebhookDeadLettered + c.EventsDeleted + c.EventBatchesDeleted + c.EventBatchTriggersDeleted + c.WebhookTriggersDeleted + c.DeliveredOutboxDeleted + c.DeadOutboxDeleted
+}
+
 // Cleanup expires short-lived authentication/session state, bounds pending
-// notification retries, and applies the configured retention window.
+// notification retries, and applies the configured retention window. It
+// retains the historical error-only API for existing callers.
 func (s *Store) Cleanup(ctx context.Context, retention time.Duration) error {
-	now := time.Now().UTC()
-	if _, err := s.db.ExecContext(ctx, "DELETE FROM sessions WHERE expires_at<=?", now.Format(time.RFC3339Nano)); err != nil {
-		return err
-	}
-	if _, err := s.db.ExecContext(ctx, "DELETE FROM auth_tokens WHERE expires_at<=?", now.Format(time.RFC3339Nano)); err != nil {
-		return err
-	}
-	if _, err := s.db.ExecContext(ctx, `DELETE FROM meta
-		WHERE (key='setup_token_hash' AND NOT EXISTS (SELECT 1 FROM auth_tokens WHERE kind='setup'))
-		   OR (key='reset_token_hash' AND NOT EXISTS (SELECT 1 FROM auth_tokens WHERE kind='reset'))`); err != nil {
-		return err
-	}
-	retryCutoff := now.Add(-outboxRetryWindow).Format(time.RFC3339Nano)
-	if _, err := s.db.ExecContext(ctx, `UPDATE outbox
-		SET status='dead',next_attempt=?,lease_until=NULL,lease_token='',last_error=CASE WHEN TRIM(last_error)='' THEN 'delivery retry window expired' ELSE last_error END
-		WHERE status IN ('pending','processing') AND first_attempt<=?
-		  AND (status='pending' OR lease_until IS NULL OR lease_until<=?)`, now.Format(time.RFC3339Nano), retryCutoff, now.Format(time.RFC3339Nano)); err != nil {
-		return err
-	}
-	webhookRetryCutoff := now.Add(-webhookTriggerRetryWindow).Format(time.RFC3339Nano)
-	if _, err := s.db.ExecContext(ctx, `UPDATE webhook_triggers
-		SET status='dead',next_attempt_at=?,lease_until=NULL,lease_token='',last_error=CASE WHEN TRIM(last_error)='' THEN 'reconciliation retry window expired' ELSE last_error END
-		WHERE status IN ('pending','processing') AND received_at<=?
-		  AND (status='pending' OR lease_until IS NULL OR lease_until<=?)`, now.Format(time.RFC3339Nano), webhookRetryCutoff, now.Format(time.RFC3339Nano)); err != nil {
-		return err
-	}
-	cutoff := now.Add(-retention).Format(time.RFC3339Nano)
-	_, err := s.db.ExecContext(ctx, "DELETE FROM events WHERE observed_at<?", cutoff)
-	if err != nil {
-		return err
-	}
-	if _, err := s.db.ExecContext(ctx, "DELETE FROM event_batches WHERE NOT EXISTS (SELECT 1 FROM events WHERE events.batch_id=event_batches.id)"); err != nil {
-		return err
-	}
-	if _, err := s.db.ExecContext(ctx, "DELETE FROM event_batch_triggers WHERE NOT EXISTS (SELECT 1 FROM event_batches WHERE event_batches.id=event_batch_triggers.batch_id)"); err != nil {
-		return err
-	}
-	// Ledger entries are retained beyond event snapshots so the hash chain
-	// remains a durable audit trail after the 30-day history retention sweep.
-	if _, err := s.db.ExecContext(ctx, "DELETE FROM webhook_triggers WHERE received_at<? AND status IN ('processed','dead')", cutoff); err != nil {
-		return err
-	}
-	if _, err := s.db.ExecContext(ctx, "DELETE FROM outbox WHERE status='delivered' AND delivered_at<?", cutoff); err != nil {
-		return err
-	}
-	_, err = s.db.ExecContext(ctx, "DELETE FROM outbox WHERE status='dead' AND created_at<?", cutoff)
+	_, err := s.CleanupWithOptions(ctx, CleanupOptions{Retention: retention})
 	return err
+}
+
+// CleanupWithOptions runs a bounded, resumable retention pass. Every batch is
+// an independent autocommit transaction capped by BatchSize and
+// TransactionBudget. If PassBudget is reached, Remaining is true and a later
+// pass can continue from the same keyset predicates without skipping rows.
+func (s *Store) CleanupWithOptions(ctx context.Context, options CleanupOptions) (stats CleanupStats, err error) {
+	started := time.Now()
+	defer func() { stats.Duration = time.Since(started) }()
+	if err := ctx.Err(); err != nil {
+		return stats, err
+	}
+	if options.BatchSize <= 0 {
+		options.BatchSize = defaultCleanupBatchSize
+	}
+	if options.BatchSize > 1024 {
+		options.BatchSize = 1024
+	}
+	if options.TransactionBudget <= 0 {
+		options.TransactionBudget = defaultCleanupTransactionBudget
+	}
+	if options.PassBudget <= 0 {
+		options.PassBudget = defaultCleanupPassBudget
+	}
+	deadline := time.Now().Add(options.PassBudget)
+	now := time.Now().UTC()
+	nowValue := now.Format(time.RFC3339Nano)
+	retryCutoff := now.Add(-outboxRetryWindow).Format(time.RFC3339Nano)
+	webhookRetryCutoff := now.Add(-webhookTriggerRetryWindow).Format(time.RFC3339Nano)
+	cutoff := now.Add(-options.Retention).Format(time.RFC3339Nano)
+	budget := cleanupBudget{deadline: deadline, transaction: options.TransactionBudget, batchSize: options.BatchSize}
+
+	phases := []cleanupPhase{
+		{name: "sessions", query: `DELETE FROM sessions WHERE rowid IN (SELECT rowid FROM sessions WHERE expires_at<=? ORDER BY expires_at,rowid LIMIT ?)`, args: []any{nowValue}, add: func(n int64) { stats.SessionsDeleted += n }},
+		{name: "auth_tokens", query: `DELETE FROM auth_tokens WHERE rowid IN (SELECT rowid FROM auth_tokens WHERE expires_at<=? ORDER BY expires_at,rowid LIMIT ?)`, args: []any{nowValue}, add: func(n int64) { stats.AuthTokensDeleted += n }},
+		{name: "meta", query: `DELETE FROM meta WHERE rowid IN (SELECT rowid FROM meta WHERE (key='setup_token_hash' AND NOT EXISTS (SELECT 1 FROM auth_tokens WHERE kind='setup')) OR (key='reset_token_hash' AND NOT EXISTS (SELECT 1 FROM auth_tokens WHERE kind='reset')) ORDER BY rowid LIMIT ?)`, args: nil, add: func(n int64) { stats.MetaDeleted += n }},
+		{name: "outbox_dead_letter", query: `UPDATE outbox SET status='dead',next_attempt=?,lease_until=NULL,lease_token='',last_error=CASE WHEN TRIM(last_error)='' THEN 'delivery retry window expired' ELSE last_error END WHERE rowid IN (SELECT rowid FROM outbox WHERE status IN ('pending','processing') AND first_attempt<=? AND (status='pending' OR lease_until IS NULL OR lease_until<=?) ORDER BY first_attempt,rowid LIMIT ?)`, args: []any{nowValue, retryCutoff, nowValue}, add: func(n int64) { stats.OutboxDeadLettered += n }},
+		{name: "webhook_dead_letter", query: `UPDATE webhook_triggers SET status='dead',next_attempt_at=?,lease_until=NULL,lease_token='',last_error=CASE WHEN TRIM(last_error)='' THEN 'reconciliation retry window expired' ELSE last_error END WHERE rowid IN (SELECT rowid FROM webhook_triggers WHERE status IN ('pending','processing') AND received_at<=? AND (status='pending' OR lease_until IS NULL OR lease_until<=?) ORDER BY received_at,rowid LIMIT ?)`, args: []any{nowValue, webhookRetryCutoff, nowValue}, add: func(n int64) { stats.WebhookDeadLettered += n }},
+		{name: "events", query: `DELETE FROM events WHERE rowid IN (SELECT rowid FROM events WHERE observed_at<? ORDER BY observed_at,rowid LIMIT ?)`, args: []any{cutoff}, add: func(n int64) { stats.EventsDeleted += n }},
+		{name: "event_batches", query: `DELETE FROM event_batches WHERE rowid IN (SELECT b.rowid FROM event_batches b WHERE NOT EXISTS (SELECT 1 FROM events WHERE events.batch_id=b.id) ORDER BY b.observed_at,b.rowid LIMIT ?)`, args: nil, add: func(n int64) { stats.EventBatchesDeleted += n }},
+		{name: "event_batch_triggers", query: `DELETE FROM event_batch_triggers WHERE rowid IN (SELECT t.rowid FROM event_batch_triggers t WHERE NOT EXISTS (SELECT 1 FROM event_batches WHERE event_batches.id=t.batch_id) ORDER BY t.batch_id,t.trigger_id LIMIT ?)`, args: nil, add: func(n int64) { stats.EventBatchTriggersDeleted += n }},
+		// Ledger entries are intentionally absent from this list. They outlive
+		// event snapshots so the signed chain remains an audit trail.
+		{name: "webhook_triggers", query: `DELETE FROM webhook_triggers WHERE rowid IN (SELECT rowid FROM webhook_triggers WHERE received_at<? AND status IN ('processed','dead') ORDER BY received_at,rowid LIMIT ?)`, args: []any{cutoff}, add: func(n int64) { stats.WebhookTriggersDeleted += n }},
+		{name: "delivered_outbox", query: `DELETE FROM outbox WHERE rowid IN (SELECT rowid FROM outbox WHERE status='delivered' AND delivered_at<? ORDER BY delivered_at,rowid LIMIT ?)`, args: []any{cutoff}, add: func(n int64) { stats.DeliveredOutboxDeleted += n }},
+		{name: "dead_outbox", query: `DELETE FROM outbox WHERE rowid IN (SELECT rowid FROM outbox WHERE status='dead' AND created_at<? ORDER BY created_at,rowid LIMIT ?)`, args: []any{cutoff}, add: func(n int64) { stats.DeadOutboxDeleted += n }},
+	}
+	for _, phase := range phases {
+		phaseDone, phaseErr := s.runCleanupPhase(ctx, &stats, phase, &budget)
+		if phaseErr != nil {
+			stats.FailedPhase = phase.name
+			return stats, phaseErr
+		}
+		if !phaseDone {
+			stats.Remaining = true
+			return stats, nil
+		}
+	}
+	return stats, nil
+}
+
+type cleanupPhase struct {
+	name  string
+	query string
+	args  []any
+	add   func(int64)
+}
+
+type cleanupBudget struct {
+	deadline    time.Time
+	transaction time.Duration
+	batchSize   int
+}
+
+func (b cleanupBudget) expired() bool { return !time.Now().Before(b.deadline) }
+
+func (s *Store) runCleanupPhase(ctx context.Context, stats *CleanupStats, phase cleanupPhase, budget *cleanupBudget) (bool, error) {
+	for {
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
+		if budget.expired() {
+			return false, nil
+		}
+		args := append([]any(nil), phase.args...)
+		args = append(args, budget.batchSize)
+		transactionBudget := budget.transaction
+		if remaining := time.Until(budget.deadline); remaining < transactionBudget {
+			transactionBudget = remaining
+		}
+		if transactionBudget <= 0 {
+			return false, nil
+		}
+		batchCtx, cancel := context.WithTimeout(ctx, transactionBudget)
+		result, err := s.db.ExecContext(batchCtx, phase.query, args...)
+		cancel()
+		stats.Transactions++
+		if err != nil {
+			return false, fmt.Errorf("cleanup %s: %w", phase.name, err)
+		}
+		changed, err := result.RowsAffected()
+		if err != nil {
+			return false, fmt.Errorf("cleanup %s rows affected: %w", phase.name, err)
+		}
+		if changed == 0 {
+			return true, nil
+		}
+		phase.add(changed)
+	}
 }

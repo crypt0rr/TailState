@@ -101,6 +101,40 @@ func TestBuildReportsUnclaimedInstallation(t *testing.T) {
 	}
 }
 
+func TestBuildReportsReadOnlyDatabaseState(t *testing.T) {
+	missing := Build(boot.Config{ListenAddr: "127.0.0.1:8080"}, Runtime{
+		DatabaseMissing: true,
+		Storage:         StorageRuntime{ConfiguredProfile: &StorageProfile{DatabaseLimitBytes: 512 << 20}},
+	}, nil)
+	if missing.State != "ok" {
+		t.Fatalf("missing database state=%q, want ok", missing.State)
+	}
+	if _, ok := finding(missing, "database_missing"); !ok {
+		t.Fatal("missing database finding missing")
+	}
+	pending := Build(boot.Config{ListenAddr: "127.0.0.1:8080"}, Runtime{
+		SchemaVersion:          11,
+		SchemaMigrationPending: true,
+		Storage: StorageRuntime{
+			ConfiguredProfile: &StorageProfile{DatabaseLimitBytes: 512 << 20},
+			PersistedProfile:  &StorageProfile{DatabaseLimitBytes: 256 << 20},
+		},
+	}, nil)
+	if pending.State != "warning" {
+		t.Fatalf("pending database state=%q, want warning", pending.State)
+	}
+	if _, ok := finding(pending, "database_migration_pending"); !ok {
+		t.Fatal("migration pending finding missing")
+	}
+	encoded, err := json.Marshal(pending)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encoded), "secret") || !strings.Contains(string(encoded), "configured_profile") || !strings.Contains(string(encoded), "persisted_profile") {
+		t.Fatalf("database diagnostics missing safe profile data or leaking credentials: %s", encoded)
+	}
+}
+
 func TestBuildReportsStoragePressureWithoutPayloads(t *testing.T) {
 	report := Build(boot.Config{ListenAddr: "127.0.0.1:8080"}, Runtime{
 		Configured: true,

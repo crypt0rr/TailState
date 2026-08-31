@@ -191,6 +191,33 @@ func doctor(args []string) error {
 	if err != nil {
 		return fmt.Errorf("doctor configuration: %w", err)
 	}
+	configuredProfile := store.StorageLimits{
+		SnapshotBytes:    config.StorageLimits.SnapshotBytes,
+		EventValueBytes:  config.StorageLimits.EventValueBytes,
+		HistoryPageBytes: config.StorageLimits.HistoryPageBytes,
+		RejectBytes:      config.StorageLimits.RejectBytes,
+		DatabaseBytes:    config.StorageLimits.DatabaseBytes,
+	}
+	configuredLimits, err := store.NormalizeStorageLimits(configuredProfile)
+	if err != nil {
+		return fmt.Errorf("doctor storage limits: %w", err)
+	}
+	runtime := diagnostics.Runtime{
+		Storage: diagnostics.StorageRuntime{
+			SnapshotLimitBytes:    configuredLimits.SnapshotBytes,
+			EventValueLimitBytes:  configuredLimits.EventValueBytes,
+			HistoryPageLimitBytes: configuredLimits.HistoryPageBytes,
+			RejectLimitBytes:      configuredLimits.RejectBytes,
+			DatabaseLimitBytes:    configuredLimits.DatabaseBytes,
+			ConfiguredProfile:     diagnosticsStorageProfile(configuredLimits),
+		},
+	}
+	if _, err := os.Stat(config.DatabasePath()); errors.Is(err, os.ErrNotExist) {
+		runtime.DatabaseMissing = true
+		return writeDoctorReport(diagnostics.Build(config, runtime, nil), *jsonOutput)
+	} else if err != nil {
+		return fmt.Errorf("doctor database path: %w", err)
+	}
 	key, err := config.MasterKey()
 	if err != nil {
 		return fmt.Errorf("doctor master key: %w", err)
@@ -199,41 +226,61 @@ func doctor(args []string) error {
 	if err != nil {
 		return fmt.Errorf("doctor master key: %w", err)
 	}
-	st, err := store.Open(config.DatabasePath(), box)
+	st, inspection, err := store.OpenReadOnly(config.DatabasePath(), box, configuredProfile)
 	if err != nil {
 		return fmt.Errorf("doctor database: %w", err)
 	}
 	defer st.Close()
 
-	runtime := diagnostics.Runtime{}
-	status, err := st.Status(context.Background())
-	if err != nil {
-		return fmt.Errorf("doctor status: %w", err)
+	runtime.SchemaVersion = inspection.SchemaVersion
+	runtime.SchemaMigrationPending = inspection.SchemaMigrationPending
+	runtime.Storage = diagnostics.StorageRuntime{
+		SnapshotLimitBytes:    inspection.EffectiveStorageLimits.SnapshotBytes,
+		EventValueLimitBytes:  inspection.EffectiveStorageLimits.EventValueBytes,
+		HistoryPageLimitBytes: inspection.EffectiveStorageLimits.HistoryPageBytes,
+		RejectLimitBytes:      inspection.EffectiveStorageLimits.RejectBytes,
+		DatabaseLimitBytes:    inspection.EffectiveStorageLimits.DatabaseBytes,
+		ConfiguredProfile:     diagnosticsStorageProfile(inspection.ConfiguredStorageLimits),
 	}
-	runtime.Configured = status.Configured
-	runtime.BaselineReady = status.BaselineReady
-	runtime.BaselineDegraded = status.BaselineDegraded
-	runtime.BaselineReason = status.BaselineReason
-	runtime.Destinations = status.Destinations
-	runtime.EnabledDestinations = status.EnabledDestinations
-	if storage, storageErr := st.StorageMetrics(context.Background()); storageErr == nil {
-		limits := st.StorageLimits()
-		runtime.Storage = diagnostics.StorageRuntime{
-			SnapshotLimitBytes:      limits.SnapshotBytes,
-			EventValueLimitBytes:    limits.EventValueBytes,
-			HistoryPageLimitBytes:   limits.HistoryPageBytes,
-			RejectLimitBytes:        limits.RejectBytes,
-			DatabaseLimitBytes:      storage.DatabaseLimitBytes,
-			DatabaseBytes:           storage.DatabaseBytes,
-			StoragePressure:         storage.PressureRatio(),
-			SnapshotTruncations:     storage.SnapshotTruncations,
-			EventValueTruncations:   storage.EventValueTruncations,
-			HistoryPageTruncations:  storage.HistoryPageTruncations,
-			OversizedWritesRejected: storage.OversizedWritesRejected,
+	if inspection.PersistedStorageFound {
+		runtime.Storage.PersistedProfile = diagnosticsStorageProfile(inspection.PersistedStorageLimits)
+	}
+	if inspection.SchemaVersionPresent && !inspection.SchemaMigrationPending {
+		status, statusErr := st.Status(context.Background())
+		if statusErr != nil {
+			return fmt.Errorf("doctor status: %w", statusErr)
 		}
+		runtime.Configured = status.Configured
+		runtime.BaselineReady = status.BaselineReady
+		runtime.BaselineDegraded = status.BaselineDegraded
+		runtime.BaselineReason = status.BaselineReason
+		runtime.Destinations = status.Destinations
+		runtime.EnabledDestinations = status.EnabledDestinations
 	}
-	report := diagnostics.Build(config, runtime, nil)
-	if *jsonOutput {
+	if storage, storageErr := st.StorageMetrics(context.Background()); storageErr == nil {
+		runtime.Storage.DatabaseLimitBytes = storage.DatabaseLimitBytes
+		runtime.Storage.DatabaseBytes = storage.DatabaseBytes
+		runtime.Storage.StoragePressure = storage.PressureRatio()
+		runtime.Storage.SnapshotTruncations = storage.SnapshotTruncations
+		runtime.Storage.EventValueTruncations = storage.EventValueTruncations
+		runtime.Storage.HistoryPageTruncations = storage.HistoryPageTruncations
+		runtime.Storage.OversizedWritesRejected = storage.OversizedWritesRejected
+	}
+	return writeDoctorReport(diagnostics.Build(config, runtime, nil), *jsonOutput)
+}
+
+func diagnosticsStorageProfile(limits store.StorageLimits) *diagnostics.StorageProfile {
+	return &diagnostics.StorageProfile{
+		SnapshotLimitBytes:    limits.SnapshotBytes,
+		EventValueLimitBytes:  limits.EventValueBytes,
+		HistoryPageLimitBytes: limits.HistoryPageBytes,
+		RejectLimitBytes:      limits.RejectBytes,
+		DatabaseLimitBytes:    limits.DatabaseBytes,
+	}
+}
+
+func writeDoctorReport(report diagnostics.Report, jsonOutput bool) error {
+	if jsonOutput {
 		if err := json.NewEncoder(os.Stdout).Encode(report); err != nil {
 			return fmt.Errorf("write doctor report: %w", err)
 		}
@@ -242,7 +289,18 @@ func doctor(args []string) error {
 		fmt.Fprintf(os.Stdout, "Listener: %s\n", report.Listener)
 		fmt.Fprintf(os.Stdout, "Secure cookies: %t\n", report.CookieSecure)
 		fmt.Fprintf(os.Stdout, "Trusted proxies: %d\n", report.TrustedProxyCount)
+		if report.DatabaseMissing {
+			fmt.Fprintln(os.Stdout, "Database: not initialized")
+		} else if report.SchemaVersion > 0 {
+			fmt.Fprintf(os.Stdout, "Database schema: %d\n", report.SchemaVersion)
+		}
 		fmt.Fprintf(os.Stdout, "Storage: %d/%d bytes (snapshot limit %d, event limit %d, history page limit %d)\n", report.Storage.DatabaseBytes, report.Storage.DatabaseLimitBytes, report.Storage.SnapshotLimitBytes, report.Storage.EventValueLimitBytes, report.Storage.HistoryPageLimitBytes)
+		if report.Storage.ConfiguredProfile != nil {
+			fmt.Fprintf(os.Stdout, "Configured storage profile: snapshot %d, event %d, history page %d, reject %d, database %d bytes\n", report.Storage.ConfiguredProfile.SnapshotLimitBytes, report.Storage.ConfiguredProfile.EventValueLimitBytes, report.Storage.ConfiguredProfile.HistoryPageLimitBytes, report.Storage.ConfiguredProfile.RejectLimitBytes, report.Storage.ConfiguredProfile.DatabaseLimitBytes)
+		}
+		if report.Storage.PersistedProfile != nil {
+			fmt.Fprintf(os.Stdout, "Persisted storage profile: snapshot %d, event %d, history page %d, reject %d, database %d bytes\n", report.Storage.PersistedProfile.SnapshotLimitBytes, report.Storage.PersistedProfile.EventValueLimitBytes, report.Storage.PersistedProfile.HistoryPageLimitBytes, report.Storage.PersistedProfile.RejectLimitBytes, report.Storage.PersistedProfile.DatabaseLimitBytes)
+		}
 		for _, finding := range report.Findings {
 			fmt.Fprintf(os.Stdout, "%s [%s] %s\n  %s\n", strings.ToUpper(string(finding.Severity)), finding.Code, finding.Summary, finding.Remediation)
 		}

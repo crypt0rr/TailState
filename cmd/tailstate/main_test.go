@@ -5,7 +5,9 @@ import (
 	"context"
 	"database/sql"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -14,6 +16,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/crypt0rr/tailstate/internal/boot"
+	"github.com/crypt0rr/tailstate/internal/diagnostics"
+	"github.com/crypt0rr/tailstate/internal/secret"
 	"github.com/crypt0rr/tailstate/internal/store"
 )
 
@@ -40,6 +45,29 @@ func configureCommandEnvironment(t *testing.T, dataDir string) string {
 	t.Setenv("TAILSTATE_TS_API_URL", "http://127.0.0.1:1234/api/v2")
 	t.Setenv("TAILSTATE_TS_OAUTH_URL", "http://127.0.0.1:1234/oauth/token")
 	return keyPath
+}
+
+func captureStdout(t *testing.T, call func() error) (string, error) {
+	t.Helper()
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	original := os.Stdout
+	os.Stdout = writer
+	callErr := call()
+	if err := writer.Close(); err != nil && callErr == nil {
+		callErr = err
+	}
+	os.Stdout = original
+	output, err := io.ReadAll(reader)
+	if closeErr := reader.Close(); err == nil {
+		err = closeErr
+	}
+	if callErr == nil && err != nil {
+		callErr = err
+	}
+	return string(output), callErr
 }
 
 func claimCommandAdmin(t *testing.T, st *store.Store) {
@@ -97,9 +125,95 @@ func TestRunCommandDispatchAndHealthcheck(t *testing.T) {
 	if err := doctor([]string{"-json"}); err != nil {
 		t.Fatalf("doctor returned error: %v", err)
 	}
+	if _, err := os.Stat(filepath.Join(dataDir, "tailstate.db")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("doctor created a database: %v", err)
+	}
 	if err := doctor([]string{"-bad-flag"}); err == nil {
 		t.Fatal("invalid doctor flag was accepted")
 	}
+}
+
+func TestDoctorReportsReadOnlyDatabaseStates(t *testing.T) {
+	dataDir := t.TempDir()
+	configureCommandEnvironment(t, dataDir)
+	output, err := captureStdout(t, func() error { return doctor(nil) })
+	if err != nil {
+		t.Fatalf("missing-database doctor returned error: %v", err)
+	}
+	if !strings.Contains(output, "Database: not initialized") || !strings.Contains(output, "INFO [database_missing]") || !strings.Contains(output, "Configured storage profile:") {
+		t.Fatalf("missing-database report=%q", output)
+	}
+
+	path := filepath.Join(dataDir, "tailstate.db")
+	db, err := sql.Open("sqlite", "file:"+path+"?_pragma=busy_timeout(5000)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec("CREATE TABLE schema_version(version INTEGER NOT NULL); INSERT INTO schema_version VALUES(11)"); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	output, err = captureStdout(t, func() error { return doctor(nil) })
+	if err != nil {
+		t.Fatalf("migration-pending doctor returned error: %v", err)
+	}
+	if !strings.Contains(output, "Database schema: 11") || !strings.Contains(output, "WARNING [database_migration_pending]") {
+		t.Fatalf("migration-pending report=%q", output)
+	}
+}
+
+func TestDoctorUsesConfiguredAndPersistedProfilesWithoutWriting(t *testing.T) {
+	dataDir := t.TempDir()
+	configureCommandEnvironment(t, dataDir)
+	key, err := storeBoxFromCommandKey(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dataDir, "tailstate.db")
+	initial, err := store.OpenWithLimits(path, key, store.StorageLimits{DatabaseBytes: 16 << 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := initial.Close(); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("TAILSTATE_DATABASE_LIMIT_BYTES", "33554432")
+	output, err := captureStdout(t, func() error { return doctor([]string{"-json"}) })
+	if err != nil {
+		t.Fatalf("current-database doctor returned error: %v", err)
+	}
+	var report diagnostics.Report
+	if err := json.Unmarshal([]byte(output), &report); err != nil {
+		t.Fatalf("decode doctor report %q: %v", output, err)
+	}
+	if report.SchemaVersion == 0 || report.Storage.ConfiguredProfile == nil || report.Storage.PersistedProfile == nil {
+		t.Fatalf("doctor report omitted schema/profile metadata: %#v", report)
+	}
+	if report.Storage.ConfiguredProfile.DatabaseLimitBytes != 33554432 || report.Storage.PersistedProfile.DatabaseLimitBytes != 16<<20 || report.Storage.DatabaseLimitBytes != 33554432 {
+		t.Fatalf("doctor profiles=%#v effective=%d", report.Storage, report.Storage.DatabaseLimitBytes)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(before) != string(after) {
+		t.Fatal("doctor changed the current database")
+	}
+}
+
+func storeBoxFromCommandKey(dataDir string) (*secret.Box, error) {
+	key, err := boot.ReadMasterKeyFile(filepath.Join(dataDir, "master.key"))
+	if err != nil {
+		return nil, err
+	}
+	return secret.NewBox(key)
 }
 
 func TestMainAndServeRejectInvalidConfiguration(t *testing.T) {

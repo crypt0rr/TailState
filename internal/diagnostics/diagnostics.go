@@ -79,6 +79,10 @@ type StorageRuntime struct {
 	RejectLimitBytes        int64
 	DatabaseLimitBytes      int64
 	DatabaseBytes           int64
+	DatabaseFileBytes       int64
+	DatabaseWALBytes        int64
+	DatabaseSHMBytes        int64
+	DatabasePhysicalBytes   int64
 	StoragePressure         float64
 	SnapshotTruncations     uint64
 	EventValueTruncations   uint64

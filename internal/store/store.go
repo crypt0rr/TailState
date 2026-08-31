@@ -18,11 +18,12 @@ import (
 )
 
 type Store struct {
-	db          *sql.DB
-	box         *secret.Box
-	evidenceKey evidenceSigningKey
-	limits      atomic.Value // stores StorageLimits
-	counters    storageCounters
+	db           *sql.DB
+	databasePath string
+	box          *secret.Box
+	evidenceKey  evidenceSigningKey
+	limits       atomic.Value // stores StorageLimits
+	counters     storageCounters
 }
 
 type Settings struct {
@@ -305,7 +306,7 @@ func OpenWithLimits(path string, box *secret.Box, configuredLimits StorageLimits
 		db.Close()
 		return nil, fmt.Errorf("database migration failed while creating outbox retention index; stop TailState and restore the verified pre-upgrade backup before retrying: %w", err)
 	}
-	st := &Store{db: db, box: box}
+	st := &Store{db: db, databasePath: path, box: box}
 	st.limits.Store(limits)
 	present, err = verifyExistingMasterKey(db, box)
 	if err != nil {

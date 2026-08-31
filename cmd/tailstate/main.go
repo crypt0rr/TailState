@@ -262,6 +262,10 @@ func doctor(args []string) error {
 	if storage, storageErr := st.StorageMetrics(context.Background()); storageErr == nil {
 		runtime.Storage.DatabaseLimitBytes = storage.DatabaseLimitBytes
 		runtime.Storage.DatabaseBytes = storage.DatabaseBytes
+		runtime.Storage.DatabaseFileBytes = storage.DatabaseFileBytes
+		runtime.Storage.DatabaseWALBytes = storage.DatabaseWALBytes
+		runtime.Storage.DatabaseSHMBytes = storage.DatabaseSHMBytes
+		runtime.Storage.DatabasePhysicalBytes = storage.DatabasePhysicalBytes
 		runtime.Storage.StoragePressure = storage.PressureRatio()
 		runtime.Storage.SnapshotTruncations = storage.SnapshotTruncations
 		runtime.Storage.EventValueTruncations = storage.EventValueTruncations
@@ -303,6 +307,7 @@ func writeDoctorReport(report diagnostics.Report, jsonOutput bool) error {
 		if report.Storage.PersistedProfile != nil {
 			fmt.Fprintf(os.Stdout, "Persisted storage profile: snapshot %d, event %d, history page %d, reject %d, database %d bytes\n", report.Storage.PersistedProfile.SnapshotLimitBytes, report.Storage.PersistedProfile.EventValueLimitBytes, report.Storage.PersistedProfile.HistoryPageLimitBytes, report.Storage.PersistedProfile.RejectLimitBytes, report.Storage.PersistedProfile.DatabaseLimitBytes)
 		}
+		fmt.Fprintf(os.Stdout, "Physical storage: main=%d wal=%d shm=%d total=%d bytes\n", report.Storage.DatabaseFileBytes, report.Storage.DatabaseWALBytes, report.Storage.DatabaseSHMBytes, report.Storage.DatabasePhysicalBytes)
 		for _, finding := range report.Findings {
 			fmt.Fprintf(os.Stdout, "%s [%s] %s\n  %s\n", strings.ToUpper(string(finding.Severity)), finding.Code, finding.Summary, finding.Remediation)
 		}

@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -193,8 +194,11 @@ type storageCounters struct {
 }
 
 // StorageMetrics is the bounded, low-cardinality storage signal exposed to
-// diagnostics and Prometheus. It intentionally omits provider payloads and
-// destination URLs.
+// diagnostics and Prometheus. DatabaseBytes is the logical SQLite allocation
+// used by the configured page budget. The DatabaseFileBytes, DatabaseWALBytes,
+// DatabaseSHMBytes, and DatabasePhysicalBytes fields are physical filesystem
+// observations and are not enforcement values. It intentionally omits
+// provider payloads and destination URLs.
 type StorageMetrics struct {
 	SnapshotTruncations     uint64
 	EventValueTruncations   uint64
@@ -202,6 +206,10 @@ type StorageMetrics struct {
 	OversizedWritesRejected uint64
 	DatabaseBytes           int64
 	DatabaseLimitBytes      int64
+	DatabaseFileBytes       int64
+	DatabaseWALBytes        int64
+	DatabaseSHMBytes        int64
+	DatabasePhysicalBytes   int64
 }
 
 // ErrStorageBudgetExceeded indicates that SQLite rejected a write because the
@@ -301,6 +309,10 @@ func (s *Store) StorageMetrics(ctx context.Context) (StorageMetrics, error) {
 	if err := s.db.QueryRowContext(ctx, "PRAGMA page_size").Scan(&pageSize); err != nil {
 		return StorageMetrics{}, err
 	}
+	physical, err := s.physicalStorageMetrics(ctx)
+	if err != nil {
+		return StorageMetrics{}, err
+	}
 	return StorageMetrics{
 		SnapshotTruncations:     s.counters.snapshotTruncations.Load(),
 		EventValueTruncations:   s.counters.eventTruncations.Load(),
@@ -308,7 +320,60 @@ func (s *Store) StorageMetrics(ctx context.Context) (StorageMetrics, error) {
 		OversizedWritesRejected: s.counters.oversizedWriteRejects.Load(),
 		DatabaseBytes:           pageCount * pageSize,
 		DatabaseLimitBytes:      limits.DatabaseBytes,
+		DatabaseFileBytes:       physical.main,
+		DatabaseWALBytes:        physical.wal,
+		DatabaseSHMBytes:        physical.shm,
+		DatabasePhysicalBytes:   physical.total,
 	}, nil
+}
+
+type physicalStorageMetrics struct {
+	main, wal, shm, total int64
+}
+
+func (s *Store) physicalStorageMetrics(ctx context.Context) (physicalStorageMetrics, error) {
+	if err := ctx.Err(); err != nil {
+		return physicalStorageMetrics{}, err
+	}
+	path := s.databasePath
+	if path == "" {
+		var sequence int64
+		var name, databaseFile string
+		if err := s.db.QueryRowContext(ctx, "PRAGMA database_list").Scan(&sequence, &name, &databaseFile); err != nil {
+			return physicalStorageMetrics{}, fmt.Errorf("read database path: %w", err)
+		}
+		path = databaseFile
+	}
+	if path == "" || path == ":memory:" {
+		return physicalStorageMetrics{}, nil
+	}
+	main, err := physicalFileBytes(path)
+	if err != nil {
+		return physicalStorageMetrics{}, fmt.Errorf("read database file size: %w", err)
+	}
+	wal, err := physicalFileBytes(path + "-wal")
+	if err != nil {
+		return physicalStorageMetrics{}, fmt.Errorf("read database WAL file size: %w", err)
+	}
+	shm, err := physicalFileBytes(path + "-shm")
+	if err != nil {
+		return physicalStorageMetrics{}, fmt.Errorf("read database SHM file size: %w", err)
+	}
+	return physicalStorageMetrics{main: main, wal: wal, shm: shm, total: main + wal + shm}, nil
+}
+
+func physicalFileBytes(path string) (int64, error) {
+	info, err := os.Stat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	if !info.Mode().IsRegular() {
+		return 0, fmt.Errorf("%s is not a regular file", path)
+	}
+	return info.Size(), nil
 }
 
 func (m StorageMetrics) PressureRatio() float64 {

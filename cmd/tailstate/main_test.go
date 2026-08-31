@@ -132,8 +132,8 @@ func TestRunCommandDispatchAndHealthcheck(t *testing.T) {
 	if err := doctor([]string{"-bad-flag"}); err == nil {
 		t.Fatal("invalid doctor flag was accepted")
 	}
-	if err := evidenceAudit([]string{"-batch-size", "1"}); err != nil {
-		t.Fatalf("read-only evidence audit returned error: %v", err)
+	if err := evidenceAudit([]string{"-batch-size", "1"}); err == nil || !strings.Contains(err.Error(), "evidence audit database") {
+		t.Fatalf("missing-database evidence audit error=%v", err)
 	}
 }
 

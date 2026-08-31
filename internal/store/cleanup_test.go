@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 )
@@ -57,5 +58,28 @@ func TestCleanupWithOptionsHonorsCancellation(t *testing.T) {
 	}
 	if stats.Transactions != 0 || stats.Duration < 0 {
 		t.Fatalf("canceled cleanup performed work: %+v", stats)
+	}
+}
+
+func TestCleanupWithOptionsClampsBatchAndBoundsTransactions(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	if _, err := st.CleanupWithOptions(ctx, CleanupOptions{Retention: time.Hour, BatchSize: 2048, TransactionBudget: time.Hour, PassBudget: time.Second}); err != nil {
+		t.Fatalf("clamped cleanup failed: %v", err)
+	}
+	if _, err := st.CleanupWithOptions(ctx, CleanupOptions{Retention: time.Hour, BatchSize: 1, TransactionBudget: time.Hour, PassBudget: time.Second}); err != nil {
+		t.Fatalf("bounded transaction cleanup failed: %v", err)
+	}
+}
+
+func TestCleanupWithOptionsReportsFailedPhase(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	if _, err := st.db.ExecContext(ctx, "DROP TABLE sessions"); err != nil {
+		t.Fatal(err)
+	}
+	stats, err := st.CleanupWithOptions(ctx, CleanupOptions{Retention: time.Hour})
+	if err == nil || stats.FailedPhase != "sessions" || !strings.Contains(err.Error(), "cleanup sessions") {
+		t.Fatalf("failed cleanup stats=%+v err=%v", stats, err)
 	}
 }

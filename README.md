@@ -437,6 +437,13 @@ database that already exceeds the configured ceiling. The limit covers the
 logical SQLite database, while the signed evidence ledger remains retained for
 audit and is never silently deleted to make room.
 
+Diagnostics and `/metrics` also expose the observed physical sizes of the main
+`tailstate.db` file, its `-wal` and `-shm` sidecars, and their total. These
+physical gauges are volume-safety observations, not additional enforcement
+limits; a missing transient sidecar is reported as zero. The logical
+`tailstate_storage_bytes` value remains the one compared with
+`TAILSTATE_DATABASE_LIMIT_BYTES`.
+
 ## Local development
 
 TailState uses Go 1.26.6. CI reads this version from `go.mod`, and the

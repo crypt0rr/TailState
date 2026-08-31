@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -423,6 +424,145 @@ func TestStorageLimitValidationAndMetricEdges(t *testing.T) {
 	}
 	if (&Store{}).StorageLimits() != DefaultStorageLimits() {
 		t.Fatal("uninitialized store did not return default limits")
+	}
+}
+
+func TestStorageMetricsExposePhysicalSQLiteUsage(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "tailstate.db")
+	box, err := secret.NewBox(make([]byte, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err := Open(path, box)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	initial, err := st.StorageMetrics(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mainInfo, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if initial.DatabaseFileBytes != mainInfo.Size() || initial.DatabaseFileBytes <= 0 || initial.DatabasePhysicalBytes < initial.DatabaseFileBytes {
+		t.Fatalf("initial physical metrics=%#v main_file=%d", initial, mainInfo.Size())
+	}
+	if initial.DatabasePhysicalBytes != initial.DatabaseFileBytes+initial.DatabaseWALBytes+initial.DatabaseSHMBytes {
+		t.Fatalf("physical total=%d does not equal components in %#v", initial.DatabasePhysicalBytes, initial)
+	}
+
+	reader, err := sql.Open("sqlite", path+"?_pragma=busy_timeout(5000)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader.SetMaxOpenConns(1)
+	defer reader.Close()
+	readTx, err := reader.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer readTx.Rollback()
+	var count int
+	if err := readTx.QueryRowContext(ctx, "SELECT COUNT(*) FROM meta").Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 8; i++ {
+		if _, err := st.db.ExecContext(ctx, "INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)", "physical-metric-filler-"+strconv.Itoa(i), strings.Repeat("x", 64<<10)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	grown, err := st.StorageMetrics(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if grown.DatabasePhysicalBytes <= initial.DatabasePhysicalBytes {
+		t.Fatalf("physical usage did not grow: initial=%#v grown=%#v", initial, grown)
+	}
+	if grown.DatabaseWALBytes <= initial.DatabaseWALBytes && grown.DatabaseFileBytes <= initial.DatabaseFileBytes {
+		t.Fatalf("neither main nor WAL usage grew: initial=%#v grown=%#v", initial, grown)
+	}
+
+	if got, err := physicalFileBytes(filepath.Join(t.TempDir(), "missing-sidecar")); err != nil || got != 0 {
+		t.Fatalf("missing sidecar size=%d err=%v", got, err)
+	}
+	missingSidecarsPath := filepath.Join(t.TempDir(), "database")
+	if err := os.WriteFile(missingSidecarsPath, []byte("main"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	missingSidecars, err := (&Store{db: st.db, databasePath: missingSidecarsPath}).physicalStorageMetrics(ctx)
+	if err != nil || missingSidecars.wal != 0 || missingSidecars.shm != 0 {
+		t.Fatalf("missing sidecars metrics=%#v err=%v", missingSidecars, err)
+	}
+	directory := filepath.Join(t.TempDir(), "sidecar-directory")
+	if err := os.Mkdir(directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := physicalFileBytes(directory); err == nil {
+		t.Fatal("directory was accepted as a physical SQLite file")
+	}
+	canceled, cancel := context.WithCancel(ctx)
+	cancel()
+	if _, err := st.physicalStorageMetrics(canceled); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled physical metrics error=%v", err)
+	}
+	badPath := filepath.Join(t.TempDir(), "database")
+	if err := os.Mkdir(badPath+"-wal", 0o700); err != nil {
+		t.Fatal(err)
+	}
+	badStore := &Store{db: st.db, databasePath: badPath}
+	if _, err := badStore.StorageMetrics(ctx); err == nil || !strings.Contains(err.Error(), "WAL file size") {
+		t.Fatalf("invalid WAL sidecar error=%v", err)
+	}
+	mainDirectory := filepath.Join(t.TempDir(), "database")
+	if err := os.Mkdir(mainDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := (&Store{db: st.db, databasePath: mainDirectory}).StorageMetrics(ctx); err == nil || !strings.Contains(err.Error(), "database file size") {
+		t.Fatalf("invalid main database file error=%v", err)
+	}
+	shmPath := filepath.Join(t.TempDir(), "database")
+	if err := os.WriteFile(shmPath, []byte("main"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(shmPath+"-shm", 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := (&Store{db: st.db, databasePath: shmPath}).StorageMetrics(ctx); err == nil || !strings.Contains(err.Error(), "SHM file size") {
+		t.Fatalf("invalid SHM sidecar error=%v", err)
+	}
+	if _, err := physicalFileBytes("invalid\x00path"); err == nil {
+		t.Fatal("invalid file path unexpectedly succeeded")
+	}
+	closedDB, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := closedDB.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := (&Store{db: closedDB}).physicalStorageMetrics(ctx); err == nil || !strings.Contains(err.Error(), "read database path") {
+		t.Fatalf("closed database path error=%v", err)
+	}
+
+	memoryDB, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	memoryStore := &Store{db: memoryDB}
+	memoryMetrics, err := memoryStore.StorageMetrics(ctx)
+	if err != nil {
+		memoryDB.Close()
+		t.Fatal(err)
+	}
+	if memoryMetrics.DatabasePhysicalBytes != 0 {
+		memoryDB.Close()
+		t.Fatalf("in-memory physical metrics=%#v", memoryMetrics)
+	}
+	if err := memoryDB.Close(); err != nil {
+		t.Fatal(err)
 	}
 }
 

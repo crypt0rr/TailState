@@ -144,6 +144,10 @@ func TestBuildReportsStoragePressureWithoutPayloads(t *testing.T) {
 			HistoryPageLimitBytes: 4096,
 			DatabaseLimitBytes:    100,
 			DatabaseBytes:         95,
+			DatabaseFileBytes:     80,
+			DatabaseWALBytes:      10,
+			DatabaseSHMBytes:      5,
+			DatabasePhysicalBytes: 95,
 			StoragePressure:       0.95,
 		},
 	}, nil)
@@ -156,6 +160,9 @@ func TestBuildReportsStoragePressureWithoutPayloads(t *testing.T) {
 	}
 	if strings.Contains(string(encoded), "provider") || strings.Contains(string(encoded), "secret") {
 		t.Fatalf("storage diagnostics contain payload material: %s", encoded)
+	}
+	if !strings.Contains(string(encoded), `"DatabasePhysicalBytes":95`) {
+		t.Fatalf("physical storage diagnostics missing: %s", encoded)
 	}
 	errorReport := Build(boot.Config{ListenAddr: "127.0.0.1:8080"}, Runtime{Configured: true, Storage: StorageRuntime{DatabaseLimitBytes: 100, DatabaseBytes: 100, StoragePressure: 1}}, nil)
 	if finding, ok := finding(errorReport, "storage_pressure"); !ok || finding.Severity != SeverityError || errorReport.State != "error" {

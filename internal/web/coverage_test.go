@@ -233,6 +233,10 @@ func TestHealthReadyMetricsAndSecurityHeaders(t *testing.T) {
 		"tailstate_notification_destinations 1",
 		"tailstate_notification_destinations_enabled 1",
 		"tailstate_notifications_paused 0",
+		"tailstate_storage_database_file_bytes",
+		"tailstate_storage_wal_bytes",
+		"tailstate_storage_shm_bytes",
+		"tailstate_storage_physical_bytes",
 	} {
 		if !strings.Contains(metricsBody, want) {
 			t.Fatalf("notification metric %q missing from metrics body: %s", want, metricsBody)

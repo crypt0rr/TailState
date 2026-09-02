@@ -18,7 +18,7 @@ RUN mkdir -p /data \
 
 FROM scratch
 ARG VERSION=dev
-ARG GO_VERSION=1.26.6
+ARG GO_VERSION=1.27.1
 ARG BUILD_COMMIT=unknown
 ARG TARGETOS
 ARG TARGETARCH
@@ -27,8 +27,8 @@ LABEL org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.revision="${BUILD_COMMIT}" \
       org.opencontainers.image.source="https://github.com/crypt0rr/tailstate" \
       org.opencontainers.image.build.go="${GO_VERSION}" \
-      org.opencontainers.image.base.name="golang:1.26.6-alpine3.24" \
-      org.opencontainers.image.base.digest="sha256:3889b425f035be855a72fb4755265311293b6d414521f0a519d819df32222d83" \
+      org.opencontainers.image.base.name="golang:1.27.1-alpine3.24" \
+      org.opencontainers.image.base.digest="sha256:3f6d04dc61331ee3c2fbbaad62d54412a84680f6a041d269a20a5270a078515b" \
       org.opencontainers.image.build.target.os="${TARGETOS}" \
       org.opencontainers.image.build.target.architecture="${TARGETARCH}" \
       org.opencontainers.image.build.target.variant="${TARGETVARIANT}"

@@ -6,7 +6,7 @@ explainable history guarantees described in [README.md](README.md).
 
 ## Before opening a change
 
-Use Go 1.26.6 (the version in `go.mod`) and keep changes focused. CI and the
+Use Go 1.27.1 (the version in `go.mod`) and keep changes focused. CI and the
 release container use this same compiler; verify the two pins with
 `bash scripts/check-go-toolchain.sh`. Do not add
 credentials, database files, backup archives, generated coverage output, or

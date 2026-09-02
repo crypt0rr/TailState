@@ -446,7 +446,7 @@ limits; a missing transient sidecar is reported as zero. The logical
 
 ## Local development
 
-TailState uses Go 1.26.6. CI reads this version from `go.mod`, and the
+TailState uses Go 1.27.1. CI reads this version from `go.mod`, and the
 release container is built with the same digest-pinned Go builder. Run
 `bash scripts/check-go-toolchain.sh` to verify that the tested and published
 toolchains remain aligned before changing either declaration.

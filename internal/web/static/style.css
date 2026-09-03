@@ -30,7 +30,9 @@ header {
   background: var(--card);
 }
 
+.brand { display: flex; align-items: baseline; gap: 10px; min-width: 0; }
 header strong { font-size: 20px; }
+.app-version { color: var(--muted); font-size: 12px; font-weight: 600; letter-spacing: .02em; white-space: nowrap; }
 
 nav { display: flex; align-items: center; gap: 18px; }
 nav form { display: inline; }

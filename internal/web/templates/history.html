@@ -7,7 +7,7 @@
   <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
-<header><strong>TailState</strong><nav><a href="/status">Status</a><a class="active" href="/history">History</a><a href="/settings">Settings</a><form method="post" action="/logout"><input type="hidden" name="_csrf" value="{{.CSRF}}"><button class="link" type="submit">Log out</button></form></nav></header>
+<header><div class="brand"><strong>TailState</strong><span class="app-version">Version {{.Version}}</span></div><nav><a href="/status">Status</a><a class="active" href="/history">History</a><a href="/settings">Settings</a><form method="post" action="/logout"><input type="hidden" name="_csrf" value="{{.CSRF}}"><button class="link" type="submit">Log out</button></form></nav></header>
 <main>
 <section class="card history-card">
   <div class="section-heading"><div><h1>Change history</h1><p>Review normalized Tailscale inventory changes and see whether each notification was delivered.</p></div><span class="retention-note">Events retained for 30 days{{if .EvidenceSigningKeyID}} · Signed key <code>{{.EvidenceSigningKeyID}}</code>{{end}}</span></div>

@@ -4,7 +4,7 @@ go 1.27.1
 
 require (
 	github.com/nicholas-fedor/shoutrrr v0.19.0
-	golang.org/x/crypto v0.55.0
+	golang.org/x/crypto v0.56.0
 	modernc.org/sqlite v1.58.0
 )
 

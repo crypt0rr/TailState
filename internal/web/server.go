@@ -53,6 +53,7 @@ const maxTrackedLoginIPs = 4096
 
 type pageData struct {
 	Error, Message, CSRF, Challenge string
+	Version                         string
 	Configured                      bool
 	Settings                        store.Settings
 	DeviceSeconds, InventorySeconds int64
@@ -186,6 +187,7 @@ func (s *Server) security(next http.Handler) http.Handler {
 }
 func (s *Server) render(w http.ResponseWriter, name string, data pageData) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	data.Version = s.config.Version
 	if err := s.templates[name].Execute(w, data); err != nil {
 		slog.Error("render template", "template", name, "error", err)
 	}

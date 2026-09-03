@@ -64,6 +64,20 @@ func TestStatusRendersAndReportsSettingsFailure(t *testing.T) {
 	}
 }
 
+func TestWebInterfaceDisplaysVersion(t *testing.T) {
+	server, _, _ := testServer(t)
+	for _, page := range []string{"setup", "login", "reset", "status", "history", "settings"} {
+		response := httptest.NewRecorder()
+		server.render(response, page, pageData{})
+		if response.Code != http.StatusOK {
+			t.Fatalf("%s page status=%d", page, response.Code)
+		}
+		if !strings.Contains(response.Body.String(), "Version test") {
+			t.Fatalf("%s page does not display the configured version: %s", page, response.Body.String())
+		}
+	}
+}
+
 func TestMetricsReportsStoreFailure(t *testing.T) {
 	server, st, _ := testServer(t)
 	if err := st.Close(); err != nil {

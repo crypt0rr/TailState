@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.26.0
 # Keep this compiler aligned with the `go` directive in go.mod. CI checks the
 # two declarations so the tested and published binaries use the same toolchain.
-FROM golang:1.27.1-alpine3.24@sha256:3f6d04dc61331ee3c2fbbaad62d54412a84680f6a041d269a20a5270a078515b AS builder
+FROM golang:1.27.1-alpine3.24@sha256:cf6fca6641884b8433441b2b0652976f975e1d0fdd26d177eaaf8596087f3125 AS builder
 ARG VERSION=dev
 ARG GO_VERSION=1.27.1
 ARG BUILD_COMMIT=unknown

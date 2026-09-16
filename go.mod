@@ -3,7 +3,7 @@ module github.com/crypt0rr/tailstate
 go 1.27.1
 
 require (
-	github.com/nicholas-fedor/shoutrrr v0.20.0
+	github.com/nicholas-fedor/shoutrrr v0.21.0
 	golang.org/x/crypto v0.57.0
 	modernc.org/sqlite v1.58.0
 )
@@ -25,9 +25,14 @@ require (
 	golang.org/x/sys v0.48.0 // indirect
 	golang.org/x/telemetry v0.0.0-20260908163034-4bcc4b2ee518 // indirect
 	golang.org/x/term v0.46.0 // indirect
+	golang.org/x/text v0.42.0 // indirect
 	golang.org/x/tools v0.50.0 // indirect
 	golang.org/x/vuln v1.8.0 // indirect
 	honnef.co/go/tools v0.8.1 // indirect
+	mellium.im/reader v0.1.0 // indirect
+	mellium.im/sasl v0.3.2 // indirect
+	mellium.im/xmlstream v0.15.4 // indirect
+	mellium.im/xmpp v0.23.0 // indirect
 	modernc.org/libc v1.75.6 // indirect
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.12.1 // indirect

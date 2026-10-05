@@ -13,6 +13,7 @@ of truth and the safety net for missed events.
 - DNS nameservers, preferences, search paths, and split DNS.
 - Policy section fingerprints without storing policy contents.
 - Credential metadata, webhook configuration inventory, log-streaming configuration/status, contacts, posture integrations, and tailnet settings.
+- Upcoming expiry of device node keys and auth keys: a daily check warns before they expire (see [Expiry warnings](#expiry-warnings)).
 
 The REST API does not expose authoritative online state. TailState therefore does **not** generate online/offline notifications. What is ignored depends on the collector:
 
@@ -83,10 +84,52 @@ After claiming the installation, the authenticated Settings page asks for:
 4. Device and secondary inventory polling intervals, in whole seconds. Device
    polling accepts 15 seconds to 24 hours (86400 seconds); inventory polling
    accepts 30 seconds to 24 hours.
+5. Optional expiry warning windows (default `14, 3` days) and an expiry tag
+   filter; see [Expiry warnings](#expiry-warnings).
 
 Add destinations on the authenticated Settings page, then save monitoring settings. Each destination is validated and can be tested independently. The form is validated locally first (interval range, required OAuth credentials, webhook secret of at most 1024 bytes, and a tailnet name without spaces, slashes, or URL syntax), so a mistake is reported immediately with a specific message and nothing is sent to Tailscale. TailState then performs a Tailscale API check, bounded to 20 seconds so a slow or rate-limited API still produces a "Tailscale test failed" page, and builds a silent baseline. The status page shows baseline counts, collector capabilities, source health, and delivery state. Rotating the OAuth secret or changing poll intervals refreshes the monitor without discarding the existing baseline; changing the tailnet or OAuth client identity starts a new generation and dead-letters pending and in-flight event notifications from the previous identity (an in-flight sender can no longer complete or requeue them) while preserving their history for audit. System and release notifications remain eligible for delivery.
 
 The authenticated **History** page keeps a 30-day, searchable ledger of semantic inventory changes. Each poll is grouped into a batch with the affected collector, resource, previous/current normalized snapshots, field-level differences, and the delivery state for every destination. Use it to investigate a notification without exposing credentials or volatile API fields. The page shows the fingerprint of the Ed25519 key used to sign evidence exports.
+
+### Expiry warnings
+
+TailState already stores each device's key expiry and each auth key's expiry,
+but those fields only produce events when they change. A separate daily check
+reads the current snapshots and warns *before* a device node key or auth key
+expires, so a server does not silently drop off the tailnet and automated
+enrolment does not break on an expired auth key.
+
+- **Windows.** Each window is a number of days before expiry (default `14` and
+  `3`; at most four windows between 1 and 365 days). Leave the field blank on
+  the Settings page to disable warnings.
+- **One grouped notification per window.** Every resource that newly entered a
+  window is listed in one system notification for that window, with its name,
+  tags, and expiry. A resource inside several windows at once is reported once,
+  in the tightest window.
+- **Each resource and window alerts once.** The warning state lives in the
+  existing `meta` table (no schema change) and is committed in the same
+  transaction as the notification. When the expiry changes (for example after a
+  device is re-authenticated or an auth key is replaced) the state for that
+  resource resets, so the new expiry is warned about again when it comes close.
+- **Delivered like health alerts.** Expiry warnings are system notifications,
+  not inventory changes: like collector health alerts they reach every enabled
+  destination regardless of routing and mute rules, are rendered in each
+  destination's message format, name the instance and tailnet in the title,
+  carry an `Observed at` line, and link to `/status` when
+  `TAILSTATE_PUBLIC_URL` is set. A long list is shortened at line boundaries
+  with an explicit count of the omitted resources.
+- **Exclusions.** Devices with key expiry disabled, ephemeral devices, revoked
+  or invalid keys, OAuth clients, and short-lived API access tokens are never
+  warned about. Only machine auth keys (`keyType: auth`) are considered.
+- **Tag filter.** Optionally list tags such as `tag:server`; only devices and
+  auth keys carrying one of them (for auth keys, the tags they create devices
+  with) are warned about.
+
+The status page shows an **Expiring soon** card listing everything that expires
+within the widest window (14 days when warnings are disabled), using the same
+exclusions and tag filter. The first check runs two minutes after start-up so
+the first poll can refresh the snapshots; failed checks are retried after 15
+minutes.
 
 ### Faster reconciliation with Tailscale webhooks
 
@@ -409,7 +452,7 @@ in a disposable project before relying on the procedure for an outage.
 - Each paginated collection is bounded to 10,000 items and 64 MiB of response data across all pages, in addition to the 16 MiB per-response cap. If an aggregate limit is exceeded, the collector fails without applying partial inventory or deleting the last known snapshots. Device-detail requests share a bounded eight-worker queue so a large device list cannot create one job and result buffer per device. If the two-minute device-detail deadline expires, the poll is reported as partial with the number of devices left unrefreshed, their previous snapshots are kept, and the next poll starts with the stalest devices so every device is eventually refreshed.
 - If every destination is disabled, or the last destination is removed, monitoring continues and notifications are reported as paused.
 - API collector failures alert after three consecutive failures and once on recovery. Transitions observed in one poll are grouped into one message per destination (one "unhealthy" and later one "recovered"), each collector listed with a bounded reason: `auth rejected`, `rate limited`, `timeout`, `upstream 5xx`, `invalid response`, `unsupported`, or `network error`. Provider error text is never included. A revoked OAuth credential therefore produces one grouped alert per poll schedule (device and inventory collectors are polled on separate schedules) instead of one alert per collector.
-- Every notification names the tailnet (prefixed by `TAILSTATE_INSTANCE_LABEL` when set) in its title and carries an `Observed at <UTC RFC3339>` line. With `TAILSTATE_PUBLIC_URL` set, digests link to their History batch (`/history?batch=<id>`) and health alerts to `/status`. The Settings test message names the instance, tailnet, TailState version, and time.
+- Every notification names the tailnet (prefixed by `TAILSTATE_INSTANCE_LABEL` when set) in its title and carries an `Observed at <UTC RFC3339>` line. With `TAILSTATE_PUBLIC_URL` set, digests link to their History batch (`/history?batch=<id>`) and health alerts and expiry warnings to `/status`. The Settings test message names the instance, tailnet, TailState version, and time.
 - A failed or partial collector is retried after 30 seconds, and each further consecutive failure doubles the delay up to that collector's configured polling interval; a successful poll resets the backoff. A permanently broken endpoint or device therefore settles back to the normal cadence instead of repeating its requests every 30 seconds. Webhook triggers that are processed together poll the union of their collectors once, while each trigger still succeeds or retries only on the collectors it requested.
 - Per-collector retry deadlines (failure retries, unsupported confirmation) are persisted and honored after a restart or a settings save, so a short retry is never replaced by the full polling interval.
 - A 403/404 from an optional plan-specific endpoint is treated as an
@@ -461,8 +504,8 @@ changes, and a destination whose rules match nothing in a batch receives no
 digest. For example, a paging channel with "high only" receives nothing for a
 batch of client upgrades, while a default destination still receives it.
 Destinations created before routing existed, and new destinations, receive all
-changes. Collector health and release notifications are not inventory changes
-and always reach every enabled destination.
+changes. Collector health, expiry warnings, and release notifications are not
+inventory changes and always reach every enabled destination.
 
 ### Noise controls
 
@@ -585,7 +628,7 @@ the optional webhook secret are entered in the authenticated UI.
 | `TAILSTATE_METRICS_TOKEN` | empty | Loopback-only `/metrics` when empty; bearer token for remote scrapes |
 | `TAILSTATE_TRUSTED_PROXIES` | empty | Comma-separated proxy IPs/CIDRs allowed to supply `X-Forwarded-For` and `X-Forwarded-Proto` |
 | `TAILSTATE_LOG_LEVEL` | `info` | `info` or `debug` structured logging |
-| `TAILSTATE_PUBLIC_URL` | empty | External `https://` base URL of this instance (no credentials, query, or fragment). Digests then link to `/history?batch=<id>` and health alerts to `/status`; empty emits no links |
+| `TAILSTATE_PUBLIC_URL` | empty | External `https://` base URL of this instance (no credentials, query, or fragment). Digests then link to `/history?batch=<id>` and health alerts and expiry warnings to `/status`; empty emits no links |
 | `TAILSTATE_INSTANCE_LABEL` | empty | Optional instance name (at most 64 printable bytes) shown in every notification title next to the tailnet |
 | `TAILSTATE_CONTAINER` | `false` (`1` in the image) | Marks the official container image; its wildcard listener is then an informational diagnostic |
 | `TAILSTATE_SNAPSHOT_LIMIT_BYTES` | `1048576` | Maximum normalized snapshot value retained per resource; `0` uses the default |

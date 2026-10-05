@@ -113,6 +113,49 @@ func (c Context) Digest(in DigestInput) Message {
 	return message
 }
 
+// ExpiryLine is one resource listed in an expiry warning.
+type ExpiryLine struct {
+	Kind     string
+	Name     string
+	Tags     []string
+	Expires  time.Time
+	DaysLeft int
+}
+
+// ExpiryWarning builds one grouped system notification for resources that
+// entered the given warning window. Like Digest, it names the instance and
+// tailnet, states when the check observed the expiries, links to the Status
+// page when a public URL is configured, and is shortened only at line
+// boundaries with an explicit count of the omitted resources.
+func (c Context) ExpiryWarning(windowDays int, lines []ExpiryLine, observedAt time.Time) Message {
+	message := c.message("⏳", fmt.Sprintf("Tailscale keys expiring within %d day(s)", windowDays),
+		line(strong(fmt.Sprintf("%d resource(s)", len(lines))), lit(fmt.Sprintf(" entered the %d-day expiry warning window. Re-authenticate devices or replace auth keys before they expire.", windowDays))),
+		observedLine(observedAt),
+	)
+	if statusURL := c.StatusURL(); statusURL != "" {
+		message.Lines = append(message.Lines, line(link("Open TailState status", statusURL)))
+	}
+	message.Lines = append(message.Lines, blank())
+	const reserve = 200 // room for the closing omission note
+	size := markdownSize(message)
+	for index, entry := range lines {
+		spans := []Span{txt(entry.Kind), lit(" "), bold(entry.Name)}
+		if len(entry.Tags) > 0 {
+			spans = append(spans, lit(" ("), code(strings.Join(entry.Tags, ", ")), lit(")"))
+		}
+		spans = append(spans, lit(" expires "), code(entry.Expires.UTC().Format("2006-01-02 15:04 UTC")), lit(fmt.Sprintf(" (%d day(s) left)", entry.DaysLeft)))
+		l := item(spans...)
+		rendered := len(markdownLine(l)) + 1
+		if size+rendered > digestBudget-reserve {
+			message.Lines = append(message.Lines, blank(), line(emph(fmt.Sprintf("%d more resource(s) omitted; total: %d. See the TailState status page for the full list.", len(lines)-index, len(lines)))))
+			break
+		}
+		message.Lines = append(message.Lines, l)
+		size += rendered
+	}
+	return message
+}
+
 // escape makes value inert in bold and prose Markdown contexts. It must not
 // be used inside a code span: CommonMark does not process backslash escapes
 // there, so every escape would be shown literally. Use escapeCode instead.

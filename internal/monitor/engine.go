@@ -206,14 +206,18 @@ func (e *Engine) takeTriggerOverflow() []ReconcileRequest {
 	return out
 }
 
-// Run starts the scheduler, delivery worker, and retention worker. Wait must
+// Run starts the scheduler, delivery worker, expiry worker, and retention worker. Wait must
 // be called after the context is cancelled when the owning process is shutting
 // down so the store is not closed while a worker is still writing to it.
 func (e *Engine) Run(ctx context.Context) {
-	e.wg.Add(3)
+	e.wg.Add(4)
 	go func() {
 		defer e.wg.Done()
 		e.scheduler(ctx)
+	}()
+	go func() {
+		defer e.wg.Done()
+		e.expiryWorker(ctx)
 	}()
 	go func() {
 		defer e.wg.Done()

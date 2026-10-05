@@ -26,6 +26,7 @@ import (
 
 	"github.com/crypt0rr/tailstate/internal/boot"
 	"github.com/crypt0rr/tailstate/internal/diagnostics"
+	"github.com/crypt0rr/tailstate/internal/expiry"
 	"github.com/crypt0rr/tailstate/internal/model"
 	"github.com/crypt0rr/tailstate/internal/monitor"
 	"github.com/crypt0rr/tailstate/internal/notify"
@@ -102,6 +103,19 @@ type pageData struct {
 	NotificationsPaused             bool
 	NotificationState               diagnostics.NotificationState
 	Diagnostics                     diagnostics.Report
+	ExpiryDays, ExpiryTags          string
+	Expiring                        []expiringResource
+	ExpiryHorizonDays               int
+	ExpiryFiltered                  bool
+}
+
+// expiringResource is one row of the status page's "Expiring soon" card.
+type expiringResource struct {
+	Kind     string
+	Name     string
+	Tags     string
+	Expires  time.Time
+	DaysLeft int
 }
 
 type destinationPage struct {
@@ -558,7 +572,45 @@ func (s *Server) status(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	s.render(w, "status", pageData{CSRF: csrf, Status: status})
+	data := pageData{CSRF: csrf, Status: status}
+	data.Expiring, data.ExpiryHorizonDays, data.ExpiryFiltered = s.expiringSoon(r.Context(), time.Now().UTC())
+	s.render(w, "status", data)
+}
+
+// expiringSoon lists device node keys and auth keys that expire within the
+// widest configured warning window, using the same filters as the warnings.
+// A read failure only hides the card; it never fails the status page.
+func (s *Server) expiringSoon(ctx context.Context, now time.Time) ([]expiringResource, int, bool) {
+	settings, err := s.store.Settings(ctx)
+	if err != nil {
+		return nil, expiry.DefaultHorizonDays, false
+	}
+	horizon := expiry.HorizonDays(settings.ExpiryWarningDays)
+	filtered := len(settings.ExpiryTagFilter) > 0
+	devices, err := s.store.CollectorSnapshots(ctx, settings.Generation, "devices")
+	if err != nil {
+		slog.Error("load device snapshots for expiry card", "error", err)
+		return nil, horizon, filtered
+	}
+	keys, err := s.store.CollectorSnapshots(ctx, settings.Generation, "keys")
+	if err != nil {
+		slog.Error("load key snapshots for expiry card", "error", err)
+		return nil, horizon, filtered
+	}
+	items := expiry.Upcoming(expiry.Items(expirySnapshots(devices), expirySnapshots(keys), settings.ExpiryTagFilter), now, horizon)
+	out := make([]expiringResource, 0, len(items))
+	for _, item := range items {
+		out = append(out, expiringResource{Kind: item.KindLabel(), Name: item.Name, Tags: strings.Join(item.Tags, ", "), Expires: item.Expires, DaysLeft: item.DaysLeft(now)})
+	}
+	return out, horizon, filtered
+}
+
+func expirySnapshots(records []store.SnapshotRecord) []expiry.Snapshot {
+	out := make([]expiry.Snapshot, 0, len(records))
+	for _, record := range records {
+		out = append(out, expiry.Snapshot{ID: record.ResourceID, Name: record.Name, Raw: record.Raw})
+	}
+	return out
 }
 
 func (s *Server) history(w http.ResponseWriter, r *http.Request) {
@@ -712,6 +764,19 @@ func (s *Server) settingsPost(w http.ResponseWriter, r *http.Request) {
 	configured := currentErr == nil
 	clearWebhookSecret := r.FormValue("clear_webhook_secret") == "on" || r.FormValue("clear_webhook_secret") == "true"
 	input := store.Settings{Tailnet: strings.TrimSpace(r.FormValue("tailnet")), OAuthClientID: strings.TrimSpace(r.FormValue("client_id")), OAuthClientSecret: r.FormValue("client_secret"), WebhookSecret: strings.TrimSpace(r.FormValue("webhook_secret")), ClearWebhookSecret: clearWebhookSecret}
+	// A form that omits an option (for example a script written for an older
+	// release) keeps the current value instead of disabling it.
+	expiryDaysOK := true
+	if _, present := r.PostForm["expiry_warning_days"]; present {
+		input.ExpiryWarningDays, expiryDaysOK = parseExpiryDays(r.PostForm.Get("expiry_warning_days"))
+	} else if configured {
+		input.ExpiryWarningDays = current.ExpiryWarningDays
+	}
+	if _, present := r.PostForm["expiry_tag_filter"]; present {
+		input.ExpiryTagFilter = splitList(r.PostForm.Get("expiry_tag_filter"))
+	} else if configured {
+		input.ExpiryTagFilter = current.ExpiryTagFilter
+	}
 	if input.Tailnet == "" {
 		input.Tailnet = "-"
 	}
@@ -725,8 +790,19 @@ func (s *Server) settingsPost(w http.ResponseWriter, r *http.Request) {
 	}
 	data := s.settingsData(r.Context(), csrf, configured, input, r)
 	data.DeviceSeconds, data.InventorySeconds = device, inventory
+	if _, present := r.PostForm["expiry_warning_days"]; present {
+		data.ExpiryDays = strings.TrimSpace(r.PostForm.Get("expiry_warning_days"))
+	}
+	if _, present := r.PostForm["expiry_tag_filter"]; present {
+		data.ExpiryTags = strings.TrimSpace(r.PostForm.Get("expiry_tag_filter"))
+	}
 	// Validate everything that needs no I/O before contacting Tailscale, so
 	// an invalid form fails instantly with a specific message.
+	if !expiryDaysOK {
+		data.Error = "Expiry warning windows must be whole numbers of days, for example \"14, 3\"."
+		s.render(w, "settings", data)
+		return
+	}
 	if message := settingsInputError(&input, device, inventory, err1, err2); message != "" {
 		data.Error = message
 		s.render(w, "settings", data)
@@ -807,14 +883,55 @@ func settingsInputError(input *store.Settings, device, inventory int64, deviceEr
 	if len(input.WebhookSecret) > store.MaxWebhookSecretBytes {
 		return fmt.Sprintf("Webhook secret must be at most %d bytes.", store.MaxWebhookSecretBytes)
 	}
+	if _, err := store.NormalizeExpiryWarningDays(input.ExpiryWarningDays); err != nil {
+		return fmt.Sprintf("Expiry warning windows must be at most %d whole numbers of days between 1 and %d.", store.MaxExpiryWarningWindows, store.MaxExpiryWarningDays)
+	}
+	if _, err := store.NormalizeExpiryTagFilter(input.ExpiryTagFilter); err != nil {
+		return fmt.Sprintf("Expiry tag filter must be a comma-separated list of at most %d tags such as tag:server.", store.MaxExpiryTagFilters)
+	}
 	if err := store.ValidateSettings(*input); err != nil {
 		return "Tailnet must be \"-\" or a tailnet name without spaces, slashes, or URL syntax."
 	}
 	return ""
 }
 
+// parseExpiryDays parses a comma- or space-separated list of whole days. A
+// blank value disables expiry warnings and is returned as an empty, non-nil
+// slice (nil would select the defaults).
+func parseExpiryDays(raw string) ([]int, bool) {
+	fields := splitList(raw)
+	days := make([]int, 0, len(fields))
+	for _, field := range fields {
+		value, err := strconv.Atoi(field)
+		if err != nil {
+			return nil, false
+		}
+		days = append(days, value)
+	}
+	return days, true
+}
+
+func splitList(raw string) []string {
+	return strings.FieldsFunc(raw, func(r rune) bool {
+		return r == ',' || r == ' ' || r == '\t' || r == '\r' || r == '\n'
+	})
+}
+
+func joinInts(values []int) string {
+	parts := make([]string, 0, len(values))
+	for _, value := range values {
+		parts = append(parts, strconv.Itoa(value))
+	}
+	return strings.Join(parts, ", ")
+}
+
 func (s *Server) settingsData(ctx context.Context, csrf string, configured bool, settings store.Settings, request *http.Request) pageData {
 	data := pageData{CSRF: csrf, Configured: configured, Settings: settings, DeviceSeconds: int64(settings.DeviceInterval.Seconds()), InventorySeconds: int64(settings.InventoryInterval.Seconds()), Diagnostics: s.diagnosticReport(ctx, request), Collectors: knownCollectors(), HistoryEventTypes: []string{"created", "changed", "removed"}}
+	expiryDays := settings.ExpiryWarningDays
+	if expiryDays == nil {
+		expiryDays = store.DefaultExpiryWarningDays()
+	}
+	data.ExpiryDays, data.ExpiryTags = joinInts(expiryDays), strings.Join(settings.ExpiryTagFilter, ", ")
 	destinations, err := s.store.ListDestinations(ctx)
 	if err == nil {
 		data.Destinations = make([]destinationPage, 0, len(destinations))

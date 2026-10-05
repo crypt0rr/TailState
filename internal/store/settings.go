@@ -41,7 +41,7 @@ func ValidateSettings(in Settings) error {
 	if in.InventoryInterval < MinInventoryPollInterval || in.InventoryInterval > MaxPollInterval {
 		return fmt.Errorf("inventory poll interval must be between %s and %s", MinInventoryPollInterval, MaxPollInterval)
 	}
-	return nil
+	return validateMonitoringOptions(in)
 }
 
 func (s *Store) SaveSettings(ctx context.Context, in Settings) (int64, error) {
@@ -147,6 +147,9 @@ func (s *Store) SaveSettings(ctx context.Context, in Settings) (int64, error) {
 			return 0, err
 		}
 	}
+	if err := saveMonitoringOptionsTx(ctx, tx, in); err != nil {
+		return 0, err
+	}
 	if generationChanged {
 		if _, err := tx.ExecContext(ctx, "DELETE FROM snapshots WHERE generation<>?", generation); err != nil {
 			return 0, err
@@ -212,6 +215,9 @@ func (s *Store) Settings(ctx context.Context) (Settings, error) {
 			return Settings{}, fmt.Errorf("parse settings baseline timestamp: %w", parseErr)
 		}
 		out.BaselineAt = &t
+	}
+	if err := s.loadMonitoringOptions(ctx, &out); err != nil {
+		return Settings{}, err
 	}
 	return out, nil
 }

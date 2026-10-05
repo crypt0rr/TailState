@@ -45,6 +45,13 @@ type Settings struct {
 	Revision     string
 	ConfiguredAt time.Time
 	BaselineAt   *time.Time
+	// ExpiryWarningDays lists the windows, in days before expiry, at which a
+	// node key or auth key expiry warning is sent. nil selects the defaults
+	// (14 and 3 days); an empty non-nil slice disables expiry warnings.
+	ExpiryWarningDays []int
+	// ExpiryTagFilter limits expiry warnings to resources carrying at least
+	// one of these tags. An empty filter includes every resource.
+	ExpiryTagFilter []string
 }
 
 type CollectorState struct {

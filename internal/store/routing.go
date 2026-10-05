@@ -16,8 +16,8 @@ import (
 
 // RoutingRules select which changes a destination receives. The zero value
 // routes every change, which is also how destinations created before schema
-// v14 are migrated. System notifications (collector health and release
-// updates) are not changes and always reach every enabled destination.
+// v14 are migrated. System notifications (collector health, expiry warnings,
+// and release updates) are not changes and always reach every enabled destination.
 type RoutingRules struct {
 	// MinSeverity is the lowest severity delivered; empty means low (all).
 	MinSeverity model.Severity

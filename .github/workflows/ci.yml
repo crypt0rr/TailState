@@ -89,14 +89,10 @@ jobs:
         env:
           TAILSTATE_BACKUP_IMAGE: tailstate:backup-sidecar
         run: bash scripts/compose-smoke.sh tailstate:ci 18083
-      - name: Validate HTTPS proxy Compose override
-        run: |
-          set -euo pipefail
-          docker compose -f compose.yaml -f compose.remote.yaml config >/tmp/tailstate-remote-compose.yaml
-          grep -q 'caddy:2.11-alpine' /tmp/tailstate-remote-compose.yaml
-          grep -q 'published: "80"' /tmp/tailstate-remote-compose.yaml
-          grep -q 'published: "443"' /tmp/tailstate-remote-compose.yaml
-          ! grep -q 'published: "8080"' /tmp/tailstate-remote-compose.yaml
+      - name: Validate HTTPS proxy Compose override (ports and egress)
+        env:
+          TAILSTATE_BACKUP_IMAGE: tailstate:backup-sidecar
+        run: bash scripts/remote-compose-check.sh
       - name: HTTPS reverse-proxy runtime smoke test
         env:
           TAILSTATE_BACKUP_IMAGE: tailstate:backup-sidecar

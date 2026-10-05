@@ -162,7 +162,9 @@ and application wiring reproducible.
 
 With the copied `Caddyfile`, start the private listener and HTTPS proxy
 together. The proxy has a public network for ACME certificate renewal and a
-separate fixed-address private network for TailState. The fixed proxy address and
+separate fixed-address internal network for reaching TailState. TailState also
+joins an outbound-only `tailstate-egress` network so it can reach the Tailscale
+API and notification providers; no service publishes ports on that network. The fixed proxy address and
 `TAILSTATE_TRUSTED_PROXIES` setting are paired intentionally; if you choose a
 different subnet or proxy address, change both values together:
 

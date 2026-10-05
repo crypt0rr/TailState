@@ -113,6 +113,7 @@ type pageData struct {
 	HistoryPrevURL                  string
 	HistoryFrom, HistoryTo          string
 	HistoryExportURL                string
+	HistoryExportFields             []historyExportField
 	EvidenceSigningKeyID            string
 	Destinations                    []destinationPage
 	NotificationsPaused             bool
@@ -786,6 +787,7 @@ func (s *Server) history(w http.ResponseWriter, r *http.Request) {
 		data.HistoryPrevURL = historyNewerURL(filter, history.PrevCursor)
 	}
 	data.HistoryExportURL = historyExportURL(filter)
+	data.HistoryExportFields = historyExportFields(filter)
 	s.render(w, "history", data)
 }
 
@@ -793,16 +795,37 @@ func (s *Server) historyExport(w http.ResponseWriter, r *http.Request) {
 	if _, ok := s.requireAuth(w, r, false); !ok {
 		return
 	}
-	pack, err := s.store.ExportEvidencePack(r.Context(), historyFilter(r))
+	filter := historyFilter(r)
+	// Exports default to the largest pack; a smaller "limit" is honored so a
+	// script can request smaller parts.
+	filter.Limit = 0
+	if limit, err := strconv.Atoi(strings.TrimSpace(r.URL.Query().Get("limit"))); err == nil && limit > 0 {
+		filter.Limit = limit
+	}
+	pack, err := s.store.ExportEvidencePack(r.Context(), filter)
 	if err != nil {
 		if errors.Is(err, store.ErrEvidencePackTooLarge) {
-			http.Error(w, "history export is too large; narrow the filters and try again", http.StatusRequestEntityTooLarge)
+			http.Error(w, "history export is too large: the newest matching batch alone exceeds the evidence pack size limit; narrow the filters and try again", http.StatusRequestEntityTooLarge)
 			return
 		}
 		http.Error(w, "export history", http.StatusInternalServerError)
 		return
 	}
-	filename := "tailstate-drift-evidence-" + time.Now().UTC().Format("20060102T150405Z") + ".json"
+	filename := "tailstate-drift-evidence-" + time.Now().UTC().Format("20060102T150405Z")
+	var part struct {
+		Truncated  bool  `json:"truncated"`
+		NextCursor int64 `json:"next_cursor"`
+	}
+	if err := json.Unmarshal(pack, &part); err == nil && part.Truncated && part.NextCursor > 0 {
+		// A partial pack names its continuation cursor in the file name and
+		// in headers, so the operator (or a script following rel="next") can
+		// request the next part with the same filters.
+		next := strconv.FormatInt(part.NextCursor, 10)
+		filename += "-next-" + next
+		w.Header().Set("X-TailState-Evidence-Next-Cursor", next)
+		w.Header().Set("Link", "<"+historyExportPartURL(filter, part.NextCursor, filter.Limit)+`>; rel="next"`)
+	}
+	filename += ".json"
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.Header().Set("Content-Disposition", `attachment; filename="`+filename+`"`)
 	w.Header().Set("Cache-Control", "no-store")
@@ -916,6 +939,38 @@ func historyNewerURL(filter store.HistoryFilter, after int64) string {
 	values := historyQuery(filter)
 	values.Set("after", strconv.FormatInt(after, 10))
 	return "/history?" + values.Encode()
+}
+
+// historyExportPartURL requests the evidence pack part that follows a
+// partial pack whose next_cursor is cursor, keeping the same filters.
+func historyExportPartURL(filter store.HistoryFilter, cursor int64, limit int) string {
+	values := historyQuery(filter)
+	values.Set("cursor", strconv.FormatInt(cursor, 10))
+	if limit > 0 {
+		values.Set("limit", strconv.Itoa(limit))
+	}
+	return "/history/export?" + values.Encode()
+}
+
+// historyExportField is a hidden form field that carries a History filter
+// into the "Download next part" form.
+type historyExportField struct {
+	Name  string
+	Value string
+}
+
+func historyExportFields(filter store.HistoryFilter) []historyExportField {
+	values := historyQuery(filter)
+	names := make([]string, 0, len(values))
+	for name := range values {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	fields := make([]historyExportField, 0, len(names))
+	for _, name := range names {
+		fields = append(fields, historyExportField{Name: name, Value: values.Get(name)})
+	}
+	return fields
 }
 
 func historyExportURL(filter store.HistoryFilter) string {

@@ -39,9 +39,12 @@ type evidenceSigningKey struct {
 	keyID   string
 }
 
-// evidenceLedgerLinks returns the complete chain segment spanning the
-// selected batches. Filtered exports can therefore verify links for batches
-// that are not included in the event payload itself.
+// evidenceLedgerLinks returns the chain segment spanning the selected
+// batches. Filtered exports can therefore verify links for batches that are
+// not included in the event payload itself. At most evidenceLedgerLinkLimit
+// links are returned, newest sequences first in the read and ascending in the
+// result: when the span is longer, the segment stops short of the oldest
+// selected batches and the exporter leaves those batches for the next part.
 func (s *Store) evidenceLedgerLinks(ctx context.Context, batches []HistoryBatch) ([]EvidenceLedgerLink, error) {
 	var minSequence, maxSequence int64
 	for _, batch := range batches {
@@ -62,39 +65,41 @@ func (s *Store) evidenceLedgerLinks(ctx context.Context, batches []HistoryBatch)
 	// A filtered or paginated export may start in the middle of the ledger; the
 	// predecessor lets an offline verifier distinguish a valid range boundary
 	// from a broken chain without exposing the predecessor's event payload.
-	startSequence := minSequence
-	if startSequence > 1 {
-		startSequence--
-	}
+	startSequence := ledgerCheckpointSequence(minSequence)
+	limit := min(int64(evidenceLedgerLinkLimit), maxSequence-startSequence+1)
 	rows, err := s.db.QueryContext(ctx, `SELECT sequence,batch_id,prev_hash,entry_hash,signature,key_id
-		FROM evidence_ledger WHERE sequence BETWEEN ? AND ? ORDER BY sequence`, startSequence, maxSequence)
+		FROM evidence_ledger WHERE sequence BETWEEN ? AND ? ORDER BY sequence DESC LIMIT ?`, startSequence, maxSequence, limit)
 	if err != nil {
 		return nil, err
 	}
-	// The size guard below can return before the normal rows.Close path. Keep
-	// the connection release unconditional so an oversized export cannot leak
-	// a SQLite rows handle and stall later history requests.
 	defer rows.Close()
-	links := make([]EvidenceLedgerLink, 0, min(maxEvidenceLedgerLinks, int(maxSequence-startSequence+1)))
+	links := make([]EvidenceLedgerLink, 0, limit)
 	for rows.Next() {
-		if len(links) >= maxEvidenceLedgerLinks {
-			return nil, ErrEvidencePackTooLarge
-		}
 		var link EvidenceLedgerLink
 		if err := rows.Scan(&link.Sequence, &link.BatchID, &link.PrevHash, &link.EntryHash, &link.Signature, &link.KeyID); err != nil {
-			rows.Close()
 			return nil, err
 		}
 		links = append(links, link)
 	}
 	if err := rows.Err(); err != nil {
-		rows.Close()
 		return nil, err
 	}
 	if err := rows.Close(); err != nil {
 		return nil, err
 	}
+	for left, right := 0, len(links)-1; left < right; left, right = left+1, right-1 {
+		links[left], links[right] = links[right], links[left]
+	}
 	return links, nil
+}
+
+// ledgerCheckpointSequence is the first ledger sequence an export must carry
+// for a range whose oldest batch has the given sequence.
+func ledgerCheckpointSequence(sequence int64) int64 {
+	if sequence > 1 {
+		return sequence - 1
+	}
+	return sequence
 }
 
 type ledgerQueryer interface {

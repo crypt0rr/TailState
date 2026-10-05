@@ -13,6 +13,9 @@ rollback requires restoring the backup taken before the upgrade. See
 
 ## [Unreleased]
 
+### Fixed
+- Large histories export as a chain of signed evidence packs instead of failing: a pack that reaches the read, event, ledger-link, or size budget carries the batches that fit with `truncated` and `next_cursor`, and the History page offers **Download next part** (#155).
+
 ## [0.13.0] - 2026-10-06
 
 - **Schema:** 14 (migrates from 13)

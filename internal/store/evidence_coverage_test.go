@@ -5,7 +5,6 @@ import (
 	"errors"
 	"strings"
 	"testing"
-	"time"
 )
 
 func TestEvidenceJSONNormalizesEmptyAndInvalidValues(t *testing.T) {
@@ -25,53 +24,56 @@ func TestEvidenceJSONNormalizesEmptyAndInvalidValues(t *testing.T) {
 	}
 }
 
-func TestExportEvidencePackRejectsTooManyEvents(t *testing.T) {
+// TestEvidenceExportChainsPacksAtEventCap replaces the old "too many
+// events" failure: the event cap now ends a pack early instead of refusing
+// the export, and the continuation part holds the remaining batches.
+func TestEvidenceExportChainsPacksAtEventCap(t *testing.T) {
 	st := testStore(t)
 	ctx := context.Background()
-	now := time.Now().UTC().Format(time.RFC3339Nano)
-	tx, err := st.db.BeginTx(ctx, nil)
-	if err != nil {
+	ids := insertEvidenceBatches(t, st, 100, 21, "[]", "device")
+	if err := st.backfillEvidenceLedger(ctx); err != nil {
 		t.Fatal(err)
 	}
-	for batch := 0; batch < 100; batch++ {
-		result, err := tx.ExecContext(ctx, "INSERT INTO event_batches(generation,observed_at,change_count,created_at) VALUES(1,?,?,?)", now, 21, now)
-		if err != nil {
-			tx.Rollback()
-			t.Fatal(err)
+	packs := exportEvidenceChain(t, st, HistoryFilter{})
+	assertEvidenceChainCovers(t, packs, ids)
+	perPack := maxEvidenceEvents / 21
+	if len(packs) != 2 || len(packs[0].Batches) != perPack || len(packs[1].Batches) != 100-perPack {
+		t.Fatalf("event-capped chain sizes=%v, want [%d %d]", evidenceChainSizes(packs), perPack, 100-perPack)
+	}
+	for _, pack := range packs {
+		events := 0
+		for _, batch := range pack.Batches {
+			events += len(batch.Events)
 		}
-		batchID, err := result.LastInsertId()
-		if err != nil {
-			tx.Rollback()
-			t.Fatal(err)
-		}
-		for event := 0; event < 21; event++ {
-			if _, err := tx.ExecContext(ctx, "INSERT INTO events(batch_id,generation,observed_at,collector,event_type,resource_id,name,changes_json) VALUES(?,1,?,'devices','changed',?,?,?)", batchID, now, "device-"+string(rune(event)), "server", "[]"); err != nil {
-				tx.Rollback()
-				t.Fatal(err)
-			}
+		if events > maxEvidenceEvents {
+			t.Fatalf("pack carries %d events, above the %d cap", events, maxEvidenceEvents)
 		}
 	}
-	if err := tx.Commit(); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := st.ExportEvidencePack(ctx, HistoryFilter{}); err != ErrEvidencePackTooLarge {
-		t.Fatalf("large evidence export error=%v, want %v", err, ErrEvidencePackTooLarge)
+}
+
+// TestEvidenceExportRejectsOnlyAnUnexportableNewestBatch keeps the error for
+// the one case that cannot make progress: the newest matching batch alone
+// is over a budget.
+func TestEvidenceExportRejectsOnlyAnUnexportableNewestBatch(t *testing.T) {
+	ctx := context.Background()
+	oversized := testStore(t)
+	insertEvidenceBatches(t, oversized, 1, 1, `"`+strings.Repeat("x", 6<<20)+`"`, "device")
+	if _, err := oversized.ExportEvidencePack(ctx, HistoryFilter{}); !errors.Is(err, ErrEvidencePackTooLarge) {
+		t.Fatalf("oversized newest batch export error=%v, want %v", err, ErrEvidencePackTooLarge)
 	}
 
-	large := testStore(t)
-	result, err := large.db.ExecContext(ctx, "INSERT INTO event_batches(generation,observed_at,change_count,created_at) VALUES(1,?,?,?)", now, 1, now)
-	if err != nil {
-		t.Fatal(err)
+	crowded := testStore(t)
+	insertEvidenceBatches(t, crowded, 1, maxEvidenceEvents+1, "[]", "device")
+	if _, err := crowded.ExportEvidencePack(ctx, HistoryFilter{}); !errors.Is(err, ErrEvidencePackTooLarge) {
+		t.Fatalf("over-cap newest batch export error=%v, want %v", err, ErrEvidencePackTooLarge)
 	}
-	batchID, err := result.LastInsertId()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := large.db.ExecContext(ctx, "INSERT INTO events(batch_id,generation,observed_at,collector,event_type,resource_id,name,changes_json,after_json) VALUES(?,1,?,'devices','changed','device-large','server','[]',?)", batchID, now, strings.Repeat("x", 6<<20)); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := large.ExportEvidencePack(ctx, HistoryFilter{}); err != ErrEvidencePackTooLarge {
-		t.Fatalf("large encoded evidence export error=%v, want %v", err, ErrEvidencePackTooLarge)
+
+	// The read budget passes this batch (its estimate counts raw bytes), but
+	// HTML escaping makes the encoded pack six times larger.
+	escaped := testStore(t)
+	insertEvidenceBatches(t, escaped, 1, 1, `"`+strings.Repeat("<", 1<<20)+`"`, "device")
+	if _, err := escaped.ExportEvidencePack(ctx, HistoryFilter{}); !errors.Is(err, ErrEvidencePackTooLarge) {
+		t.Fatalf("over-size encoded newest batch export error=%v, want %v", err, ErrEvidencePackTooLarge)
 	}
 }
 

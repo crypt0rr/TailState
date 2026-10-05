@@ -55,6 +55,19 @@
     </div>
   </form>
 
+  <form class="history-filters history-export-next" method="get" action="/history/export" aria-label="Download the next evidence pack part">
+    {{- range .HistoryExportFields}}
+    <input type="hidden" name="{{.Name}}" value="{{.Value}}">
+    {{- end}}
+    <p class="muted">A large history is exported as a chain of signed packs. When a pack has <code>"truncated": true</code>, its file name ends in <code>-next-&lt;cursor&gt;</code>; enter that <code>next_cursor</code> to download the next part with the same filters. Every part verifies on its own with <code>tailstate evidence verify</code>.</p>
+    <label for="history-export-cursor">Next cursor
+      <input id="history-export-cursor" type="number" name="cursor" min="1" step="1" required inputmode="numeric" autocomplete="off">
+    </label>
+    <div class="filter-actions">
+      <button type="submit">Download next part</button>
+    </div>
+  </form>
+
   {{if .Error}}<div class="error" role="alert">{{.Error}}</div>{{end}}
   {{if .History.Truncated}}<div class="notice" role="status">This page reached its {{.History.ByteLimit}}-byte history read budget. Older batches were not loaded{{if .History.TruncationReason}} ({{.History.TruncationReason}}){{end}}. Narrow the filters to inspect more detail.</div>{{end}}
 

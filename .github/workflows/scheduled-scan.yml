@@ -1,0 +1,114 @@
+name: Scheduled vulnerability scan
+
+# New Go advisories and base-image CVEs appear between commits. This weekly
+# scan re-checks main with govulncheck and the published images with Grype,
+# and opens (or updates) one tracking issue when anything fails.
+on:
+  schedule:
+    - cron: "17 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: scheduled-scan
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      failures: ${{ steps.summary.outputs.failures }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Go vulnerability check (main)
+        id: govulncheck
+        continue-on-error: true
+        run: go tool govulncheck ./...
+      - name: Resolve published images
+        id: images
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName)"
+          echo "release=ghcr.io/crypt0rr/tailstate:${tag#v}" >> "$GITHUB_OUTPUT"
+          echo "sidecar=$(bash scripts/backup-image.sh)" >> "$GITHUB_OUTPUT"
+      - name: Scan latest image
+        id: latest
+        continue-on-error: true
+        uses: anchore/scan-action@27805bf3b4e84b4a5c980df22ed233c00390a439 # v7.4.2
+        with:
+          image: ghcr.io/crypt0rr/tailstate:latest
+          fail-build: true
+          severity-cutoff: high
+      - name: Scan newest release image
+        id: release
+        continue-on-error: true
+        uses: anchore/scan-action@27805bf3b4e84b4a5c980df22ed233c00390a439 # v7.4.2
+        with:
+          image: ${{ steps.images.outputs.release }}
+          fail-build: true
+          severity-cutoff: high
+      - name: Scan pinned backup sidecar
+        id: sidecar
+        continue-on-error: true
+        uses: anchore/scan-action@27805bf3b4e84b4a5c980df22ed233c00390a439 # v7.4.2
+        with:
+          image: ${{ steps.images.outputs.sidecar }}
+          fail-build: true
+          severity-cutoff: high
+      - name: Summarize
+        id: summary
+        env:
+          GOVULNCHECK: ${{ steps.govulncheck.outcome }}
+          LATEST: ${{ steps.latest.outcome }}
+          RELEASE: ${{ steps.release.outcome }}
+          SIDECAR: ${{ steps.sidecar.outcome }}
+          RELEASE_IMAGE: ${{ steps.images.outputs.release }}
+        run: |
+          set -euo pipefail
+          failures=()
+          [[ "$GOVULNCHECK" == "success" ]] || failures+=("govulncheck on main")
+          [[ "$LATEST" == "success" ]] || failures+=("ghcr.io/crypt0rr/tailstate:latest")
+          [[ "$RELEASE" == "success" ]] || failures+=("$RELEASE_IMAGE")
+          [[ "$SIDECAR" == "success" ]] || failures+=("backup sidecar")
+          joined="$(IFS=';'; echo "${failures[*]:-}")"
+          echo "failures=$joined" >> "$GITHUB_OUTPUT"
+          if (( ${#failures[@]} > 0 )); then
+            echo "Vulnerability scan failed for: $joined" >&2
+            exit 1
+          fi
+
+  report:
+    needs: scan
+    if: ${{ failure() && github.event_name == 'schedule' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - name: Open or update the tracking issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FAILURES: ${{ needs.scan.outputs.failures }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          title="Scheduled vulnerability scan failed"
+          body="$(printf 'The weekly vulnerability scan failed for: %s\n\nRun: %s\n' "${FAILURES:-unknown}" "$RUN_URL")"
+          existing="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "\"$title\" in:title" --json number --jq '.[0].number // empty')"
+          if [[ -n "$existing" ]]; then
+            gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" --body "$body"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --label security --body "$body" \
+              || gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "$body"
+          fi

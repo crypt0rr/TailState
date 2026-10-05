@@ -41,6 +41,7 @@ type Server struct {
 	loginMu              sync.Mutex
 	loginAttempts        map[string][]time.Time
 	globalFailures       map[credentialAction][]time.Time
+	settingsTestTimeout  time.Duration
 	authWork             chan struct{}
 	challengeKey         []byte
 	challengeMu          sync.Mutex
@@ -52,7 +53,14 @@ type Server struct {
 }
 
 const (
-	maxTrackedLoginIPs = 4096
+	// serverWriteTimeout is the default per-response write deadline.
+	serverWriteTimeout = 30 * time.Second
+	// defaultSettingsTestTimeout bounds the Tailscale connection test run by
+	// a settings save. settingsRenderAllowance is the time left afterwards to
+	// render the result; together they stay below serverWriteTimeout.
+	defaultSettingsTestTimeout = 20 * time.Second
+	settingsRenderAllowance    = 5 * time.Second
+	maxTrackedLoginIPs         = 4096
 	// loginFailureWindow and loginFailuresPerClient define the per-client
 	// credential throttle.
 	loginFailureWindow     = 15 * time.Minute
@@ -125,6 +133,7 @@ func New(config boot.Config, st *store.Store, engine *monitor.Engine) (*Server, 
 		templates:            templates,
 		loginAttempts:        map[string][]time.Time{},
 		globalFailures:       map[credentialAction][]time.Time{},
+		settingsTestTimeout:  defaultSettingsTestTimeout,
 		authWork:             make(chan struct{}, 2),
 		challengeKey:         challengeKey,
 		consumedChallenges:   map[string]time.Time{},
@@ -168,7 +177,7 @@ func (s *Server) Handler() http.Handler {
 }
 
 func (s *Server) Serve(ctx context.Context) error {
-	server := &http.Server{Addr: s.config.ListenAddr, Handler: s.Handler(), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second}
+	server := &http.Server{Addr: s.config.ListenAddr, Handler: s.Handler(), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: serverWriteTimeout, IdleTimeout: 60 * time.Second}
 	errCh := make(chan error, 1)
 	go func() {
 		slog.Info("TailState web server listening", "address", s.config.ListenAddr)
@@ -578,8 +587,8 @@ func (s *Server) settingsPost(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid form", 400)
 		return
 	}
-	device, err1 := strconv.ParseInt(r.FormValue("device_interval"), 10, 64)
-	inventory, err2 := strconv.ParseInt(r.FormValue("inventory_interval"), 10, 64)
+	device, err1 := strconv.ParseInt(strings.TrimSpace(r.FormValue("device_interval")), 10, 64)
+	inventory, err2 := strconv.ParseInt(strings.TrimSpace(r.FormValue("inventory_interval")), 10, 64)
 	current, currentErr := s.store.Settings(r.Context())
 	if currentErr != nil && !errors.Is(currentErr, sql.ErrNoRows) {
 		slog.Error("load settings for update", "error", currentErr)
@@ -588,7 +597,10 @@ func (s *Server) settingsPost(w http.ResponseWriter, r *http.Request) {
 	}
 	configured := currentErr == nil
 	clearWebhookSecret := r.FormValue("clear_webhook_secret") == "on" || r.FormValue("clear_webhook_secret") == "true"
-	input := store.Settings{Tailnet: strings.TrimSpace(r.FormValue("tailnet")), OAuthClientID: strings.TrimSpace(r.FormValue("client_id")), OAuthClientSecret: r.FormValue("client_secret"), WebhookSecret: strings.TrimSpace(r.FormValue("webhook_secret")), ClearWebhookSecret: clearWebhookSecret, DeviceInterval: time.Duration(device) * time.Second, InventoryInterval: time.Duration(inventory) * time.Second}
+	input := store.Settings{Tailnet: strings.TrimSpace(r.FormValue("tailnet")), OAuthClientID: strings.TrimSpace(r.FormValue("client_id")), OAuthClientSecret: r.FormValue("client_secret"), WebhookSecret: strings.TrimSpace(r.FormValue("webhook_secret")), ClearWebhookSecret: clearWebhookSecret}
+	if input.Tailnet == "" {
+		input.Tailnet = "-"
+	}
 	if configured {
 		if input.OAuthClientSecret == "" {
 			input.OAuthClientSecret = current.OAuthClientSecret
@@ -599,13 +611,20 @@ func (s *Server) settingsPost(w http.ResponseWriter, r *http.Request) {
 	}
 	data := s.settingsData(r.Context(), csrf, configured, input, r)
 	data.DeviceSeconds, data.InventorySeconds = device, inventory
-	if err1 != nil || err2 != nil {
-		data.Error = "Poll intervals must be whole seconds."
+	// Validate everything that needs no I/O before contacting Tailscale, so
+	// an invalid form fails instantly with a specific message.
+	if message := settingsInputError(&input, device, inventory, err1, err2); message != "" {
+		data.Error = message
 		s.render(w, "settings", data)
 		return
 	}
 	client := tailscale.New(s.config.TailscaleBase, s.config.OAuthTokenURL, s.config.Version, tailscale.Credentials{Tailnet: input.Tailnet, ClientID: input.OAuthClientID, ClientSecret: input.OAuthClientSecret})
-	testCtx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	// The connection test must finish, and its result page render, before
+	// the server's write deadline; otherwise a slow API produces a blank
+	// connection reset instead of "Tailscale test failed". Bound the test
+	// below the deadline and extend this response's deadline to cover it.
+	_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(s.settingsTestTimeout + settingsRenderAllowance))
+	testCtx, cancel := context.WithTimeout(r.Context(), s.settingsTestTimeout)
 	defer cancel()
 	if err := client.Test(testCtx); err != nil {
 		data.Error = "Tailscale test failed: " + tailscale.SafeError(err)
@@ -642,6 +661,42 @@ func (s *Server) settingsPost(w http.ResponseWriter, r *http.Request) {
 	}
 	s.engine.Wake()
 	http.Redirect(w, r, "/status", http.StatusSeeOther)
+}
+
+// settingsInputError validates the settings form locally and, when valid,
+// stores the parsed intervals in input. Seconds are range-checked before they
+// are converted to a time.Duration so huge values cannot overflow.
+func settingsInputError(input *store.Settings, device, inventory int64, deviceErr, inventoryErr error) string {
+	maxSeconds := int64(store.MaxPollInterval / time.Second)
+	for _, field := range []struct {
+		label   string
+		seconds int64
+		err     error
+		min     time.Duration
+	}{
+		{"Device", device, deviceErr, store.MinDevicePollInterval},
+		{"Inventory", inventory, inventoryErr, store.MinInventoryPollInterval},
+	} {
+		minSeconds := int64(field.min / time.Second)
+		if field.err != nil && !errors.Is(field.err, strconv.ErrRange) {
+			return field.label + " poll interval must be a whole number of seconds."
+		}
+		if field.err != nil || field.seconds < minSeconds || field.seconds > maxSeconds {
+			return fmt.Sprintf("%s poll interval must be between %d and %d seconds.", field.label, minSeconds, maxSeconds)
+		}
+	}
+	input.DeviceInterval = time.Duration(device) * time.Second
+	input.InventoryInterval = time.Duration(inventory) * time.Second
+	if input.OAuthClientID == "" || input.OAuthClientSecret == "" {
+		return "OAuth client ID and secret are required."
+	}
+	if len(input.WebhookSecret) > store.MaxWebhookSecretBytes {
+		return fmt.Sprintf("Webhook secret must be at most %d bytes.", store.MaxWebhookSecretBytes)
+	}
+	if err := store.ValidateSettings(*input); err != nil {
+		return "Tailnet must be \"-\" or a tailnet name without spaces, slashes, or URL syntax."
+	}
+	return ""
 }
 
 func (s *Server) settingsData(ctx context.Context, csrf string, configured bool, settings store.Settings, request *http.Request) pageData {

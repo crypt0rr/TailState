@@ -11,19 +11,45 @@ import (
 	"github.com/crypt0rr/tailstate/internal/notify"
 )
 
+// Local settings bounds. They are exported so the settings form can reject
+// out-of-range input before any outbound Tailscale request.
+const (
+	MinDevicePollInterval    = 15 * time.Second
+	MinInventoryPollInterval = 30 * time.Second
+	MaxPollInterval          = 24 * time.Hour
+	MaxWebhookSecretBytes    = 1024
+	MaxTailnetBytes          = 255
+)
+
+// ValidateSettings checks the settings constraints that need no I/O. It is
+// applied by SaveSettings, so out-of-range values can never be persisted.
+func ValidateSettings(in Settings) error {
+	tailnet := strings.TrimSpace(in.Tailnet)
+	if len(tailnet) > MaxTailnetBytes || strings.ContainsAny(tailnet, "/?#%\\ \t\r\n") {
+		return errors.New("tailnet name is too long or contains invalid characters")
+	}
+	if len(strings.TrimSpace(in.WebhookSecret)) > MaxWebhookSecretBytes {
+		return fmt.Errorf("webhook secret exceeds %d bytes", MaxWebhookSecretBytes)
+	}
+	if in.OAuthClientID == "" || in.OAuthClientSecret == "" {
+		return errors.New("OAuth credentials are required")
+	}
+	if in.DeviceInterval < MinDevicePollInterval || in.DeviceInterval > MaxPollInterval {
+		return fmt.Errorf("device poll interval must be between %s and %s", MinDevicePollInterval, MaxPollInterval)
+	}
+	if in.InventoryInterval < MinInventoryPollInterval || in.InventoryInterval > MaxPollInterval {
+		return fmt.Errorf("inventory poll interval must be between %s and %s", MinInventoryPollInterval, MaxPollInterval)
+	}
+	return nil
+}
+
 func (s *Store) SaveSettings(ctx context.Context, in Settings) (int64, error) {
 	if strings.TrimSpace(in.Tailnet) == "" {
 		in.Tailnet = "-"
 	}
 	in.WebhookSecret = strings.TrimSpace(in.WebhookSecret)
-	if len(in.WebhookSecret) > 1024 {
-		return 0, errors.New("webhook secret is too long")
-	}
-	if in.OAuthClientID == "" || in.OAuthClientSecret == "" {
-		return 0, errors.New("OAuth credentials are required")
-	}
-	if in.DeviceInterval < 15*time.Second || in.InventoryInterval < 30*time.Second {
-		return 0, errors.New("poll intervals are too short")
+	if err := ValidateSettings(in); err != nil {
+		return 0, err
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {

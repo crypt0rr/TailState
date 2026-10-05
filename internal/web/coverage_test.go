@@ -485,7 +485,7 @@ func TestSettingsAndDestinationMutationBranches(t *testing.T) {
 
 	badIntervals := url.Values{"_csrf": {csrf}, "tailnet": {"-"}, "client_id": {"client"}, "client_secret": {"secret"}, "device_interval": {"not-a-number"}, "inventory_interval": {"300"}}
 	badResponse := coveragePost(t, server, "/settings", badIntervals, cookies)
-	if badResponse.Code != http.StatusOK || !strings.Contains(badResponse.Body.String(), "Poll intervals must be whole seconds") {
+	if badResponse.Code != http.StatusOK || !strings.Contains(badResponse.Body.String(), "Device poll interval must be a whole number of seconds") {
 		t.Fatalf("invalid settings response %d: %s", badResponse.Code, badResponse.Body.String())
 	}
 	validSettings := url.Values{"_csrf": {csrf}, "tailnet": {"-"}, "client_id": {"client"}, "client_secret": {"secret"}, "webhook_secret": {"webhook-secret"}, "device_interval": {"60"}, "inventory_interval": {"300"}}

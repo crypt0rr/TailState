@@ -68,9 +68,11 @@ After claiming the installation, the authenticated Settings page asks for:
 1. Tailnet (`-` uses the OAuth credential's tailnet).
 2. OAuth client ID and secret with `all:read`.
 3. At least one notification destination using a Shoutrrr URL.
-4. Device and secondary inventory polling intervals.
+4. Device and secondary inventory polling intervals, in whole seconds. Device
+   polling accepts 15 seconds to 24 hours (86400 seconds); inventory polling
+   accepts 30 seconds to 24 hours.
 
-Add destinations on the authenticated Settings page, then save monitoring settings. Each destination is validated and can be tested independently. TailState then performs a Tailscale API check and builds a silent baseline. The status page shows baseline counts, collector capabilities, source health, and delivery state. Rotating the OAuth secret or changing poll intervals refreshes the monitor without discarding the existing baseline; changing the tailnet or OAuth client identity starts a new generation and dead-letters pending event notifications from the previous identity while preserving their history for audit. System and release notifications remain eligible for delivery.
+Add destinations on the authenticated Settings page, then save monitoring settings. Each destination is validated and can be tested independently. The form is validated locally first (interval range, required OAuth credentials, webhook secret of at most 1024 bytes, and a tailnet name without spaces, slashes, or URL syntax), so a mistake is reported immediately with a specific message and nothing is sent to Tailscale. TailState then performs a Tailscale API check, bounded to 20 seconds so a slow or rate-limited API still produces a "Tailscale test failed" page, and builds a silent baseline. The status page shows baseline counts, collector capabilities, source health, and delivery state. Rotating the OAuth secret or changing poll intervals refreshes the monitor without discarding the existing baseline; changing the tailnet or OAuth client identity starts a new generation and dead-letters pending event notifications from the previous identity while preserving their history for audit. System and release notifications remain eligible for delivery.
 
 The authenticated **History** page keeps a 30-day, searchable ledger of semantic inventory changes. Each poll is grouped into a batch with the affected collector, resource, previous/current normalized snapshots, field-level differences, and the delivery state for every destination. Use it to investigate a notification without exposing credentials or volatile API fields. The page shows the fingerprint of the Ed25519 key used to sign evidence exports.
 

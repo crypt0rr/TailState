@@ -48,7 +48,7 @@ func (s *Store) ListDestinations(ctx context.Context, includeDeleted ...bool) ([
 			return nil, err
 		}
 		if encrypted != "" {
-			d.ServiceURL, err = s.box.Decrypt(encrypted)
+			d.ServiceURL, err = s.box.Open(destinationBinding(d.ID), encrypted)
 			if err != nil {
 				return nil, err
 			}
@@ -205,9 +205,11 @@ func upsertDestinationTx(ctx context.Context, tx *sql.Tx, box *secret.Box, id in
 			return 0, err
 		}
 		encoded := existingEncoded
-		if existing, decryptErr := box.Decrypt(existingEncoded); decryptErr != nil || existing != serviceURL {
+		// Reuse the stored ciphertext only when it is already a bound v2
+		// envelope for this row; an unchanged legacy value is upgraded.
+		if existing, decryptErr := box.Open(destinationBinding(id), existingEncoded); decryptErr != nil || existing != serviceURL || !secret.IsCurrentEnvelope(existingEncoded) {
 			var err error
-			encoded, err = box.Encrypt(serviceURL)
+			encoded, err = box.Seal(destinationBinding(id), serviceURL)
 			if err != nil {
 				return 0, err
 			}
@@ -225,15 +227,29 @@ func upsertDestinationTx(ctx context.Context, tx *sql.Tx, box *secret.Box, id in
 		}
 		return id, nil
 	}
-	encoded, err := box.Encrypt(serviceURL)
+	return insertDestinationTx(ctx, tx, box, name, serviceURL, enabled, now)
+}
+
+// insertDestinationTx creates a destination row and then seals its URL with
+// the row's binding, which depends on the ID SQLite assigns. Both writes are
+// in the caller's transaction, so no row is ever committed without its URL.
+func insertDestinationTx(ctx context.Context, tx *sql.Tx, box *secret.Box, name, serviceURL string, enabled bool, now string) (int64, error) {
+	result, err := tx.ExecContext(ctx, "INSERT INTO notification_destinations(name,service_url_enc,enabled,created_at,updated_at) VALUES(?,'',?,?,?)", name, boolInt(enabled), now, now)
 	if err != nil {
 		return 0, err
 	}
-	result, err := tx.ExecContext(ctx, "INSERT INTO notification_destinations(name,service_url_enc,enabled,created_at,updated_at) VALUES(?,?,?,?,?)", name, encoded, boolInt(enabled), now, now)
+	id, err := result.LastInsertId()
 	if err != nil {
 		return 0, err
 	}
-	return result.LastInsertId()
+	encoded, err := box.Seal(destinationBinding(id), serviceURL)
+	if err != nil {
+		return 0, err
+	}
+	if _, err := tx.ExecContext(ctx, "UPDATE notification_destinations SET service_url_enc=? WHERE id=?", encoded, id); err != nil {
+		return 0, err
+	}
+	return id, nil
 }
 
 func boolInt(value bool) int {

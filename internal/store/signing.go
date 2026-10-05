@@ -143,7 +143,7 @@ func loadOrCreateEvidenceSigningKey(ctx context.Context, db *sql.DB, box *secret
 		if err != nil {
 			return evidenceSigningKey{}, fmt.Errorf("generate evidence signing key: %w", err)
 		}
-		privateEnvelope, err := box.Encrypt(base64.RawStdEncoding.EncodeToString(private))
+		privateEnvelope, err := box.Seal(metaBinding(evidenceSigningPrivateKeyMeta), base64.RawStdEncoding.EncodeToString(private))
 		if err != nil {
 			return evidenceSigningKey{}, fmt.Errorf("encrypt evidence signing key: %w", err)
 		}
@@ -171,7 +171,7 @@ func loadOrCreateEvidenceSigningKey(ctx context.Context, db *sql.DB, box *secret
 	if len(values) != 3 {
 		return evidenceSigningKey{}, errors.New("evidence signing key metadata is incomplete")
 	}
-	privateEncoded, err := box.Decrypt(values[evidenceSigningPrivateKeyMeta])
+	privateEncoded, err := box.Open(metaBinding(evidenceSigningPrivateKeyMeta), values[evidenceSigningPrivateKeyMeta])
 	if err != nil {
 		return evidenceSigningKey{}, fmt.Errorf("decrypt evidence signing key: %w", err)
 	}

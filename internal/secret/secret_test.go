@@ -14,16 +14,16 @@ func TestBoxRoundTripAndWrongKey(t *testing.T) {
 	key := make([]byte, 32)
 	key[0] = 1
 	box, _ := NewBox(key)
-	encrypted, err := box.Encrypt("sensitive")
+	encrypted, err := box.EncryptLegacy("sensitive")
 	if err != nil {
 		t.Fatal(err)
 	}
-	plain, err := box.Decrypt(encrypted)
+	plain, err := box.Open("", encrypted)
 	if err != nil || plain != "sensitive" {
 		t.Fatalf("round trip: %q %v", plain, err)
 	}
 	other, _ := NewBox(make([]byte, 32))
-	if _, err := other.Decrypt(encrypted); err == nil {
+	if _, err := other.Open("", encrypted); err == nil {
 		t.Fatal("wrong key decrypted value")
 	}
 }

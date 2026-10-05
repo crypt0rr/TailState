@@ -326,7 +326,7 @@ func OpenWithLimits(path string, box *secret.Box, configuredLimits StorageLimits
 		return nil, err
 	}
 	if !present {
-		encrypted, encryptErr := box.Encrypt("tailstate-master-key-check")
+		encrypted, encryptErr := box.Seal(metaBinding(masterKeyCheckMeta), "tailstate-master-key-check")
 		if encryptErr != nil {
 			db.Close()
 			return nil, encryptErr
@@ -398,7 +398,7 @@ func verifyExistingMasterKey(db *sql.DB, box *secret.Box) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	plain, decryptErr := box.Decrypt(keyCheck)
+	plain, decryptErr := box.Open(metaBinding(masterKeyCheckMeta), keyCheck)
 	if decryptErr != nil || plain != "tailstate-master-key-check" {
 		return true, errors.New("master key does not match this TailState database")
 	}

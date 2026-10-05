@@ -129,7 +129,7 @@ plan-unsupported collectors remain informational.
 
 Compose creates the Docker-managed `tailstate-data` volume and stores `/data/tailstate.db` there. Snapshots, events, baseline state, sessions, and the delivery outbox survive container replacement. The image creates `/data` as `0700`, the process runs with a `077` umask, and the database and its `-wal`/`-shm` sidecars are kept at `0600` (including sidecars left by an unclean shutdown). An existing host directory is not re-permissioned; restrict a bind-mounted data directory to the service user yourself.
 
-OAuth secrets, the Tailscale webhook secret, every Shoutrrr destination URL, and the evidence-ledger private key are encrypted with AES-256-GCM using `secrets/tailstate_master_key`. Destination credentials and upstream provider response bodies are never echoed into HTML, logs, persisted delivery errors, or the history ledger; delivery history keeps only bounded, provider-independent status reasons. Normalized history snapshots are retained for 30 days, exclude volatile fields, and replace known secret values with one-way fingerprints so presence and rotation remain auditable without exposing the value. OAuth access tokens exist only in memory. Back up the master key separately: TailState intentionally refuses to start if the key is missing or incorrect, and encrypted settings and signed history cannot be recovered without it.
+OAuth secrets, the Tailscale webhook secret, every Shoutrrr destination URL, and the evidence-ledger private key are encrypted with AES-256-GCM using `secrets/tailstate_master_key`, each bound to its storage location. Destination credentials and upstream provider response bodies are never echoed into HTML, logs, persisted delivery errors, or the history ledger; delivery history keeps only bounded, provider-independent status reasons. Normalized history snapshots are retained for 30 days, exclude volatile fields, and replace known secret values with one-way fingerprints so presence and rotation remain auditable without exposing the value. OAuth access tokens exist only in memory. Back up the master key separately: TailState intentionally refuses to start if the key is missing or incorrect, and encrypted settings and signed history cannot be recovered without it.
 
 The image is scratch-based, runs as UID/GID `10001`, uses a read-only root filesystem, drops every Linux capability, and publishes the UI only on `127.0.0.1` by default. Keep that publish address when using a reverse proxy; let the proxy terminate TLS and expose the public listener:
 
@@ -258,6 +258,15 @@ The command re-encrypts all protected values in one transaction and preserves
 the evidence signing identity. If it fails, the old key remains valid; do not
 replace the configured key file until the command reports success. Keep the old
 key and a verified database backup until the new deployment has been checked.
+
+Each encrypted value is bound to the row and column that stores it (AES-GCM
+additional data), so a ciphertext copied to another row or column fails to
+decrypt instead of, for example, redirecting one destination to another's URL.
+Values written by releases before this binding use the older unbound format;
+they stay readable, and are rewritten in the bound format when changed or when
+`admin rekey` runs. Rekey also accepts the current key file
+(`-new-key-file` pointing at the configured key) to upgrade every value without
+rotating the key.
 
 ### Backup
 

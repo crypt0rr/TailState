@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/crypt0rr/tailstate/internal/notify"
+	"github.com/crypt0rr/tailstate/internal/secret"
 )
 
 func (s *Store) SaveSettings(ctx context.Context, in Settings) (int64, error) {
@@ -41,11 +42,11 @@ func (s *Store) SaveSettings(ctx context.Context, in Settings) (int64, error) {
 	} else if err != nil {
 		return 0, err
 	} else {
-		oldSecret, decryptErr := s.box.Decrypt(oldSecretEnc)
+		oldSecret, decryptErr := s.box.Open(settingsBinding("oauth_secret_enc"), oldSecretEnc)
 		if decryptErr != nil {
 			return 0, decryptErr
 		}
-		if oldSecret == in.OAuthClientSecret {
+		if oldSecret == in.OAuthClientSecret && secret.IsCurrentEnvelope(oldSecretEnc) {
 			secretEnc = oldSecretEnc
 		}
 		if oldTailnet != in.Tailnet || oldClient != in.OAuthClientID {
@@ -54,7 +55,7 @@ func (s *Store) SaveSettings(ctx context.Context, in Settings) (int64, error) {
 		}
 	}
 	if secretEnc == "" {
-		secretEnc, err = s.box.Encrypt(in.OAuthClientSecret)
+		secretEnc, err = s.box.Seal(settingsBinding("oauth_secret_enc"), in.OAuthClientSecret)
 		if err != nil {
 			return 0, err
 		}
@@ -65,12 +66,12 @@ func (s *Store) SaveSettings(ctx context.Context, in Settings) (int64, error) {
 	} else if in.WebhookSecret != "" {
 		reuse := false
 		if oldWebhookSecretEnc != "" {
-			if oldWebhookSecret, decryptErr := s.box.Decrypt(oldWebhookSecretEnc); decryptErr == nil && oldWebhookSecret == in.WebhookSecret {
+			if oldWebhookSecret, decryptErr := s.box.Open(settingsBinding("webhook_secret_enc"), oldWebhookSecretEnc); decryptErr == nil && oldWebhookSecret == in.WebhookSecret && secret.IsCurrentEnvelope(oldWebhookSecretEnc) {
 				reuse = true
 			}
 		}
 		if !reuse {
-			webhookSecretEnc, err = s.box.Encrypt(in.WebhookSecret)
+			webhookSecretEnc, err = s.box.Seal(settingsBinding("webhook_secret_enc"), in.WebhookSecret)
 			if err != nil {
 				return 0, err
 			}
@@ -85,8 +86,8 @@ func (s *Store) SaveSettings(ctx context.Context, in Settings) (int64, error) {
 		if convertErr != nil {
 			return 0, convertErr
 		}
-		if oldLegacyURL, decryptErr := s.box.Decrypt(legacyURLEnc); decryptErr != nil || oldLegacyURL != in.MattermostURL {
-			legacyURLEnc, err = s.box.Encrypt(in.MattermostURL)
+		if oldLegacyURL, decryptErr := s.box.Open(settingsBinding("mattermost_url_enc"), legacyURLEnc); decryptErr != nil || oldLegacyURL != in.MattermostURL || !secret.IsCurrentEnvelope(legacyURLEnc) {
+			legacyURLEnc, err = s.box.Seal(settingsBinding("mattermost_url_enc"), in.MattermostURL)
 			if err != nil {
 				return 0, err
 			}
@@ -156,18 +157,18 @@ func (s *Store) Settings(ctx context.Context) (Settings, error) {
 	if err != nil {
 		return Settings{}, err
 	}
-	out.OAuthClientSecret, err = s.box.Decrypt(secretEnc)
+	out.OAuthClientSecret, err = s.box.Open(settingsBinding("oauth_secret_enc"), secretEnc)
 	if err != nil {
 		return Settings{}, err
 	}
 	if urlEnc != "" {
-		out.MattermostURL, err = s.box.Decrypt(urlEnc)
+		out.MattermostURL, err = s.box.Open(settingsBinding("mattermost_url_enc"), urlEnc)
 		if err != nil {
 			return Settings{}, err
 		}
 	}
 	if webhookSecretEnc != "" {
-		out.WebhookSecret, err = s.box.Decrypt(webhookSecretEnc)
+		out.WebhookSecret, err = s.box.Open(settingsBinding("webhook_secret_enc"), webhookSecretEnc)
 		if err != nil {
 			return Settings{}, err
 		}

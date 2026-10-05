@@ -154,7 +154,7 @@ func (s *Store) readOutboxItem(scanner outboxScanner) (OutboxItem, error) {
 	// Deleted destinations have their URL scrubbed; claims never select them,
 	// but an empty value must not be treated as a decryption failure.
 	if encrypted != "" {
-		item.Destination.ServiceURL, err = s.box.Decrypt(encrypted)
+		item.Destination.ServiceURL, err = s.box.Open(destinationBinding(item.DestinationID), encrypted)
 		if err != nil {
 			return OutboxItem{}, err
 		}

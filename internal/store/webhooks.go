@@ -28,7 +28,7 @@ func (s *Store) WebhookSecret(ctx context.Context) (string, error) {
 	if encrypted == "" {
 		return "", nil
 	}
-	return s.box.Decrypt(encrypted)
+	return s.box.Open(settingsBinding("webhook_secret_enc"), encrypted)
 }
 
 // RecordWebhookTrigger persists verified event metadata and returns whether

@@ -486,8 +486,8 @@ func TestSchemaV2HistoryMigrationBackfillsBatchCorrelation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	legacySecret, _ := box.Encrypt("secret")
-	legacyURL, _ := box.Encrypt("mattermost://TailState@mattermost.example/token")
+	legacySecret, _ := box.EncryptLegacy("secret")
+	legacyURL, _ := box.EncryptLegacy("mattermost://TailState@mattermost.example/token")
 	db, err := sql.Open("sqlite", "file:"+path+"?_pragma=busy_timeout(5000)")
 	if err != nil {
 		t.Fatal(err)

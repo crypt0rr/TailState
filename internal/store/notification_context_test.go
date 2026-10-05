@@ -13,20 +13,31 @@ import (
 
 var testTime = time.Date(2026, 10, 5, 12, 0, 0, 0, time.UTC)
 
+// scanRenderedPayload reads payload_format and payload and renders the row
+// as Markdown, the format a generic destination receives.
+func scanRenderedPayload(t *testing.T, rows interface{ Scan(...any) error }, extra ...any) string {
+	t.Helper()
+	var format, payload string
+	if err := rows.Scan(append(extra, &format, &payload)...); err != nil {
+		t.Fatal(err)
+	}
+	rendered, err := notify.Prepare(format, payload, "", notify.FormatMarkdown)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return rendered
+}
+
 func pendingPayloads(t *testing.T, st *Store, batchID int64) []string {
 	t.Helper()
-	rows, err := st.db.QueryContext(context.Background(), "SELECT payload FROM outbox WHERE COALESCE(batch_id,0)=? ORDER BY id", batchID)
+	rows, err := st.db.QueryContext(context.Background(), "SELECT payload_format,payload FROM outbox WHERE COALESCE(batch_id,0)=? ORDER BY id", batchID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer rows.Close()
 	var out []string
 	for rows.Next() {
-		var payload string
-		if err := rows.Scan(&payload); err != nil {
-			t.Fatal(err)
-		}
-		out = append(out, payload)
+		out = append(out, scanRenderedPayload(t, rows))
 	}
 	return out
 }

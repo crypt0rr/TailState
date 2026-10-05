@@ -184,7 +184,8 @@ func enqueueDigestTx(ctx context.Context, tx *sql.Tx, digest notify.DigestFunc, 
 	if err := rows.Close(); err != nil {
 		return err
 	}
-	payloads := map[string]string{}
+	type encoded struct{ format, payload string }
+	payloads := map[string]encoded{}
 	for _, destination := range destinations {
 		key := destination.rules.key()
 		payload, rendered := payloads[key]
@@ -199,16 +200,41 @@ func enqueueDigestTx(ctx context.Context, tx *sql.Tx, digest notify.DigestFunc, 
 				}
 			}
 			if len(filtered.Changes) > 0 {
-				payload = notify.Markdown(digest(filtered))
+				format, body, err := notify.EncodePayload(digest(filtered))
+				if err != nil {
+					return err
+				}
+				payload = encoded{format: format, payload: body}
 			}
 			payloads[key] = payload
 		}
-		if payload == "" {
+		if payload.payload == "" {
 			continue
 		}
-		if _, err := tx.ExecContext(ctx, "INSERT INTO outbox(batch_id,destination_id,payload,status,next_attempt,first_attempt,created_at) VALUES(?,?,?,'pending',?,?,?)", input.BatchID, destination.id, payload, now, now, now); err != nil {
+		if _, err := tx.ExecContext(ctx, "INSERT INTO outbox(batch_id,destination_id,payload,payload_format,status,next_attempt,first_attempt,created_at) VALUES(?,?,?,?,'pending',?,?,?)", input.BatchID, destination.id, payload.payload, payload.format, now, now, now); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+// SetDestinationFormat sets the message format override of an active
+// destination; notify.FormatAuto selects the format from the URL scheme.
+func (s *Store) SetDestinationFormat(ctx context.Context, id int64, format string) error {
+	format, err := notify.ValidateFormat(format)
+	if err != nil {
+		return err
+	}
+	result, err := s.db.ExecContext(ctx, "UPDATE notification_destinations SET message_format=?,updated_at=? WHERE id=? AND deleted_at IS NULL", format, time.Now().UTC().Format(time.RFC3339Nano), id)
+	if err != nil {
+		return err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if changed == 0 {
+		return errors.New("notification destination not found")
 	}
 	return nil
 }

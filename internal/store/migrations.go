@@ -794,9 +794,11 @@ func migrateSchemaV12ToV13(db *sql.DB) error {
 	return nil
 }
 
-// migrateSchemaV13ToV14 adds notification routing, classification, and noise
-// control state. Every new column defaults to the pre-upgrade behaviour:
-// destinations route all changes and no event is muted. Existing events are
+// migrateSchemaV13ToV14 adds notification routing, classification, noise
+// control, and per-service rendering state. Every new column defaults to the
+// pre-upgrade behaviour: destinations route all changes, choose their format
+// from the URL scheme, no event is muted, and queued outbox rows keep their
+// pre-rendered Markdown. Existing events are
 // classified in bounded, resumable chunks; severity is derived data and is
 // not part of the signed evidence ledger payload, and the ledger records the
 // muted flag only when it is set, so neither can change an existing digest.
@@ -815,6 +817,10 @@ func migrateSchemaV13ToV14(db *sql.DB) error {
 		{table: "notification_destinations", name: "route_change_kinds", definition: "TEXT NOT NULL DEFAULT ''"},
 		{table: "events", name: "severity", definition: "TEXT NOT NULL DEFAULT ''"},
 		{table: "events", name: "muted", definition: "INTEGER NOT NULL DEFAULT 0"},
+		{table: "notification_destinations", name: "message_format", definition: "TEXT NOT NULL DEFAULT ''"},
+		// Existing rows hold pre-rendered Markdown and keep being delivered
+		// unchanged; new rows store a format-neutral message.
+		{table: "outbox", name: "payload_format", definition: "TEXT NOT NULL DEFAULT 'markdown'"},
 	} {
 		if err := addColumnIfMissing(tx, column.table, column.name, column.definition); err != nil {
 			return err

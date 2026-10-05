@@ -22,6 +22,8 @@ var v14Columns = []struct{ table, column string }{
 	{"notification_destinations", "route_change_kinds"},
 	{"events", "severity"},
 	{"events", "muted"},
+	{"notification_destinations", "message_format"},
+	{"outbox", "payload_format"},
 }
 
 func downgradeToV13(t *testing.T, db *sql.DB) {
@@ -79,6 +81,10 @@ func TestSchemaV14MigrationKeepsDefaultsAndEvidence(t *testing.T) {
 	if err != nil || len(upgrade.Changes) != devices {
 		t.Fatalf("upgrade batch changes=%d err=%v", len(upgrade.Changes), err)
 	}
+	const legacyPayload = "### Tailscale inventory changed\n**1 change(s):** queued before the upgrade"
+	if err := st.EnqueueSystem(ctx, legacyPayload); err != nil {
+		t.Fatal(err)
+	}
 	preUpgradePack, err := st.ExportEvidencePack(ctx, HistoryFilter{})
 	if err != nil {
 		t.Fatal(err)
@@ -99,8 +105,31 @@ func TestSchemaV14MigrationKeepsDefaultsAndEvidence(t *testing.T) {
 		t.Fatalf("schema version=%d err=%v", schemaVersion, err)
 	}
 	destinations, err := st.ListDestinations(ctx)
-	if err != nil || len(destinations) != 1 || !destinations[0].Routing.AllChanges() {
+	if err != nil || len(destinations) != 1 || !destinations[0].Routing.AllChanges() || destinations[0].Format != notify.FormatAuto {
 		t.Fatalf("migrated destination routing=%+v err=%v", destinations, err)
+	}
+	// Rows queued before the upgrade are pre-rendered Markdown and are still
+	// delivered exactly as stored, whatever format the destination uses.
+	if err := st.SetDestinationFormat(ctx, destinations[0].ID, notify.FormatPlain); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := st.ClaimDueOutbox(ctx, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyFound := false
+	for _, item := range claimed {
+		if item.PayloadFormat != notify.PayloadMarkdown {
+			t.Fatalf("pre-upgrade row has payload format %q", item.PayloadFormat)
+		}
+		prepared, err := notify.Prepare(item.PayloadFormat, item.Payload, item.Destination.ServiceURL, item.Destination.Format)
+		if err != nil || prepared != item.Payload {
+			t.Fatalf("pre-upgrade row was not delivered unchanged: %q err=%v", prepared, err)
+		}
+		legacyFound = legacyFound || item.Payload == legacyPayload
+	}
+	if !legacyFound {
+		t.Fatal("the pre-upgrade outbox row was not claimable after the migration")
 	}
 	var unclassified, low int
 	if err := st.db.QueryRow("SELECT COUNT(*) FROM events WHERE severity=''").Scan(&unclassified); err != nil || unclassified != 0 {
@@ -144,6 +173,7 @@ func TestSchemaV13ToV14ReportsErrors(t *testing.T) {
 		db := migrationErrorDB(t)
 		if _, err := db.Exec(`CREATE TABLE notification_destinations(id INTEGER PRIMARY KEY);
 CREATE TABLE events(id INTEGER PRIMARY KEY, severity TEXT NOT NULL DEFAULT '');
+CREATE TABLE outbox(id INTEGER PRIMARY KEY);
 INSERT INTO events(id) VALUES(1);`); err != nil {
 			t.Fatal(err)
 		}

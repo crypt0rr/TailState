@@ -8,6 +8,7 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/crypt0rr/tailstate/internal/notify"
 	"github.com/crypt0rr/tailstate/internal/store"
 	"github.com/crypt0rr/tailstate/internal/tailscale"
 )
@@ -59,15 +60,19 @@ func TestRevokedCredentialsSendOneGroupedHealthMessagePerDestination(t *testing.
 		}
 	}
 	var payloads []string
-	rows, err := db.QueryContext(ctx, "SELECT destination_id,payload FROM outbox ORDER BY id")
+	rows, err := db.QueryContext(ctx, "SELECT destination_id,payload_format,payload FROM outbox ORDER BY id")
 	if err != nil {
 		t.Fatal(err)
 	}
 	perDestination := map[int64]int{}
 	for rows.Next() {
 		var destination int64
-		var payload string
-		if err := rows.Scan(&destination, &payload); err != nil {
+		var format, stored string
+		if err := rows.Scan(&destination, &format, &stored); err != nil {
+			t.Fatal(err)
+		}
+		payload, err := notify.Prepare(format, stored, "generic://notify.example", "")
+		if err != nil {
 			t.Fatal(err)
 		}
 		perDestination[destination]++

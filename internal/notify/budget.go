@@ -40,19 +40,32 @@ func MessageLimit(serviceURL string) int {
 	return digestBudget
 }
 
-const shortenedNoteFormat = "\n_Shortened for this destination: %d more line(s) omitted. See TailState History for the full batch._"
+const (
+	shortenedNoteFormat      = "\n_Shortened for this destination: %d more line(s) omitted. See TailState History for the full batch._"
+	shortenedPlainNoteFormat = "\nShortened for this destination: %d more line(s) omitted. See TailState History for the full batch."
+)
 
-// FitMessage shortens message to at most limit bytes. It removes whole lines
-// from the end so Markdown spans are never cut in half, and appends an
-// explicit note saying how many lines were omitted. A single first line that
-// is longer than the limit is truncated at a UTF-8 boundary.
+// FitMessage shortens a Markdown message to at most limit bytes. It removes
+// whole lines from the end so Markdown spans are never cut in half, and
+// appends an explicit note saying how many lines were omitted. A single first
+// line that is longer than the limit is truncated at a UTF-8 boundary.
 func FitMessage(message string, limit int) string {
+	return FitMessageFor(message, limit, FormatMarkdown)
+}
+
+// FitMessageFor is FitMessage with the omission note written in the given
+// format, so plain-text destinations never receive Markdown emphasis.
+func FitMessageFor(message string, limit int, format string) string {
 	if limit <= 0 || len(message) <= limit {
 		return message
 	}
+	noteFormat := shortenedNoteFormat
+	if format == FormatPlain {
+		noteFormat = shortenedPlainNoteFormat
+	}
 	lines := strings.SplitAfter(message, "\n")
 	for kept := len(lines) - 1; kept >= 1; kept-- {
-		note := fmt.Sprintf(shortenedNoteFormat, countLines(lines[kept:]))
+		note := fmt.Sprintf(noteFormat, countLines(lines[kept:]))
 		body := strings.TrimRight(strings.Join(lines[:kept], ""), "\n")
 		if len(body)+len(note) <= limit {
 			return body + note

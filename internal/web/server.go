@@ -115,6 +115,9 @@ type destinationPage struct {
 	ExcludeCollectors string
 	ChangeKinds       map[string]bool
 	RoutingSummary    string
+	// Format is the saved override; EffectiveFormat is what is sent.
+	Format          string
+	EffectiveFormat string
 }
 
 // routingSummary describes a destination's rules in one line.
@@ -827,6 +830,8 @@ func (s *Server) settingsData(ctx context.Context, csrf string, configured bool,
 				ExcludeCollectors: strings.Join(destination.Routing.ExcludeCollectors, ", "),
 				ChangeKinds:       kinds,
 				RoutingSummary:    routingSummary(destination.Routing),
+				Format:            destination.Format,
+				EffectiveFormat:   notify.FormatFor(destination.ServiceURL, destination.Format),
 			})
 		}
 		enabled := 0
@@ -935,9 +940,13 @@ func (s *Server) destinationPost(w http.ResponseWriter, r *http.Request) {
 		// save without them never resets a destination's rules.
 		withRouting := r.FormValue("routing") == "1"
 		var rules store.RoutingRules
+		var format string
 		if withRouting {
 			var err error
-			if rules, err = routingFromForm(r); err != nil {
+			if rules, err = routingFromForm(r); err == nil {
+				format, err = notify.ValidateFormat(r.FormValue("message_format"))
+			}
+			if err != nil {
 				data := s.currentSettingsData(ctx, csrf, r)
 				data.Error = "Notification routing was not saved: " + err.Error() + "."
 				s.render(w, "settings", data)
@@ -947,6 +956,9 @@ func (s *Server) destinationPost(w http.ResponseWriter, r *http.Request) {
 		savedID, err := s.store.SaveDestination(ctx, store.NotificationDestination{ID: id, Name: r.FormValue("name"), ServiceURL: serviceURL, Enabled: enabled})
 		if err == nil && withRouting {
 			err = s.store.SetDestinationRouting(ctx, savedID, rules)
+		}
+		if err == nil && withRouting {
+			err = s.store.SetDestinationFormat(ctx, savedID, format)
 		}
 		if err != nil {
 			slog.Error("save notification destination", "error", err)
@@ -969,10 +981,25 @@ func (s *Server) destinationPost(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 		}
+		// Render the test exactly as deliveries to this destination are
+		// rendered: by URL scheme, or by the saved or submitted override.
+		override := strings.TrimSpace(r.FormValue("message_format"))
+		if override == "" && id > 0 {
+			if existing, err := s.store.ListDestinations(ctx); err == nil {
+				for _, destination := range existing {
+					if destination.ID == id {
+						override = destination.Format
+						break
+					}
+				}
+			}
+		}
 		testCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 		defer cancel()
 		data := s.currentSettingsData(ctx, csrf, r)
-		if err := notify.New().Send(testCtx, serviceURL, notify.Markdown(s.notificationContext(ctx).Test(time.Now()))); err != nil {
+		format := notify.FormatFor(serviceURL, override)
+		message := notify.FitMessageFor(notify.Render(s.notificationContext(ctx).Test(time.Now()), format), notify.MessageLimit(serviceURL), format)
+		if err := notify.New().Send(testCtx, serviceURL, message); err != nil {
 			data.Error = "Notification test failed: " + notify.SafeTestError(err, serviceURL)
 		} else {
 			data.Message = "Notification test sent."

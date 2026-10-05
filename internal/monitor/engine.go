@@ -913,7 +913,17 @@ func (e *Engine) deliverItemWithLease(ctx context.Context, item store.OutboxItem
 	if lease == nil {
 		lease = e.startOutboxLease(ctx, item)
 	}
-	sendErr := e.sender.Send(ctx, item.Destination.ServiceURL, item.Payload)
+	// Render the stored payload for this destination's service (or its
+	// override) and fit it to the service budget. Legacy Markdown rows are
+	// sent unchanged. A payload that cannot be decoded can never succeed and
+	// is dead-lettered without contacting the provider.
+	message, prepareErr := notify.Prepare(item.PayloadFormat, item.Payload, item.Destination.ServiceURL, item.Destination.Format)
+	var sendErr error
+	if prepareErr != nil {
+		sendErr = &notify.DeliveryError{Message: prepareErr.Error(), Permanent: true}
+	} else {
+		sendErr = e.sender.Send(ctx, item.Destination.ServiceURL, message)
+	}
 	lease.stop()
 	elapsed := time.Since(started)
 	e.recordDeliveryDuration(elapsed)

@@ -254,8 +254,11 @@ func (s *Store) TrackAppVersion(ctx context.Context, current string, notificatio
 	notified := configured > 0 && enabledDestinations > 0
 	if notified {
 		now := time.Now().UTC().Format(time.RFC3339Nano)
-		payload := notify.Markdown(notification(previous, current))
-		if err = enqueueOutboxTx(ctx, tx, payload, now, 0); err != nil {
+		payloadFormat, payload, encodeErr := notify.EncodePayload(notification(previous, current))
+		if encodeErr != nil {
+			return false, encodeErr
+		}
+		if err = enqueueOutboxTx(ctx, tx, payloadFormat, payload, now, 0); err != nil {
 			return false, err
 		}
 	}

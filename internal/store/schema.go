@@ -53,7 +53,8 @@ CREATE TABLE IF NOT EXISTS notification_destinations (
   route_min_severity TEXT NOT NULL DEFAULT '',
   route_include_collectors TEXT NOT NULL DEFAULT '',
   route_exclude_collectors TEXT NOT NULL DEFAULT '',
-  route_change_kinds TEXT NOT NULL DEFAULT ''
+  route_change_kinds TEXT NOT NULL DEFAULT '',
+  message_format TEXT NOT NULL DEFAULT ''
 );
 -- Destination names are display labels, not identities. Duplicate names are
 -- intentionally allowed so two endpoints from the same provider can retain
@@ -196,7 +197,8 @@ CREATE TABLE IF NOT EXISTS outbox (
   created_at TEXT NOT NULL,
   delivered_at TEXT,
   lease_until TEXT,
-  lease_token TEXT NOT NULL DEFAULT ''
+  lease_token TEXT NOT NULL DEFAULT '',
+  payload_format TEXT NOT NULL DEFAULT 'markdown'
 );
 CREATE INDEX IF NOT EXISTS outbox_due ON outbox(status, next_attempt);
 `

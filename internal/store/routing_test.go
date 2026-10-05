@@ -35,7 +35,7 @@ func addDestination(t *testing.T, st *Store, name string, rules RoutingRules) in
 
 func batchDeliveries(t *testing.T, st *Store, batchID int64) map[int64]string {
 	t.Helper()
-	rows, err := st.db.QueryContext(context.Background(), "SELECT destination_id,payload FROM outbox WHERE batch_id=? ORDER BY id", batchID)
+	rows, err := st.db.QueryContext(context.Background(), "SELECT destination_id,payload_format,payload FROM outbox WHERE batch_id=? ORDER BY id", batchID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -43,10 +43,7 @@ func batchDeliveries(t *testing.T, st *Store, batchID int64) map[int64]string {
 	out := map[int64]string{}
 	for rows.Next() {
 		var id int64
-		var payload string
-		if err := rows.Scan(&id, &payload); err != nil {
-			t.Fatal(err)
-		}
+		payload := scanRenderedPayload(t, rows, &id)
 		out[id] = payload
 	}
 	return out
@@ -162,6 +159,35 @@ func TestDestinationsSharingRulesShareOneDigestAndFiltersApply(t *testing.T) {
 	// removals rule set matched nothing, so it is not rendered at all.
 	if calls != 3 {
 		t.Fatalf("digest rendered %d times, want once per distinct non-empty rule set (3)", calls)
+	}
+}
+
+func TestDestinationFormatOverride(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	id, err := st.SaveDestination(ctx, NotificationDestination{Name: "hook", ServiceURL: "generic://notify.example/hook", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetDestinationFormat(ctx, id, " Slack "); err != nil {
+		t.Fatal(err)
+	}
+	destinations, err := st.ListDestinations(ctx)
+	if err != nil || destinations[0].Format != notify.FormatSlack {
+		t.Fatalf("format=%+v err=%v", destinations, err)
+	}
+	if err := st.SetDestinationFormat(ctx, id, "html"); err == nil {
+		t.Fatal("unknown format saved")
+	}
+	if err := st.SetDestinationFormat(ctx, 999, notify.FormatPlain); err == nil || !strings.Contains(err.Error(), "not found") {
+		t.Fatalf("missing destination format error=%v", err)
+	}
+	if err := st.EnqueueMessage(ctx, notify.Context{}.Update("1", "2", testTime)); err != nil {
+		t.Fatal(err)
+	}
+	items, err := st.ClaimDueOutbox(ctx, 10)
+	if err != nil || len(items) != 1 || items[0].PayloadFormat != notify.PayloadMessage || items[0].Destination.Format != notify.FormatSlack {
+		t.Fatalf("claimed items=%+v err=%v", items, err)
 	}
 }
 

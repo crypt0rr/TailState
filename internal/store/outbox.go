@@ -12,8 +12,8 @@ import (
 	"github.com/crypt0rr/tailstate/internal/notify"
 )
 
-const outboxSelect = `SELECT o.id,COALESCE(o.batch_id,0),o.destination_id,o.payload,o.attempts,o.first_attempt,
-		COALESCE(o.lease_until,''),COALESCE(o.lease_token,''),d.name,d.service_url_enc,d.enabled,d.created_at,d.updated_at,COALESCE(d.deleted_at,'')
+const outboxSelect = `SELECT o.id,COALESCE(o.batch_id,0),o.destination_id,o.payload,o.payload_format,o.attempts,o.first_attempt,
+		COALESCE(o.lease_until,''),COALESCE(o.lease_token,''),d.name,d.service_url_enc,d.enabled,d.created_at,d.updated_at,COALESCE(d.deleted_at,''),d.message_format
 		FROM outbox o JOIN notification_destinations d ON d.id=o.destination_id`
 
 type outboxScanner interface {
@@ -21,20 +21,30 @@ type outboxScanner interface {
 }
 
 // EnqueueMessage queues a system notification (health, update) for every
-// enabled destination.
+// enabled destination. The message is stored format-neutral and rendered for
+// each destination's service when it is sent.
 func (s *Store) EnqueueMessage(ctx context.Context, message notify.Message) error {
-	return s.EnqueueSystem(ctx, notify.Markdown(message))
+	payloadFormat, payload, err := notify.EncodePayload(message)
+	if err != nil {
+		return err
+	}
+	return s.enqueueSystem(ctx, payloadFormat, payload)
 }
 
-// EnqueueSystem queues pre-rendered Markdown for every enabled destination.
+// EnqueueSystem queues pre-rendered Markdown for every enabled destination;
+// it is delivered unchanged.
 func (s *Store) EnqueueSystem(ctx context.Context, payload string) error {
+	return s.enqueueSystem(ctx, notify.PayloadMarkdown, payload)
+}
+
+func (s *Store) enqueueSystem(ctx context.Context, payloadFormat, payload string) error {
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	if err := enqueueOutboxTx(ctx, tx, payload, now, 0); err != nil {
+	if err := enqueueOutboxTx(ctx, tx, payloadFormat, payload, now, 0); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -137,9 +147,9 @@ func (s *Store) ClaimDueOutbox(ctx context.Context, limit int, leases ...time.Du
 func (s *Store) readOutboxItem(scanner outboxScanner) (OutboxItem, error) {
 	var item OutboxItem
 	var batchID sql.NullInt64
-	var first, leaseUntil, encrypted, created, updated, deleted, name string
+	var first, leaseUntil, encrypted, created, updated, deleted, name, format string
 	var enabled int
-	if err := scanner.Scan(&item.ID, &batchID, &item.DestinationID, &item.Payload, &item.Attempts, &first, &leaseUntil, &item.LeaseToken, &name, &encrypted, &enabled, &created, &updated, &deleted); err != nil {
+	if err := scanner.Scan(&item.ID, &batchID, &item.DestinationID, &item.Payload, &item.PayloadFormat, &item.Attempts, &first, &leaseUntil, &item.LeaseToken, &name, &encrypted, &enabled, &created, &updated, &deleted, &format); err != nil {
 		return OutboxItem{}, err
 	}
 	if batchID.Valid {
@@ -157,7 +167,7 @@ func (s *Store) readOutboxItem(scanner outboxScanner) (OutboxItem, error) {
 		}
 		item.LeaseUntil = &value
 	}
-	item.Destination = NotificationDestination{ID: item.DestinationID, Name: name, Enabled: enabled == 1}
+	item.Destination = NotificationDestination{ID: item.DestinationID, Name: name, Enabled: enabled == 1, Format: format}
 	// Deleted destinations have their URL scrubbed; claims never select them,
 	// but an empty value must not be treated as a decryption failure.
 	if encrypted != "" {
@@ -184,7 +194,7 @@ func (s *Store) readOutboxItem(scanner outboxScanner) (OutboxItem, error) {
 	return item, nil
 }
 
-func enqueueOutboxTx(ctx context.Context, tx *sql.Tx, payload, now string, batchID int64) error {
+func enqueueOutboxTx(ctx context.Context, tx *sql.Tx, payloadFormat, payload, now string, batchID int64) error {
 	rows, err := tx.QueryContext(ctx, "SELECT id FROM notification_destinations WHERE enabled=1 AND deleted_at IS NULL ORDER BY id")
 	if err != nil {
 		return err
@@ -199,7 +209,7 @@ func enqueueOutboxTx(ctx context.Context, tx *sql.Tx, payload, now string, batch
 		if batchID > 0 {
 			batchValue = batchID
 		}
-		if _, err := tx.ExecContext(ctx, "INSERT INTO outbox(batch_id,destination_id,payload,status,next_attempt,first_attempt,created_at) VALUES(?,?,?,'pending',?,?,?)", batchValue, destinationID, payload, now, now, now); err != nil {
+		if _, err := tx.ExecContext(ctx, "INSERT INTO outbox(batch_id,destination_id,payload,payload_format,status,next_attempt,first_attempt,created_at) VALUES(?,?,?,?,'pending',?,?,?)", batchValue, destinationID, payload, payloadFormat, now, now, now); err != nil {
 			rows.Close()
 			return err
 		}

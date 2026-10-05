@@ -85,6 +85,10 @@ type OutboxItem struct {
 	DestinationID int64
 	Destination   NotificationDestination
 	Payload       string
+	// PayloadFormat is notify.PayloadMarkdown for pre-rendered Markdown
+	// (every row written before schema v14) or notify.PayloadMessage for a
+	// format-neutral message rendered at send time.
+	PayloadFormat string
 	Attempts      int
 	FirstAttempt  time.Time
 	LeaseUntil    *time.Time

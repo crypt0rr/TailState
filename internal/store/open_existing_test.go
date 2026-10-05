@@ -70,6 +70,12 @@ func TestOpenExistingIssuesResetTokensWhileServing(t *testing.T) {
 				servingErr = err
 				return
 			}
+			// SQLite's busy handler waits by sleeping and is not fair. A
+			// writer that re-acquires the lock in a zero-pause loop can starve
+			// the other writer past busy_timeout on a loaded machine, which no
+			// real serving workload does. A short pause keeps both writers
+			// continuously interleaved without that artificial starvation.
+			time.Sleep(time.Millisecond)
 		}
 	}()
 	deadline := time.Now().Add(1500 * time.Millisecond)

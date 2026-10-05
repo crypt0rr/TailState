@@ -134,7 +134,11 @@ func (s *Store) ApplyBatchWithBatch(ctx context.Context, generation int64, resul
 				continue
 			}
 			next := now.Add(unsupportedDemotionInterval).Format(time.RFC3339Nano)
-			_, err = tx.ExecContext(ctx, `INSERT INTO collector_state(generation,collector,supported,baseline,last_error,next_poll,partial) VALUES(?,?,0,0,'unsupported',?,0) ON CONFLICT(generation,collector) DO UPDATE SET supported=0,last_error='unsupported',next_poll=excluded.next_poll,partial=0`, generation, result.Collector, next)
+			reason := strings.TrimSpace(result.UnsupportedReason)
+			if reason == "" {
+				reason = "unsupported"
+			}
+			_, err = tx.ExecContext(ctx, `INSERT INTO collector_state(generation,collector,supported,baseline,last_error,next_poll,partial) VALUES(?,?,0,0,?,?,0) ON CONFLICT(generation,collector) DO UPDATE SET supported=0,last_error=excluded.last_error,next_poll=excluded.next_poll,partial=0`, generation, result.Collector, reason, next)
 			if err != nil {
 				return ChangeBatchResult{}, err
 			}
@@ -202,9 +206,20 @@ func (s *Store) ApplyBatchWithBatch(ctx context.Context, generation int64, resul
 			case err != nil:
 				return ChangeBatchResult{}, err
 			case oldHash != hash:
-				if baseline == 1 {
+				// A snapshot stored in a different upstream shape (for example
+				// legacy DNS endpoints versus dns/configuration) is compared only
+				// on the fields both shapes express: a shape change alone is
+				// absorbed silently, a real change is still reported.
+				var oldComparable, newComparable []byte
+				transition := false
+				if !oldValue.truncated {
+					oldComparable, newComparable, transition = model.ShapeTransition(result.Collector, oldRaw, raw)
+				}
+				if baseline == 1 && !(transition && bytes.Equal(oldComparable, newComparable)) {
 					diff := model.DiffResult{}
-					if !oldValue.truncated {
+					if transition {
+						diff = model.DiffDetailed(oldComparable, newComparable)
+					} else if !oldValue.truncated {
 						diff = model.DiffDetailed(oldRaw, raw)
 					}
 					record(model.Change{Kind: "changed", Collector: result.Collector, ResourceID: resource.ID, Type: resource.Type, Name: resource.Name, Fields: diff.Fields, FieldsTruncated: diff.FieldsTruncated, TotalFields: diff.TotalFields}, oldValue, existingStoredValue(raw, hash, int64(len(raw)), false))

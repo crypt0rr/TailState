@@ -52,6 +52,9 @@ type Settings struct {
 	// ExpiryTagFilter limits expiry warnings to resources carrying at least
 	// one of these tags. An empty filter includes every resource.
 	ExpiryTagFilter []string
+	// OAuthScopes lists the read scopes requested for the Tailscale access
+	// token. nil or empty selects all:read.
+	OAuthScopes []string
 }
 
 type CollectorState struct {

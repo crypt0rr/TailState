@@ -22,9 +22,18 @@ import (
 )
 
 var CoreCollectors = []string{"devices"}
-var InventoryCollectors = []string{"device_details", "users", "user_invites", "dns", "policy", "keys", "webhooks", "log_streaming", "contacts", "posture", "settings"}
+var InventoryCollectors = []string{"device_details", "users", "user_invites", "dns", "policy", "keys", "webhooks", "log_streaming", "contacts", "posture", "settings", "services", "oauth_apps"}
 
-type Credentials struct{ Tailnet, ClientID, ClientSecret string }
+// DefaultOAuthScope is requested when no scopes are configured.
+const DefaultOAuthScope = "all:read"
+
+// Credentials identify the OAuth client and tailnet. Scopes lists the OAuth
+// scopes requested for the access token; an empty list requests
+// DefaultOAuthScope.
+type Credentials struct {
+	Tailnet, ClientID, ClientSecret string
+	Scopes                          []string
+}
 
 // CollectionLimits bound the aggregate amount of data retained while a
 // paginated collection is assembled. The per-response limit in get is still
@@ -165,6 +174,22 @@ func IsUnsupported(err error) bool {
 	return errors.As(err, &e) && (e.Status == http.StatusForbidden || e.Status == http.StatusNotFound)
 }
 
+// UnsupportedReason returns a bounded, operator-facing label for an
+// unsupported collector response. A 403 is what Tailscale returns both for a
+// plan without the feature and for an access token that lacks the scope, so
+// the label names both; a 404 means the endpoint or feature is not available
+// for this tailnet. Provider response text is never included.
+func UnsupportedReason(err error) string {
+	var e *HTTPError
+	if errors.As(err, &e) && e.Status == http.StatusForbidden {
+		return "unsupported (insufficient OAuth scope or plan: HTTP 403)"
+	}
+	if errors.As(err, &e) && e.Status == http.StatusNotFound {
+		return "unsupported (not available for this tailnet: HTTP 404)"
+	}
+	return "unsupported"
+}
+
 // IsUnsupportedCollector applies plan-capability semantics only to optional
 // collectors. Core device inventory and its dependent details must surface a
 // 404 as an upstream failure; otherwise a transient endpoint disappearance
@@ -223,6 +248,13 @@ func (c *Client) Collect(ctx context.Context, collector string) ([]model.Resourc
 		return c.collection(ctx, c.tailnet("posture/integrations"), "integrations", collector, "posture_integration", []string{"id", "integrationId", "integrationID"})
 	case "settings":
 		return c.single(ctx, c.tailnet("settings"), collector, "settings", "Tailnet settings")
+	case "services":
+		// Per-service hosts and approvals are not collected: Tailscale requires
+		// the write-capable "services" scope for those endpoints, which a
+		// read-only monitor must not hold.
+		return c.collection(ctx, c.tailnet("services"), "vipServices", collector, "service", []string{"name"})
+	case "oauth_apps":
+		return c.collection(ctx, c.tailnet("oauth-apps"), "oauthApps", collector, "oauth_app", []string{"id"})
 	default:
 		return nil, fmt.Errorf("unknown collector %q", collector)
 	}
@@ -478,7 +510,24 @@ func (c *Client) clearDeviceCache() {
 	c.deviceCacheMu.Unlock()
 }
 
+// dns reads the combined DNS configuration endpoint, which also reports
+// per-resolver useWithExitNode and the overrideLocalDNS preference. A 404
+// (an API without the endpoint) falls back to the four legacy endpoints. The
+// store compares the two shapes on the fields both can express, so switching
+// between them never reports drift by itself.
 func (c *Client) dns(ctx context.Context) ([]model.Resource, error) {
+	value, err := c.getObject(ctx, c.tailnet("dns/configuration"), "DNS configuration")
+	if err == nil {
+		return []model.Resource{{ID: "dns", Type: "dns", Name: "DNS configuration", Collector: "dns", Data: value}}, nil
+	}
+	var httpErr *HTTPError
+	if errors.As(err, &httpErr) && httpErr.Status == http.StatusNotFound {
+		return c.legacyDNS(ctx)
+	}
+	return nil, err
+}
+
+func (c *Client) legacyDNS(ctx context.Context) ([]model.Resource, error) {
 	data := map[string]any{}
 	supported := 0
 	for _, endpoint := range []string{"nameservers", "preferences", "searchpaths", "split-dns"} {
@@ -570,7 +619,8 @@ func (c *Client) single(ctx context.Context, endpoint, collector, typ, name stri
 }
 
 // getObject fetches a single-object endpoint. Settings, contacts, policy, the
-// DNS sub-endpoints and log-streaming configuration are always JSON objects;
+// DNS configuration and legacy DNS sub-endpoints, and log-streaming
+// configuration are always JSON objects;
 // an empty body, null, an array or a scalar is an invalid upstream response.
 // Returning an error keeps the last snapshot instead of replacing a baseline
 // with a degenerate value (and reporting the flip back as drift later).
@@ -900,7 +950,7 @@ func (c *Client) accessToken(ctx context.Context) (string, error) {
 	if c.token != "" && time.Until(c.expires) > 5*time.Minute {
 		return c.token, nil
 	}
-	form := url.Values{"grant_type": {"client_credentials"}, "scope": {"all:read"}, "client_id": {c.credentials.ClientID}, "client_secret": {c.credentials.ClientSecret}}
+	form := url.Values{"grant_type": {"client_credentials"}, "scope": {c.scope()}, "client_id": {c.credentials.ClientID}, "client_secret": {c.credentials.ClientSecret}}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.tokenURL, strings.NewReader(form.Encode()))
 	if err != nil {
 		return "", err
@@ -938,6 +988,20 @@ func (c *Client) accessToken(ctx context.Context) (string, error) {
 	c.token = payload.AccessToken
 	c.expires = time.Now().Add(time.Duration(payload.ExpiresIn) * time.Second)
 	return c.token, nil
+}
+
+// scope returns the space-separated OAuth scope parameter.
+func (c *Client) scope() string {
+	scopes := make([]string, 0, len(c.credentials.Scopes))
+	for _, scope := range c.credentials.Scopes {
+		if scope = strings.TrimSpace(scope); scope != "" {
+			scopes = append(scopes, scope)
+		}
+	}
+	if len(scopes) == 0 {
+		return DefaultOAuthScope
+	}
+	return strings.Join(scopes, " ")
 }
 
 func (c *Client) tailnet(suffix string) string {

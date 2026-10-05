@@ -147,7 +147,7 @@ func (s *Store) SaveSettings(ctx context.Context, in Settings) (int64, error) {
 			return 0, err
 		}
 	}
-	if err := saveMonitoringOptionsTx(ctx, tx, in); err != nil {
+	if err := saveMonitoringOptionsTx(ctx, tx, in, generation); err != nil {
 		return 0, err
 	}
 	if generationChanged {

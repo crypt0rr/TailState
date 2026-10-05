@@ -20,9 +20,12 @@ type Resource struct {
 }
 
 type Collected struct {
-	Collector         string
-	Resources         []Resource
-	Unsupported       bool
+	Collector   string
+	Resources   []Resource
+	Unsupported bool
+	// UnsupportedReason is a bounded label (never provider text) recorded as
+	// the collector's status when Unsupported is set.
+	UnsupportedReason string
 	Partial           bool
 	PartialError      string
 	PartialErrorCount int
@@ -90,6 +93,12 @@ var collectorFields = map[string]map[string]struct{}{
 	"device_details": fieldSet("postureattributes", "deviceinvites"),
 	"posture":        fieldSet("provider", "cloudid", "clientid", "tenantid", "id", "configupdated", "status"),
 	"log_streaming":  fieldSet("configuration", "network"),
+	// Tailscale Services (VIPServiceInfo). Addresses, ports, and tags are the
+	// exposure surface; the display name and comment identify the service.
+	"services": fieldSet("name", "displayname", "addrs", "comment", "ports", "tags"),
+	// OAuth apps. clientSecret is only returned at creation and is excluded
+	// along with the volatile created/updated timestamps.
+	"oauth_apps": fieldSet("id", "name", "description", "redirecturis", "scopes", "allowednodeattributes"),
 }
 
 func fieldSet(fields ...string) map[string]struct{} {

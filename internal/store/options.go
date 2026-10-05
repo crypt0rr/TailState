@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
 	"sort"
 	"strings"
 )
@@ -23,7 +24,13 @@ const (
 	MaxExpiryWarningDays    = 365
 	MaxExpiryTagFilters     = 32
 	maxExpiryTagBytes       = 128
+	MaxOAuthScopes          = 32
 )
+
+// readScope accepts Tailscale read scopes such as all:read, dns:read, or
+// devices:core:read. Write scopes are rejected: TailState never modifies a
+// tailnet and must not hold a token that could.
+var readScope = regexp.MustCompile(`^[a-z][a-z_]*(:[a-z][a-z_]*)*:read$`)
 
 // DefaultExpiryWarningDays returns the warning windows used when an operator
 // has not configured any.
@@ -32,6 +39,40 @@ func DefaultExpiryWarningDays() []int { return []int{14, 3} }
 type monitoringOptions struct {
 	ExpiryWarningDays []int    `json:"expiry_warning_days"`
 	ExpiryTagFilter   []string `json:"expiry_tag_filter"`
+	OAuthScopes       []string `json:"oauth_scopes,omitempty"`
+}
+
+// DefaultOAuthScopes returns the scopes requested when none are configured.
+func DefaultOAuthScopes() []string { return []string{"all:read"} }
+
+// NormalizeOAuthScopes validates the OAuth scopes requested for the access
+// token and returns them de-duplicated and sorted. An empty list selects
+// all:read. Only read scopes are accepted.
+func NormalizeOAuthScopes(scopes []string) ([]string, error) {
+	seen := make(map[string]struct{}, len(scopes))
+	out := make([]string, 0, len(scopes))
+	for _, scope := range scopes {
+		scope = strings.TrimSpace(scope)
+		if scope == "" {
+			continue
+		}
+		if len(scope) > 64 || !readScope.MatchString(scope) {
+			return nil, errors.New(`OAuth scopes must be read scopes such as "all:read" or "devices:core:read"`)
+		}
+		if _, duplicate := seen[scope]; duplicate {
+			continue
+		}
+		seen[scope] = struct{}{}
+		out = append(out, scope)
+	}
+	if len(out) > MaxOAuthScopes {
+		return nil, fmt.Errorf("at most %d OAuth scopes are allowed", MaxOAuthScopes)
+	}
+	if len(out) == 0 {
+		return DefaultOAuthScopes(), nil
+	}
+	sort.Strings(out)
+	return out, nil
 }
 
 // NormalizeExpiryWarningDays validates warning windows and returns them
@@ -94,6 +135,9 @@ func validateMonitoringOptions(in Settings) error {
 	if _, err := NormalizeExpiryTagFilter(in.ExpiryTagFilter); err != nil {
 		return err
 	}
+	if _, err := NormalizeOAuthScopes(in.OAuthScopes); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -106,10 +150,19 @@ func normalizedMonitoringOptions(in Settings) (monitoringOptions, error) {
 	if err != nil {
 		return monitoringOptions{}, err
 	}
-	return monitoringOptions{ExpiryWarningDays: days, ExpiryTagFilter: tags}, nil
+	scopes, err := NormalizeOAuthScopes(in.OAuthScopes)
+	if err != nil {
+		return monitoringOptions{}, err
+	}
+	return monitoringOptions{ExpiryWarningDays: days, ExpiryTagFilter: tags, OAuthScopes: scopes}, nil
 }
 
-func saveMonitoringOptionsTx(ctx context.Context, tx *sql.Tx, in Settings) error {
+// saveMonitoringOptionsTx persists the options. When the requested OAuth
+// scopes change, collectors currently marked unsupported in the active
+// generation are made due immediately: a broadened scope must not wait out
+// the six-hour unsupported window before the newly permitted collector is
+// polled (its first successful poll is still a silent baseline).
+func saveMonitoringOptionsTx(ctx context.Context, tx *sql.Tx, in Settings, generation int64) error {
 	options, err := normalizedMonitoringOptions(in)
 	if err != nil {
 		return err
@@ -118,8 +171,29 @@ func saveMonitoringOptionsTx(ctx context.Context, tx *sql.Tx, in Settings) error
 	if err != nil {
 		return err
 	}
-	_, err = tx.ExecContext(ctx, "INSERT INTO meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", monitoringOptionsMeta, string(raw))
-	return err
+	previousScopes := DefaultOAuthScopes()
+	var previous string
+	switch err := tx.QueryRowContext(ctx, "SELECT value FROM meta WHERE key=?", monitoringOptionsMeta).Scan(&previous); {
+	case errors.Is(err, sql.ErrNoRows):
+	case err != nil:
+		return err
+	default:
+		var stored monitoringOptions
+		if json.Unmarshal([]byte(previous), &stored) == nil {
+			if scopes, scopeErr := NormalizeOAuthScopes(stored.OAuthScopes); scopeErr == nil {
+				previousScopes = scopes
+			}
+		}
+	}
+	if _, err = tx.ExecContext(ctx, "INSERT INTO meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", monitoringOptionsMeta, string(raw)); err != nil {
+		return err
+	}
+	if strings.Join(previousScopes, " ") != strings.Join(options.OAuthScopes, " ") {
+		if _, err = tx.ExecContext(ctx, "UPDATE collector_state SET next_poll=NULL WHERE generation=? AND supported=0", generation); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // loadMonitoringOptions fills the option fields of out. A missing row (a
@@ -128,6 +202,7 @@ func saveMonitoringOptionsTx(ctx context.Context, tx *sql.Tx, in Settings) error
 func (s *Store) loadMonitoringOptions(ctx context.Context, out *Settings) error {
 	out.ExpiryWarningDays = DefaultExpiryWarningDays()
 	out.ExpiryTagFilter = nil
+	out.OAuthScopes = DefaultOAuthScopes()
 	var raw string
 	err := s.db.QueryRowContext(ctx, "SELECT value FROM meta WHERE key=?", monitoringOptionsMeta).Scan(&raw)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -145,6 +220,9 @@ func (s *Store) loadMonitoringOptions(ctx context.Context, out *Settings) error 
 	}
 	if tags, tagsErr := NormalizeExpiryTagFilter(stored.ExpiryTagFilter); tagsErr == nil && len(tags) > 0 {
 		out.ExpiryTagFilter = tags
+	}
+	if scopes, scopeErr := NormalizeOAuthScopes(stored.OAuthScopes); scopeErr == nil {
+		out.OAuthScopes = scopes
 	}
 	return nil
 }

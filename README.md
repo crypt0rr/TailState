@@ -10,7 +10,9 @@ of truth and the safety net for missed events.
 
 - Devices, stable tailnet IPv4/IPv6 addresses, details, authorization, tags, key expiry, client version, routes, posture attributes, and invites.
 - Users (members and shared/external users, collected with `type=all`) and user invites. Shared users that already existed when upgrading from a version that collected members only are absorbed silently into the existing baseline on the first poll after the upgrade; a user shared after that is reported as created.
-- DNS nameservers, preferences, search paths, and split DNS.
+- DNS configuration from `dns/configuration`: nameservers, split DNS, search paths, MagicDNS and override-local-DNS preferences, and each resolver's `useWithExitNode` flag. If that endpoint returns `404`, TailState falls back to the four legacy DNS endpoints.
+- Tailscale Services (`services`): each service's name, display name, addresses, ports, tags, and comment.
+- OAuth apps (`oauth_apps`): name, description, redirect URIs, granted scopes, and allowed node attributes (never the client secret or timestamps).
 - Policy section fingerprints without storing policy contents.
 - Credential metadata, webhook configuration inventory, log-streaming configuration/status, contacts, posture integrations, and tailnet settings.
 - Upcoming expiry of device node keys and auth keys: a daily check warns before they expire (see [Expiry warnings](#expiry-warnings)).
@@ -31,7 +33,7 @@ Because the last group has an open schema, a field that Tailscale adds to its AP
 
 ## Quick start
 
-Requirements: Docker with Compose and a Tailscale OAuth client permitted to request `all:read`.
+Requirements: Docker with Compose and a Tailscale OAuth client permitted to request `all:read` (or the narrower read scopes listed in [OAuth scopes](#oauth-scopes)).
 
 First, create the local environment file and encryption key:
 
@@ -79,7 +81,8 @@ The logs contain a one-time setup token. Open [http://127.0.0.1:8080/setup](http
 After claiming the installation, the authenticated Settings page asks for:
 
 1. Tailnet (`-` uses the OAuth credential's tailnet).
-2. OAuth client ID and secret with `all:read`.
+2. OAuth client ID and secret, and the OAuth scopes to request (default
+   `all:read`; see [OAuth scopes](#oauth-scopes)).
 3. At least one notification destination using a Shoutrrr URL.
 4. Device and secondary inventory polling intervals, in whole seconds. Device
    polling accepts 15 seconds to 24 hours (86400 seconds); inventory polling
@@ -90,6 +93,47 @@ After claiming the installation, the authenticated Settings page asks for:
 Add destinations on the authenticated Settings page, then save monitoring settings. Each destination is validated and can be tested independently. The form is validated locally first (interval range, required OAuth credentials, webhook secret of at most 1024 bytes, and a tailnet name without spaces, slashes, or URL syntax), so a mistake is reported immediately with a specific message and nothing is sent to Tailscale. TailState then performs a Tailscale API check, bounded to 20 seconds so a slow or rate-limited API still produces a "Tailscale test failed" page, and builds a silent baseline. The status page shows baseline counts, collector capabilities, source health, and delivery state. Rotating the OAuth secret or changing poll intervals refreshes the monitor without discarding the existing baseline; changing the tailnet or OAuth client identity starts a new generation and dead-letters pending and in-flight event notifications from the previous identity (an in-flight sender can no longer complete or requeue them) while preserving their history for audit. System and release notifications remain eligible for delivery.
 
 The authenticated **History** page keeps a 30-day, searchable ledger of semantic inventory changes. Each poll is grouped into a batch with the affected collector, resource, previous/current normalized snapshots, field-level differences, and the delivery state for every destination. Use it to investigate a notification without exposing credentials or volatile API fields. The page shows the fingerprint of the Ed25519 key used to sign evidence exports.
+
+### OAuth scopes
+
+TailState requests `all:read` by default. To run with a least-privilege OAuth
+client, grant it only the read scopes for the collectors you want and list the
+same scopes (space- or comma-separated) in **OAuth scopes** on the Settings
+page. Only read scopes (ending in `:read`) are accepted; TailState never
+requests a write scope.
+
+| Collector | Read scope |
+| --- | --- |
+| `devices` (required; also used by the settings test) | `devices:core:read` |
+| `device_details` | `devices:posture_attributes:read`, `device_invites:read` |
+| `users` | `users:read` |
+| `user_invites` | `user_invites:read` |
+| `dns` | `dns:read` |
+| `policy` | `policy_file:read` |
+| `keys` | `auth_keys:read`; add `api_access_tokens:read`, `oauth_keys:read`, and `federated_keys:read` to see those credential types |
+| `webhooks` | `webhooks:read` |
+| `log_streaming` | `log_streaming:read` |
+| `contacts` | `account_settings:read` |
+| `posture` | `feature_settings:read` |
+| `settings` | `feature_settings:read`; some fields also need `logs:network:read`, `networking_settings:read`, or `policy_file:read` |
+| `services` | `services:read` |
+| `oauth_apps` | `oauth_apps:read` |
+
+A collector whose endpoint answers `403` is shown on the status page as
+**Unsupported** with the label "insufficient OAuth scope or plan (HTTP 403)"
+(Tailscale uses the same status for a missing scope and a plan without the
+feature); a `404` is labelled "not available for this tailnet". Without
+`devices:posture_attributes:read` or `device_invites:read`, the per-device
+detail is recorded as an explicit unsupported value. Unsupported collectors are
+informational and do not degrade readiness. Changing the scopes makes every
+unsupported collector due for an immediate re-check; a collector that becomes
+readable baselines silently. Narrowing scopes can hide resources or fields
+(for example other credential types under `keys`), which are then reported as
+removed or changed, so settle on the scopes before the first baseline.
+
+Per-service hosts and approvals (`/services/{name}/devices` and
+`/services/{name}/device/{id}/approved`) are not collected: Tailscale requires
+the write-capable `services` scope for them.
 
 ### Expiry warnings
 
@@ -438,9 +482,9 @@ in a disposable project before relying on the procedure for an outage.
 - The first complete supported inventory is a silent baseline.
 - Stable additions and modifications alert on the next successful poll.
 - Removals require absence from two complete successful polls.
-- One device change is reported once. A device's appearance and removal are `devices` events only (its `device_details` snapshot is created and deleted silently); routes and client/OS versions are reported by `devices`, so `device_details` does not fetch the routes endpoint and ignores the `node:os`, `node:osVersion`, and `node:tsVersion` posture attributes. Snapshots stored by older releases are re-normalized before diffing, so upgrading does not report drift.
+- One device change is reported once. A device's appearance and removal are `devices` events only (its `device_details` snapshot is created and deleted silently); routes and client/OS versions are reported by `devices`, so `device_details` does not fetch the routes endpoint and ignores the `node:os`, `node:osVersion`, and `node:tsVersion` posture attributes. Snapshots stored by older releases are re-normalized before diffing, so upgrading does not report drift. A DNS snapshot stored from the legacy endpoints is compared with the `dns/configuration` response only on the fields both express (nameservers, MagicDNS, search paths, split DNS), so the upgrade, and any later fallback between the two endpoints, is silent unless one of those fields actually changed. New collectors (`services`, `oauth_apps`) take a silent baseline on their first successful poll.
 - Failed or partial polls never delete snapshots.
-- Single-object endpoints (tailnet settings, contacts, policy, each DNS sub-endpoint, and log-streaming configuration and status) must return a JSON object. A `null`, empty, array, or scalar body is treated as an invalid upstream response: the collector fails, no events are recorded, and the last snapshot is kept.
+- Single-object endpoints (tailnet settings, contacts, policy, the DNS configuration and each legacy DNS sub-endpoint, and log-streaming configuration and status) must return a JSON object. A `null`, empty, array, or scalar body is treated as an invalid upstream response: the collector fails, no events are recorded, and the last snapshot is kept.
 - Multiple changes in one poll become one digest, fanned out into one durable outbox item per enabled destination (subject to its [routing rules](#severity-and-routing)). The outbox stores a format-neutral message that is rendered when it is sent, in the format the receiving service displays: Slack mrkdwn for `slack` and `googlechat` (single-asterisk bold, no `###` headings, `<url|label>` links, and `&`, `<`, `>` escaped so a resource name cannot mention a channel), plain text for `telegram`, `smtp`, `pushover`, `matrix`, `ntfy`, `gotify`, `signal`, `bark`, `join`, `lark`, `wecom`, `pushbullet`, `ifttt`, `opsgenie`, `pagerduty`, `mqtt`, `twilio`, `xmpp`, `signalgrid`, and `hass`, and Markdown for every other service (for example `mattermost`, `discord`, `rocketchat`, `zulip`, `teams`, and `generic`). Each destination can override the automatic choice under **Edit destination** in Settings; the Settings test message uses the same format. Each digest is fitted to the receiving service's message limit (for example 4,096 bytes for Telegram, Lark, WeCom, and ntfy, 1,024 for Pushover, and 10,000 for Zulip) by dropping whole lines from the end and adding an explicit "lines omitted, see History" note. A provider that still rejects a message as too large (or with HTTP 413) dead-letters it immediately instead of retrying for 24 hours.
 - Every change batch is also recorded in the authenticated History page with field-level diffs and redacted normalized before/after snapshots. Filters support collector, change type, severity, resource name or ID, and a single batch (`/history?batch=<id>`, the target of notification links); history is retained for 30 days. Normalized snapshots are capped at 1 MiB and each event before/after value at 512 KiB. Larger values retain their SHA-256, original byte count, configured limit, and a bounded truncation marker instead of the provider body; the authenticated UI calls this out explicitly. A normal history page reads at most 2 MiB of stored event data and displays a truncation notice with a cursor when that budget is reached. The hard 4 MiB raw-write ceiling prevents an unusually large normalized value from entering SQLite unbounded; the small marker remains queryable for audit.
 - The History page can download a filtered, redacted JSON evidence pack for incident reports and offline review. Packs (format version 4) include normalized snapshots, field diffs, each event's severity and `muted` flag, destination delivery outcomes, a SHA-256 content hash, and an Ed25519 signature over a hash-linked event ledger; exports are limited to 100 batches, 2,000 events, and 5 MiB. A changed export fails verification.
@@ -489,7 +533,7 @@ collector, and History can be filtered by severity.
 | --- | --- |
 | High | Any `policy`, `log_streaming`, `settings` (tailnet settings), or `webhooks` change; a `keys` resource created; a `users` change to `role`; a `devices` change to `tags`, `authorized` false→true, or `keyExpiryDisabled` false→true |
 | Low | A `devices` change whose changed fields are all `clientVersion`, `updateAvailable`, `os`, or `distro` |
-| Medium | Everything else, for example devices created or removed, route changes (`enabledRoutes`, `advertisedRoutes`), user invites, users created or removed, keys removed, DNS, contacts, and posture changes |
+| Medium | Everything else, for example devices created or removed, route changes (`enabledRoutes`, `advertisedRoutes`), user invites, users created or removed, keys removed, DNS, contacts, posture, `services`, and `oauth_apps` changes |
 
 A changed resource takes the highest severity of its changed fields; a change
 whose field list was truncated is at least medium, because the omitted fields

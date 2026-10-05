@@ -104,6 +104,7 @@ type pageData struct {
 	NotificationState               diagnostics.NotificationState
 	Diagnostics                     diagnostics.Report
 	ExpiryDays, ExpiryTags          string
+	OAuthScopes                     string
 	Expiring                        []expiringResource
 	ExpiryHorizonDays               int
 	ExpiryFiltered                  bool
@@ -777,6 +778,11 @@ func (s *Server) settingsPost(w http.ResponseWriter, r *http.Request) {
 	} else if configured {
 		input.ExpiryTagFilter = current.ExpiryTagFilter
 	}
+	if _, present := r.PostForm["oauth_scopes"]; present {
+		input.OAuthScopes = splitList(r.PostForm.Get("oauth_scopes"))
+	} else if configured {
+		input.OAuthScopes = current.OAuthScopes
+	}
 	if input.Tailnet == "" {
 		input.Tailnet = "-"
 	}
@@ -796,6 +802,9 @@ func (s *Server) settingsPost(w http.ResponseWriter, r *http.Request) {
 	if _, present := r.PostForm["expiry_tag_filter"]; present {
 		data.ExpiryTags = strings.TrimSpace(r.PostForm.Get("expiry_tag_filter"))
 	}
+	if _, present := r.PostForm["oauth_scopes"]; present {
+		data.OAuthScopes = strings.TrimSpace(r.PostForm.Get("oauth_scopes"))
+	}
 	// Validate everything that needs no I/O before contacting Tailscale, so
 	// an invalid form fails instantly with a specific message.
 	if !expiryDaysOK {
@@ -808,7 +817,7 @@ func (s *Server) settingsPost(w http.ResponseWriter, r *http.Request) {
 		s.render(w, "settings", data)
 		return
 	}
-	client := tailscale.New(s.config.TailscaleBase, s.config.OAuthTokenURL, s.config.Version, tailscale.Credentials{Tailnet: input.Tailnet, ClientID: input.OAuthClientID, ClientSecret: input.OAuthClientSecret})
+	client := tailscale.New(s.config.TailscaleBase, s.config.OAuthTokenURL, s.config.Version, tailscale.Credentials{Tailnet: input.Tailnet, ClientID: input.OAuthClientID, ClientSecret: input.OAuthClientSecret, Scopes: input.OAuthScopes})
 	// The connection test must finish, and its result page render, before
 	// the server's write deadline; otherwise a slow API produces a blank
 	// connection reset instead of "Tailscale test failed". Bound the test
@@ -889,6 +898,9 @@ func settingsInputError(input *store.Settings, device, inventory int64, deviceEr
 	if _, err := store.NormalizeExpiryTagFilter(input.ExpiryTagFilter); err != nil {
 		return fmt.Sprintf("Expiry tag filter must be a comma-separated list of at most %d tags such as tag:server.", store.MaxExpiryTagFilters)
 	}
+	if _, err := store.NormalizeOAuthScopes(input.OAuthScopes); err != nil {
+		return fmt.Sprintf("OAuth scopes must be at most %d read scopes such as all:read or devices:core:read; write scopes are not accepted.", store.MaxOAuthScopes)
+	}
 	if err := store.ValidateSettings(*input); err != nil {
 		return "Tailnet must be \"-\" or a tailnet name without spaces, slashes, or URL syntax."
 	}
@@ -932,6 +944,11 @@ func (s *Server) settingsData(ctx context.Context, csrf string, configured bool,
 		expiryDays = store.DefaultExpiryWarningDays()
 	}
 	data.ExpiryDays, data.ExpiryTags = joinInts(expiryDays), strings.Join(settings.ExpiryTagFilter, ", ")
+	scopes := settings.OAuthScopes
+	if len(scopes) == 0 {
+		scopes = store.DefaultOAuthScopes()
+	}
+	data.OAuthScopes = strings.Join(scopes, " ")
 	destinations, err := s.store.ListDestinations(ctx)
 	if err == nil {
 		data.Destinations = make([]destinationPage, 0, len(destinations))

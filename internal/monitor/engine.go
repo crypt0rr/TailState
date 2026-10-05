@@ -914,7 +914,7 @@ func (e *Engine) deliverItemWithLease(ctx context.Context, item store.OutboxItem
 	// error cannot reach logs or durable outbox history even if the sender did
 	// not sanitize it itself.
 	safeMessage := notify.SafeDeliveryError(sendErr)
-	dead := time.Since(item.FirstAttempt) >= 24*time.Hour
+	dead := time.Since(item.FirstAttempt) >= 24*time.Hour || notify.IsPermanent(sendErr)
 	var delivery *notify.DeliveryError
 	delay := retryDelay(item.Attempts)
 	if errors.As(sendErr, &delivery) && delivery.RetryAfter > 0 {

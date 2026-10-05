@@ -26,13 +26,13 @@ func TestVersionOneMigrationAddsDestinationAndPreservesLegacyOutbox(t *testing.T
 			if err != nil {
 				t.Fatal(err)
 			}
-			legacySecret, err := box.Encrypt("oauth-secret")
+			legacySecret, err := box.EncryptLegacy("oauth-secret")
 			if err != nil {
 				t.Fatal(err)
 			}
 			legacyURL := ""
 			if tt.withLegacyURL {
-				legacyURL, err = box.Encrypt("https://mattermost.example/hooks/token")
+				legacyURL, err = box.EncryptLegacy("https://mattermost.example/hooks/token")
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -136,19 +136,19 @@ func TestVersionFourMigrationThroughOpenPreservesDurableState(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	secretValue, err := box.Encrypt("oauth-secret")
+	secretValue, err := box.EncryptLegacy("oauth-secret")
 	if err != nil {
 		t.Fatal(err)
 	}
-	mattermostURL, err := box.Encrypt("mattermost://TailState@mattermost.example/token")
+	mattermostURL, err := box.EncryptLegacy("mattermost://TailState@mattermost.example/token")
 	if err != nil {
 		t.Fatal(err)
 	}
-	webhookSecret, err := box.Encrypt("webhook-secret")
+	webhookSecret, err := box.EncryptLegacy("webhook-secret")
 	if err != nil {
 		t.Fatal(err)
 	}
-	destinationURL, err := box.Encrypt("generic://notify.example/hooks/token")
+	destinationURL, err := box.EncryptLegacy("generic://notify.example/hooks/token")
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -46,6 +46,9 @@ jobs:
     permissions:
       contents: read
       packages: write
+      # Keyless Sigstore signing of the build-provenance attestation.
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -199,6 +202,27 @@ jobs:
             test "$promoted_platforms" = "$candidate_platforms"
           done <<< "$RELEASE_TAGS"
           echo "verified=true" >> "$GITHUB_OUTPUT"
+          echo "digest=$promoted_digest" >> "$GITHUB_OUTPUT"
+
+      - name: Sign build provenance for the promoted image
+        # Attest the promoted index digest that the version, minor, and latest
+        # tags resolve to (not the candidate digest, which promotion changes).
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ghcr.io/crypt0rr/tailstate
+          subject-digest: ${{ steps.promote.outputs.digest }}
+          push-to-registry: true
+
+      - name: Verify the signed attestation
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          set -euo pipefail
+          while IFS= read -r tag; do
+            [[ -n "$tag" ]] || continue
+            gh attestation verify "oci://$tag" --owner "${GITHUB_REPOSITORY_OWNER}" --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/release.yml"
+          done <<< "$RELEASE_TAGS"
 
       - name: Remove release candidate
         # The candidate is an implementation detail of this run. Remove it

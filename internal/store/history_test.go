@@ -486,8 +486,8 @@ func TestSchemaV2HistoryMigrationBackfillsBatchCorrelation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	legacySecret, _ := box.Encrypt("secret")
-	legacyURL, _ := box.Encrypt("mattermost://TailState@mattermost.example/token")
+	legacySecret, _ := box.EncryptLegacy("secret")
+	legacyURL, _ := box.EncryptLegacy("mattermost://TailState@mattermost.example/token")
 	db, err := sql.Open("sqlite", "file:"+path+"?_pragma=busy_timeout(5000)")
 	if err != nil {
 		t.Fatal(err)
@@ -617,8 +617,10 @@ func TestCleanupRemovesExpiredHistoryBatches(t *testing.T) {
 		t.Fatal(err)
 	}
 	old := time.Now().UTC().Add(-48 * time.Hour).Format(time.RFC3339Nano)
-	if _, err := st.db.ExecContext(ctx, "UPDATE events SET observed_at=?", old); err != nil {
-		t.Fatal(err)
+	for _, table := range []string{"events", "event_batches"} {
+		if _, err := st.db.ExecContext(ctx, "UPDATE "+table+" SET observed_at=?", old); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if err := st.Cleanup(ctx, 24*time.Hour); err != nil {
 		t.Fatal(err)

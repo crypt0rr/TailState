@@ -432,28 +432,8 @@ func (s *Store) CleanupWithOptions(ctx context.Context, options CleanupOptions) 
 		options.PassBudget = defaultCleanupPassBudget
 	}
 	deadline := time.Now().Add(options.PassBudget)
-	now := time.Now().UTC()
-	nowValue := now.Format(time.RFC3339Nano)
-	retryCutoff := now.Add(-outboxRetryWindow).Format(time.RFC3339Nano)
-	webhookRetryCutoff := now.Add(-webhookTriggerRetryWindow).Format(time.RFC3339Nano)
-	cutoff := now.Add(-options.Retention).Format(time.RFC3339Nano)
 	budget := cleanupBudget{deadline: deadline, transaction: options.TransactionBudget, batchSize: options.BatchSize}
-
-	phases := []cleanupPhase{
-		{name: "sessions", query: `DELETE FROM sessions WHERE rowid IN (SELECT rowid FROM sessions WHERE expires_at<=? ORDER BY expires_at,rowid LIMIT ?)`, args: []any{nowValue}, add: func(n int64) { stats.SessionsDeleted += n }},
-		{name: "auth_tokens", query: `DELETE FROM auth_tokens WHERE rowid IN (SELECT rowid FROM auth_tokens WHERE expires_at<=? ORDER BY expires_at,rowid LIMIT ?)`, args: []any{nowValue}, add: func(n int64) { stats.AuthTokensDeleted += n }},
-		{name: "meta", query: `DELETE FROM meta WHERE rowid IN (SELECT rowid FROM meta WHERE (key='setup_token_hash' AND NOT EXISTS (SELECT 1 FROM auth_tokens WHERE kind='setup')) OR (key='reset_token_hash' AND NOT EXISTS (SELECT 1 FROM auth_tokens WHERE kind='reset')) ORDER BY rowid LIMIT ?)`, args: nil, add: func(n int64) { stats.MetaDeleted += n }},
-		{name: "outbox_dead_letter", query: `UPDATE outbox SET status='dead',next_attempt=?,lease_until=NULL,lease_token='',last_error=CASE WHEN TRIM(last_error)='' THEN 'delivery retry window expired' ELSE last_error END WHERE rowid IN (SELECT rowid FROM outbox WHERE status IN ('pending','processing') AND first_attempt<=? AND (status='pending' OR lease_until IS NULL OR lease_until<=?) ORDER BY first_attempt,rowid LIMIT ?)`, args: []any{nowValue, retryCutoff, nowValue}, add: func(n int64) { stats.OutboxDeadLettered += n }},
-		{name: "webhook_dead_letter", query: `UPDATE webhook_triggers SET status='dead',next_attempt_at=?,lease_until=NULL,lease_token='',last_error=CASE WHEN TRIM(last_error)='' THEN 'reconciliation retry window expired' ELSE last_error END WHERE rowid IN (SELECT rowid FROM webhook_triggers WHERE status IN ('pending','processing') AND received_at<=? AND (status='pending' OR lease_until IS NULL OR lease_until<=?) ORDER BY received_at,rowid LIMIT ?)`, args: []any{nowValue, webhookRetryCutoff, nowValue}, add: func(n int64) { stats.WebhookDeadLettered += n }},
-		{name: "events", query: `DELETE FROM events WHERE rowid IN (SELECT rowid FROM events WHERE observed_at<? ORDER BY observed_at,rowid LIMIT ?)`, args: []any{cutoff}, add: func(n int64) { stats.EventsDeleted += n }},
-		{name: "event_batches", query: `DELETE FROM event_batches WHERE rowid IN (SELECT b.rowid FROM event_batches b WHERE NOT EXISTS (SELECT 1 FROM events WHERE events.batch_id=b.id) ORDER BY b.observed_at,b.rowid LIMIT ?)`, args: nil, add: func(n int64) { stats.EventBatchesDeleted += n }},
-		{name: "event_batch_triggers", query: `DELETE FROM event_batch_triggers WHERE rowid IN (SELECT t.rowid FROM event_batch_triggers t WHERE NOT EXISTS (SELECT 1 FROM event_batches WHERE event_batches.id=t.batch_id) ORDER BY t.batch_id,t.trigger_id LIMIT ?)`, args: nil, add: func(n int64) { stats.EventBatchTriggersDeleted += n }},
-		// Ledger entries are intentionally absent from this list. They outlive
-		// event snapshots so the signed chain remains an audit trail.
-		{name: "webhook_triggers", query: `DELETE FROM webhook_triggers WHERE rowid IN (SELECT rowid FROM webhook_triggers WHERE received_at<? AND status IN ('processed','dead') ORDER BY received_at,rowid LIMIT ?)`, args: []any{cutoff}, add: func(n int64) { stats.WebhookTriggersDeleted += n }},
-		{name: "delivered_outbox", query: `DELETE FROM outbox WHERE rowid IN (SELECT rowid FROM outbox WHERE status='delivered' AND delivered_at<? ORDER BY delivered_at,rowid LIMIT ?)`, args: []any{cutoff}, add: func(n int64) { stats.DeliveredOutboxDeleted += n }},
-		{name: "dead_outbox", query: `DELETE FROM outbox WHERE rowid IN (SELECT rowid FROM outbox WHERE status='dead' AND created_at<? ORDER BY created_at,rowid LIMIT ?)`, args: []any{cutoff}, add: func(n int64) { stats.DeadOutboxDeleted += n }},
-	}
+	phases := cleanupPhases(&stats, time.Now().UTC(), options.Retention)
 	for _, phase := range phases {
 		phaseDone, phaseErr := s.runCleanupPhase(ctx, &stats, phase, &budget)
 		if phaseErr != nil {
@@ -466,6 +446,50 @@ func (s *Store) CleanupWithOptions(ctx context.Context, options CleanupOptions) 
 		}
 	}
 	return stats, nil
+}
+
+// cleanupPhases returns the retention statements in execution order. Every
+// statement must be able to reach its candidate rows through an index range
+// (asserted by TestCleanupStatementsUseIndexedPlans): a no-op pass then costs
+// a few index probes instead of a full table scan that could exceed the
+// per-transaction budget on large or slow hosts.
+func cleanupPhases(stats *CleanupStats, now time.Time, retention time.Duration) []cleanupPhase {
+	nowValue := now.Format(time.RFC3339Nano)
+	retryCutoff := now.Add(-outboxRetryWindow).Format(time.RFC3339Nano)
+	webhookRetryCutoff := now.Add(-webhookTriggerRetryWindow).Format(time.RFC3339Nano)
+	cutoff := now.Add(-retention).Format(time.RFC3339Nano)
+	return []cleanupPhase{
+		{name: "sessions", query: `DELETE FROM sessions WHERE rowid IN (SELECT rowid FROM sessions WHERE expires_at<=? ORDER BY expires_at,rowid LIMIT ?)`, args: []any{nowValue}, add: func(n int64) { stats.SessionsDeleted += n }},
+		{name: "auth_tokens", query: `DELETE FROM auth_tokens WHERE rowid IN (SELECT rowid FROM auth_tokens WHERE expires_at<=? ORDER BY expires_at,rowid LIMIT ?)`, args: []any{nowValue}, add: func(n int64) { stats.AuthTokensDeleted += n }},
+		// The legacy token-hash cleanup matches at most two rows, so it needs
+		// no ordering; auth_tokens_kind keeps the existence checks indexed.
+		{name: "meta", query: `DELETE FROM meta WHERE rowid IN (SELECT rowid FROM meta WHERE (key='setup_token_hash' AND NOT EXISTS (SELECT 1 FROM auth_tokens WHERE kind='setup')) OR (key='reset_token_hash' AND NOT EXISTS (SELECT 1 FROM auth_tokens WHERE kind='reset')) LIMIT ?)`, args: nil, add: func(n int64) { stats.MetaDeleted += n }},
+		// Dead-lettering changes status, so a processed row no longer matches
+		// and a later batch or pass resumes without ordering. Ordering by
+		// first_attempt across two status values would force a temporary sort.
+		{name: "outbox_dead_letter", query: `UPDATE outbox SET status='dead',next_attempt=?,lease_until=NULL,lease_token='',last_error=CASE WHEN TRIM(last_error)='' THEN 'delivery retry window expired' ELSE last_error END WHERE rowid IN (SELECT rowid FROM outbox WHERE status IN ('pending','processing') AND first_attempt<=? AND (status='pending' OR lease_until IS NULL OR lease_until<=?) LIMIT ?)`, args: []any{nowValue, retryCutoff, nowValue}, add: func(n int64) { stats.OutboxDeadLettered += n }},
+		{name: "webhook_dead_letter", query: `UPDATE webhook_triggers SET status='dead',next_attempt_at=?,lease_until=NULL,lease_token='',last_error=CASE WHEN TRIM(last_error)='' THEN 'reconciliation retry window expired' ELSE last_error END WHERE rowid IN (SELECT rowid FROM webhook_triggers WHERE status IN ('pending','processing') AND received_at<=? AND (status='pending' OR lease_until IS NULL OR lease_until<=?) LIMIT ?)`, args: []any{nowValue, webhookRetryCutoff, nowValue}, add: func(n int64) { stats.WebhookDeadLettered += n }},
+		{name: "events", query: `DELETE FROM events WHERE rowid IN (SELECT rowid FROM events WHERE observed_at<? ORDER BY observed_at,rowid LIMIT ?)`, args: []any{cutoff}, add: func(n int64) { stats.EventsDeleted += n }},
+		// A batch and its events share one observed_at, so only batches older
+		// than the retention cutoff can have lost their events. Bounding the
+		// candidates by that cutoff turns the orphan check into an index range.
+		{name: "event_batches", query: `DELETE FROM event_batches WHERE rowid IN (SELECT b.rowid FROM event_batches b WHERE b.observed_at<? AND NOT EXISTS (SELECT 1 FROM events WHERE events.batch_id=b.id) ORDER BY b.observed_at,b.rowid LIMIT ?)`, args: []any{cutoff}, add: func(n int64) { stats.EventBatchesDeleted += n }},
+		// Trigger links are removed after their batch. Batch IDs are
+		// allocated in observation order, so links of expired batches sort
+		// below the first batch that is still inside the retention window;
+		// the NOT EXISTS guard keeps any out-of-order link that still has a
+		// batch. When no batch remains, every link is a candidate.
+		{name: "event_batch_triggers", query: `DELETE FROM event_batch_triggers WHERE rowid IN (SELECT t.rowid FROM event_batch_triggers t WHERE t.batch_id<COALESCE((SELECT b.id FROM event_batches b WHERE b.observed_at>=? ORDER BY b.observed_at,b.id LIMIT 1),9223372036854775807) AND NOT EXISTS (SELECT 1 FROM event_batches WHERE event_batches.id=t.batch_id) ORDER BY t.batch_id,t.trigger_id LIMIT ?)`, args: []any{cutoff}, add: func(n int64) { stats.EventBatchTriggersDeleted += n }},
+		// Ledger entries are intentionally absent from this list. They outlive
+		// event snapshots so the signed chain remains an audit trail.
+		// Only rows past the retention cutoff are candidates, so drive the
+		// search from the received_at index. The unary + keeps the planner from
+		// choosing the status index, which would visit every processed row
+		// inside the retention window and then sort.
+		{name: "webhook_triggers", query: `DELETE FROM webhook_triggers WHERE rowid IN (SELECT rowid FROM webhook_triggers WHERE received_at<? AND +status IN ('processed','dead') ORDER BY received_at,id LIMIT ?)`, args: []any{cutoff}, add: func(n int64) { stats.WebhookTriggersDeleted += n }},
+		{name: "delivered_outbox", query: `DELETE FROM outbox WHERE rowid IN (SELECT rowid FROM outbox WHERE status='delivered' AND delivered_at<? ORDER BY delivered_at,created_at,id LIMIT ?)`, args: []any{cutoff}, add: func(n int64) { stats.DeliveredOutboxDeleted += n }},
+		{name: "dead_outbox", query: `DELETE FROM outbox WHERE rowid IN (SELECT rowid FROM outbox WHERE status='dead' AND created_at<? ORDER BY created_at,rowid LIMIT ?)`, args: []any{cutoff}, add: func(n int64) { stats.DeadOutboxDeleted += n }},
+	}
 }
 
 type cleanupPhase struct {

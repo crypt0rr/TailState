@@ -45,11 +45,11 @@ func TestNewBoxAndDecryptRejectMalformedCiphertexts(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, malformed := range []string{"", "v2:value", "v1:not-base64", "v1:"} {
-		if _, err := box.Decrypt(malformed); err == nil {
+		if _, err := box.Open("", malformed); err == nil {
 			t.Fatalf("malformed ciphertext accepted: %q", malformed)
 		}
 	}
-	encrypted, err := box.Encrypt("secret")
+	encrypted, err := box.EncryptLegacy("secret")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -58,19 +58,19 @@ func TestNewBoxAndDecryptRejectMalformedCiphertexts(t *testing.T) {
 		replacement = 'B'
 	}
 	tampered := encrypted[:3] + string(replacement) + encrypted[4:]
-	if _, err := box.Decrypt(tampered); err == nil {
+	if _, err := box.Open("", tampered); err == nil {
 		t.Fatal("tampered ciphertext decrypted")
 	}
 }
 
 func TestBoxRejectsInvalidInternalKey(t *testing.T) {
 	box := &Box{key: make([]byte, 31)}
-	if _, err := box.Encrypt("secret"); err == nil {
-		t.Fatal("Encrypt accepted an invalid internal key")
+	if _, err := box.EncryptLegacy("secret"); err == nil {
+		t.Fatal("EncryptLegacy accepted an invalid internal key")
 	}
 	encoded := base64.RawURLEncoding.EncodeToString(make([]byte, 16))
-	if _, err := box.Decrypt(envelopeVersion + ":" + encoded); err == nil {
-		t.Fatal("Decrypt accepted an invalid internal key")
+	if _, err := box.Open("", envelopeVersion+":"+encoded); err == nil {
+		t.Fatal("Open accepted an invalid internal key")
 	}
 }
 
@@ -82,8 +82,8 @@ func TestRandomSourceFailuresAreReturned(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := box.Encrypt("secret"); err == nil {
-		t.Fatal("Encrypt hid a random source failure")
+	if _, err := box.EncryptLegacy("secret"); err == nil {
+		t.Fatal("EncryptLegacy hid a random source failure")
 	}
 	if _, err := PasswordHash("a secure password"); err == nil {
 		t.Fatal("PasswordHash hid a random source failure")

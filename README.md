@@ -70,7 +70,7 @@ After claiming the installation, the authenticated Settings page asks for:
 3. At least one notification destination using a Shoutrrr URL.
 4. Device and secondary inventory polling intervals.
 
-Add destinations on the authenticated Settings page, then save monitoring settings. Each destination is validated and can be tested independently. TailState then performs a Tailscale API check and builds a silent baseline. The status page shows baseline counts, collector capabilities, source health, and delivery state. Rotating the OAuth secret or changing poll intervals refreshes the monitor without discarding the existing baseline; changing the tailnet or OAuth client identity starts a new generation and dead-letters pending event notifications from the previous identity while preserving their history for audit. System and release notifications remain eligible for delivery.
+Add destinations on the authenticated Settings page, then save monitoring settings. Each destination is validated and can be tested independently. TailState then performs a Tailscale API check and builds a silent baseline. The status page shows baseline counts, collector capabilities, source health, and delivery state. Rotating the OAuth secret or changing poll intervals refreshes the monitor without discarding the existing baseline; changing the tailnet or OAuth client identity starts a new generation and dead-letters pending and in-flight event notifications from the previous identity (an in-flight sender can no longer complete or requeue them) while preserving their history for audit. System and release notifications remain eligible for delivery.
 
 The authenticated **History** page keeps a 30-day, searchable ledger of semantic inventory changes. Each poll is grouped into a batch with the affected collector, resource, previous/current normalized snapshots, field-level differences, and the delivery state for every destination. Use it to investigate a notification without exposing credentials or volatile API fields. The page shows the fingerprint of the Ed25519 key used to sign evidence exports.
 
@@ -127,9 +127,9 @@ plan-unsupported collectors remain informational.
 
 ## Security and persistence
 
-Compose creates the Docker-managed `tailstate-data` volume and stores `/data/tailstate.db` there. Snapshots, events, baseline state, sessions, and the delivery outbox survive container replacement.
+Compose creates the Docker-managed `tailstate-data` volume and stores `/data/tailstate.db` there. Snapshots, events, baseline state, sessions, and the delivery outbox survive container replacement. The image creates `/data` as `0700`, the process runs with a `077` umask, and the database and its `-wal`/`-shm` sidecars are kept at `0600` (including sidecars left by an unclean shutdown). An existing host directory is not re-permissioned; restrict a bind-mounted data directory to the service user yourself.
 
-OAuth secrets, the Tailscale webhook secret, every Shoutrrr destination URL, and the evidence-ledger private key are encrypted with AES-256-GCM using `secrets/tailstate_master_key`. Destination credentials and upstream provider response bodies are never echoed into HTML, logs, persisted delivery errors, or the history ledger; delivery history keeps only bounded, provider-independent status reasons. Normalized history snapshots are retained for 30 days, exclude volatile fields, and replace known secret values with one-way fingerprints so presence and rotation remain auditable without exposing the value. OAuth access tokens exist only in memory. Back up the master key separately: TailState intentionally refuses to start if the key is missing or incorrect, and encrypted settings and signed history cannot be recovered without it.
+OAuth secrets, the Tailscale webhook secret, every Shoutrrr destination URL, and the evidence-ledger private key are encrypted with AES-256-GCM using `secrets/tailstate_master_key`, each bound to its storage location. Destination credentials and upstream provider response bodies are never echoed into HTML, logs, persisted delivery errors, or the history ledger; delivery history keeps only bounded, provider-independent status reasons. Normalized history snapshots are retained for 30 days, exclude volatile fields, and replace known secret values with one-way fingerprints so presence and rotation remain auditable without exposing the value. OAuth access tokens exist only in memory. Back up the master key separately: TailState intentionally refuses to start if the key is missing or incorrect, and encrypted settings and signed history cannot be recovered without it.
 
 The image is scratch-based, runs as UID/GID `10001`, uses a read-only root filesystem, drops every Linux capability, and publishes the UI only on `127.0.0.1` by default. Compose also caps the process count, rotates container logs (3 × 10 MiB), and allows a 30-second stop grace period so an in-flight notification can finish its durable bookkeeping instead of being resent after a restart. The optional Caddy proxy in `compose.remote.yaml` runs with only `NET_BIND_SERVICE`, `no-new-privileges`, a memory limit, a healthcheck against its loopback admin API, and HTTP/3 (`443/udp`). Keep that publish address when using a reverse proxy; let the proxy terminate TLS and expose the public listener:
 
@@ -261,6 +261,15 @@ the evidence signing identity. If it fails, the old key remains valid; do not
 replace the configured key file until the command reports success. Keep the old
 key and a verified database backup until the new deployment has been checked.
 
+Each encrypted value is bound to the row and column that stores it (AES-GCM
+additional data), so a ciphertext copied to another row or column fails to
+decrypt instead of, for example, redirecting one destination to another's URL.
+Values written by releases before this binding use the older unbound format;
+they stay readable, and are rewritten in the bound format when changed or when
+`admin rekey` runs. Rekey also accepts the current key file
+(`-new-key-file` pointing at the configured key) to upgrade every value without
+rotating the key.
+
 ### Backup
 
 Use the repository helper to stop TailState, archive the exact data volume, and
@@ -319,12 +328,12 @@ in a disposable project before relying on the procedure for an outage.
 - One device change is reported once. A device's appearance and removal are `devices` events only (its `device_details` snapshot is created and deleted silently); routes and client/OS versions are reported by `devices`, so `device_details` does not fetch the routes endpoint and ignores the `node:os`, `node:osVersion`, and `node:tsVersion` posture attributes. Snapshots stored by older releases are re-normalized before diffing, so upgrading does not report drift.
 - Failed or partial polls never delete snapshots.
 - Single-object endpoints (tailnet settings, contacts, policy, each DNS sub-endpoint, and log-streaming configuration and status) must return a JSON object. A `null`, empty, array, or scalar body is treated as an invalid upstream response: the collector fails, no events are recorded, and the last snapshot is kept.
-- Multiple changes in one poll become one digest, fanned out into one durable outbox item per enabled destination.
+- Multiple changes in one poll become one digest, fanned out into one durable outbox item per enabled destination. Each digest is fitted to the receiving service's message limit (for example 4,096 bytes for Telegram, Lark, WeCom, and ntfy, 1,024 for Pushover, and 10,000 for Zulip) by dropping whole lines from the end and adding an explicit "lines omitted, see History" note. A provider that still rejects a message as too large (or with HTTP 413) dead-letters it immediately instead of retrying for 24 hours.
 - Every change batch is also recorded in the authenticated History page with field-level diffs and redacted normalized before/after snapshots. Filters support collector, change type, and resource name or ID; history is retained for 30 days. Normalized snapshots are capped at 1 MiB and each event before/after value at 512 KiB. Larger values retain their SHA-256, original byte count, configured limit, and a bounded truncation marker instead of the provider body; the authenticated UI calls this out explicitly. A normal history page reads at most 2 MiB of stored event data and displays a truncation notice with a cursor when that budget is reached. The hard 4 MiB raw-write ceiling prevents an unusually large normalized value from entering SQLite unbounded; the small marker remains queryable for audit.
 - The History page can download a filtered, redacted JSON evidence pack for incident reports and offline review. Packs include normalized snapshots, field diffs, destination delivery outcomes, a SHA-256 content hash, and an Ed25519 signature over a hash-linked event ledger; exports are limited to 100 batches, 2,000 events, and 5 MiB. A changed export fails verification.
 - Verify an export offline with `tailstate evidence verify --file tailstate-drift-evidence.json`. Verification checks the content hash, embedded public key fingerprint, signature, and included ledger links; packs and public-key files are bounded before decoding (5 MiB and 4 KiB respectively). For independent trust, print the instance public key with `tailstate evidence public-key`, save it as a base64 file, and pass it with `--public-key public.key`.
 - Audit the persisted evidence ledger explicitly with `tailstate evidence audit`. The command opens the existing database read-only, verifies sequence continuity, predecessor hashes, signatures, key IDs, stored head, and canonical payload digests, then resumes through bounded pages until the chain is complete. Pass `--public-key public.key` to anchor verification to an independently trusted Ed25519 key; entries whose event snapshots have aged out are reported as cryptographically verified but payload-unverifiable. The audit never creates a database, runs migrations, generates keys, or changes metadata, and can run while TailState is serving from SQLite WAL mode.
-- Shoutrrr deliveries retry independently for up to 24 hours across restarts, then remain visible as dead letters until the 30-day operational retention window expires. Delivery is at-least-once: each outbox row is leased while a sender is in flight, and if the process stops after a provider accepts a message but before the durable bookkeeping update commits, that message may be sent again after the lease expires. Per-lease fencing prevents a stale worker from changing a newer retry attempt. Disabling or removing a destination dead-letters its pending or in-flight items; newly added destinations receive only future notifications.
+- Shoutrrr deliveries retry independently for up to 24 hours across restarts, then remain visible as dead letters until the 30-day operational retention window expires. Delivery is at-least-once: each outbox row is leased while a sender is in flight, and if the process stops after a provider accepts a message but before the durable bookkeeping update commits, that message may be sent again after the lease expires. Per-lease fencing prevents a stale worker from changing a newer retry attempt. Disabling or removing a destination dead-letters its pending or in-flight items; newly added destinations receive only future notifications. Removing a destination also erases its encrypted URL (and overwrites the freed database space), so a leaked webhook credential is not carried into later backups; History keeps the destination name for past deliveries.
 - Tailscale API requests retry network errors, `429`, and the transient gateway statuses `502`, `503`, and `504` with exponential backoff; a transient OAuth token-endpoint failure (network error, `429`, or `5xx`) is retried the same way instead of failing every request that needs a token. Retries honor `Retry-After` while capping a provider delay at five minutes and the complete retry window for one request at 30 seconds; a gateway retry that would not fit in that window reports the upstream status immediately. Cursor pagination keeps the original query parameters (for example `fields=all`) on every page. Collectors also have a two-minute poll deadline, so a throttled endpoint cannot stall the scheduler indefinitely.
 - Each paginated collection is bounded to 10,000 items and 64 MiB of response data across all pages, in addition to the 16 MiB per-response cap. If an aggregate limit is exceeded, the collector fails without applying partial inventory or deleting the last known snapshots. Device-detail requests share a bounded eight-worker queue so a large device list cannot create one job and result buffer per device. If the two-minute device-detail deadline expires, the poll is reported as partial with the number of devices left unrefreshed, their previous snapshots are kept, and the next poll starts with the stalest devices so every device is eventually refreshed.
 - If every destination is disabled, monitoring continues and notifications are reported as paused.
@@ -413,6 +422,14 @@ to 24 hours and removes dead-letter rows after
 the normal 30-day retention period. Legacy token hashes remain only as a
 rollback aid and are removed by cleanup once their active token record expires.
 
+Schema v13 erases the encrypted service URL of notification destinations that
+were removed before this release; removed destinations keep their name for
+History. It also drops two redundant indexes (`events_observed_at` and
+`evidence_ledger_batch_id`, which duplicate `events_retention` and the ledger's
+unique batch constraint) and adds `outbox_dead_retention` and
+`auth_tokens_kind`, so every retention statement reaches its rows through an
+index search and a pass with nothing to delete stays cheap on large databases.
+
 ## Runtime configuration
 
 Only bootstrap settings use environment variables; application credentials and
@@ -499,11 +516,24 @@ are documented in [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Releases
 
-Pushing a semantic tag such as `v1.0.0` starts the verified release promotion workflow. The exact tagged commit must pass the reusable CI gate, including tests, coverage, Staticcheck, Govulncheck, an Anchore high-severity scan, runtime healthchecks, backup/restore validation, and a multi-architecture build. Release promotion first pushes one immutable candidate manifest, scans and smoke-tests both platform images by digest, and only then creates an annotated stable manifest copy whose platform digests match the candidate. The version, minor, and stable-only `latest` tags point to that verified copy; the temporary candidate package version is removed after the aliases are verified. The workflow publishes signed-build metadata, an SBOM, and `linux/amd64` plus `linux/arm64` images to:
+Pushing a semantic tag such as `v1.0.0` starts the verified release promotion workflow. The exact tagged commit must pass the reusable CI gate, including tests, coverage, Staticcheck, Govulncheck, an Anchore high-severity scan, runtime healthchecks, backup/restore validation, and a multi-architecture build. Release promotion first pushes one immutable candidate manifest, scans and smoke-tests both platform images by digest, and only then creates an annotated stable manifest copy whose platform digests match the candidate. The version, minor, and stable-only `latest` tags point to that verified copy; the temporary candidate package version is removed after the aliases are verified. The workflow publishes a Sigstore-signed build-provenance attestation, an SBOM, and `linux/amd64` plus `linux/arm64` images to:
 
 ```text
 ghcr.io/crypt0rr/tailstate
 ```
+
+Verify that an image was built by this repository's release workflow before
+deploying it:
+
+```console
+gh attestation verify oci://ghcr.io/crypt0rr/tailstate:<version> \
+  --owner crypt0rr \
+  --signer-workflow crypt0rr/TailState/.github/workflows/release.yml
+```
+
+The attestation covers the promoted multi-architecture index digest that the
+version, minor, and `latest` tags resolve to, so the same check works for a
+pinned digest (`oci://ghcr.io/crypt0rr/tailstate@sha256:...`).
 
 The workflow also creates the matching GitHub Release with generated notes. Use the immutable version tag or image digest in deployments; reserve `latest` for development convenience. For a rollback, set `TAILSTATE_IMAGE` to a previously verified digest and keep the matching `secrets/tailstate_master_key` backup available:
 

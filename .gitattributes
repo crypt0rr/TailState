@@ -1,0 +1,3 @@
+# The invariant manifest is an append-only list of test names; union merges
+# keep both sides when parallel branches add entries.
+.github/invariant-tests.txt merge=union

@@ -115,6 +115,7 @@ func TestVersionedMigrationsReportSchemaWriteErrors(t *testing.T) {
 		{version: 8, call: migrateSchemaV8ToV9, trigger: "fail_partial_error_count_schema_version", want: "record partial error count migration"},
 		{version: 9, call: migrateSchemaV9ToV10, trigger: "fail_webhook_lease_fencing_schema_version", want: "record webhook lease fencing migration"},
 		{version: 10, call: migrateSchemaV10ToV11, trigger: "fail_outbox_lease_fencing_schema_version", want: "record outbox lease fencing migration"},
+		{version: 12, call: migrateSchemaV12ToV13, trigger: "fail_persistence_hardening_schema_version", want: "record persistence hardening migration"},
 	}
 	for _, tt := range tests {
 		t.Run("version "+strconv.Itoa(tt.version), func(t *testing.T) {

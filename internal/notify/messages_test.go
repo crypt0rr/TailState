@@ -38,8 +38,8 @@ func TestDigestBoundsLargePayload(t *testing.T) {
 	if len(message) > 12000 {
 		t.Fatalf("digest exceeded size limit: %d", len(message))
 	}
-	if !strings.Contains(message, "Additional changes omitted") && !strings.HasSuffix(message, "…") {
-		t.Fatal("large digest did not report omitted changes or truncate")
+	if !strings.Contains(message, "more change(s) omitted; total: 500") {
+		t.Fatal("large digest did not report omitted changes")
 	}
 }
 

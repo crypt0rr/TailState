@@ -122,11 +122,6 @@
           <input type="hidden" name="id" value="{{.ID}}">
           <button type="submit" aria-label="Send test to {{.Name}}">Send test</button>
         </form>
-        <form method="post" action="/settings/destinations/delete">
-          <input type="hidden" name="_csrf" value="{{$.CSRF}}">
-          <input type="hidden" name="id" value="{{.ID}}">
-          <button class="button-danger" type="submit" aria-label="Remove {{.Name}}">Remove</button>
-        </form>
       </div>
       <details class="destination-edit">
         <summary>Edit destination<span class="visually-hidden"> {{.Name}}</span></summary>
@@ -180,6 +175,20 @@
           </fieldset>
           <button type="submit" aria-label="Save changes to {{.Name}}">Save changes</button>
         </form>
+      </details>
+      <details class="destination-remove">
+        <summary>Remove<span class="visually-hidden"> {{.Name}}</span></summary>
+        <div class="confirm-panel" role="group" aria-labelledby="remove-heading-{{.ID}}">
+          <p id="remove-heading-{{.ID}}"><strong>Remove {{.Name}}?</strong>
+            {{if .Pending}}{{.Pending}} pending notification{{if ne .Pending 1}}s{{end}} for this destination will be dead-lettered and not delivered.{{else}}No notifications are pending for this destination.{{end}}
+            Its encrypted URL is erased; History keeps its name for past deliveries. This cannot be undone.</p>
+          <form method="post" action="/settings/destinations/delete">
+            <input type="hidden" name="_csrf" value="{{$.CSRF}}">
+            <input type="hidden" name="id" value="{{.ID}}">
+            <input type="hidden" name="confirm" value="remove">
+            <button class="button-danger" type="submit" aria-label="Confirm removal of {{.Name}}">Remove {{.Name}}</button>
+          </form>
+        </div>
       </details>
     </article>
     {{- end}}

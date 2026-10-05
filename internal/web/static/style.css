@@ -231,8 +231,12 @@ code { overflow-wrap: anywhere; }
 .destination-actions { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 8px; margin-top: 16px; }
 .destination-actions form { margin: 0; }
 .destination-actions button { padding: 8px 12px; font-size: 14px; }
-.destination-edit { margin-top: 18px; border-top: 1px solid var(--border); padding-top: 14px; }
+.destination-edit, .destination-remove { margin-top: 18px; border-top: 1px solid var(--border); padding-top: 14px; }
 .destination-edit summary { cursor: pointer; color: var(--accent); font-weight: 700; }
+.destination-remove summary { cursor: pointer; color: var(--bad-text); font-weight: 700; }
+.confirm-panel { margin-top: 12px; padding: 14px; border: 1px solid var(--bad-border); border-radius: 8px; background: var(--bad-bg); }
+.confirm-panel p { margin-top: 0; color: var(--text); }
+.confirm-panel form { margin: 0; }
 .destination-edit form { margin-top: 16px; }
 .destination-edit label { margin-bottom: 12px; }
 .add-destination { margin-top: 30px; padding-top: 26px; border-top: 1px solid var(--border); }

@@ -32,7 +32,7 @@ func TestDestinationRoutingIsEditableWithCSRF(t *testing.T) {
 		"min_severity": {"high"}, "include_collectors": {"policy, keys"}, "exclude_collectors": {""}, "change_kinds": {"created", "changed"},
 	}
 	forged := coveragePost(t, server, "/settings/destinations", form, cookies)
-	if forged.Code != http.StatusUnauthorized {
+	if forged.Code != http.StatusForbidden {
 		t.Fatalf("routing change without CSRF status=%d", forged.Code)
 	}
 	form.Set("_csrf", csrf)
@@ -56,18 +56,18 @@ func TestDestinationRoutingIsEditableWithCSRF(t *testing.T) {
 	invalid := cloneForm(form)
 	invalid.Set("include_collectors", "policy, nonsense")
 	rejected := coveragePost(t, server, "/settings/destinations", invalid, cookies)
-	if rejected.Code != http.StatusOK || !strings.Contains(rejected.Body.String(), "Notification routing was not saved") {
-		t.Fatalf("unknown collector status=%d body=%s", rejected.Code, rejected.Body.String())
+	if body := followFlash(t, server, cookies, rejected); rejected.Code != http.StatusSeeOther || !strings.Contains(body, "Notification routing was not saved") {
+		t.Fatalf("unknown collector status=%d body=%s", rejected.Code, body)
 	}
 	invalid = cloneForm(form)
 	invalid.Set("exclude_collectors", "nonsense")
-	if rejected := coveragePost(t, server, "/settings/destinations", invalid, cookies); !strings.Contains(rejected.Body.String(), "Notification routing was not saved") {
-		t.Fatalf("unknown excluded collector accepted: %s", rejected.Body.String())
+	if rejected := followFlash(t, server, cookies, coveragePost(t, server, "/settings/destinations", invalid, cookies)); !strings.Contains(rejected, "Notification routing was not saved") {
+		t.Fatalf("unknown excluded collector accepted: %s", rejected)
 	}
 	invalid = cloneForm(form)
 	invalid.Set("min_severity", "critical")
-	if rejected := coveragePost(t, server, "/settings/destinations", invalid, cookies); !strings.Contains(rejected.Body.String(), "Notification routing was not saved") {
-		t.Fatalf("unknown severity accepted: %s", rejected.Body.String())
+	if rejected := followFlash(t, server, cookies, coveragePost(t, server, "/settings/destinations", invalid, cookies)); !strings.Contains(rejected, "Notification routing was not saved") {
+		t.Fatalf("unknown severity accepted: %s", rejected)
 	}
 
 	rename := url.Values{"_csrf": {csrf}, "action": {"save"}, "id": {fmt.Sprint(id)}, "name": {"Pager renamed"}, "enabled": {"on"}}

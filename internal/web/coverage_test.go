@@ -554,14 +554,14 @@ func TestSettingsAndDestinationMutationBranches(t *testing.T) {
 	}
 
 	testResponse := coveragePost(t, server, "/settings/destinations/test", url.Values{"_csrf": {csrf}, "id": {strconv.FormatInt(destinationID, 10)}, "service_url": {"not-a-shoutrrr-url"}}, cookies)
-	if testResponse.Code != http.StatusOK || !strings.Contains(testResponse.Body.String(), "Notification test failed") {
+	if testResponse.Code != http.StatusSeeOther || !strings.Contains(followFlash(t, server, cookies, testResponse), "Notification test failed") {
 		t.Fatalf("invalid destination test response %d: %s", testResponse.Code, testResponse.Body.String())
 	}
 	unknown := coveragePost(t, server, "/settings/destinations", url.Values{"_csrf": {csrf}, "action": {"unknown"}}, cookies)
 	if unknown.Code != http.StatusBadRequest || !strings.Contains(unknown.Body.String(), "unknown destination action") {
 		t.Fatalf("unknown destination action status=%d body=%s", unknown.Code, unknown.Body.String())
 	}
-	removed := coveragePost(t, server, "/settings/destinations/remove", url.Values{"_csrf": {csrf}, "id": {strconv.FormatInt(destinationID, 10)}}, cookies)
+	removed := coveragePost(t, server, "/settings/destinations/remove", url.Values{"_csrf": {csrf}, "id": {strconv.FormatInt(destinationID, 10)}, "confirm": {"remove"}}, cookies)
 	if removed.Code != http.StatusSeeOther {
 		t.Fatalf("remove destination status=%d body=%s", removed.Code, removed.Body.String())
 	}
@@ -608,18 +608,19 @@ func TestDestinationTestAndUnknownMutationErrors(t *testing.T) {
 	invalid := coveragePost(t, server, "/settings/destinations", url.Values{
 		"_csrf": {csrf}, "action": {"save"}, "name": {"Invalid"}, "service_url": {"not-a-shoutrrr-url"}, "enabled": {"on"},
 	}, cookies)
-	if invalid.Code != http.StatusOK || !strings.Contains(invalid.Body.String(), "Notification destination was not saved") {
+	if invalid.Code != http.StatusSeeOther || !strings.Contains(followFlash(t, server, cookies, invalid), "Notification destination was not saved") {
 		t.Fatalf("invalid destination save status=%d body=%s", invalid.Code, invalid.Body.String())
 	}
 	secretURL := "not-a-shoutrrr-url?token=notification-secret"
 	secretTest := coveragePost(t, server, "/settings/destinations/test", url.Values{
 		"_csrf": {csrf}, "service_url": {secretURL},
 	}, cookies)
-	if secretTest.Code != http.StatusOK || !strings.Contains(secretTest.Body.String(), "Notification test failed") {
+	secretPage := followFlash(t, server, cookies, secretTest)
+	if secretTest.Code != http.StatusSeeOther || !strings.Contains(secretPage, "Notification test failed") {
 		t.Fatalf("secret-bearing notification test status=%d body=%s", secretTest.Code, secretTest.Body.String())
 	}
-	if strings.Contains(secretTest.Body.String(), "notification-secret") {
-		t.Fatalf("destination credential leaked into notification test HTML: %s", secretTest.Body.String())
+	if strings.Contains(secretPage, "notification-secret") {
+		t.Fatalf("destination credential leaked into notification test HTML: %s", secretPage)
 	}
 
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -648,23 +649,24 @@ func TestDestinationTestAndUnknownMutationErrors(t *testing.T) {
 	defer failingNotification.Close()
 	failingURL := strings.Replace(failingNotification.URL, "http://", "generic://", 1) + "?disabletls=true"
 	failedTest := coveragePost(t, server, "/settings/destinations/test", url.Values{"_csrf": {csrf}, "id": {id}, "service_url": {failingURL}}, cookies)
-	if failedTest.Code != http.StatusOK || !strings.Contains(failedTest.Body.String(), "Notification test failed") {
+	failedPage := followFlash(t, server, cookies, failedTest)
+	if failedTest.Code != http.StatusSeeOther || !strings.Contains(failedPage, "Notification test failed") {
 		t.Fatalf("failed notification test status=%d body=%s", failedTest.Code, failedTest.Body.String())
 	}
-	if strings.Contains(failedTest.Body.String(), "UPSTREAM-NOTIFICATION-SECRET") {
-		t.Fatalf("provider response leaked into notification test HTML: %s", failedTest.Body.String())
+	if strings.Contains(failedPage, "UPSTREAM-NOTIFICATION-SECRET") {
+		t.Fatalf("provider response leaked into notification test HTML: %s", failedPage)
 	}
 
 	tested := coveragePost(t, server, "/settings/destinations/test", url.Values{"_csrf": {csrf}, "id": {id}}, cookies)
-	if tested.Code != http.StatusOK || !strings.Contains(tested.Body.String(), "Notification test sent") {
+	if tested.Code != http.StatusSeeOther || !strings.Contains(followFlash(t, server, cookies, tested), "Notification test sent") {
 		t.Fatalf("successful destination test status=%d body=%s", tested.Code, tested.Body.String())
 	}
 	unknownToggle := coveragePost(t, server, "/settings/destinations/toggle", url.Values{"_csrf": {csrf}, "id": {"999999"}, "enabled": {"true"}}, cookies)
-	if unknownToggle.Code != http.StatusBadRequest || !strings.Contains(unknownToggle.Body.String(), "Notification destination not found") {
+	if unknownToggle.Code != http.StatusSeeOther || !strings.Contains(followFlash(t, server, cookies, unknownToggle), "Notification destination not found") {
 		t.Fatalf("unknown destination toggle status=%d body=%s", unknownToggle.Code, unknownToggle.Body.String())
 	}
-	unknownDelete := coveragePost(t, server, "/settings/destinations/remove", url.Values{"_csrf": {csrf}, "id": {"999999"}}, cookies)
-	if unknownDelete.Code != http.StatusBadRequest || !strings.Contains(unknownDelete.Body.String(), "Notification destination not found") {
+	unknownDelete := coveragePost(t, server, "/settings/destinations/remove", url.Values{"_csrf": {csrf}, "id": {"999999"}, "confirm": {"remove"}}, cookies)
+	if unknownDelete.Code != http.StatusSeeOther || !strings.Contains(followFlash(t, server, cookies, unknownDelete), "Notification destination not found") {
 		t.Fatalf("unknown destination delete status=%d body=%s", unknownDelete.Code, unknownDelete.Body.String())
 	}
 }
@@ -672,7 +674,7 @@ func TestDestinationTestAndUnknownMutationErrors(t *testing.T) {
 func TestWebAuthenticationAndHelperErrorBranches(t *testing.T) {
 	server, st, _ := testServer(t)
 	unauthorized := coveragePost(t, server, "/logout", nil, nil)
-	if unauthorized.Code != http.StatusUnauthorized {
+	if unauthorized.Code != http.StatusSeeOther || unauthorized.Header().Get("Location") != "/login" {
 		t.Fatalf("unauthenticated logout status=%d body=%s", unauthorized.Code, unauthorized.Body.String())
 	}
 	if got := remoteIP(&http.Request{RemoteAddr: "198.51.100.7"}); got != "198.51.100.7" {
@@ -962,24 +964,24 @@ func TestWebCSRFAndFormBoundaryBranches(t *testing.T) {
 	server, _, db, cookies := webServerWithDatabase(t)
 	unauthSettings := httptest.NewRecorder()
 	server.Handler().ServeHTTP(unauthSettings, httptest.NewRequest(http.MethodGet, "/settings", nil))
-	if unauthSettings.Code != http.StatusSeeOther || unauthSettings.Header().Get("Location") != "/login" {
+	if unauthSettings.Code != http.StatusSeeOther || unauthSettings.Header().Get("Location") != "/login?next=%2Fsettings" {
 		t.Fatalf("unauthenticated settings status=%d location=%q", unauthSettings.Code, unauthSettings.Header().Get("Location"))
 	}
 	unauthSettingsPost := coveragePost(t, server, "/settings", url.Values{}, nil)
-	if unauthSettingsPost.Code != http.StatusUnauthorized {
-		t.Fatalf("unauthenticated settings POST status=%d body=%s", unauthSettingsPost.Code, unauthSettingsPost.Body.String())
+	if unauthSettingsPost.Code != http.StatusSeeOther || unauthSettingsPost.Header().Get("Location") != "/login?next=%2Fsettings" {
+		t.Fatalf("unauthenticated settings POST status=%d location=%q", unauthSettingsPost.Code, unauthSettingsPost.Header().Get("Location"))
 	}
 	unauthStatus := httptest.NewRecorder()
 	server.Handler().ServeHTTP(unauthStatus, httptest.NewRequest(http.MethodGet, "/status", nil))
-	if unauthStatus.Code != http.StatusSeeOther || unauthStatus.Header().Get("Location") != "/login" {
+	if unauthStatus.Code != http.StatusSeeOther || unauthStatus.Header().Get("Location") != "/login?next=%2Fstatus" {
 		t.Fatalf("unauthenticated status status=%d location=%q", unauthStatus.Code, unauthStatus.Header().Get("Location"))
 	}
 	unauthorized := coveragePost(t, server, "/settings/destinations", url.Values{}, nil)
-	if unauthorized.Code != http.StatusUnauthorized {
+	if unauthorized.Code != http.StatusSeeOther || unauthorized.Header().Get("Location") != "/login?next=%2Fsettings" {
 		t.Fatalf("unauthorized destination status=%d body=%s", unauthorized.Code, unauthorized.Body.String())
 	}
 	wrongCSRF := coveragePost(t, server, "/settings/destinations", url.Values{"_csrf": {"wrong"}}, cookies)
-	if wrongCSRF.Code != http.StatusUnauthorized {
+	if wrongCSRF.Code != http.StatusForbidden {
 		t.Fatalf("wrong csrf destination status=%d body=%s", wrongCSRF.Code, wrongCSRF.Body.String())
 	}
 	defaultSave := coveragePost(t, server, "/settings/destinations", url.Values{"_csrf": {coverageCSRF(t, cookies)}, "name": {"Default action"}, "service_url": {"generic://example.invalid/path"}, "enabled": {"on"}}, cookies)

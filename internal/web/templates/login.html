@@ -2,10 +2,13 @@
 {{define "content"}}
 <section class="card">
   <h1>Sign in</h1>
-  <p>Sign in to manage Tailscale monitoring.</p>
+  <p>{{if .Next}}Sign in to continue to the page you requested.{{else}}Sign in to manage Tailscale monitoring.{{end}}</p>
   {{if .Error}}<div class="error" role="alert">{{.Error}}</div>{{end}}
   <form method="post" action="/login">
     <input type="hidden" name="_challenge" value="{{.Challenge}}">
+    {{- if .Next}}
+    <input type="hidden" name="next" value="{{.Next}}">
+    {{- end}}
     <label for="login-password">Password
       <input id="login-password" type="password" name="password" autocomplete="current-password" required>
     </label>

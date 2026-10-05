@@ -91,6 +91,8 @@ const (
 type pageData struct {
 	Error, Message, CSRF, Challenge string
 	Version                         string
+	// Next is a validated same-site page to return to after login.
+	Next string
 	// Page names the template being rendered. The shared layout uses it to
 	// choose the navigation and mark the active link.
 	Page string
@@ -149,6 +151,9 @@ type destinationPage struct {
 	// Format is the saved override; EffectiveFormat is what is sent.
 	Format          string
 	EffectiveFormat string
+	// Pending counts the pending and in-flight notifications that removing
+	// the destination would dead-letter.
+	Pending int
 }
 
 // routingSummary describes a destination's rules in one line.
@@ -468,11 +473,15 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/setup", http.StatusSeeOther)
 		return
 	}
+	next, _ := safeReturnPath(r.URL.Query().Get("next"))
 	if s.authenticated(r, false) {
-		http.Redirect(w, r, "/status", http.StatusSeeOther)
+		if next == "" {
+			next = "/status"
+		}
+		http.Redirect(w, r, next, http.StatusSeeOther)
 		return
 	}
-	s.renderCredential(w, r, "login", credentialActionLogin, pageData{})
+	s.renderCredential(w, r, "login", credentialActionLogin, pageData{Next: next})
 }
 
 func (s *Server) adminExists(w http.ResponseWriter, r *http.Request) (bool, bool) {
@@ -495,8 +504,9 @@ func (s *Server) loginPost(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid form", http.StatusBadRequest)
 		return
 	}
+	next, _ := safeReturnPath(r.FormValue("next"))
 	if !s.validateCredentialChallenge(r, credentialActionLogin) {
-		s.renderCredential(w, r, "login", credentialActionLogin, pageData{Error: credentialChallengeError})
+		s.renderCredential(w, r, "login", credentialActionLogin, pageData{Error: credentialChallengeError, Next: next})
 		return
 	}
 	select {
@@ -509,7 +519,7 @@ func (s *Server) loginPost(w http.ResponseWriter, r *http.Request) {
 	if !s.store.Authenticate(r.Context(), r.FormValue("password")) {
 		s.recordFailure(credentialActionLogin, ip)
 		s.recordCredentialRejection(credentialActionLogin)
-		s.renderCredential(w, r, "login", credentialActionLogin, pageData{Error: "Invalid password."})
+		s.renderCredential(w, r, "login", credentialActionLogin, pageData{Error: "Invalid password.", Next: next})
 		return
 	}
 	s.clearFailures(ip)
@@ -517,12 +527,15 @@ func (s *Server) loginPost(w http.ResponseWriter, r *http.Request) {
 	if !s.startSession(w, r) {
 		return
 	}
-	http.Redirect(w, r, "/", http.StatusSeeOther)
+	if next == "" {
+		next = "/"
+	}
+	http.Redirect(w, r, next, http.StatusSeeOther)
 }
 
 func (s *Server) logout(w http.ResponseWriter, r *http.Request) {
 	if !s.authenticated(r, true) {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		s.rejectUnauthenticated(w, r, true)
 		return
 	}
 	if cookie, err := r.Cookie("tailstate_session"); err == nil {
@@ -913,6 +926,7 @@ func (s *Server) settings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	data := s.settingsData(r.Context(), csrf, configured, current, r)
+	s.applyFlash(w, r, &data)
 	s.render(w, "settings", data)
 }
 func (s *Server) settingsPost(w http.ResponseWriter, r *http.Request) {
@@ -1129,6 +1143,14 @@ func (s *Server) settingsData(ctx context.Context, csrf string, configured bool,
 	}
 	destinations, err := s.store.ListDestinations(ctx)
 	if err == nil {
+		pending := map[int64]int{}
+		if deliveries, deliveryErr := s.store.DestinationDeliveries(ctx); deliveryErr == nil {
+			for _, delivery := range deliveries {
+				pending[delivery.ID] = delivery.Pending + delivery.Processing
+			}
+		} else {
+			slog.Error("load destination delivery state", "error", deliveryErr)
+		}
 		data.Destinations = make([]destinationPage, 0, len(destinations))
 		for _, destination := range destinations {
 			kinds := map[string]bool{}
@@ -1144,6 +1166,7 @@ func (s *Server) settingsData(ctx context.Context, csrf string, configured bool,
 				RoutingSummary:    routingSummary(destination.Routing),
 				Format:            destination.Format,
 				EffectiveFormat:   notify.FormatFor(destination.ServiceURL, destination.Format),
+				Pending:           pending[destination.ID],
 			})
 		}
 		enabled := 0
@@ -1161,19 +1184,6 @@ func (s *Server) settingsData(ctx context.Context, csrf string, configured bool,
 		slog.Error("load mute rules", "error", err)
 	}
 	return data
-}
-
-func (s *Server) currentSettingsData(ctx context.Context, csrf string, requests ...*http.Request) pageData {
-	var request *http.Request
-	if len(requests) > 0 {
-		request = requests[0]
-	}
-	settings, err := s.store.Settings(ctx)
-	if err != nil {
-		settings = store.Settings{Tailnet: "-", DeviceInterval: time.Minute, InventoryInterval: 5 * time.Minute}
-		return s.settingsData(ctx, csrf, false, settings, request)
-	}
-	return s.settingsData(ctx, csrf, true, settings, request)
 }
 
 func (s *Server) diagnosticReport(ctx context.Context, request *http.Request) diagnostics.Report {
@@ -1210,9 +1220,12 @@ func (s *Server) diagnosticReport(ctx context.Context, request *http.Request) di
 	return diagnostics.Build(s.config, runtime, request)
 }
 
+// destinationPost handles every destination form. Each outcome, success or
+// failure, is reported with Post/Redirect/Get and a one-time flash message,
+// so reloading the resulting page never repeats a test notification, a
+// toggle, or a removal.
 func (s *Server) destinationPost(w http.ResponseWriter, r *http.Request) {
-	csrf, ok := s.requireAuth(w, r, true)
-	if !ok {
+	if _, ok := s.requireAuth(w, r, true); !ok {
 		return
 	}
 	if err := r.ParseForm(); err != nil {
@@ -1238,14 +1251,7 @@ func (s *Server) destinationPost(w http.ResponseWriter, r *http.Request) {
 	case "save":
 		serviceURL := strings.TrimSpace(r.FormValue("service_url"))
 		if serviceURL == "" && id > 0 {
-			if existing, err := s.store.ListDestinations(ctx); err == nil {
-				for _, destination := range existing {
-					if destination.ID == id {
-						serviceURL = destination.ServiceURL
-						break
-					}
-				}
-			}
+			serviceURL = s.storedDestinationURL(ctx, id)
 		}
 		enabled := r.FormValue("enabled") == "on" || r.FormValue("enabled") == "true"
 		// Forms that carry routing fields mark themselves with routing=1, so a
@@ -1259,9 +1265,7 @@ func (s *Server) destinationPost(w http.ResponseWriter, r *http.Request) {
 				format, err = notify.ValidateFormat(r.FormValue("message_format"))
 			}
 			if err != nil {
-				data := s.currentSettingsData(ctx, csrf, r)
-				data.Error = "Notification routing was not saved: " + err.Error() + "."
-				s.render(w, "settings", data)
+				s.redirectWithFlash(w, r, "/settings", flashKindError, "Notification routing was not saved: "+err.Error()+".")
 				return
 			}
 		}
@@ -1274,24 +1278,15 @@ func (s *Server) destinationPost(w http.ResponseWriter, r *http.Request) {
 		}
 		if err != nil {
 			slog.Error("save notification destination", "error", err)
-			data := s.currentSettingsData(ctx, csrf, r)
-			data.Error = destinationMutationMessage("save", err)
-			s.render(w, "settings", data)
+			s.redirectWithFlash(w, r, "/settings", flashKindError, destinationMutationMessage("save", err))
 			return
 		}
 		s.engine.Wake()
-		http.Redirect(w, r, "/settings", http.StatusSeeOther)
+		s.redirectWithFlash(w, r, "/settings", flashKindSuccess, "Notification destination saved.")
 	case "test":
 		serviceURL := strings.TrimSpace(r.FormValue("service_url"))
 		if serviceURL == "" && id > 0 {
-			if existing, err := s.store.ListDestinations(ctx); err == nil {
-				for _, destination := range existing {
-					if destination.ID == id {
-						serviceURL = destination.ServiceURL
-						break
-					}
-				}
-			}
+			serviceURL = s.storedDestinationURL(ctx, id)
 		}
 		// Render the test exactly as deliveries to this destination are
 		// rendered: by URL scheme, or by the saved or submitted override.
@@ -1308,15 +1303,13 @@ func (s *Server) destinationPost(w http.ResponseWriter, r *http.Request) {
 		}
 		testCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 		defer cancel()
-		data := s.currentSettingsData(ctx, csrf, r)
 		format := notify.FormatFor(serviceURL, override)
 		message := notify.FitMessageFor(notify.Render(s.notificationContext(ctx).Test(time.Now()), format), notify.MessageLimit(serviceURL), format)
 		if err := notify.New().Send(testCtx, serviceURL, message); err != nil {
-			data.Error = "Notification test failed: " + notify.SafeTestError(err, serviceURL)
-		} else {
-			data.Message = "Notification test sent."
+			s.redirectWithFlash(w, r, "/settings", flashKindError, "Notification test failed: "+notify.SafeTestError(err, serviceURL))
+			return
 		}
-		s.render(w, "settings", data)
+		s.redirectWithFlash(w, r, "/settings", flashKindSuccess, "Notification test sent.")
 	case "toggle":
 		enabled := r.FormValue("enabled") == "true" || r.FormValue("enabled") == "on"
 		if r.URL.Path == "/settings/destinations/enable" {
@@ -1326,29 +1319,44 @@ func (s *Server) destinationPost(w http.ResponseWriter, r *http.Request) {
 		}
 		if err := s.store.SetDestinationEnabled(ctx, id, enabled); err != nil {
 			slog.Error("update notification destination", "error", err)
-			http.Error(w, destinationMutationMessage("update", err), http.StatusBadRequest)
+			s.redirectWithFlash(w, r, "/settings", flashKindError, destinationMutationMessage("update", err))
 			return
 		}
 		s.engine.Wake()
-		http.Redirect(w, r, "/settings", http.StatusSeeOther)
+		message := "Notification destination enabled."
+		if !enabled {
+			message = "Notification destination disabled; its pending notifications were dead-lettered."
+		}
+		s.redirectWithFlash(w, r, "/settings", flashKindSuccess, message)
 	case "delete":
+		// Removal is irreversible (the encrypted URL is erased), so the form
+		// must carry the explicit confirmation from the confirmation step.
+		if r.FormValue("confirm") != "remove" {
+			s.redirectWithFlash(w, r, "/settings", flashKindError, "The destination was not removed. Open \"Remove\" and confirm the removal.")
+			return
+		}
+		name, pending := s.destinationPending(ctx, id)
 		if err := s.store.DeleteDestination(ctx, id); err != nil {
 			slog.Error("remove notification destination", "error", err)
-			http.Error(w, destinationMutationMessage("remove", err), http.StatusBadRequest)
+			s.redirectWithFlash(w, r, "/settings", flashKindError, destinationMutationMessage("remove", err))
 			return
 		}
 		s.engine.Wake()
-		http.Redirect(w, r, "/settings", http.StatusSeeOther)
+		noun := "notifications were"
+		if pending == 1 {
+			noun = "notification was"
+		}
+		s.redirectWithFlash(w, r, "/settings", flashKindSuccess, fmt.Sprintf("Removed %s; %d pending %s dead-lettered.", name, pending, noun))
 	default:
 		http.Error(w, "unknown destination action", http.StatusBadRequest)
 	}
 }
 
 // mutePost adds or removes a mute rule. Collector and field rules must name
-// a collector this release monitors.
+// a collector this release monitors. Like the destination forms, every
+// outcome is reported with Post/Redirect/Get and a one-time flash message.
 func (s *Server) mutePost(w http.ResponseWriter, r *http.Request) {
-	csrf, ok := s.requireAuth(w, r, true)
-	if !ok {
+	if _, ok := s.requireAuth(w, r, true); !ok {
 		return
 	}
 	ctx := r.Context()
@@ -1358,29 +1366,25 @@ func (s *Server) mutePost(w http.ResponseWriter, r *http.Request) {
 		if kind == store.MuteCollector || kind == store.MuteField {
 			collector, _, _ := strings.Cut(value, ".")
 			if _, err := splitCollectorList(collector); err != nil || collector == "" {
-				data := s.currentSettingsData(ctx, csrf, r)
-				data.Error = "Mute rule was not saved: unknown collector."
-				s.render(w, "settings", data)
+				s.redirectWithFlash(w, r, "/settings", flashKindError, "Mute rule was not saved: unknown collector.")
 				return
 			}
 		}
 		if _, err := s.store.AddMuteRule(ctx, kind, value); err != nil {
-			data := s.currentSettingsData(ctx, csrf, r)
-			data.Error = "Mute rule was not saved: " + muteRuleMessage(err) + "."
-			s.render(w, "settings", data)
+			s.redirectWithFlash(w, r, "/settings", flashKindError, "Mute rule was not saved: "+muteRuleMessage(err)+".")
 			return
 		}
+		s.redirectWithFlash(w, r, "/settings", flashKindSuccess, "Mute rule added.")
 	case "delete":
 		id, _ := strconv.ParseInt(r.FormValue("id"), 10, 64)
 		if err := s.store.DeleteMuteRule(ctx, id); err != nil {
-			http.Error(w, "Mute rule not found.", http.StatusBadRequest)
+			s.redirectWithFlash(w, r, "/settings", flashKindError, "Mute rule not found.")
 			return
 		}
+		s.redirectWithFlash(w, r, "/settings", flashKindSuccess, "Mute rule removed.")
 	default:
 		http.Error(w, "unknown mute rule action", http.StatusBadRequest)
-		return
 	}
-	http.Redirect(w, r, "/settings", http.StatusSeeOther)
 }
 
 // muteRuleMessage keeps validation messages and hides storage details.
@@ -1403,6 +1407,35 @@ func (s *Server) notificationContext(ctx context.Context) notify.Context {
 		messages.Tailnet = settings.Tailnet
 	}
 	return messages
+}
+
+// storedDestinationURL returns the saved URL of an active destination, or
+// "" when it cannot be read.
+func (s *Server) storedDestinationURL(ctx context.Context, id int64) string {
+	existing, err := s.store.ListDestinations(ctx)
+	if err != nil {
+		return ""
+	}
+	for _, destination := range existing {
+		if destination.ID == id {
+			return destination.ServiceURL
+		}
+	}
+	return ""
+}
+
+// destinationPending returns a destination's display name and the number of
+// pending or in-flight notifications that removing it would dead-letter.
+func (s *Server) destinationPending(ctx context.Context, id int64) (string, int) {
+	deliveries, err := s.store.DestinationDeliveries(ctx)
+	if err == nil {
+		for _, delivery := range deliveries {
+			if delivery.ID == id {
+				return delivery.Name, delivery.Pending + delivery.Processing
+			}
+		}
+	}
+	return "the destination", 0
 }
 
 func destinationMutationMessage(action string, err error) string {
@@ -1855,11 +1888,7 @@ func (s *Server) requireAuth(w http.ResponseWriter, r *http.Request, csrf bool) 
 		_ = r.ParseForm()
 	}
 	if !s.authenticated(r, csrf) {
-		if r.Method == http.MethodGet {
-			http.Redirect(w, r, "/login", http.StatusSeeOther)
-		} else {
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
-		}
+		s.rejectUnauthenticated(w, r, csrf)
 		return "", false
 	}
 	cookie, _ := r.Cookie("tailstate_csrf")

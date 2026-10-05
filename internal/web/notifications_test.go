@@ -51,8 +51,8 @@ func TestSettingsTestMessageNamesInstanceTailnetAndVersion(t *testing.T) {
 	defer upstream.Close()
 	serviceURL := strings.Replace(upstream.URL, "http://", "generic://", 1) + "?disabletls=true&template=json&messagekey=text"
 	response := coveragePost(t, server, "/settings/destinations/test", url.Values{"_csrf": {csrf}, "service_url": {serviceURL}}, cookies)
-	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "Notification test sent") {
-		t.Fatalf("test status=%d body=%s", response.Code, response.Body.String())
+	if result := followFlash(t, server, cookies, response); response.Code != http.StatusSeeOther || !strings.Contains(result, "Notification test sent") {
+		t.Fatalf("test status=%d body=%s", response.Code, result)
 	}
 	mu.Lock()
 	defer mu.Unlock()

@@ -52,12 +52,12 @@ func TestDestinationFormatOverrideIsEditableAndUsedForTests(t *testing.T) {
 	}
 	invalid := cloneForm(form)
 	invalid.Set("message_format", "html")
-	if rejected := coveragePost(t, server, "/settings/destinations", invalid, cookies); !strings.Contains(rejected.Body.String(), "Notification routing was not saved") {
-		t.Fatalf("unknown format accepted: %s", rejected.Body.String())
+	if rejected := followFlash(t, server, cookies, coveragePost(t, server, "/settings/destinations", invalid, cookies)); !strings.Contains(rejected, "Notification routing was not saved") {
+		t.Fatalf("unknown format accepted: %s", rejected)
 	}
 	tested := coveragePost(t, server, "/settings/destinations/test", url.Values{"_csrf": {csrf}, "id": {fmt.Sprint(id)}}, cookies)
-	if !strings.Contains(tested.Body.String(), "Notification test sent") {
-		t.Fatalf("test status=%d body=%s", tested.Code, tested.Body.String())
+	if result := followFlash(t, server, cookies, tested); tested.Code != http.StatusSeeOther || !strings.Contains(result, "Notification test sent") {
+		t.Fatalf("test status=%d body=%s", tested.Code, result)
 	}
 	mu.Lock()
 	plainBody := body
@@ -66,8 +66,8 @@ func TestDestinationFormatOverrideIsEditableAndUsedForTests(t *testing.T) {
 		t.Fatalf("test message was not rendered as plain text: %s", plainBody)
 	}
 	tested = coveragePost(t, server, "/settings/destinations/test", url.Values{"_csrf": {csrf}, "service_url": {serviceURL}, "message_format": {"markdown"}}, cookies)
-	if !strings.Contains(tested.Body.String(), "Notification test sent") {
-		t.Fatalf("markdown test body=%s", tested.Body.String())
+	if result := followFlash(t, server, cookies, tested); !strings.Contains(result, "Notification test sent") {
+		t.Fatalf("markdown test body=%s", result)
 	}
 	mu.Lock()
 	defer mu.Unlock()

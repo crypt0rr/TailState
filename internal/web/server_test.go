@@ -526,7 +526,7 @@ func TestHistoryRequiresAuthenticationAndShowsExplainableChanges(t *testing.T) {
 
 	unauthenticated := httptest.NewRecorder()
 	server.Handler().ServeHTTP(unauthenticated, httptest.NewRequest(http.MethodGet, "/history", nil))
-	if unauthenticated.Code != http.StatusSeeOther || unauthenticated.Header().Get("Location") != "/login" {
+	if unauthenticated.Code != http.StatusSeeOther || unauthenticated.Header().Get("Location") != "/login?next=%2Fhistory" {
 		t.Fatalf("history was not protected: status=%d location=%q", unauthenticated.Code, unauthenticated.Header().Get("Location"))
 	}
 	unauthenticatedExport := httptest.NewRecorder()

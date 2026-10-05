@@ -24,23 +24,24 @@ func TestMuteRulesAreManagedInSettingsWithCSRF(t *testing.T) {
 	ctx := context.Background()
 
 	add := url.Values{"action": {"add"}, "kind": {"field"}, "value": {"devices.clientVersion"}}
-	if forged := coveragePost(t, server, "/settings/mutes", add, cookies); forged.Code != http.StatusUnauthorized {
+	if forged := coveragePost(t, server, "/settings/mutes", add, cookies); forged.Code != http.StatusForbidden {
 		t.Fatalf("mute rule without CSRF status=%d", forged.Code)
 	}
 	add.Set("_csrf", csrf)
 	if saved := coveragePost(t, server, "/settings/mutes", add, cookies); saved.Code != http.StatusSeeOther {
 		t.Fatalf("mute rule save status=%d body=%s", saved.Code, saved.Body.String())
 	}
-	if duplicate := coveragePost(t, server, "/settings/mutes", add, cookies); !strings.Contains(duplicate.Body.String(), "an identical rule already exists") {
-		t.Fatalf("duplicate rule response: %s", duplicate.Body.String())
+	if duplicate := followFlash(t, server, cookies, coveragePost(t, server, "/settings/mutes", add, cookies)); !strings.Contains(duplicate, "an identical rule already exists") {
+		t.Fatalf("duplicate rule response: %s", duplicate)
 	}
 	for _, invalid := range []url.Values{
 		{"_csrf": {csrf}, "action": {"add"}, "kind": {"collector"}, "value": {"nonsense"}},
 		{"_csrf": {csrf}, "action": {"add"}, "kind": {"field"}, "value": {"nonsense.field"}},
 		{"_csrf": {csrf}, "action": {"add"}, "kind": {"tag"}, "value": {"ci"}},
 	} {
-		if response := coveragePost(t, server, "/settings/mutes", invalid, cookies); response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "Mute rule was not saved") {
-			t.Fatalf("invalid rule %v status=%d body=%s", invalid, response.Code, response.Body.String())
+		response := coveragePost(t, server, "/settings/mutes", invalid, cookies)
+		if body := followFlash(t, server, cookies, response); response.Code != http.StatusSeeOther || !strings.Contains(body, "Mute rule was not saved") {
+			t.Fatalf("invalid rule %v status=%d body=%s", invalid, response.Code, body)
 		}
 	}
 	page := authenticatedGet(t, server, "/settings", cookies).Body.String()
@@ -67,11 +68,13 @@ func TestMuteRulesAreManagedInSettingsWithCSRF(t *testing.T) {
 		t.Fatalf("rules=%+v err=%v", rules, err)
 	}
 	remove := url.Values{"_csrf": {csrf}, "action": {"delete"}, "id": {fmt.Sprint(rules[0].ID)}}
-	if removed := coveragePost(t, server, "/settings/mutes", remove, cookies); removed.Code != http.StatusSeeOther {
-		t.Fatalf("remove status=%d", removed.Code)
+	removed := coveragePost(t, server, "/settings/mutes", remove, cookies)
+	if body := followFlash(t, server, cookies, removed); removed.Code != http.StatusSeeOther || !strings.Contains(body, "Mute rule removed.") {
+		t.Fatalf("remove status=%d body=%s", removed.Code, body)
 	}
-	if missing := coveragePost(t, server, "/settings/mutes", remove, cookies); missing.Code != http.StatusBadRequest {
-		t.Fatalf("removing a missing rule status=%d", missing.Code)
+	missing := coveragePost(t, server, "/settings/mutes", remove, cookies)
+	if body := followFlash(t, server, cookies, missing); missing.Code != http.StatusSeeOther || !strings.Contains(body, "Mute rule not found.") || !strings.Contains(body, `role="alert"`) {
+		t.Fatalf("removing a missing rule status=%d body=%s", missing.Code, body)
 	}
 	if unknown := coveragePost(t, server, "/settings/mutes", url.Values{"_csrf": {csrf}, "action": {"rename"}}, cookies); unknown.Code != http.StatusBadRequest {
 		t.Fatalf("unknown action status=%d", unknown.Code)

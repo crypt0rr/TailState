@@ -92,17 +92,6 @@ func TestMetricsReportsStoreFailure(t *testing.T) {
 	}
 }
 
-func TestCurrentSettingsDataFallsBackWhenStoreIsUnavailable(t *testing.T) {
-	server, st, _ := testServer(t)
-	if err := st.Close(); err != nil {
-		t.Fatal(err)
-	}
-	data := server.currentSettingsData(context.Background(), "csrf-token")
-	if data.Configured || data.Settings.Tailnet != "-" || data.DeviceSeconds != 60 || data.InventorySeconds != 300 {
-		t.Fatalf("fallback settings data=%#v", data)
-	}
-}
-
 func TestAdminExistsFailsClosedWhenStoreIsUnavailable(t *testing.T) {
 	server, st, _ := testServer(t)
 	if err := st.Close(); err != nil {

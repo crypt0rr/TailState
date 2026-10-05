@@ -346,7 +346,7 @@ func TestDestinationButtonsHaveDistinctAccessibleNames(t *testing.T) {
 		}
 		names[name] = true
 	}
-	for _, want := range []string{"Disable Primary", "Enable Backup", "Send test to Primary", "Remove Backup"} {
+	for _, want := range []string{"Disable Primary", "Enable Backup", "Send test to Primary", "Confirm removal of Backup"} {
 		if !names[want] {
 			t.Fatalf("missing destination button name %q in %v", want, names)
 		}

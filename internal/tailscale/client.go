@@ -57,6 +57,13 @@ type Client struct {
 	deviceCache             []map[string]any
 	token                   string
 	expires                 time.Time
+	// detailMu guards the device-detail refresh order. detailAttempt records
+	// the poll sequence in which each device's detail requests last ran to
+	// completion so a deadline-limited poll starts with the stalest devices
+	// and every device is eventually refreshed.
+	detailMu      sync.Mutex
+	detailPoll    int64
+	detailAttempt map[string]int64
 }
 
 type HTTPError struct {
@@ -66,9 +73,10 @@ type HTTPError struct {
 }
 
 // PartialError reports a collector response that contained usable resources
-// but could not complete every related request. Count is the number of failed
-// related requests. Callers may apply the returned resources while preserving
-// existing snapshots for missing items.
+// but could not complete every related request. Count is the number of
+// resources missing from the response, including resources that were never
+// requested because a deadline expired. Callers may apply the returned
+// resources while preserving existing snapshots for missing items.
 type PartialError struct {
 	Err   error
 	Count int
@@ -196,7 +204,7 @@ func (c *Client) Collect(ctx context.Context, collector string) ([]model.Resourc
 	case "device_details":
 		return c.deviceDetails(ctx)
 	case "users":
-		return c.collection(ctx, c.tailnet("users"), "users", collector, "user", []string{"id", "userId", "userID", "loginName"})
+		return c.collection(ctx, c.tailnet("users?type=all"), "users", collector, "user", []string{"id", "userId", "userID", "loginName"})
 	case "user_invites":
 		return c.collection(ctx, c.tailnet("user-invites"), "userInvites", collector, "user_invite", []string{"id", "inviteId", "inviteID"})
 	case "keys":
@@ -269,6 +277,7 @@ func (c *Client) deviceDetailsFromDevices(ctx context.Context, devices []map[str
 		aggregateBytes += responseBytes
 		return nil
 	}
+	order := c.deviceDetailOrder(devices)
 	jobs := make(chan detailJob)
 	workers := min(deviceDetailWorkers, len(devices))
 	results := make(chan detailResult, max(1, workers))
@@ -285,11 +294,13 @@ func (c *Client) deviceDetailsFromDevices(ctx context.Context, devices []map[str
 				}
 				combined := map[string]any{}
 				var detailErr error
+				// Routes are not fetched here: devices?fields=all already returns
+				// advertisedRoutes and enabledRoutes, so a routes sub-request
+				// would only report every route change a second time.
 				for _, detail := range []struct {
 					key  string
 					path string
 				}{
-					{key: "routes", path: "routes"},
 					{key: "postureAttributes", path: "attributes"},
 					{key: "deviceInvites", path: "device-invites"},
 				} {
@@ -336,9 +347,9 @@ func (c *Client) deviceDetailsFromDevices(ctx context.Context, devices []map[str
 	}
 	go func() {
 		defer close(jobs)
-		for index, device := range devices {
+		for _, index := range order {
 			select {
-			case jobs <- detailJob{index: index, device: device}:
+			case jobs <- detailJob{index: index, device: devices[index]}:
 			case <-detailCtx.Done():
 				return
 			}
@@ -349,17 +360,22 @@ func (c *Client) deviceDetailsFromDevices(ctx context.Context, devices []map[str
 		close(results)
 	}()
 	ordered := make([]detailResult, 0, len(devices))
+	completed := make([]int, 0, len(devices))
 	var partialErr error
-	partialCount := 0
 	for result := range results {
 		if result.err != nil {
-			partialCount++
+			// A request cancelled by the poll deadline was not really attempted;
+			// leave it at the front of the next poll's refresh order.
+			if ctx.Err() == nil {
+				completed = append(completed, result.index)
+			}
 			if partialErr == nil {
 				partialErr = result.err
 			}
 			continue
 		}
 		if result.hasValue {
+			completed = append(completed, result.index)
 			ordered = append(ordered, result)
 		}
 	}
@@ -374,10 +390,60 @@ func (c *Client) deviceDetailsFromDevices(ctx context.Context, devices []map[str
 	for _, result := range ordered {
 		out = append(out, result.resource)
 	}
-	if partialErr != nil {
-		return out, &PartialError{Err: partialErr, Count: partialCount}
+	c.recordDeviceDetailAttempts(devices, completed)
+	// Count every device missing from the result, including devices that were
+	// never dispatched because the deadline expired. A deadline must never look
+	// like a complete response.
+	if missing := len(devices) - len(out); missing > 0 {
+		if partialErr == nil {
+			cause := ctx.Err()
+			if cause == nil {
+				cause = errors.New("device detail results were incomplete")
+			}
+			partialErr = fmt.Errorf("device_details refreshed %d of %d devices before the poll deadline: %w", len(out), len(devices), cause)
+		}
+		return out, &PartialError{Err: partialErr, Count: missing}
 	}
 	return out, nil
+}
+
+// deviceDetailOrder returns device indexes ordered stalest-first: devices
+// whose detail requests have never completed come first, then the ones that
+// completed longest ago. Ties keep the API list order. A poll that hits its
+// deadline therefore resumes with the devices it could not reach instead of
+// starving the same tail of the list on every poll.
+func (c *Client) deviceDetailOrder(devices []map[string]any) []int {
+	order := make([]int, len(devices))
+	attempts := make([]int64, len(devices))
+	c.detailMu.Lock()
+	for index, device := range devices {
+		order[index] = index
+		attempts[index] = c.detailAttempt[idFor(device, []string{"id", "nodeId", "nodeID"})]
+	}
+	c.detailMu.Unlock()
+	sort.SliceStable(order, func(i, j int) bool { return attempts[order[i]] < attempts[order[j]] })
+	return order
+}
+
+// recordDeviceDetailAttempts marks the supplied device indexes as refreshed
+// in a new poll sequence and forgets devices that are no longer listed.
+func (c *Client) recordDeviceDetailAttempts(devices []map[string]any, completed []int) {
+	c.detailMu.Lock()
+	defer c.detailMu.Unlock()
+	c.detailPoll++
+	next := make(map[string]int64, len(devices))
+	for _, device := range devices {
+		id := idFor(device, []string{"id", "nodeId", "nodeID"})
+		if previous, ok := c.detailAttempt[id]; ok && id != "" {
+			next[id] = previous
+		}
+	}
+	for _, index := range completed {
+		if id := idFor(devices[index], []string{"id", "nodeId", "nodeID"}); id != "" {
+			next[id] = c.detailPoll
+		}
+	}
+	c.detailAttempt = next
 }
 
 func (c *Client) cacheDeviceResources(resources []model.Resource) {
@@ -416,7 +482,7 @@ func (c *Client) dns(ctx context.Context) ([]model.Resource, error) {
 	data := map[string]any{}
 	supported := 0
 	for _, endpoint := range []string{"nameservers", "preferences", "searchpaths", "split-dns"} {
-		value, err := c.get(ctx, c.tailnet("dns/"+endpoint))
+		value, err := c.getObject(ctx, c.tailnet("dns/"+endpoint), "DNS "+endpoint)
 		if err != nil {
 			if IsUnsupported(err) {
 				data[endpoint] = map[string]any{"unsupported": true}
@@ -434,21 +500,15 @@ func (c *Client) dns(ctx context.Context) ([]model.Resource, error) {
 }
 
 func (c *Client) policy(ctx context.Context) ([]model.Resource, error) {
-	value, err := c.get(ctx, c.tailnet("acl"))
+	object, err := c.getObject(ctx, c.tailnet("acl"), "policy")
 	if err != nil {
 		return nil, err
 	}
 	sections := map[string]any{}
-	if object, ok := value.(map[string]any); ok {
-		for key, section := range object {
-			raw, _, _ := model.CanonicalForSection("policy", key, section)
-			sum := sha256.Sum256(raw)
-			sections[key] = hex.EncodeToString(sum[:])
-		}
-	} else {
-		raw, _, _ := model.Canonical(value)
+	for key, section := range object {
+		raw, _, _ := model.CanonicalForSection("policy", key, section)
 		sum := sha256.Sum256(raw)
-		sections["policy"] = hex.EncodeToString(sum[:])
+		sections[key] = hex.EncodeToString(sum[:])
 	}
 	return []model.Resource{{ID: "policy", Type: "policy", Name: "Tailnet policy", Collector: "policy", Data: sections}}, nil
 }
@@ -464,7 +524,7 @@ func (c *Client) logStreaming(ctx context.Context) ([]model.Resource, error) {
 	data := map[string]any{}
 	forbidden := 0
 	for _, kind := range []string{"configuration", "network"} {
-		stream, err := c.get(ctx, c.tailnet("logging/"+kind+"/stream"))
+		stream, err := c.getObject(ctx, c.tailnet("logging/"+kind+"/stream"), kind+" log stream")
 		if err != nil {
 			var httpErr *HTTPError
 			switch {
@@ -478,10 +538,8 @@ func (c *Client) logStreaming(ctx context.Context) ([]model.Resource, error) {
 			}
 			return nil, err
 		}
-		if _, ok := stream.(map[string]any); !ok {
-			return nil, fmt.Errorf("tailscale %s log stream response was not a JSON object", kind)
-		}
-		status, err := c.get(ctx, c.tailnet("logging/"+kind+"/stream/status"))
+		var status any
+		status, err = c.getObject(ctx, c.tailnet("logging/"+kind+"/stream/status"), kind+" log stream status")
 		if err != nil {
 			// The stream configuration was read successfully; a missing
 			// status or an unreachable logging backend must not discard it.
@@ -504,11 +562,28 @@ func (c *Client) logStreaming(ctx context.Context) ([]model.Resource, error) {
 const logStreamStatusUnavailable = model.HealthStatusUnavailable
 
 func (c *Client) single(ctx context.Context, endpoint, collector, typ, name string) ([]model.Resource, error) {
-	value, err := c.get(ctx, endpoint)
+	value, err := c.getObject(ctx, endpoint, collector)
 	if err != nil {
 		return nil, err
 	}
 	return []model.Resource{{ID: collector, Type: typ, Name: name, Collector: collector, Data: value}}, nil
+}
+
+// getObject fetches a single-object endpoint. Settings, contacts, policy, the
+// DNS sub-endpoints and log-streaming configuration are always JSON objects;
+// an empty body, null, an array or a scalar is an invalid upstream response.
+// Returning an error keeps the last snapshot instead of replacing a baseline
+// with a degenerate value (and reporting the flip back as drift later).
+func (c *Client) getObject(ctx context.Context, endpoint, name string) (map[string]any, error) {
+	value, err := c.get(ctx, endpoint)
+	if err != nil {
+		return nil, err
+	}
+	object, ok := value.(map[string]any)
+	if !ok || object == nil {
+		return nil, fmt.Errorf("tailscale %s response was not a JSON object", name)
+	}
+	return object, nil
 }
 
 func (c *Client) collection(ctx context.Context, endpoint, arrayKey, collector, typ string, ids []string) ([]model.Resource, error) {
@@ -602,9 +677,18 @@ func (c *Client) allPagesWithOptions(ctx context.Context, endpoint, arrayKey str
 			}
 			out = append(out, obj)
 		}
-		candidate := ""
+		candidate, cursor := "", ""
 		if objectOK {
-			candidate = nextURL(object)
+			candidate, cursor = nextPage(object)
+		}
+		if cursor != "" {
+			// A bare cursor continues the current request: keep its existing
+			// query parameters (fields=all, all=true, type=...) and only
+			// replace the cursor.
+			candidate, err = withCursor(next, cursor)
+			if err != nil {
+				return nil, err
+			}
 		}
 		if candidate == "" {
 			return out, nil
@@ -644,19 +728,34 @@ func (c *Client) resolvePaginationURL(current, candidate string) (string, error)
 	return pageURL.String(), nil
 }
 
-func nextURL(object map[string]any) string {
+// nextPage returns either an explicit next-page link or a bare pagination
+// cursor from a collection response.
+func nextPage(object map[string]any) (link, cursor string) {
 	if value, ok := object["next"].(string); ok {
-		return value
+		return value, ""
 	}
 	if p, ok := object["pagination"].(map[string]any); ok {
 		if value, ok := p["next"].(string); ok {
-			return value
+			return value, ""
 		}
 		if cursor, ok := p["nextCursor"].(string); ok && cursor != "" {
-			return "?cursor=" + url.QueryEscape(cursor)
+			return "", cursor
 		}
 	}
-	return ""
+	return "", ""
+}
+
+// withCursor merges a pagination cursor into the current page URL without
+// dropping its other query parameters.
+func withCursor(current, cursor string) (string, error) {
+	currentURL, err := url.Parse(current)
+	if err != nil {
+		return "", fmt.Errorf("invalid current pagination URL: %w", err)
+	}
+	query := currentURL.Query()
+	query.Set("cursor", cursor)
+	currentURL.RawQuery = query.Encode()
+	return currentURL.String(), nil
 }
 
 func (c *Client) get(ctx context.Context, endpoint string) (any, error) {
@@ -673,6 +772,12 @@ func (c *Client) getWithBytes(ctx context.Context, endpoint string) (any, int64,
 	for attempt := 0; attempt < 4; attempt++ {
 		token, err := c.accessToken(retryCtx)
 		if err != nil {
+			// A token-endpoint blip (network error, 429 or 5xx) must not fail
+			// every request that happens to need a fresh token. Retry it within
+			// the same per-request budget.
+			if delay, transient := transientTokenDelay(err, attempt); transient && attempt < 3 && waitWithinBudget(retryCtx, delay) {
+				continue
+			}
 			return nil, 0, err
 		}
 		req, err := http.NewRequestWithContext(retryCtx, http.MethodGet, endpoint, nil)
@@ -713,6 +818,15 @@ func (c *Client) getWithBytes(ctx context.Context, endpoint string) (any, int64,
 			}
 			continue
 		}
+		if transientGatewayStatus(resp.StatusCode) && attempt < 3 {
+			// Tailscale documents 502/503/504 as "try again later". Retry with
+			// backoff (or the provider's Retry-After) while the request budget
+			// allows; otherwise report the upstream status unchanged.
+			delay := retryAfter(resp.Header.Get("Retry-After"), time.Duration(1<<attempt)*time.Second)
+			if waitWithinBudget(retryCtx, delay) {
+				continue
+			}
+		}
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 			return nil, int64(len(body)), &HTTPError{Status: resp.StatusCode, URL: endpoint, Body: safeBody(body)}
 		}
@@ -726,6 +840,56 @@ func (c *Client) getWithBytes(ctx context.Context, endpoint string) (any, int64,
 		return value, int64(len(body)), nil
 	}
 	return nil, 0, errors.New("tailscale request retries exhausted")
+}
+
+// oauthStatusError reports a non-2xx token endpoint response.
+type oauthStatusError struct {
+	Status     int
+	RetryAfter string
+}
+
+func (e *oauthStatusError) Error() string {
+	return fmt.Sprintf("OAuth token request returned %d", e.Status)
+}
+
+// oauthTransportError reports a token request that failed before a response
+// was received.
+type oauthTransportError struct{ Err error }
+
+func (e *oauthTransportError) Error() string { return e.Err.Error() }
+func (e *oauthTransportError) Unwrap() error { return e.Err }
+
+func transientGatewayStatus(status int) bool {
+	return status == http.StatusBadGateway || status == http.StatusServiceUnavailable || status == http.StatusGatewayTimeout
+}
+
+// transientTokenDelay classifies token endpoint failures that are worth
+// retrying and returns the delay before the next attempt.
+func transientTokenDelay(err error, attempt int) (time.Duration, bool) {
+	fallback := time.Duration(1<<attempt) * time.Second
+	var statusErr *oauthStatusError
+	if errors.As(err, &statusErr) {
+		if statusErr.Status == http.StatusTooManyRequests || statusErr.Status >= 500 {
+			return retryAfter(statusErr.RetryAfter, fallback), true
+		}
+		return 0, false
+	}
+	var transportErr *oauthTransportError
+	if errors.As(err, &transportErr) && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+		return fallback, true
+	}
+	return 0, false
+}
+
+// waitWithinBudget sleeps before a retry only when the retry can still start
+// inside the request's deadline. It reports false without sleeping when the
+// delay would exhaust the budget, so the caller returns the upstream error
+// instead of a less useful context deadline error.
+func waitWithinBudget(ctx context.Context, delay time.Duration) bool {
+	if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) <= delay {
+		return false
+	}
+	return waitForRetry(ctx, delay)
 }
 
 func (c *Client) accessToken(ctx context.Context) (string, error) {
@@ -743,7 +907,7 @@ func (c *Client) accessToken(ctx context.Context) (string, error) {
 	req.SetBasicAuth(c.credentials.ClientID, c.credentials.ClientSecret)
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return "", err
+		return "", &oauthTransportError{Err: err}
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxOAuthResponseBytes+1))
@@ -754,7 +918,7 @@ func (c *Client) accessToken(ctx context.Context) (string, error) {
 		return "", fmt.Errorf("OAuth response exceeds %d bytes", maxOAuthResponseBytes)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return "", fmt.Errorf("OAuth token request returned %d", resp.StatusCode)
+		return "", &oauthStatusError{Status: resp.StatusCode, RetryAfter: resp.Header.Get("Retry-After")}
 	}
 	var payload struct {
 		AccessToken string `json:"access_token"`

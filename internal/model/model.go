@@ -84,7 +84,10 @@ var collectorFields = map[string]map[string]struct{}{
 	"users": fieldSet(
 		"id", "displayname", "loginname", "profilepicurl", "tailnetid", "created", "type", "role", "status",
 	),
-	"device_details": fieldSet("routes", "postureattributes", "deviceinvites"),
+	// Routes are reported by the devices collector (fields=all). Dropping the
+	// legacy "routes" key here also re-normalizes snapshots stored by older
+	// releases, so upgrading does not report the removal as drift.
+	"device_details": fieldSet("postureattributes", "deviceinvites"),
 	"posture":        fieldSet("provider", "cloudid", "clientid", "tenantid", "id", "configupdated", "status"),
 	"log_streaming":  fieldSet("configuration", "network"),
 }
@@ -116,6 +119,9 @@ func normalizeFor(collector string, value any, root, tenantKeys bool, path strin
 				continue
 			}
 			if collector == "device_details" && compact == "detail" {
+				continue
+			}
+			if collector == "device_details" && devicePostureDuplicate(path, compact) {
 				continue
 			}
 			if collector == "log_streaming" && root && legacyUnsupportedLogStream(child) {
@@ -175,6 +181,23 @@ func normalizeFor(collector string, value any, root, tenantKeys bool, path strin
 	default:
 		return value
 	}
+}
+
+// devicePostureDuplicates are built-in posture attributes that repeat the
+// devices collector's clientVersion and os fields. Reporting them again under
+// device_details would turn one client upgrade into two notifications.
+var devicePostureDuplicates = map[string]struct{}{
+	"node:tsversion": {},
+	"node:os":        {},
+	"node:osversion": {},
+}
+
+func devicePostureDuplicate(path, key string) bool {
+	if _, duplicate := devicePostureDuplicates[key]; !duplicate {
+		return false
+	}
+	section, _, _ := strings.Cut(path, ".")
+	return strings.EqualFold(section, "postureAttributes")
 }
 
 func tenantKeySection(collector, key string) bool {

@@ -37,7 +37,6 @@ const (
 	deliveryLeaseRenewalFraction    = 3
 	minDeliveryLeaseRenewalInterval = 100 * time.Millisecond
 	deliveryDurationBucketCount     = 9
-	cleanupContinuationInterval     = time.Second
 )
 
 var deliveryDurationBucketBounds = [deliveryDurationBucketCount]float64{0.1, 0.5, 1, 5, 15, 30, 60, 120, 300}
@@ -136,8 +135,12 @@ var (
 	schedulerWaitInterval      = 5 * time.Second
 	deliveryPollInterval       = 2 * time.Second
 	cleanupPollInterval        = time.Hour
-	collectorPollTimeout       = 2 * time.Minute
-	collectorRetryInterval     = 30 * time.Second
+	// cleanupContinuationInterval is used only when a successful bounded
+	// cleanup pass stopped with work remaining, and as the first retry after
+	// a cleanup error.
+	cleanupContinuationInterval = time.Second
+	collectorPollTimeout        = 2 * time.Minute
+	collectorRetryInterval      = 30 * time.Second
 )
 
 const maxTriggerOverflow = 1024
@@ -335,15 +338,21 @@ func (e *Engine) scheduler(ctx context.Context) {
 				initialSuccess := e.poll(ctx, client, settings, allCollectors(), false)
 				stop(deviceTimer)
 				stop(inventoryTimer)
-				deviceTimer = time.NewTimer(nextPollDelay(settings.DeviceInterval, initialSuccess))
-				inventoryTimer = time.NewTimer(nextPollDelay(settings.InventoryInterval, initialSuccess))
+				// The initial poll only covers collectors that are already due.
+				// Persisted per-collector deadlines (failure retries, unsupported
+				// confirmation) must survive a restart instead of being replaced by
+				// the full configured interval.
+				deviceTimer = time.NewTimer(e.pollTimerDelay(ctx, settings.Generation, tailscale.CoreCollectors, settings.DeviceInterval, initialSuccess))
+				inventoryTimer = time.NewTimer(e.pollTimerDelay(ctx, settings.Generation, tailscale.InventoryCollectors, settings.InventoryInterval, initialSuccess))
 			} else {
 				// Refreshing a credential or interval must not reset the baseline,
 				// but the old timers must not keep using the previous interval.
+				// Short persisted retry deadlines still apply, so an operator who
+				// fixes a broken secret gets the pending retry promptly.
 				stop(deviceTimer)
 				stop(inventoryTimer)
-				deviceTimer = time.NewTimer(jitter(settings.DeviceInterval))
-				inventoryTimer = time.NewTimer(jitter(settings.InventoryInterval))
+				deviceTimer = time.NewTimer(e.pollTimerDelay(ctx, settings.Generation, tailscale.CoreCollectors, settings.DeviceInterval, true))
+				inventoryTimer = time.NewTimer(e.pollTimerDelay(ctx, settings.Generation, tailscale.InventoryCollectors, settings.InventoryInterval, true))
 			}
 		}
 		if overflow := e.takeTriggerOverflow(); len(overflow) > 0 {
@@ -619,11 +628,48 @@ func (e *Engine) pollWithOutcomes(ctx context.Context, client *tailscale.Client,
 	if err := e.store.SetNextPollErr(ctx, settings.Generation, inventoryCollectors, time.Now().Add(settings.InventoryInterval)); err != nil {
 		slog.Error("schedule inventory collectors", "error", err)
 	}
-	if err := e.store.SetNextPollErr(ctx, settings.Generation, retryCollectors, time.Now().Add(collectorRetryInterval)); err != nil {
-		slog.Error("schedule collector retry", "error", err)
-	}
+	e.scheduleCollectorRetries(ctx, settings, retryCollectors)
 	outcome.success = success
 	return outcome
+}
+
+// scheduleCollectorRetries reschedules failed or partial collectors with an
+// exponential backoff based on their persisted consecutive failure count. The
+// delay starts at collectorRetryInterval and is capped at the collector's
+// configured interval, so a permanently broken endpoint (or one device whose
+// detail request keeps failing) settles back to the normal cadence instead of
+// repeating a full fan-out every 30 seconds.
+func (e *Engine) scheduleCollectorRetries(ctx context.Context, settings store.Settings, collectors []string) {
+	if len(collectors) == 0 {
+		return
+	}
+	failures, err := e.store.CollectorFailureCounts(ctx, settings.Generation, collectors)
+	if err != nil {
+		slog.Error("read collector failure counts", "error", err)
+	}
+	now := time.Now()
+	for _, collector := range collectors {
+		interval := settings.InventoryInterval
+		if collector == "devices" {
+			interval = settings.DeviceInterval
+		}
+		next := now.Add(collectorRetryDelay(failures[collector], interval))
+		if err := e.store.SetNextPollErr(ctx, settings.Generation, []string{collector}, next); err != nil {
+			slog.Error("schedule collector retry", "collector", collector, "error", err)
+		}
+	}
+}
+
+// collectorRetryDelay doubles collectorRetryInterval for each consecutive
+// failure after the first and caps the result at the configured interval. An
+// interval shorter than the base retry keeps the base retry.
+func collectorRetryDelay(failures int, interval time.Duration) time.Duration {
+	limit := max(interval, collectorRetryInterval)
+	delay := collectorRetryInterval
+	for attempt := 1; attempt < failures && delay < limit; attempt++ {
+		delay *= 2
+	}
+	return min(delay, limit)
 }
 
 func (e *Engine) processDurableTriggers(ctx context.Context, client *tailscale.Client, settings store.Settings) bool {
@@ -643,39 +689,22 @@ func (e *Engine) processDurableTriggers(ctx context.Context, client *tailscale.C
 	if len(triggers) == 0 {
 		return false
 	}
-	type triggerGroup struct {
-		claims     []store.WebhookTrigger
-		collectors []string
-	}
-	groups := make(map[string]*triggerGroup, len(triggers))
+	// Coalesce every trigger claimed in this pass into one poll of the union
+	// of their collectors, so overlapping webhook scopes poll each collector at
+	// most once. Outcomes stay per collector: each claim is completed or
+	// retried only on the collectors it requested.
+	var collectors []string
 	for _, trigger := range triggers {
-		collectors := normalizeCollectors(trigger.Collectors)
-		key := strings.Join(collectors, "\x00")
-		if len(collectors) == 0 {
-			key = "*"
+		scope := normalizeCollectors(trigger.Collectors)
+		if len(scope) == 0 {
+			collectors = allCollectors()
+			break
 		}
-		group := groups[key]
-		if group == nil {
-			group = &triggerGroup{collectors: collectors}
-			if key == "*" {
-				group.collectors = allCollectors()
-			}
-			groups[key] = group
-		}
-		group.claims = append(group.claims, trigger)
+		collectors = append(collectors, scope...)
 	}
-	keys := make([]string, 0, len(groups))
-	for key := range groups {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	for _, key := range keys {
-		group := groups[key]
-		triggerIDs := webhookTriggerIDs(group.claims)
-		outcome := e.pollWithOutcomes(ctx, client, settings, group.collectors, true, triggerIDs...)
-		for _, claim := range group.claims {
-			e.finishClaimedTriggers(ctx, []store.WebhookTrigger{claim}, outcome.succeeds(claim.Collectors), claim.Attempts)
-		}
+	outcome := e.pollWithOutcomes(ctx, client, settings, normalizeCollectors(collectors), true, webhookTriggerIDs(triggers)...)
+	for _, claim := range triggers {
+		e.finishClaimedTriggers(ctx, []store.WebhookTrigger{claim}, outcome.succeeds(claim.Collectors), claim.Attempts)
 	}
 	return true
 }
@@ -991,8 +1020,34 @@ func (e *Engine) recordCleanup(stats store.CleanupStats, err error) {
 	e.cleanupStats.deadOutboxDeleted.Add(uint64(max(stats.DeadOutboxDeleted, 0)))
 }
 
+// cleanupBackoff schedules retention passes. Genuine leftover work continues
+// after cleanupContinuationInterval; consecutive errors back off
+// exponentially from that interval up to cleanupPollInterval so a persistent
+// failure (corruption, a full disk, a storage limit) does not open a write
+// transaction and log an error every second forever. A successful pass
+// resets the backoff.
+type cleanupBackoff struct {
+	failures int
+}
+
+func (b *cleanupBackoff) next(remaining bool, err error) time.Duration {
+	if err != nil {
+		b.failures++
+		delay := cleanupContinuationInterval
+		for attempt := 1; attempt < b.failures && delay < cleanupPollInterval; attempt++ {
+			delay *= 2
+		}
+		return min(delay, cleanupPollInterval)
+	}
+	b.failures = 0
+	if remaining && cleanupPollInterval > cleanupContinuationInterval {
+		return cleanupContinuationInterval
+	}
+	return cleanupPollInterval
+}
+
 func (e *Engine) cleanup(ctx context.Context) {
-	run := func(initial bool) bool {
+	run := func(initial bool) (bool, error) {
 		stats, err := e.store.CleanupWithOptions(ctx, store.CleanupOptions{Retention: 30 * 24 * time.Hour})
 		e.recordCleanup(stats, err)
 		if err != nil {
@@ -1003,32 +1058,23 @@ func (e *Engine) cleanup(ctx context.Context) {
 					slog.Error("retention cleanup failed", "phase", stats.FailedPhase, "error", err)
 				}
 			}
-			// A transient lock or I/O error should be retried on the early
-			// continuation schedule instead of waiting a full hour.
-			return true
+			// A transient lock or I/O error is retried soon, with backoff for
+			// consecutive failures (see cleanupBackoff).
+			return stats.Remaining, err
 		}
 		slog.Info("retention cleanup completed", "duration_ms", stats.Duration.Milliseconds(), "transactions", stats.Transactions, "sessions_deleted", stats.SessionsDeleted, "auth_tokens_deleted", stats.AuthTokensDeleted, "meta_deleted", stats.MetaDeleted, "outbox_dead_lettered", stats.OutboxDeadLettered, "webhook_dead_lettered", stats.WebhookDeadLettered, "events_deleted", stats.EventsDeleted, "event_batches_deleted", stats.EventBatchesDeleted, "event_batch_triggers_deleted", stats.EventBatchTriggersDeleted, "webhook_triggers_deleted", stats.WebhookTriggersDeleted, "delivered_outbox_deleted", stats.DeliveredOutboxDeleted, "dead_outbox_deleted", stats.DeadOutboxDeleted, "remaining", stats.Remaining)
-		return stats.Remaining
+		return stats.Remaining, nil
 	}
 
-	remaining := run(true)
-	wait := cleanupPollInterval
-	if remaining && wait > cleanupContinuationInterval {
-		wait = cleanupContinuationInterval
-	}
-	timer := time.NewTimer(wait)
+	var backoff cleanupBackoff
+	timer := time.NewTimer(backoff.next(run(true)))
 	defer timer.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-timer.C:
-			remaining = run(false)
-			wait := cleanupPollInterval
-			if remaining && wait > cleanupContinuationInterval {
-				wait = cleanupContinuationInterval
-			}
-			timer.Reset(wait)
+			timer.Reset(backoff.next(run(false)))
 		}
 	}
 }

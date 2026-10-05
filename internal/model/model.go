@@ -67,6 +67,11 @@ var redactedFields = map[string]struct{}{
 	"tokenvalue":    {},
 	"password":      {},
 	"webhooksecret": {},
+	// Log-streaming destination credentials. The API documents
+	// s3SecretAccessKey as write-only but does not mark gcsCredentials that
+	// way; neither may ever be stored or diffed in clear text.
+	"gcscredentials":    {},
+	"s3secretaccesskey": {},
 }
 
 var collectorFields = map[string]map[string]struct{}{
@@ -111,6 +116,13 @@ func normalizeFor(collector string, value any, root, tenantKeys bool, path strin
 				continue
 			}
 			if collector == "device_details" && compact == "detail" {
+				continue
+			}
+			if collector == "log_streaming" && root && legacyUnsupportedLogStream(child) {
+				// Releases before v0.11.16 stored a 404 ("not configured")
+				// as {"unsupported": true}; read it as the current
+				// explicit state so upgrading does not report drift.
+				out[key] = map[string]any{"configured": false}
 				continue
 			}
 			if !tenantKeys {
@@ -244,10 +256,27 @@ func normalizeUserStatus(value any) any {
 	return value
 }
 
+func legacyUnsupportedLogStream(value any) bool {
+	stream, ok := value.(map[string]any)
+	if !ok || len(stream) != 1 {
+		return false
+	}
+	unsupported, ok := stream["unsupported"].(bool)
+	return ok && unsupported
+}
+
+// HealthStatusUnavailable records that a collector could read a resource's
+// configuration but not its health status (for example a log stream whose
+// logging backend is unreachable).
+const HealthStatusUnavailable = "unavailable"
+
 func normalizeHealthStatus(value any) any {
 	status, ok := value.(map[string]any)
 	if !ok {
 		return value
+	}
+	if state, ok := status["state"].(string); ok && state == HealthStatusUnavailable && len(status) == 1 {
+		return map[string]any{"state": HealthStatusUnavailable}
 	}
 	errorMessage, _ := status["error"].(string)
 	if errorMessage == "" {

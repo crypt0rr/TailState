@@ -14,6 +14,10 @@ services:
       TAILSTATE_TRUSTED_PROXIES: "172.30.0.2/32"
     networks:
       - tailstate-private
+      # The private proxy network is internal (no outbound route). TailState
+      # still needs egress to the Tailscale API and notification providers,
+      # so it also joins a normal bridge network that publishes no ports.
+      - tailstate-egress
 
   caddy:
     image: caddy:2.11-alpine@sha256:d44355d3c2149dc580ce2cac735955d1c08d3d00882c30489c241aa51a5c10d9
@@ -21,6 +25,27 @@ services:
     ports:
       - "80:80"
       - "443:443"
+      - "443:443/udp"
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 256m
+    pids_limit: 256
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      # Caddy's admin API listens on loopback inside the container only.
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:2019/config/"]
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy-data:/data
@@ -37,11 +62,15 @@ volumes:
   caddy-config:
 
 networks:
-  # Keep TailState off the public bridge. Caddy joins both networks so it can
-  # reach TailState and obtain/renew certificates from the ACME service.
+  # Caddy reaches TailState only over this internal network. Caddy also joins
+  # caddy-public for ACME certificate issuance and renewal.
   tailstate-private:
     internal: true
     ipam:
       config:
         - subnet: 172.30.0.0/24
   caddy-public:
+  # Outbound-only network for TailState. No service publishes ports on it, so
+  # it adds egress to the Tailscale API and Shoutrrr destinations without
+  # making the listener reachable from outside the host.
+  tailstate-egress:

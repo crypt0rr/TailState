@@ -9,11 +9,36 @@
   "customManagers": [
     {
       "customType": "regex",
-      "managerFilePatterns": ["/(^|\\/)scripts\\/backup-image\\.sh$/"],
+      "managerFilePatterns": [
+        "/(^|\\/)scripts\\/backup-image\\.sh$/"
+      ],
       "matchStrings": [
         "# renovate: datasource=(?<datasource>docker) depName=(?<depName>[^\\s]+)\\nbackup_image=\"\\$\\{TAILSTATE_BACKUP_IMAGE:-[^\":]+:(?<currentValue>[^@\"]+)(?:@(?<currentDigest>sha256:[a-f0-9]+))?\\}\""
       ],
       "versioningTemplate": "docker"
+    }
+  ],
+  "osvVulnerabilityAlerts": true,
+  "packageRules": [
+    {
+      "description": "Group digest-only refreshes of pinned images and actions into one weekly PR and merge it automatically once required CI checks pass.",
+      "matchUpdateTypes": [
+        "digest",
+        "pinDigest"
+      ],
+      "groupName": "pinned digests",
+      "schedule": [
+        "before 6am on monday"
+      ],
+      "automerge": true,
+      "automergeType": "pr"
+    },
+    {
+      "description": "Give new Go module releases time to be retracted before they are proposed.",
+      "matchManagers": [
+        "gomod"
+      ],
+      "minimumReleaseAge": "3 days"
     }
   ]
 }

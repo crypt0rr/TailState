@@ -7,6 +7,16 @@ services:
     # Keep authentication work and an unexpected upstream response bounded to
     # the container instead of allowing an OOM to affect the host.
     mem_limit: ${TAILSTATE_MEMORY_LIMIT:-512m}
+    pids_limit: 128
+    # An in-flight notification can take up to 15 s plus 5 s of durable
+    # bookkeeping; Docker's default 10 s grace would SIGKILL it and cause a
+    # duplicate alert once the delivery lease expires.
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     read_only: true
     environment:
       TAILSTATE_LISTEN_ADDR: 0.0.0.0:8080

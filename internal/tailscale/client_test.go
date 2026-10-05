@@ -287,8 +287,11 @@ func TestDeviceDetailsDoNotRefetchCoreDevice(t *testing.T) {
 		t.Fatalf("unexpected device details: %#v", resources)
 	}
 	data, ok := resources[0].Data.(map[string]any)
-	if !ok || data["routes"] == nil || data["postureAttributes"] == nil || data["deviceInvites"] == nil {
+	if !ok || data["postureAttributes"] == nil || data["deviceInvites"] == nil {
 		t.Fatalf("secondary details missing: %#v", resources[0].Data)
+	}
+	if _, duplicated := data["routes"]; duplicated {
+		t.Fatalf("routes already returned by devices?fields=all were fetched again: %#v", data)
 	}
 }
 
@@ -368,11 +371,9 @@ func TestDeviceDetailNotFoundIsPartialNotUnsupported(t *testing.T) {
 			_, _ = w.Write([]byte(`{"access_token":"access","expires_in":3600}`))
 		case "/api/v2/tailnet/-/devices":
 			_, _ = w.Write([]byte(`{"devices":[{"id":"missing","hostname":"missing"},{"id":"healthy","hostname":"healthy"}]}`))
-		case "/api/v2/device/missing/routes":
+		case "/api/v2/device/missing/attributes":
 			http.NotFound(w, r)
-		case "/api/v2/device/healthy/routes":
-			_, _ = w.Write([]byte(`{"enabledRoutes":[]}`))
-		case "/api/v2/device/missing/attributes", "/api/v2/device/missing/device-invites",
+		case "/api/v2/device/missing/device-invites",
 			"/api/v2/device/healthy/attributes", "/api/v2/device/healthy/device-invites":
 			_, _ = w.Write([]byte(`{}`))
 		default:
@@ -400,12 +401,8 @@ func TestDeviceDetailNotFoundIsPartialNotUnsupported(t *testing.T) {
 	if !ok {
 		t.Fatalf("unexpected resource data %#v", resources[0].Data)
 	}
-	routes, ok := data["routes"].(map[string]any)
-	if !ok {
-		t.Fatalf("unexpected routes data: %#v", data["routes"])
-	}
-	if _, unsupported := routes["unsupported"]; unsupported {
-		t.Fatalf("404 detail endpoint was marked unsupported: %#v", data)
+	if _, ok := data["postureAttributes"].(map[string]any); !ok {
+		t.Fatalf("unexpected posture data: %#v", data["postureAttributes"])
 	}
 }
 

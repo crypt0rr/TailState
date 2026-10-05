@@ -481,9 +481,12 @@ func TestOperationalStatusUsesStableHealthState(t *testing.T) {
 
 func TestDeviceDetailsExcludeDuplicatedCoreDevice(t *testing.T) {
 	value := map[string]any{
-		"detail":  map[string]any{"hostname": "server", "addresses": []any{"100.64.0.1"}},
-		"routes":  map[string]any{"enabledRoutes": []any{"10.0.0.0/24"}},
-		"invites": []any{},
+		"detail": map[string]any{"hostname": "server", "addresses": []any{"100.64.0.1"}},
+		"routes": map[string]any{"enabledRoutes": []any{"10.0.0.0/24"}},
+		"postureAttributes": map[string]any{"attributes": map[string]any{
+			"node:os": "linux", "node:osVersion": "6.1", "node:tsVersion": "1.80.0", "custom:tier": "prod",
+		}},
+		"deviceInvites": []any{},
 	}
 	raw, _, err := CanonicalFor("device_details", value)
 	if err != nil {
@@ -492,7 +495,10 @@ func TestDeviceDetailsExcludeDuplicatedCoreDevice(t *testing.T) {
 	if strings.Contains(string(raw), "detail") || strings.Contains(string(raw), "hostname") {
 		t.Fatalf("duplicated core device retained: %s", raw)
 	}
-	if !strings.Contains(string(raw), "enabledRoutes") {
+	if strings.Contains(string(raw), "enabledRoutes") || strings.Contains(string(raw), "node:") {
+		t.Fatalf("routes or OS/version posture attributes duplicated from devices were retained: %s", raw)
+	}
+	if !strings.Contains(string(raw), "custom:tier") || !strings.Contains(string(raw), "deviceInvites") {
 		t.Fatalf("secondary device details were removed: %s", raw)
 	}
 }

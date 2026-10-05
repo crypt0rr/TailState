@@ -20,8 +20,8 @@ func TestNormalizeAndHealthEdgeCases(t *testing.T) {
 	if _, ok := details["detail"]; ok {
 		t.Fatal("device detail duplicate was retained")
 	}
-	if _, ok := details["routes"]; !ok {
-		t.Fatal("device detail routes were removed")
+	if _, ok := details["routes"]; ok {
+		t.Fatal("legacy device detail routes duplicated from devices were retained")
 	}
 	posture := NormalizeFor("posture", map[string]any{"status": "unknown"}).(map[string]any)
 	if posture["status"] != "unknown" {
@@ -30,9 +30,9 @@ func TestNormalizeAndHealthEdgeCases(t *testing.T) {
 	if fingerprint, ok := redactedFingerprint(map[string]any{"redacted_sha256": strings.Repeat("AB", 32)}); !ok || fingerprint != strings.Repeat("ab", 32) {
 		t.Fatalf("valid fingerprint=%q ok=%v", fingerprint, ok)
 	}
-	nested := NormalizeFor("device_details", map[string]any{"routes": map[string]any{"detail": "duplicate", "enabled": true}}).(map[string]any)
-	if routes := nested["routes"].(map[string]any); routes["detail"] != nil {
-		t.Fatalf("nested device detail duplicate was retained: %#v", routes)
+	nested := NormalizeFor("device_details", map[string]any{"postureAttributes": map[string]any{"detail": "duplicate", "enabled": true}}).(map[string]any)
+	if posture := nested["postureAttributes"].(map[string]any); posture["detail"] != nil {
+		t.Fatalf("nested device detail duplicate was retained: %#v", posture)
 	}
 	for _, invalid := range []any{nil, map[string]any{}, map[string]any{"redacted_sha256": "short"}, map[string]any{"redacted_sha256": strings.Repeat("gg", 32)}, map[string]any{"redacted_sha256": strings.Repeat("aa", 32), "extra": true}} {
 		if got, ok := redactedFingerprint(invalid); ok || got != "" {

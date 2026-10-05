@@ -253,7 +253,7 @@ func TestPollSanitizesTailscaleProviderErrors(t *testing.T) {
 			return
 		}
 		if r.URL.Path == "/api/v2/tailnet/-/devices" {
-			w.WriteHeader(http.StatusBadGateway)
+			w.WriteHeader(http.StatusInternalServerError)
 			_, _ = w.Write([]byte("UPSTREAM-SECRET-RESPONSE"))
 			return
 		}
@@ -269,7 +269,7 @@ func TestPollSanitizesTailscaleProviderErrors(t *testing.T) {
 	if err := db.QueryRowContext(ctx, "SELECT last_error FROM collector_state WHERE generation=? AND collector='devices'", settings.Generation).Scan(&lastError); err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(lastError, "UPSTREAM-SECRET-RESPONSE") || lastError != "Tailscale request to /api/v2/tailnet/-/devices returned HTTP 502" {
+	if strings.Contains(lastError, "UPSTREAM-SECRET-RESPONSE") || lastError != "Tailscale request to /api/v2/tailnet/-/devices returned HTTP 500" {
 		t.Fatalf("collector error was not sanitized: %q", lastError)
 	}
 }
@@ -331,7 +331,7 @@ func TestPollPersistsUsablePartialErrorCount(t *testing.T) {
 		case strings.HasPrefix(r.URL.Path, "/api/v2/device/healthy/"):
 			_, _ = w.Write([]byte(`{}`))
 		case strings.HasPrefix(r.URL.Path, "/api/v2/device/broken/"):
-			w.WriteHeader(http.StatusBadGateway)
+			w.WriteHeader(http.StatusInternalServerError)
 			_, _ = w.Write([]byte("detail provider failure"))
 		default:
 			http.NotFound(w, r)
@@ -414,7 +414,7 @@ func TestDurableTriggersHaveIndependentCollectorOutcomes(t *testing.T) {
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"devices":[{"id":"device-1","hostname":"server"}]}`))
 		case "/api/v2/tailnet/-/users":
-			w.WriteHeader(http.StatusBadGateway)
+			w.WriteHeader(http.StatusInternalServerError)
 			_, _ = w.Write([]byte("user provider unavailable"))
 		default:
 			http.NotFound(w, r)
@@ -458,7 +458,7 @@ func TestPollOutcomesAreScopedToRequestedCollectors(t *testing.T) {
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"devices":[{"id":"device-1","hostname":"server"}]}`))
 		case "/api/v2/tailnet/-/users":
-			w.WriteHeader(http.StatusBadGateway)
+			w.WriteHeader(http.StatusInternalServerError)
 			_, _ = w.Write([]byte("user provider unavailable"))
 		default:
 			http.NotFound(w, r)

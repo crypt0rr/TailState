@@ -15,7 +15,17 @@ type coverageRoundTripper func(*http.Request) (*http.Response, error)
 
 func (f coverageRoundTripper) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
 
+// skipRetryWaits makes transient-status retries immediate for tests that
+// exercise exhausted retries rather than their timing.
+func skipRetryWaits(t *testing.T) {
+	t.Helper()
+	originalWait := waitForRetry
+	waitForRetry = func(ctx context.Context, _ time.Duration) bool { return ctx.Err() == nil }
+	t.Cleanup(func() { waitForRetry = originalWait })
+}
+
 func TestOAuthResponseValidation(t *testing.T) {
+	skipRetryWaits(t)
 	tests := []struct {
 		name   string
 		status int
@@ -142,17 +152,23 @@ func TestPaginationURLValidationAndExhaustion(t *testing.T) {
 }
 
 func TestPaginationHelpersAndGetRetryBranches(t *testing.T) {
-	if got := nextURL(map[string]any{"next": "/next"}); got != "/next" {
+	if got, _ := nextPage(map[string]any{"next": "/next"}); got != "/next" {
 		t.Fatalf("direct next URL=%q", got)
 	}
-	if got := nextURL(map[string]any{"pagination": map[string]any{"next": "/page"}}); got != "/page" {
+	if got, _ := nextPage(map[string]any{"pagination": map[string]any{"next": "/page"}}); got != "/page" {
 		t.Fatalf("nested next URL=%q", got)
 	}
-	if got := nextURL(map[string]any{"pagination": map[string]any{"nextCursor": "a b"}}); got != "?cursor=a+b" {
-		t.Fatalf("cursor next URL=%q", got)
+	if _, cursor := nextPage(map[string]any{"pagination": map[string]any{"nextCursor": "a b"}}); cursor != "a b" {
+		t.Fatalf("next cursor=%q", cursor)
 	}
-	if got := nextURL(map[string]any{"pagination": map[string]any{"nextCursor": ""}}); got != "" {
-		t.Fatalf("empty cursor next URL=%q", got)
+	if link, cursor := nextPage(map[string]any{"pagination": map[string]any{"nextCursor": ""}}); link != "" || cursor != "" {
+		t.Fatalf("empty cursor link=%q cursor=%q", link, cursor)
+	}
+	if got, err := withCursor("https://api.example.test/devices?fields=all&cursor=old", "a b"); err != nil || got != "https://api.example.test/devices?cursor=a+b&fields=all" {
+		t.Fatalf("merged cursor URL=%q err=%v", got, err)
+	}
+	if _, err := withCursor("://bad", "x"); err == nil {
+		t.Fatal("invalid current URL accepted for cursor merge")
 	}
 	badBase := New("://invalid", "https://oauth.example.test/token", "test", Credentials{})
 	if _, err := badBase.resolvePaginationURL("https://api.example.test/devices", "/devices"); err == nil {
@@ -289,6 +305,7 @@ func TestCollectorHTTPErrorBranches(t *testing.T) {
 }
 
 func TestLogStreamingKeepsConfigurationWhenStatusIsUnavailable(t *testing.T) {
+	skipRetryWaits(t)
 	for _, status := range []int{http.StatusNotFound, http.StatusForbidden, http.StatusBadGateway} {
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.URL.Path == "/oauth/token" {

@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -306,4 +307,94 @@ func newOutboxLeaseToken() (string, error) {
 		return "", fmt.Errorf("generate outbox lease token: %w", err)
 	}
 	return hex.EncodeToString(token[:]), nil
+}
+
+// ErrDestinationDisabled is returned when dead letters are retried for a
+// destination that is disabled; re-enable it first so the retry is explicit.
+var ErrDestinationDisabled = errors.New("notification destination is disabled")
+
+// DestinationDelivery summarizes the outbox for one active destination.
+// RetryableDead counts the dead letters RetryDeadOutbox would requeue.
+type DestinationDelivery struct {
+	ID            int64
+	Name          string
+	Enabled       bool
+	Pending       int
+	Processing    int
+	Dead          int
+	RetryableDead int
+}
+
+// retryableDeadOutbox selects dead letters that may be requeued. Rows
+// dead-lettered because the monitoring identity changed, or whose batch
+// belongs to a previous settings generation, describe another tailnet or
+// OAuth identity and stay dead; system notifications (no batch) are eligible.
+// The column prefix lets the same predicate serve a join and an UPDATE.
+func retryableDeadOutbox(prefix string) string {
+	return prefix + `status='dead' AND ` + prefix + `last_error<>'monitoring identity changed' AND (` + prefix + `batch_id IS NULL OR NOT EXISTS (
+		SELECT 1 FROM event_batches eb WHERE eb.id=` + prefix + `batch_id AND eb.generation<>(SELECT generation FROM settings WHERE id=1)))`
+}
+
+// DestinationDeliveries returns per-destination delivery counts for every
+// active destination, including destinations with an empty outbox.
+func (s *Store) DestinationDeliveries(ctx context.Context) ([]DestinationDelivery, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT d.id,d.name,d.enabled,
+		COALESCE(SUM(o.status='pending'),0),COALESCE(SUM(o.status='processing'),0),COALESCE(SUM(o.status='dead'),0),
+		COALESCE(SUM(CASE WHEN `+retryableDeadOutbox("o.")+` THEN 1 ELSE 0 END),0)
+		FROM notification_destinations d LEFT JOIN outbox o ON o.destination_id=d.id
+		WHERE d.deleted_at IS NULL GROUP BY d.id ORDER BY d.id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []DestinationDelivery
+	for rows.Next() {
+		var delivery DestinationDelivery
+		var enabled int
+		if err := rows.Scan(&delivery.ID, &delivery.Name, &enabled, &delivery.Pending, &delivery.Processing, &delivery.Dead, &delivery.RetryableDead); err != nil {
+			return nil, err
+		}
+		delivery.Enabled = enabled == 1
+		out = append(out, delivery)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, rows.Close()
+}
+
+// RetryDeadOutbox requeues the retryable dead letters of one enabled,
+// active destination with a fresh 24-hour delivery window: attempts restart
+// at zero, the first attempt is now, and the rows are due immediately. It
+// returns the number of requeued rows. Delivery stays at-least-once; a row
+// whose provider accepted the message before it was dead-lettered may be
+// delivered again.
+func (s *Store) RetryDeadOutbox(ctx context.Context, destinationID int64) (int64, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	var enabled int
+	if err := tx.QueryRowContext(ctx, "SELECT enabled FROM notification_destinations WHERE id=? AND deleted_at IS NULL", destinationID).Scan(&enabled); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, errors.New("notification destination not found")
+		}
+		return 0, err
+	}
+	if enabled != 1 {
+		return 0, ErrDestinationDisabled
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	result, err := tx.ExecContext(ctx, `UPDATE outbox
+		SET status='pending',attempts=0,first_attempt=?,next_attempt=?,last_error='',lease_until=NULL,lease_token='',delivered_at=NULL
+		WHERE destination_id=? AND `+retryableDeadOutbox(""), now, now, destinationID)
+	if err != nil {
+		return 0, err
+	}
+	requeued, err := result.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	return requeued, tx.Commit()
 }

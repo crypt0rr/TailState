@@ -67,10 +67,26 @@ type EvidenceFilter struct {
 	Collector  string `json:"collector,omitempty"`
 	EventType  string `json:"event_type,omitempty"`
 	ResourceID string `json:"resource,omitempty"`
-	Cursor     int64  `json:"cursor,omitempty"`
-	Limit      int    `json:"limit"`
-	BatchID    int64  `json:"batch,omitempty"`
-	Severity   string `json:"severity,omitempty"`
+	// From and Until are the RFC 3339 UTC bounds of a date-range filter
+	// (inclusive and exclusive). They are omitted when no range was used, so
+	// packs without a range keep their original signed shape.
+	From     string `json:"from,omitempty"`
+	Until    string `json:"until,omitempty"`
+	Cursor   int64  `json:"cursor,omitempty"`
+	Limit    int    `json:"limit"`
+	BatchID  int64  `json:"batch,omitempty"`
+	Severity string `json:"severity,omitempty"`
+}
+
+func evidenceFilter(filter HistoryFilter) EvidenceFilter {
+	out := EvidenceFilter{Collector: filter.Collector, EventType: filter.EventType, ResourceID: filter.ResourceID, Cursor: filter.Cursor, Limit: filter.Limit, BatchID: filter.BatchID, Severity: filter.Severity}
+	if !filter.From.IsZero() {
+		out.From = filter.From.UTC().Format(time.RFC3339)
+	}
+	if !filter.Until.IsZero() {
+		out.Until = filter.Until.UTC().Format(time.RFC3339)
+	}
+	return out
 }
 
 // EvidenceBatch contains one atomic polling result and its related events and
@@ -180,6 +196,8 @@ type evidenceContent struct {
 // process while being downloaded.
 func (s *Store) ExportEvidencePack(ctx context.Context, filter HistoryFilter) ([]byte, error) {
 	filter.Limit = maxEvidenceBatches
+	// Exports always page towards older batches from Cursor.
+	filter.After = 0
 	page, err := s.listHistory(ctx, filter, maxEvidenceBytes, true)
 	if err != nil {
 		return nil, err
@@ -191,7 +209,7 @@ func (s *Store) ExportEvidencePack(ctx context.Context, filter HistoryFilter) ([
 		Format:      evidencePackFormat,
 		Version:     evidencePackVersion,
 		GeneratedAt: time.Now().UTC().Format(time.RFC3339Nano),
-		Filter:      EvidenceFilter(filter),
+		Filter:      evidenceFilter(filter),
 		Batches:     make([]EvidenceBatch, 0, len(page.Batches)),
 		LedgerLinks: make([]EvidenceLedgerLink, 0),
 		Truncated:   page.HasNext,

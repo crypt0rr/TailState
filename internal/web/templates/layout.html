@@ -6,6 +6,8 @@
   the same header without navigation. No inline scripts or styles: the
   Content-Security-Policy forbids them.
 */}}
+{{/* "when" renders a timeView: absolute UTC time plus a relative hint. */}}
+{{define "when"}}{{if .Valid}}<time datetime="{{.ISO}}">{{.UTC}}</time> <span class="relative-time">({{.Relative}})</span>{{else}}—{{end}}{{end}}
 {{define "layout"}}<!doctype html>
 <html lang="en">
 <head>

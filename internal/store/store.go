@@ -195,8 +195,17 @@ type HistoryFilter struct {
 	Collector  string
 	EventType  string
 	ResourceID string
-	Cursor     int64
-	Limit      int
+	// From and Until bound a batch's observation time: From is inclusive and
+	// Until exclusive. Both are compared at whole-second UTC precision; a
+	// zero value leaves that side open.
+	From  time.Time
+	Until time.Time
+	// Cursor pages towards older batches (ID below Cursor). After pages
+	// towards newer batches (ID above After) and is ignored when Cursor is
+	// set. Results are always returned newest first.
+	Cursor int64
+	After  int64
+	Limit  int
 	// BatchID selects exactly one batch, for notification deep links.
 	BatchID int64
 	// Severity selects events with exactly this built-in severity.
@@ -204,9 +213,13 @@ type HistoryFilter struct {
 }
 
 type HistoryPage struct {
-	Batches          []HistoryBatch
-	NextCursor       int64
-	HasNext          bool
+	Batches    []HistoryBatch
+	NextCursor int64
+	HasNext    bool
+	// PrevCursor and HasPrev describe the adjacent page of newer batches:
+	// request it with HistoryFilter.After set to PrevCursor.
+	PrevCursor       int64
+	HasPrev          bool
 	Truncated        bool
 	BytesRead        int64
 	ByteLimit        int64

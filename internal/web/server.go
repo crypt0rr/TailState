@@ -56,6 +56,9 @@ type Server struct {
 	challengeCounts      map[credentialChallengeMetric]uint64
 	credentialRejections map[string]uint64
 	webhookOutcomes      map[string]uint64
+	reconcileMu          sync.Mutex
+	lastReconcile        time.Time
+	reconcileCooldown    time.Duration
 }
 
 const (
@@ -80,6 +83,9 @@ const (
 	loginGlobalFailureBudget = 30
 	loginGlobalBackoffBase   = time.Second
 	loginGlobalBackoffMax    = 5 * time.Minute
+	// defaultReconcileCooldown rate-limits the status page's "Reconcile
+	// now" action so repeated clicks cannot turn into an API request storm.
+	defaultReconcileCooldown = 30 * time.Second
 )
 
 type pageData struct {
@@ -87,7 +93,9 @@ type pageData struct {
 	Version                         string
 	// Page names the template being rendered. The shared layout uses it to
 	// choose the navigation and mark the active link.
-	Page                            string
+	Page string
+	// Now is the render time used for relative timestamps.
+	Now                             time.Time
 	Configured                      bool
 	Settings                        store.Settings
 	DeviceSeconds, InventorySeconds int64
@@ -100,6 +108,8 @@ type pageData struct {
 	Collectors                      []string
 	MuteRules                       []store.MuteRule
 	HistoryNextURL                  string
+	HistoryPrevURL                  string
+	HistoryFrom, HistoryTo          string
 	HistoryExportURL                string
 	EvidenceSigningKeyID            string
 	Destinations                    []destinationPage
@@ -111,6 +121,9 @@ type pageData struct {
 	Expiring                        []expiringResource
 	ExpiryHorizonDays               int
 	ExpiryFiltered                  bool
+	Webhook                         store.WebhookState
+	WebhookUnavailable              bool
+	DestinationDeliveries           []store.DestinationDelivery
 }
 
 // expiringResource is one row of the status page's "Expiring soon" card.
@@ -215,7 +228,7 @@ type readinessCollector struct {
 func New(config boot.Config, st *store.Store, engine *monitor.Engine) (*Server, error) {
 	templates := map[string]*template.Template{}
 	for _, name := range []string{"setup", "login", "reset", "settings", "status", "history"} {
-		parsed, err := template.ParseFS(assets, "templates/layout.html", "templates/"+name+".html")
+		parsed, err := template.New(name).Funcs(templateFuncs()).ParseFS(assets, "templates/layout.html", "templates/"+name+".html")
 		if err != nil {
 			return nil, err
 		}
@@ -239,6 +252,7 @@ func New(config boot.Config, st *store.Store, engine *monitor.Engine) (*Server, 
 		challengeCounts:      map[credentialChallengeMetric]uint64{},
 		credentialRejections: map[string]uint64{},
 		webhookOutcomes:      map[string]uint64{},
+		reconcileCooldown:    defaultReconcileCooldown,
 	}, nil
 }
 
@@ -263,6 +277,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /reset", s.reset)
 	mux.HandleFunc("POST /reset", s.resetPost)
 	mux.HandleFunc("GET /status", s.status)
+	mux.HandleFunc("POST /status/reconcile", s.reconcile)
+	mux.HandleFunc("POST /status/destinations/retry", s.retryDeadLetters)
 	mux.HandleFunc("GET /history", s.history)
 	mux.HandleFunc("GET /history/export", s.historyExport)
 	mux.HandleFunc("GET /settings", s.settings)
@@ -343,6 +359,9 @@ func (s *Server) renderStatus(w http.ResponseWriter, name string, data pageData,
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	data.Version = s.config.Version
 	data.Page = name
+	if data.Now.IsZero() {
+		data.Now = time.Now().UTC()
+	}
 	if code != http.StatusOK {
 		w.WriteHeader(code)
 	}
@@ -579,7 +598,86 @@ func (s *Server) status(w http.ResponseWriter, r *http.Request) {
 	}
 	data := pageData{CSRF: csrf, Status: status}
 	data.Expiring, data.ExpiryHorizonDays, data.ExpiryFiltered = s.expiringSoon(r.Context(), time.Now().UTC())
+	if deliveries, err := s.store.DestinationDeliveries(r.Context()); err == nil {
+		data.DestinationDeliveries = deliveries
+	} else {
+		slog.Error("load destination delivery state", "error", err)
+	}
+	s.applyFlash(w, r, &data)
 	s.render(w, "status", data)
+}
+
+// reconcile requests an immediate broad poll of every collector. It is a
+// CSRF-protected POST, rate-limited to one request per reconcileCooldown,
+// and answers with Post/Redirect/Get so a reload cannot repeat it.
+func (s *Server) reconcile(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.requireAuth(w, r, true); !ok {
+		return
+	}
+	s.reconcileAuthorized(w, r)
+}
+
+func (s *Server) reconcileAuthorized(w http.ResponseWriter, r *http.Request) {
+	status, err := s.store.Status(r.Context())
+	if err != nil {
+		slog.Error("load status for reconcile", "error", err)
+		s.redirectWithFlash(w, r, "/status", flashKindError, "Reconciliation could not be requested. Try again.")
+		return
+	}
+	if !status.Configured {
+		s.redirectWithFlash(w, r, "/status", flashKindError, "Save the monitoring settings before requesting a reconciliation.")
+		return
+	}
+	if wait, limited := s.reserveReconcile(time.Now()); limited {
+		seconds := int64((wait + time.Second - 1) / time.Second)
+		s.redirectWithFlash(w, r, "/status", flashKindError, fmt.Sprintf("A reconciliation was requested recently. Try again in %d seconds.", seconds))
+		return
+	}
+	s.engine.Trigger(monitor.ReconcileRequest{})
+	s.redirectWithFlash(w, r, "/status", flashKindSuccess, "Reconciliation requested. Every collector will be polled within a few seconds.")
+}
+
+// reserveReconcile records a reconcile request unless one was accepted
+// within the cooldown, in which case it returns the remaining wait.
+func (s *Server) reserveReconcile(now time.Time) (time.Duration, bool) {
+	s.reconcileMu.Lock()
+	defer s.reconcileMu.Unlock()
+	if !s.lastReconcile.IsZero() {
+		if wait := s.lastReconcile.Add(s.reconcileCooldown).Sub(now); wait > 0 {
+			return wait, true
+		}
+	}
+	s.lastReconcile = now
+	return 0, false
+}
+
+// retryDeadLetters requeues one destination's retryable dead letters with a
+// fresh delivery window.
+func (s *Server) retryDeadLetters(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.requireAuth(w, r, true); !ok {
+		return
+	}
+	s.retryDeadLettersAuthorized(w, r)
+}
+
+func (s *Server) retryDeadLettersAuthorized(w http.ResponseWriter, r *http.Request) {
+	id, _ := strconv.ParseInt(r.FormValue("id"), 10, 64)
+	requeued, err := s.store.RetryDeadOutbox(r.Context(), id)
+	switch {
+	case errors.Is(err, store.ErrDestinationDisabled):
+		s.redirectWithFlash(w, r, "/status", flashKindError, "Enable the destination before retrying its dead letters.")
+		return
+	case err != nil:
+		slog.Error("retry dead notifications", "error", err)
+		s.redirectWithFlash(w, r, "/status", flashKindError, destinationMutationMessage("retry", err))
+		return
+	}
+	s.engine.Wake()
+	noun := "notifications"
+	if requeued == 1 {
+		noun = "notification"
+	}
+	s.redirectWithFlash(w, r, "/status", flashKindSuccess, fmt.Sprintf("Requeued %d dead %s for delivery.", requeued, noun))
 }
 
 // expiringSoon lists device node keys and auth keys that expire within the
@@ -624,6 +722,7 @@ func (s *Server) history(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	filter := historyFilter(r)
+	dateError := historyDateError(r)
 	history, err := s.store.ListHistory(r.Context(), filter)
 	if err != nil {
 		http.Error(w, "load history", http.StatusInternalServerError)
@@ -636,10 +735,15 @@ func (s *Server) history(w http.ResponseWriter, r *http.Request) {
 		HistoryCollectors: knownCollectors(),
 		HistoryEventTypes: []string{"created", "changed", "removed"},
 		HistorySeverities: []string{string(model.SeverityHigh), string(model.SeverityMedium), string(model.SeverityLow)},
+		Error:             dateError,
 	}
+	data.HistoryFrom, data.HistoryTo = historyDateValues(filter)
 	data.EvidenceSigningKeyID, _ = s.store.EvidenceSigningKeyID(r.Context())
 	if history.HasNext {
 		data.HistoryNextURL = historyURL(filter, history.NextCursor)
+	}
+	if history.HasPrev {
+		data.HistoryPrevURL = historyNewerURL(filter, history.PrevCursor)
 	}
 	data.HistoryExportURL = historyExportURL(filter)
 	s.render(w, "history", data)
@@ -665,14 +769,19 @@ func (s *Server) historyExport(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(pack)
 }
 
+// historyDateLayout is the format of the History page's from/to date
+// filters (an HTML date input). Dates are whole UTC days; "to" is inclusive.
+const historyDateLayout = "2006-01-02"
+
 func historyFilter(r *http.Request) store.HistoryFilter {
+	query := r.URL.Query()
 	filter := store.HistoryFilter{
-		Collector:  strings.TrimSpace(r.URL.Query().Get("collector")),
-		EventType:  strings.TrimSpace(r.URL.Query().Get("event_type")),
-		ResourceID: strings.TrimSpace(r.URL.Query().Get("resource")),
+		Collector:  strings.TrimSpace(query.Get("collector")),
+		EventType:  strings.TrimSpace(query.Get("event_type")),
+		ResourceID: strings.TrimSpace(query.Get("resource")),
 		Limit:      20,
 	}
-	if cursor, err := strconv.ParseInt(r.URL.Query().Get("cursor"), 10, 64); err == nil && cursor > 0 {
+	if cursor, err := strconv.ParseInt(query.Get("cursor"), 10, 64); err == nil && cursor > 0 {
 		filter.Cursor = cursor
 	}
 	if batch, err := strconv.ParseInt(strings.TrimSpace(r.URL.Query().Get("batch")), 10, 64); err == nil && batch > 0 {
@@ -681,12 +790,54 @@ func historyFilter(r *http.Request) store.HistoryFilter {
 	if severity, ok := model.ParseSeverity(r.URL.Query().Get("severity")); ok {
 		filter.Severity = string(severity)
 	}
+	if after, err := strconv.ParseInt(query.Get("after"), 10, 64); err == nil && after > 0 && filter.Cursor == 0 {
+		filter.After = after
+	}
+	if from, err := time.Parse(historyDateLayout, strings.TrimSpace(query.Get("from"))); err == nil {
+		filter.From = from
+	}
+	if to, err := time.Parse(historyDateLayout, strings.TrimSpace(query.Get("to"))); err == nil {
+		filter.Until = to.AddDate(0, 0, 1)
+	}
 	return filter
 }
 
-// historyFilterValues encodes the filters shared by History pagination and
-// evidence export links.
-func historyFilterValues(filter store.HistoryFilter) url.Values {
+// historyDateError explains a date filter that historyFilter ignored or
+// that cannot match anything.
+func historyDateError(r *http.Request) string {
+	query := r.URL.Query()
+	var parsed [2]time.Time
+	for index, name := range []string{"from", "to"} {
+		value := strings.TrimSpace(query.Get(name))
+		if value == "" {
+			continue
+		}
+		date, err := time.Parse(historyDateLayout, value)
+		if err != nil {
+			return "Dates must use the YYYY-MM-DD format; the invalid date was ignored."
+		}
+		parsed[index] = date
+	}
+	if !parsed[0].IsZero() && !parsed[1].IsZero() && parsed[1].Before(parsed[0]) {
+		return "The end date is before the start date, so no changes can match."
+	}
+	return ""
+}
+
+// historyDateValues returns the from/to form values for a filter.
+func historyDateValues(filter store.HistoryFilter) (string, string) {
+	var from, to string
+	if !filter.From.IsZero() {
+		from = filter.From.UTC().Format(historyDateLayout)
+	}
+	if !filter.Until.IsZero() {
+		to = filter.Until.UTC().AddDate(0, 0, -1).Format(historyDateLayout)
+	}
+	return from, to
+}
+
+// historyQuery encodes the filters shared by page links and exports.
+func historyQuery(filter store.HistoryFilter) url.Values {
 	values := url.Values{}
 	if filter.BatchID > 0 {
 		values.Set("batch", strconv.FormatInt(filter.BatchID, 10))
@@ -703,17 +854,32 @@ func historyFilterValues(filter store.HistoryFilter) url.Values {
 	if filter.Severity != "" {
 		values.Set("severity", filter.Severity)
 	}
+	from, to := historyDateValues(filter)
+	if from != "" {
+		values.Set("from", from)
+	}
+	if to != "" {
+		values.Set("to", to)
+	}
 	return values
 }
 
+// historyURL links to the page of batches older than cursor.
 func historyURL(filter store.HistoryFilter, cursor int64) string {
-	values := historyFilterValues(filter)
+	values := historyQuery(filter)
 	values.Set("cursor", strconv.FormatInt(cursor, 10))
 	return "/history?" + values.Encode()
 }
 
+// historyNewerURL links to the page of batches newer than after.
+func historyNewerURL(filter store.HistoryFilter, after int64) string {
+	values := historyQuery(filter)
+	values.Set("after", strconv.FormatInt(after, 10))
+	return "/history?" + values.Encode()
+}
+
 func historyExportURL(filter store.HistoryFilter) string {
-	values := historyFilterValues(filter)
+	values := historyQuery(filter)
 	if filter.Cursor > 0 {
 		values.Set("cursor", strconv.FormatInt(filter.Cursor, 10))
 	}
@@ -953,6 +1119,14 @@ func (s *Server) settingsData(ctx context.Context, csrf string, configured bool,
 		scopes = store.DefaultOAuthScopes()
 	}
 	data.OAuthScopes = strings.Join(scopes, " ")
+	// The webhook state reflects what is stored, not the submitted form, so
+	// a failed save never claims a secret that was not persisted.
+	if webhookState, err := s.store.WebhookStatus(ctx); err == nil {
+		data.Webhook = webhookState
+	} else {
+		slog.Error("load webhook acceleration state", "error", err)
+		data.WebhookUnavailable = true
+	}
 	destinations, err := s.store.ListDestinations(ctx)
 	if err == nil {
 		data.Destinations = make([]destinationPage, 0, len(destinations))
@@ -1242,6 +1416,8 @@ func destinationMutationMessage(action string, err error) string {
 		return "Notification destination could not be updated."
 	case "remove":
 		return "Notification destination could not be removed."
+	case "retry":
+		return "Dead notifications could not be requeued."
 	default:
 		return "Notification destination operation failed."
 	}

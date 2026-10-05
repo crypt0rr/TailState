@@ -29,36 +29,23 @@ func (s *Store) listHistory(ctx context.Context, filter HistoryFilter, byteLimit
 	if limit > 100 {
 		limit = 100
 	}
-	where := []string{"1=1"}
-	args := make([]any, 0, 5)
+	// A newer-page request reads upwards from its cursor so the batches
+	// nearest the current page are loaded (and budgeted) first; the result is
+	// reversed below so every page is displayed newest first.
+	ascending := filter.Cursor <= 0 && filter.After > 0
+	where, args := historyBatchConditions(filter)
+	order := "DESC"
 	if filter.Cursor > 0 {
 		where = append(where, "b.id < ?")
 		args = append(args, filter.Cursor)
-	}
-	if filter.BatchID > 0 {
-		where = append(where, "b.id = ?")
-		args = append(args, filter.BatchID)
-	}
-	if filter.Collector != "" {
-		where = append(where, "EXISTS (SELECT 1 FROM events e WHERE e.batch_id=b.id AND e.collector=?)")
-		args = append(args, filter.Collector)
-	}
-	if filter.EventType != "" {
-		where = append(where, "EXISTS (SELECT 1 FROM events e WHERE e.batch_id=b.id AND e.event_type=?)")
-		args = append(args, filter.EventType)
-	}
-	if filter.ResourceID != "" {
-		where = append(where, "EXISTS (SELECT 1 FROM events e WHERE e.batch_id=b.id AND (e.resource_id LIKE ? ESCAPE '\\' OR e.name LIKE ? ESCAPE '\\'))")
-		term := "%" + escapeLike(filter.ResourceID) + "%"
-		args = append(args, term, term)
-	}
-	if filter.Severity != "" {
-		where = append(where, "EXISTS (SELECT 1 FROM events e WHERE e.batch_id=b.id AND e.severity=?)")
-		args = append(args, filter.Severity)
+	} else if ascending {
+		where = append(where, "b.id > ?")
+		args = append(args, filter.After)
+		order = "ASC"
 	}
 	args = append(args, limit+1)
 	rows, err := s.db.QueryContext(ctx, `SELECT b.id,b.generation,b.observed_at,b.change_count,COALESCE(b.trigger_id,0)
-		FROM event_batches b WHERE `+strings.Join(where, " AND ")+` ORDER BY b.id DESC LIMIT ?`, args...)
+		FROM event_batches b WHERE `+strings.Join(where, " AND ")+` ORDER BY b.id `+order+` LIMIT ?`, args...)
 	if err != nil {
 		return HistoryPage{}, err
 	}
@@ -111,20 +98,118 @@ func (s *Store) listHistory(ctx context.Context, filter HistoryFilter, byteLimit
 		}
 	}
 	page.Batches = loadedBatches
-	page.HasNext = hasMoreByCount || page.Truncated
-	if page.HasNext && len(page.Batches) > 0 {
-		page.NextCursor = page.Batches[len(page.Batches)-1].ID
-	} else if page.Truncated && len(candidates) > 0 {
-		// The first batch can be larger than the entire page budget. Leave a
-		// cursor just above it so the caller can retry after narrowing the
-		// filter or increasing the configured budget; the explicit reason makes
-		// that remediation visible instead of silently dropping the batch.
-		page.NextCursor = candidates[0].ID + 1
+	if ascending {
+		page.HasPrev = hasMoreByCount || page.Truncated
+		if page.HasPrev && len(page.Batches) > 0 {
+			page.PrevCursor = page.Batches[len(page.Batches)-1].ID
+		} else if page.Truncated && len(candidates) > 0 {
+			// Mirror of the descending case: retry the oversized batch.
+			page.PrevCursor = candidates[0].ID - 1
+		}
+		for left, right := 0, len(page.Batches)-1; left < right; left, right = left+1, right-1 {
+			page.Batches[left], page.Batches[right] = page.Batches[right], page.Batches[left]
+		}
+		oldest := filter.After + 1
+		if len(page.Batches) > 0 {
+			oldest = page.Batches[len(page.Batches)-1].ID
+		}
+		if page.HasNext, err = s.historyHasBatch(ctx, filter, false, oldest); err != nil {
+			return HistoryPage{}, err
+		}
+		if page.HasNext {
+			page.NextCursor = oldest
+		}
+	} else {
+		page.HasNext = hasMoreByCount || page.Truncated
+		if page.HasNext && len(page.Batches) > 0 {
+			page.NextCursor = page.Batches[len(page.Batches)-1].ID
+		} else if page.Truncated && len(candidates) > 0 {
+			// The first batch can be larger than the entire page budget. Leave a
+			// cursor just above it so the caller can retry after narrowing the
+			// filter or increasing the configured budget; the explicit reason makes
+			// that remediation visible instead of silently dropping the batch.
+			page.NextCursor = candidates[0].ID + 1
+		}
+		if filter.Cursor > 0 {
+			newest := filter.Cursor - 1
+			if len(page.Batches) > 0 {
+				newest = page.Batches[0].ID
+			}
+			if page.HasPrev, err = s.historyHasBatch(ctx, filter, true, newest); err != nil {
+				return HistoryPage{}, err
+			}
+			if page.HasPrev {
+				page.PrevCursor = newest
+			}
+		}
 	}
 	if page.Truncated {
 		s.counters.historyTruncations.Add(1)
 	}
 	return page, nil
+}
+
+// historyBatchConditions returns the batch-level WHERE terms shared by page
+// reads and the adjacent-page probes. Cursor terms are added by the caller.
+func historyBatchConditions(filter HistoryFilter) ([]string, []any) {
+	where := []string{"1=1"}
+	args := make([]any, 0, 6)
+	if filter.BatchID > 0 {
+		where = append(where, "b.id = ?")
+		args = append(args, filter.BatchID)
+	}
+	if !filter.From.IsZero() {
+		where = append(where, "b.observed_at >= ?")
+		args = append(args, historyTimeBound(filter.From))
+	}
+	if !filter.Until.IsZero() {
+		where = append(where, "b.observed_at < ?")
+		args = append(args, historyTimeBound(filter.Until))
+	}
+	if filter.Collector != "" {
+		where = append(where, "EXISTS (SELECT 1 FROM events e WHERE e.batch_id=b.id AND e.collector=?)")
+		args = append(args, filter.Collector)
+	}
+	if filter.EventType != "" {
+		where = append(where, "EXISTS (SELECT 1 FROM events e WHERE e.batch_id=b.id AND e.event_type=?)")
+		args = append(args, filter.EventType)
+	}
+	if filter.ResourceID != "" {
+		where = append(where, "EXISTS (SELECT 1 FROM events e WHERE e.batch_id=b.id AND (e.resource_id LIKE ? ESCAPE '\\' OR e.name LIKE ? ESCAPE '\\'))")
+		term := "%" + escapeLike(filter.ResourceID) + "%"
+		args = append(args, term, term)
+	}
+	if filter.Severity != "" {
+		where = append(where, "EXISTS (SELECT 1 FROM events e WHERE e.batch_id=b.id AND e.severity=?)")
+		args = append(args, filter.Severity)
+	}
+	return where, args
+}
+
+// historyTimeBound renders a range boundary for comparison with the stored
+// RFC 3339 UTC observation time. The bound deliberately omits the zone
+// designator and fractional seconds: every stored value within that second
+// has the bound as a prefix and therefore sorts at or after it, whereas a
+// "Z"-terminated bound would sort after stored values with a fraction.
+func historyTimeBound(value time.Time) string {
+	return value.UTC().Format("2006-01-02T15:04:05")
+}
+
+// historyHasBatch reports whether a batch matching filter exists with an ID
+// above (newer) or below id. It drives the older/newer page links.
+func (s *Store) historyHasBatch(ctx context.Context, filter HistoryFilter, newer bool, id int64) (bool, error) {
+	where, args := historyBatchConditions(filter)
+	if newer {
+		where = append(where, "b.id > ?")
+	} else {
+		where = append(where, "b.id < ?")
+	}
+	args = append(args, id)
+	var exists int
+	if err := s.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM event_batches b WHERE `+strings.Join(where, " AND ")+`)`, args...).Scan(&exists); err != nil {
+		return false, err
+	}
+	return exists == 1, nil
 }
 
 // historyBatchByteEstimate reads only SQLite length metadata before loading a

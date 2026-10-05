@@ -42,6 +42,12 @@
     <label for="history-resource">Resource or ID
       <input id="history-resource" name="resource" value="{{.HistoryFilter.ResourceID}}" placeholder="Search names and IDs" autocomplete="off" spellcheck="false">
     </label>
+    <label for="history-from">From (UTC date)
+      <input id="history-from" type="date" name="from" value="{{.HistoryFrom}}">
+    </label>
+    <label for="history-to">To (UTC date, inclusive)
+      <input id="history-to" type="date" name="to" value="{{.HistoryTo}}">
+    </label>
     <div class="filter-actions">
       <button type="submit">Filter history</button>
       <a class="button-link" href="/history">Clear</a>
@@ -49,6 +55,7 @@
     </div>
   </form>
 
+  {{if .Error}}<div class="error" role="alert">{{.Error}}</div>{{end}}
   {{if .History.Truncated}}<div class="notice" role="status">This page reached its {{.History.ByteLimit}}-byte history read budget. Older batches were not loaded{{if .History.TruncationReason}} ({{.History.TruncationReason}}){{end}}. Narrow the filters to inspect more detail.</div>{{end}}
 
   {{if .History.Batches}}
@@ -139,8 +146,18 @@
     </article>
     {{- end}}
   </div>
-  {{if .History.HasNext}}<nav class="history-pagination" aria-label="History pages"><a class="button-link" href="{{.HistoryNextURL}}">Load older changes</a></nav>{{end}}
-  {{else}}
+  {{end}}
+  {{if or .HistoryPrevURL .HistoryNextURL}}
+  <nav class="history-pagination" aria-label="History pages">
+    {{- if .HistoryPrevURL}}
+    <a class="button-link" href="{{.HistoryPrevURL}}" rel="prev">Load newer changes</a>
+    {{- end}}
+    {{- if .HistoryNextURL}}
+    <a class="button-link" href="{{.HistoryNextURL}}" rel="next">Load older changes</a>
+    {{- end}}
+  </nav>
+  {{end}}
+  {{if not .History.Batches}}
   <div class="empty-state"><strong>No changes match these filters</strong><span>TailState keeps changes quiet during the initial baseline. New additions, modifications, and removals will appear here after polling.</span></div>
   {{end}}
 </section>

@@ -4,6 +4,8 @@
 {{- end}}
 {{define "content"}}
 <h1 class="visually-hidden">Status</h1>
+{{if .Message}}<div class="success" role="status">{{.Message}}</div>{{end}}
+{{if .Error}}<div class="error" role="alert">{{.Error}}</div>{{end}}
 <div class="summary">
   <section class="card" aria-labelledby="summary-setup">
     <h2 id="summary-setup" class="summary-label">Setup</h2>
@@ -11,7 +13,7 @@
   </section>
   <section class="card" aria-labelledby="summary-baseline">
     <h2 id="summary-baseline" class="summary-label">Baseline</h2>
-    <strong>{{if .Status.BaselineAt}}{{.Status.BaselineAt.Format "2006-01-02 15:04 UTC"}}{{else if .Status.BaselineDegraded}}Degraded — monitoring active{{else if .Status.BaselineReady}}Partial — monitoring active{{else}}Pending{{end}}</strong>
+    <strong>{{if .Status.BaselineAt}}{{template "when" (when .Status.BaselineAt .Now)}}{{else if .Status.BaselineDegraded}}Degraded — monitoring active{{else if .Status.BaselineReady}}Partial — monitoring active{{else}}Pending{{end}}</strong>
   </section>
   <section class="card" aria-labelledby="summary-deliveries">
     <h2 id="summary-deliveries" class="summary-label">Deliveries</h2>
@@ -49,7 +51,7 @@
         <td data-label="Resource">{{.Kind}}</td>
         <th scope="row" data-label="Name">{{.Name}}</th>
         <td data-label="Tags">{{if .Tags}}<code>{{.Tags}}</code>{{else}}—{{end}}</td>
-        <td data-label="Expires">{{.Expires.Format "2006-01-02 15:04 UTC"}} ({{.DaysLeft}} days left)</td>
+        <td data-label="Expires"><time datetime="{{.Expires.UTC.Format "2006-01-02T15:04:05Z07:00"}}">{{.Expires.UTC.Format "2006-01-02 15:04 UTC"}}</time> ({{.DaysLeft}} days left)</td>
       </tr>
       {{- end}}
     </tbody>
@@ -74,9 +76,17 @@
   <div class="section-heading">
     <div>
       <h2 id="collectors-heading">Collectors</h2>
-      <p>Current source health and polling state.</p>
+      <p>Current source health and polling state. Times are shown in UTC.</p>
     </div>
-    <a class="button-link" href="/history">View change history</a>
+    <div class="section-actions">
+      {{- if .Status.Configured}}
+      <form method="post" action="/status/reconcile">
+        <input type="hidden" name="_csrf" value="{{.CSRF}}">
+        <button class="button-secondary" type="submit">Reconcile now</button>
+      </form>
+      {{- end}}
+      <a class="button-link" href="/history">View change history</a>
+    </div>
   </div>
   {{if .Status.Collectors}}
   <table class="data-table collector-table">
@@ -86,7 +96,9 @@
         <th scope="col">Collector</th>
         <th scope="col">State</th>
         <th scope="col">Last success</th>
-        <th scope="col">Last poll</th>
+        <th scope="col">Next poll</th>
+        <th scope="col">Poll duration</th>
+        <th scope="col">Failures</th>
         <th scope="col">Details</th>
       </tr>
     </thead>
@@ -95,8 +107,10 @@
       <tr>
         <th scope="row" data-label="Collector"><code>{{.Name}}</code></th>
         <td data-label="State">{{if not .Supported}}Unsupported{{else if .Partial}}Partial{{else if ge .FailureCount 3}}Unhealthy{{else if .Baseline}}Ready{{else}}Baselining{{end}}</td>
-        <td data-label="Last success">{{if .LastSuccess}}{{.LastSuccess.Format "2006-01-02 15:04:05"}}{{else}}—{{end}}</td>
-        <td data-label="Last poll">{{if gt .PollDurationMS 0}}{{.PollDurationMS}} ms{{else}}—{{end}}</td>
+        <td data-label="Last success">{{template "when" (when .LastSuccess $.Now)}}</td>
+        <td data-label="Next poll">{{if .NextPoll}}{{template "when" (when .NextPoll $.Now)}}{{else}}Due now{{end}}</td>
+        <td data-label="Poll duration">{{if gt .PollDurationMS 0}}{{.PollDurationMS}} ms{{else}}—{{end}}</td>
+        <td data-label="Failures">{{.FailureCount}}</td>
         <td data-label="Details">{{if .LastError}}{{.LastError}}{{else}}OK{{end}}</td>
       </tr>
       {{- end}}
@@ -104,6 +118,56 @@
   </table>
   {{else}}
   <p>No collector state yet.</p>
+  {{end}}
+</section>
+
+<section class="card" aria-labelledby="deliveries-heading">
+  <div class="section-heading">
+    <div>
+      <h2 id="deliveries-heading">Delivery by destination</h2>
+      <p>Dead letters stopped retrying after their 24-hour window or a permanent provider rejection. Retrying gives them a fresh window; delivery is at-least-once, so a message the provider already accepted may arrive again.</p>
+    </div>
+  </div>
+  {{if .DestinationDeliveries}}
+  <table class="data-table delivery-table">
+    <caption class="visually-hidden">Notification outbox state per destination</caption>
+    <thead>
+      <tr>
+        <th scope="col">Destination</th>
+        <th scope="col">State</th>
+        <th scope="col">Pending</th>
+        <th scope="col">Processing</th>
+        <th scope="col">Dead</th>
+        <th scope="col">Action</th>
+      </tr>
+    </thead>
+    <tbody>
+      {{- range .DestinationDeliveries}}
+      <tr>
+        <th scope="row" data-label="Destination">{{.Name}}</th>
+        <td data-label="State">{{if .Enabled}}Enabled{{else}}Disabled{{end}}</td>
+        <td data-label="Pending">{{.Pending}}</td>
+        <td data-label="Processing">{{.Processing}}</td>
+        <td data-label="Dead">{{.Dead}}</td>
+        <td data-label="Action">
+          {{- if and .Enabled (gt .RetryableDead 0)}}
+          <form method="post" action="/status/destinations/retry">
+            <input type="hidden" name="_csrf" value="{{$.CSRF}}">
+            <input type="hidden" name="id" value="{{.ID}}">
+            <button class="button-secondary" type="submit" aria-label="Retry {{.RetryableDead}} dead letters for {{.Name}}">Retry dead letters ({{.RetryableDead}})</button>
+          </form>
+          {{- else if and (not .Enabled) (gt .RetryableDead 0)}}
+          <span class="muted">Enable to retry</span>
+          {{- else}}
+          <span class="muted">—</span>
+          {{- end}}
+        </td>
+      </tr>
+      {{- end}}
+    </tbody>
+  </table>
+  {{else}}
+  <p>No notification destinations are configured.</p>
   {{end}}
 </section>
 {{end}}

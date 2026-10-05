@@ -25,8 +25,12 @@
         <small id="settings-oauth-scopes-help">Read scopes requested for the access token (space-separated). <code>devices:core:read</code> is required; collectors without a granted scope are shown as unsupported.</small>
       </label>
       <label for="settings-webhook-secret">Tailscale webhook secret
-        <input id="settings-webhook-secret" type="password" name="webhook_secret" placeholder="{{if .Configured}}Leave blank to keep current secret{{else}}Optional{{end}}" autocomplete="new-password">
+        <input id="settings-webhook-secret" type="password" name="webhook_secret" placeholder="{{if .Webhook.Enabled}}Leave blank to keep current secret{{else}}Optional{{end}}" autocomplete="new-password" aria-describedby="webhook-state">
         <small>Paste the secret shown when you create a Tailscale webhook. TailState verifies signed deliveries at <code>/webhooks/tailscale</code>.</small>
+        <small id="webhook-state" class="webhook-state">Webhook acceleration:
+          {{- if .WebhookUnavailable}} <strong>status unavailable</strong>
+          {{- else if .Webhook.Enabled}} <strong class="state-enabled">enabled</strong> · last accepted delivery {{if .Webhook.LastAccepted}}{{template "when" (when .Webhook.LastAccepted .Now)}}{{else}}none in the last 30 days{{end}}
+          {{- else}} <strong class="state-disabled">disabled</strong> (no webhook secret is stored; polling alone keeps the inventory current){{end}}</small>
       </label>
       <label for="settings-device-interval">Device poll interval (seconds)
         <input id="settings-device-interval" type="number" min="15" max="86400" name="device_interval" value="{{.DeviceSeconds}}" inputmode="numeric" required>
@@ -43,7 +47,7 @@
         <small id="settings-expiry-tags-help">Optional. Only warn for devices and auth keys with one of these tags (comma-separated).</small>
       </label>
     </div>
-    {{if .Configured}}<label class="check-label" for="settings-clear-webhook"><input id="settings-clear-webhook" type="checkbox" name="clear_webhook_secret"> <span>Remove the configured webhook secret</span></label>{{end}}
+    {{if .Webhook.Enabled}}<label class="check-label" for="settings-clear-webhook"><input id="settings-clear-webhook" type="checkbox" name="clear_webhook_secret"> <span>Remove the configured webhook secret</span></label>{{end}}
     <button type="submit">Test and save monitoring</button>
   </form>
 </section>
@@ -60,9 +64,10 @@
     <div><dt>Listener</dt><dd><code>{{.Diagnostics.Listener}}</code></dd></div>
     <div><dt>Cookies</dt><dd><strong>{{if .Diagnostics.CookieSecure}}Secure{{else}}HTTP-compatible{{end}}</strong></dd></div>
     <div><dt>Trusted proxies</dt><dd><strong>{{.Diagnostics.TrustedProxyCount}}</strong></dd></div>
-    <div><dt>Database storage</dt><dd><strong>{{.Diagnostics.Storage.DatabaseBytes}} / {{.Diagnostics.Storage.DatabaseLimitBytes}} bytes</strong></dd></div>
-    <div><dt>Snapshot / event limits</dt><dd><strong>{{.Diagnostics.Storage.SnapshotLimitBytes}} / {{.Diagnostics.Storage.EventValueLimitBytes}} bytes</strong></dd></div>
-    <div><dt>History page limit</dt><dd><strong>{{.Diagnostics.Storage.HistoryPageLimitBytes}} bytes</strong></dd></div>
+    <div><dt>Database storage</dt><dd><strong>{{mib .Diagnostics.Storage.DatabaseBytes}} of {{mib .Diagnostics.Storage.DatabaseLimitBytes}}</strong> <span class="muted">({{percent .Diagnostics.Storage.StoragePressure}} used)</span></dd></div>
+    <div><dt>Files on disk</dt><dd><strong>{{mib .Diagnostics.Storage.DatabasePhysicalBytes}}</strong> <span class="muted">(database {{mib .Diagnostics.Storage.DatabaseFileBytes}} · WAL {{mib .Diagnostics.Storage.DatabaseWALBytes}} · SHM {{mib .Diagnostics.Storage.DatabaseSHMBytes}})</span></dd></div>
+    <div><dt>Snapshot / event limits</dt><dd><strong>{{mib .Diagnostics.Storage.SnapshotLimitBytes}} / {{mib .Diagnostics.Storage.EventValueLimitBytes}}</strong></dd></div>
+    <div><dt>History page limit</dt><dd><strong>{{mib .Diagnostics.Storage.HistoryPageLimitBytes}}</strong></dd></div>
     {{- if .Diagnostics.Request.Origin}}
     <div><dt>Current request origin</dt><dd><code>{{.Diagnostics.Request.Origin}}</code></dd></div>
     <div><dt>Forwarded scheme</dt><dd><strong>{{if .Diagnostics.Request.ForwardedProto}}{{.Diagnostics.Request.ForwardedProto}}{{else}}not set{{end}}</strong></dd></div>

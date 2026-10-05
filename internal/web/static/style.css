@@ -166,6 +166,15 @@ button.button-danger { background: transparent; border: 1px solid var(--bad-bord
 
 .section-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 24px; }
 .section-heading p { margin: -5px 0 0; max-width: 760px; }
+.section-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 12px 18px; }
+.section-actions form { margin: 0; }
+.section-actions button { padding: 8px 12px; font-size: 14px; }
+.relative-time { color: var(--muted); font-size: 13px; font-weight: 400; white-space: nowrap; }
+.webhook-state strong { color: var(--text); }
+.webhook-state .state-enabled { color: var(--good-text); }
+.webhook-state .state-disabled { color: var(--warn-text); }
+.data-table form { margin: 0; }
+.data-table td button { padding: 6px 10px; font-size: 13px; }
 .status-pill {
   display: inline-flex;
   align-items: center;
@@ -237,16 +246,17 @@ code { overflow-wrap: anywhere; }
 /* Tables. On narrow screens each row becomes a card and every cell shows
    its column name from data-label, so no value appears without a label. */
 .data-table { width: 100%; border-collapse: collapse; }
-.data-table th, .data-table td { padding: 10px 14px 10px 0; text-align: left; vertical-align: top; border-top: 1px solid var(--border); overflow-wrap: anywhere; }
+.data-table th, .data-table td { padding: 10px 14px 10px 0; text-align: left; vertical-align: top; border-top: 1px solid var(--border); overflow-wrap: break-word; }
 .data-table thead th { color: var(--muted); border-top: 0; font-size: 13px; font-weight: 700; }
 .data-table tbody th { font-weight: 400; }
+.collector-table tbody th code { white-space: nowrap; }
 
 .history-card { max-width: 980px; margin-left: auto; margin-right: auto; }
 .retention-note { color: var(--muted); font-size: 13px; }
-.history-filters { display: grid; grid-template-columns: 1fr 1fr 1.4fr auto; align-items: end; gap: 14px; margin: 26px 0; padding: 16px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); }
+.history-filters { display: grid; grid-template-columns: repeat(3, 1fr); align-items: end; gap: 14px; margin: 26px 0; padding: 16px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); }
 .history-filters label { margin: 0; }
 .history-filters select { background: var(--card); }
-.filter-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 14px; padding-bottom: 18px; }
+.filter-actions { grid-column: 1 / -1; display: flex; align-items: center; flex-wrap: wrap; gap: 14px; }
 .history-list { display: grid; gap: 16px; }
 .history-batch { border: 1px solid var(--border); border-radius: 8px; background: var(--card-raised); overflow: hidden; }
 .history-batch-heading { display: flex; justify-content: space-between; align-items: center; gap: 16px; padding: 16px 18px; border-bottom: 1px solid var(--border); }

@@ -68,6 +68,7 @@ migration without performing it.
 | 11 | 0.10.0 | Webhook (10) and outbox (11) lease fencing |
 | 12 | 0.11.5 | Snapshot/event byte and truncation metadata, bounded history |
 | 13 | 0.12.0 | Deleted-destination scrub, retention index changes |
+| 14 | 0.13.0 | Destination routing, mute rules, rendering format, format-neutral outbox payloads, event severity |
 
 The README section "Migration from older releases" describes each migration
 in detail.

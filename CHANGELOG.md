@@ -13,6 +13,27 @@ rollback requires restoring the backup taken before the upgrade. See
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-10-06
+
+- **Schema:** 14 (migrates from 13)
+- **Rollback:** restore the pre-upgrade backup; older releases refuse a schema 14 database. New evidence exports use format v4, which older releases cannot verify (v3 packs still verify).
+
+### Added
+- Notifications name the instance and tailnet, state when the batch was observed, link to History and Status when `TAILSTATE_PUBLIC_URL` is set, and group collector health changes per poll with bounded reasons (#176).
+- Built-in change severity and per-destination routing by severity, collector, and change kind (#174).
+- Mute rules, fleet-wide summaries, and upstream schema-change detection; posture expiry timestamps are ignored (#175).
+- Per-service rendering: Markdown, Slack mrkdwn, or plain text, chosen per destination (#185).
+- Proactive warnings for expiring device node keys and auth keys, and an "Expiring soon" status card (#183).
+- `services` and `oauth_apps` collectors, DNS read from `/dns/configuration`, and configurable OAuth scopes (#184).
+- Status/Settings/History usability: correct labels and time zones, Reconcile now, retry dead letters, webhook state, readable storage, date filters, and bidirectional paging (#186).
+- `help` at every level, documented exit codes, `admin backup` (online) and `admin compact` (offline) commands (#190).
+- Used-bytes storage accounting, a WAL size cap, and a read-only connection pool for health, metrics, status, and History (#191).
+
+### Changed
+- One shared, responsive, accessible layout with a light theme (#187).
+- Destination actions use Post/Redirect/Get; expired sessions return to the original page after login; removing a destination requires confirmation; a CSRF failure now returns `403` without ending the session (#188).
+- The healthcheck follows `TAILSTATE_LISTEN_ADDR`; the listener is bound before polling starts (#190).
+
 ## [0.12.0] - 2026-10-06
 
 - **Schema:** 13 (migrates from 12)
@@ -70,6 +91,7 @@ Releases before 0.11.16 are described in their
 [GitHub release notes](https://github.com/crypt0rr/TailState/releases); their
 schema versions are listed in [UPGRADING.md](UPGRADING.md#schema-history).
 
-[Unreleased]: https://github.com/crypt0rr/TailState/compare/v0.12.0...HEAD
+[Unreleased]: https://github.com/crypt0rr/TailState/compare/v0.13.0...HEAD
+[0.13.0]: https://github.com/crypt0rr/TailState/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/crypt0rr/TailState/compare/v0.11.16...v0.12.0
 [0.11.16]: https://github.com/crypt0rr/TailState/compare/v0.11.15...v0.11.16

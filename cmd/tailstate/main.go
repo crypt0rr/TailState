@@ -323,8 +323,33 @@ func writeDoctorReport(report diagnostics.Report, jsonOutput bool) error {
 	return nil
 }
 
+// openExisting opens the configured database for a narrow administrative
+// write without creating, migrating, or otherwise rewriting it.
+func openExisting(command string) (*store.Store, error) {
+	config, err := boot.Load(version)
+	if err != nil {
+		return nil, fmt.Errorf("%s configuration: %w", command, err)
+	}
+	key, err := config.MasterKey()
+	if err != nil {
+		return nil, fmt.Errorf("%s master key: %w", command, err)
+	}
+	box, err := secret.NewBox(key)
+	if err != nil {
+		return nil, fmt.Errorf("%s master key: %w", command, err)
+	}
+	st, err := store.OpenExisting(config.DatabasePath(), box)
+	if err != nil {
+		return nil, fmt.Errorf("%s database: %w", command, err)
+	}
+	return st, nil
+}
+
 func adminReset() error {
-	_, st, err := load()
+	// Reset must work while serve is running and must never create or
+	// migrate a database (a mistyped data directory or a newer image would
+	// otherwise do so silently); it writes only the reset token row.
+	st, err := openExisting("admin reset")
 	if err != nil {
 		return err
 	}
@@ -486,9 +511,24 @@ func readEvidenceInput(input io.Reader, limit int64, tooLarge error) ([]byte, er
 }
 
 func evidencePublicKey() error {
-	_, st, err := load()
+	// Read-only: a missing database, an older schema, or a missing signing
+	// key is an error. This command must never create a database or a fresh
+	// key that an operator could mistake for the instance's trusted key.
+	config, err := boot.Load(version)
 	if err != nil {
-		return err
+		return fmt.Errorf("evidence public-key configuration: %w", err)
+	}
+	key, err := config.MasterKey()
+	if err != nil {
+		return fmt.Errorf("evidence public-key master key: %w", err)
+	}
+	box, err := secret.NewBox(key)
+	if err != nil {
+		return fmt.Errorf("evidence public-key master key: %w", err)
+	}
+	st, err := store.OpenEvidenceReadOnly(config.DatabasePath(), box)
+	if err != nil {
+		return fmt.Errorf("evidence public-key database: %w", err)
 	}
 	defer st.Close()
 	public, err := st.EvidenceSigningPublicKey(context.Background())

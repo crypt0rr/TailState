@@ -223,7 +223,11 @@ func OpenWithLimits(path string, box *secret.Box, configuredLimits StorageLimits
 	if err := os.MkdirAll(filepathDir(path), 0o700); err != nil {
 		return nil, err
 	}
-	dsn := "file:" + path + "?_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)&_pragma=synchronous(FULL)"
+	// _txlock=immediate makes every transaction take the write lock when it
+	// begins. A deferred transaction that reads and then writes after another
+	// process (an admin command, for example) committed fails immediately
+	// with SQLITE_BUSY_SNAPSHOT; an immediate one waits for busy_timeout.
+	dsn := "file:" + path + "?_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)&_pragma=synchronous(FULL)&_txlock=immediate"
 	connector := newPageLimitedConnector(dsn)
 	db := sql.OpenDB(connector)
 	db.SetMaxOpenConns(1)
@@ -342,6 +346,69 @@ func OpenWithLimits(path string, box *secret.Box, configuredLimits StorageLimits
 		db.Close()
 		return nil, err
 	}
+	return st, nil
+}
+
+// OpenExisting opens an existing, current-schema database for a narrow
+// administrative write (such as issuing a password reset token) while the
+// service may be running. Unlike OpenWithLimits it never creates the file or
+// its directory, runs no bootstrap DDL, migrations, or backfills, does not
+// generate signing keys, and does not persist storage limits; a missing or
+// older-schema database is left untouched and reported as an error.
+func OpenExisting(path string, box *secret.Box) (*Store, error) {
+	if box == nil {
+		return nil, errors.New("master key is required")
+	}
+	if strings.TrimSpace(path) == "" {
+		return nil, errors.New("database path is required")
+	}
+	if _, err := os.Stat(path); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("%w: %s", ErrDatabaseNotFound, path)
+		}
+		return nil, fmt.Errorf("inspect database path: %w", err)
+	}
+	// mode=rw refuses to create a missing file. journal_mode is omitted: the
+	// serving process already configured WAL, which is persistent.
+	db, err := sql.Open("sqlite", "file:"+path+"?mode=rw&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)&_txlock=immediate")
+	if err != nil {
+		return nil, fmt.Errorf("open database: %w", err)
+	}
+	db.SetMaxOpenConns(1)
+	closeWith := func(openErr error) (*Store, error) {
+		_ = db.Close()
+		return nil, openErr
+	}
+	if err := db.Ping(); err != nil {
+		return closeWith(fmt.Errorf("open database: %w", err))
+	}
+	present, err := verifyExistingMasterKey(db, box)
+	if err != nil {
+		return closeWith(err)
+	}
+	if !present {
+		if err := verifyLegacyMasterKey(db, box); err != nil {
+			return closeWith(err)
+		}
+	}
+	if err := verifyDatabaseVersionPreflight(db); err != nil {
+		return closeWith(err)
+	}
+	version, versioned, err := readDatabaseSchemaVersion(db)
+	if err != nil {
+		return closeWith(err)
+	}
+	if !versioned {
+		return closeWith(errors.New("database is not initialized; start TailState once before running this command"))
+	}
+	if version != currentSchemaVersion {
+		return closeWith(fmt.Errorf("database schema version %d is not the current version %d; stop TailState, create a verified backup, and start the current release to migrate before running this command", version, currentSchemaVersion))
+	}
+	if !present {
+		return closeWith(errors.New("database has no master key check; start TailState once before running this command"))
+	}
+	st := &Store{db: db, databasePath: path, box: box}
+	st.limits.Store(DefaultStorageLimits())
 	return st, nil
 }
 

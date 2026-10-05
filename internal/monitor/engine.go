@@ -335,15 +335,21 @@ func (e *Engine) scheduler(ctx context.Context) {
 				initialSuccess := e.poll(ctx, client, settings, allCollectors(), false)
 				stop(deviceTimer)
 				stop(inventoryTimer)
-				deviceTimer = time.NewTimer(nextPollDelay(settings.DeviceInterval, initialSuccess))
-				inventoryTimer = time.NewTimer(nextPollDelay(settings.InventoryInterval, initialSuccess))
+				// The initial poll only covers collectors that are already due.
+				// Persisted per-collector deadlines (failure retries, unsupported
+				// confirmation) must survive a restart instead of being replaced by
+				// the full configured interval.
+				deviceTimer = time.NewTimer(e.pollTimerDelay(ctx, settings.Generation, tailscale.CoreCollectors, settings.DeviceInterval, initialSuccess))
+				inventoryTimer = time.NewTimer(e.pollTimerDelay(ctx, settings.Generation, tailscale.InventoryCollectors, settings.InventoryInterval, initialSuccess))
 			} else {
 				// Refreshing a credential or interval must not reset the baseline,
 				// but the old timers must not keep using the previous interval.
+				// Short persisted retry deadlines still apply, so an operator who
+				// fixes a broken secret gets the pending retry promptly.
 				stop(deviceTimer)
 				stop(inventoryTimer)
-				deviceTimer = time.NewTimer(jitter(settings.DeviceInterval))
-				inventoryTimer = time.NewTimer(jitter(settings.InventoryInterval))
+				deviceTimer = time.NewTimer(e.pollTimerDelay(ctx, settings.Generation, tailscale.CoreCollectors, settings.DeviceInterval, true))
+				inventoryTimer = time.NewTimer(e.pollTimerDelay(ctx, settings.Generation, tailscale.InventoryCollectors, settings.InventoryInterval, true))
 			}
 		}
 		if overflow := e.takeTriggerOverflow(); len(overflow) > 0 {

@@ -321,6 +321,7 @@ in a disposable project before relying on the procedure for an outage.
 - Each paginated collection is bounded to 10,000 items and 64 MiB of response data across all pages, in addition to the 16 MiB per-response cap. If an aggregate limit is exceeded, the collector fails without applying partial inventory or deleting the last known snapshots. Device-detail requests share a bounded eight-worker queue so a large device list cannot create one job and result buffer per device.
 - If every destination is disabled, monitoring continues and notifications are reported as paused.
 - API collector failures alert after three consecutive failures and once on recovery.
+- Per-collector retry deadlines (failure retries, unsupported confirmation) are persisted and honored after a restart or a settings save, so a short retry is never replaced by the full polling interval.
 - A 403/404 from an optional plan-specific endpoint is treated as an
   unsupported response. Collectors that have never produced a baseline are
   retried every six hours. For an established baseline, the first response is

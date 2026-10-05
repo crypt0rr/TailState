@@ -82,7 +82,7 @@ func TestStoreLifecycleAndCollectorStateBranches(t *testing.T) {
 	if notify, _, err := st.RecordCollectorFailure(ctx, generation, "devices", "again"); err != nil || notify {
 		t.Fatalf("fourth failure notification=%v err=%v", notify, err)
 	}
-	if _, err := testApplyBatch(st, ctx, generation, []model.Collected{{Collector: "devices", Resources: []model.Resource{{ID: "device-1", Type: "device", Name: "server", Data: map[string]any{"hostname": "server"}}}}}, func([]model.Change) string { return "digest" }); err != nil {
+	if _, err := testApplyBatch(st, ctx, generation, []model.Collected{{Collector: "devices", Resources: []model.Resource{{ID: "device-1", Type: "device", Name: "server", Data: map[string]any{"hostname": "server"}}}}}, notify.TextDigest("digest")); err != nil {
 		t.Fatal(err)
 	}
 	if unhealthy, err := st.CollectorWasUnhealthyWithError(ctx, generation, "devices"); err != nil || unhealthy {
@@ -350,7 +350,7 @@ func TestPersistedTimestampErrorsSurface(t *testing.T) {
 		if _, err := st.db.ExecContext(ctx, "UPDATE settings SET configured_at=? WHERE id=1", time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := testApplyBatch(st, ctx, generation, []model.Collected{{Collector: "devices", Resources: []model.Resource{{ID: "device-1", Type: "device", Name: "server", Data: map[string]any{"hostname": "server"}}}}}, func([]model.Change) string { return "baseline" }); err != nil {
+		if _, err := testApplyBatch(st, ctx, generation, []model.Collected{{Collector: "devices", Resources: []model.Resource{{ID: "device-1", Type: "device", Name: "server", Data: map[string]any{"hostname": "server"}}}}}, notify.TextDigest("baseline")); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := st.db.ExecContext(ctx, "UPDATE collector_state SET last_success='bad' WHERE generation=? AND collector='devices'", generation); err != nil {
@@ -370,10 +370,10 @@ func TestPersistedTimestampErrorsSurface(t *testing.T) {
 		resource := func(name string) []model.Resource {
 			return []model.Resource{{Collector: "devices", ID: "device-1", Type: "device", Name: name, Data: map[string]any{"hostname": name}}}
 		}
-		if _, err := testApplyBatch(st, ctx, generation, []model.Collected{{Collector: "devices", Resources: resource("server")}}, notify.Digest); err != nil {
+		if _, err := testApplyBatch(st, ctx, generation, []model.Collected{{Collector: "devices", Resources: resource("server")}}, notify.Context{}.Digest); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := testApplyBatch(st, ctx, generation, []model.Collected{{Collector: "devices", Resources: resource("changed")}}, notify.Digest); err != nil {
+		if _, err := testApplyBatch(st, ctx, generation, []model.Collected{{Collector: "devices", Resources: resource("changed")}}, notify.Context{}.Digest); err != nil {
 			t.Fatal(err)
 		}
 		var batchID int64
@@ -537,15 +537,15 @@ func TestClosedStoreReturnsOperationalErrors(t *testing.T) {
 	expectErr("SetDestinationEnabled", func() error { return st.SetDestinationEnabled(ctx, 1, true) })
 	expectErr("DeleteDestination", func() error { return st.DeleteDestination(ctx, 1) })
 	expectErr("TrackAppVersion", func() error {
-		_, err := st.TrackAppVersion(ctx, "1.0.0", func(string, string) string { return "update" })
+		_, err := st.TrackAppVersion(ctx, "1.0.0", func(string, string) notify.Message { return notify.Text("update") })
 		return err
 	})
 	expectErr("ApplyBatch", func() error {
-		_, err := testApplyBatch(st, ctx, 1, nil, func([]model.Change) string { return "" })
+		_, err := testApplyBatch(st, ctx, 1, nil, notify.TextDigest(""))
 		return err
 	})
 	expectErr("ApplyBatchWithBatch", func() error {
-		_, err := st.ApplyBatchWithBatch(ctx, 1, nil, func([]model.Change) string { return "" })
+		_, err := st.ApplyBatchWithBatch(ctx, 1, nil, notify.TextDigest(""))
 		return err
 	})
 	expectErr("RecordCollectorFailure", func() error { _, _, err := st.RecordCollectorFailure(ctx, 1, "devices", "error"); return err })
@@ -840,7 +840,7 @@ func TestTrackAppVersionQueryErrorBranches(t *testing.T) {
 		if _, err := st.db.ExecContext(ctx, "DROP TABLE outbox"); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := st.TrackAppVersion(ctx, "1.1.0", func(string, string) string { return "version changed" }); err == nil {
+		if _, err := st.TrackAppVersion(ctx, "1.1.0", func(string, string) notify.Message { return notify.Text("version changed") }); err == nil {
 			t.Fatal("TrackAppVersion succeeded without outbox")
 		}
 	})
@@ -989,13 +989,13 @@ func storeWithHistoryBatch(t *testing.T) (*Store, int64) {
 	baseline := []model.Collected{{Collector: "devices", Resources: []model.Resource{{
 		ID: "device-1", Type: "device", Name: "server", Data: map[string]any{"hostname": "server"},
 	}}}}
-	if _, err := testApplyBatch(st, ctx, generation, baseline, func([]model.Change) string { return "baseline" }); err != nil {
+	if _, err := testApplyBatch(st, ctx, generation, baseline, notify.TextDigest("baseline")); err != nil {
 		t.Fatal(err)
 	}
 	changed := []model.Collected{{Collector: "devices", Resources: []model.Resource{{
 		ID: "device-1", Type: "device", Name: "server-new", Data: map[string]any{"hostname": "server-new"},
 	}}}}
-	batch, err := st.ApplyBatchWithBatch(ctx, generation, changed, func([]model.Change) string { return "changed" })
+	batch, err := st.ApplyBatchWithBatch(ctx, generation, changed, notify.TextDigest("changed"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1246,7 +1246,7 @@ func TestApplyBatchTransactionErrorBranches(t *testing.T) {
 		if _, err := st.db.ExecContext(ctx, "DROP TABLE settings"); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := st.ApplyBatchWithBatch(ctx, 1, nil, func([]model.Change) string { return "digest" }); err == nil {
+		if _, err := st.ApplyBatchWithBatch(ctx, 1, nil, notify.TextDigest("digest")); err == nil {
 			t.Fatal("ApplyBatchWithBatch succeeded without settings")
 		}
 	})
@@ -1257,7 +1257,7 @@ func TestApplyBatchTransactionErrorBranches(t *testing.T) {
 			t.Fatal(err)
 		}
 		unsupported := []model.Collected{{Collector: "log_streaming", Unsupported: true}}
-		if _, err := st.ApplyBatchWithBatch(ctx, generation, unsupported, func([]model.Change) string { return "digest" }); err == nil {
+		if _, err := st.ApplyBatchWithBatch(ctx, generation, unsupported, notify.TextDigest("digest")); err == nil {
 			t.Fatal("unsupported collector state write unexpectedly succeeded")
 		}
 	})
@@ -1265,7 +1265,7 @@ func TestApplyBatchTransactionErrorBranches(t *testing.T) {
 	t.Run("canonicalization error", func(t *testing.T) {
 		st, generation := configuredCoverageStore(t)
 		bad := []model.Collected{{Collector: "devices", Resources: []model.Resource{{ID: "bad", Type: "device", Name: "bad", Data: map[string]any{"hostname": make(chan int)}}}}}
-		if _, err := st.ApplyBatchWithBatch(ctx, generation, bad, func([]model.Change) string { return "digest" }); err == nil {
+		if _, err := st.ApplyBatchWithBatch(ctx, generation, bad, notify.TextDigest("digest")); err == nil {
 			t.Fatal("unsupported resource data was accepted")
 		}
 	})
@@ -1276,7 +1276,7 @@ func TestApplyBatchTransactionErrorBranches(t *testing.T) {
 			t.Fatal(err)
 		}
 		empty := []model.Collected{{Collector: "devices"}}
-		if _, err := st.ApplyBatchWithBatch(ctx, generation, empty, func([]model.Change) string { return "digest" }); err == nil {
+		if _, err := st.ApplyBatchWithBatch(ctx, generation, empty, notify.TextDigest("digest")); err == nil {
 			t.Fatal("ApplyBatchWithBatch succeeded without snapshots")
 		}
 	})
@@ -1301,13 +1301,13 @@ func TestApplyBatchTransactionErrorBranches(t *testing.T) {
 				t.Fatal(err)
 			}
 			baseline := []model.Collected{{Collector: "devices", Resources: []model.Resource{{ID: "device-1", Type: "device", Name: "server", Data: map[string]any{"hostname": "server"}}}}}
-			if _, err := testApplyBatch(st, ctx, generation, baseline, func([]model.Change) string { return "baseline" }); err != nil && tt.table != "evidence_ledger" {
+			if _, err := testApplyBatch(st, ctx, generation, baseline, notify.TextDigest("baseline")); err != nil && tt.table != "evidence_ledger" {
 				// The event batch and outbox cases should fail only on the changed write;
 				// the evidence-ledger case also fails during the baseline backfill.
 				t.Fatal(err)
 			}
 			changed := []model.Collected{{Collector: "devices", Resources: []model.Resource{{ID: "device-1", Type: "device", Name: "changed", Data: map[string]any{"hostname": "changed"}}}}}
-			if _, err := st.ApplyBatchWithBatch(ctx, generation, changed, func([]model.Change) string { return "changed" }); err == nil {
+			if _, err := st.ApplyBatchWithBatch(ctx, generation, changed, notify.TextDigest("changed")); err == nil {
 				t.Fatalf("ApplyBatchWithBatch succeeded with broken %s", tt.table)
 			}
 		})
@@ -1466,7 +1466,7 @@ func TestApplyBatchWriteErrorBranches(t *testing.T) {
 		if _, err := st.db.ExecContext(ctx, `CREATE TRIGGER fail_baseline_update BEFORE UPDATE OF baseline_at ON settings BEGIN SELECT RAISE(ABORT,'baseline update failed'); END`); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := testApplyBatch(st, ctx, generation, baseline, func([]model.Change) string { return "baseline" }); err == nil {
+		if _, err := testApplyBatch(st, ctx, generation, baseline, notify.TextDigest("baseline")); err == nil {
 			t.Fatal("ApplyBatch ignored baseline update failure")
 		}
 	})
@@ -1476,49 +1476,49 @@ func TestApplyBatchWriteErrorBranches(t *testing.T) {
 		if _, err := st.db.ExecContext(ctx, `CREATE TRIGGER fail_snapshot_insert BEFORE INSERT ON snapshots BEGIN SELECT RAISE(ABORT,'snapshot insert failed'); END`); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := testApplyBatch(st, ctx, generation, baseline, func([]model.Change) string { return "baseline" }); err == nil {
+		if _, err := testApplyBatch(st, ctx, generation, baseline, notify.TextDigest("baseline")); err == nil {
 			t.Fatal("ApplyBatch ignored snapshot insert failure")
 		}
 	})
 
 	t.Run("snapshot update", func(t *testing.T) {
 		st, generation := configuredCoverageStore(t)
-		if _, err := testApplyBatch(st, ctx, generation, baseline, func([]model.Change) string { return "baseline" }); err != nil {
+		if _, err := testApplyBatch(st, ctx, generation, baseline, notify.TextDigest("baseline")); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := st.db.ExecContext(ctx, `CREATE TRIGGER fail_snapshot_update BEFORE UPDATE ON snapshots BEGIN SELECT RAISE(ABORT,'snapshot update failed'); END`); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := testApplyBatch(st, ctx, generation, changed, func([]model.Change) string { return "changed" }); err == nil {
+		if _, err := testApplyBatch(st, ctx, generation, changed, notify.TextDigest("changed")); err == nil {
 			t.Fatal("ApplyBatch ignored snapshot update failure")
 		}
 	})
 
 	t.Run("snapshot delete", func(t *testing.T) {
 		st, generation := configuredCoverageStore(t)
-		if _, err := testApplyBatch(st, ctx, generation, baseline, func([]model.Change) string { return "baseline" }); err != nil {
+		if _, err := testApplyBatch(st, ctx, generation, baseline, notify.TextDigest("baseline")); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := testApplyBatch(st, ctx, generation, []model.Collected{{Collector: "devices"}}, func([]model.Change) string { return "missing" }); err != nil {
+		if _, err := testApplyBatch(st, ctx, generation, []model.Collected{{Collector: "devices"}}, notify.TextDigest("missing")); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := st.db.ExecContext(ctx, `CREATE TRIGGER fail_snapshot_delete BEFORE DELETE ON snapshots BEGIN SELECT RAISE(ABORT,'snapshot delete failed'); END`); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := testApplyBatch(st, ctx, generation, []model.Collected{{Collector: "devices"}}, func([]model.Change) string { return "removed" }); err == nil {
+		if _, err := testApplyBatch(st, ctx, generation, []model.Collected{{Collector: "devices"}}, notify.TextDigest("removed")); err == nil {
 			t.Fatal("ApplyBatch ignored snapshot delete failure")
 		}
 	})
 
 	t.Run("collector state update", func(t *testing.T) {
 		st, generation := configuredCoverageStore(t)
-		if _, err := testApplyBatch(st, ctx, generation, baseline, func([]model.Change) string { return "baseline" }); err != nil {
+		if _, err := testApplyBatch(st, ctx, generation, baseline, notify.TextDigest("baseline")); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := st.db.ExecContext(ctx, `CREATE TRIGGER fail_collector_state_update BEFORE UPDATE ON collector_state WHEN NEW.collector='devices' BEGIN SELECT RAISE(ABORT,'collector state update failed'); END`); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := testApplyBatch(st, ctx, generation, changed, func([]model.Change) string { return "changed" }); err == nil {
+		if _, err := testApplyBatch(st, ctx, generation, changed, notify.TextDigest("changed")); err == nil {
 			t.Fatal("ApplyBatch ignored collector state update failure")
 		}
 	})
@@ -1526,14 +1526,14 @@ func TestApplyBatchWriteErrorBranches(t *testing.T) {
 	for _, table := range []string{"event_batch_triggers", "events"} {
 		t.Run(table+" insert", func(t *testing.T) {
 			st, generation := configuredCoverageStore(t)
-			if _, err := testApplyBatch(st, ctx, generation, baseline, func([]model.Change) string { return "baseline" }); err != nil {
+			if _, err := testApplyBatch(st, ctx, generation, baseline, notify.TextDigest("baseline")); err != nil {
 				t.Fatal(err)
 			}
 			trigger := "fail_" + table + "_insert"
 			if _, err := st.db.ExecContext(ctx, "CREATE TRIGGER "+trigger+" BEFORE INSERT ON "+table+" BEGIN SELECT RAISE(ABORT,'"+table+" insert failed'); END"); err != nil {
 				t.Fatal(err)
 			}
-			if _, err := st.ApplyBatchWithBatch(ctx, generation, changed, func([]model.Change) string { return "changed" }, 1); err == nil {
+			if _, err := st.ApplyBatchWithBatch(ctx, generation, changed, notify.TextDigest("changed"), 1); err == nil {
 				t.Fatalf("ApplyBatch ignored %s insert failure", table)
 			}
 		})
@@ -1743,14 +1743,14 @@ func TestApplyBatchCreatesNewBaselineResourceChange(t *testing.T) {
 	ctx := context.Background()
 	st, generation := configuredCoverageStore(t)
 	baseline := []model.Collected{{Collector: "devices", Resources: []model.Resource{{ID: "device-1", Type: "device", Name: "one", Data: map[string]any{"hostname": "one"}}}}}
-	if _, err := testApplyBatch(st, ctx, generation, baseline, func([]model.Change) string { return "baseline" }); err != nil {
+	if _, err := testApplyBatch(st, ctx, generation, baseline, notify.TextDigest("baseline")); err != nil {
 		t.Fatal(err)
 	}
 	withNewResource := []model.Collected{{Collector: "devices", Resources: []model.Resource{
 		{ID: "device-1", Type: "device", Name: "one", Data: map[string]any{"hostname": "one"}},
 		{ID: "device-2", Type: "device", Name: "two", Data: map[string]any{"hostname": "two"}},
 	}}}
-	batch, err := st.ApplyBatchWithBatch(ctx, generation, withNewResource, func([]model.Change) string { return "created" })
+	batch, err := st.ApplyBatchWithBatch(ctx, generation, withNewResource, notify.TextDigest("created"))
 	if err != nil || len(batch.Changes) != 1 || batch.Changes[0].Kind != "created" {
 		t.Fatalf("new resource change=%#v err=%v", batch, err)
 	}

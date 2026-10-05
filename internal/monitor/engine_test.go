@@ -67,10 +67,10 @@ func TestDeliveryKeepsDestinationFailuresIndependent(t *testing.T) {
 	}
 	baseline := []model.Collected{{Collector: "devices", Resources: []model.Resource{{ID: "device-1", Type: "device", Name: "server", Data: map[string]any{"hostname": "server"}}}}}
 	changed := []model.Collected{{Collector: "devices", Resources: []model.Resource{{ID: "device-1", Type: "device", Name: "server", Data: map[string]any{"hostname": "server-new"}}}}}
-	if _, err := st.ApplyBatchWithBatch(ctx, generation, baseline, notify.Digest); err != nil {
+	if _, err := st.ApplyBatchWithBatch(ctx, generation, baseline, notify.Context{}.Digest); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.ApplyBatchWithBatch(ctx, generation, changed, notify.Digest); err != nil {
+	if _, err := st.ApplyBatchWithBatch(ctx, generation, changed, notify.Context{}.Digest); err != nil {
 		t.Fatal(err)
 	}
 	sender := &scriptedSender{}

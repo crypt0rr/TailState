@@ -216,7 +216,7 @@ func (s *Store) Settings(ctx context.Context) (Settings, error) {
 	return out, nil
 }
 
-func (s *Store) TrackAppVersion(ctx context.Context, current string, notification func(previous, current string) string) (bool, error) {
+func (s *Store) TrackAppVersion(ctx context.Context, current string, notification func(previous, current string) notify.Message) (bool, error) {
 	current = strings.TrimSpace(current)
 	if current == "" || current == "dev" {
 		return false, nil
@@ -254,7 +254,7 @@ func (s *Store) TrackAppVersion(ctx context.Context, current string, notificatio
 	notified := configured > 0 && enabledDestinations > 0
 	if notified {
 		now := time.Now().UTC().Format(time.RFC3339Nano)
-		payload := notification(previous, current)
+		payload := notify.Markdown(notification(previous, current))
 		if err = enqueueOutboxTx(ctx, tx, payload, now, 0); err != nil {
 			return false, err
 		}

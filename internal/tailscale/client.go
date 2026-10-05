@@ -839,8 +839,10 @@ func (c *Client) getWithBytes(ctx context.Context, endpoint string) (any, int64,
 		}
 		return value, int64(len(body)), nil
 	}
-	return nil, 0, errors.New("tailscale request retries exhausted")
+	return nil, 0, errRetriesExhausted
 }
+
+var errRetriesExhausted = errors.New("tailscale request retries exhausted")
 
 // oauthStatusError reports a non-2xx token endpoint response.
 type oauthStatusError struct {

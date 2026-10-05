@@ -35,6 +35,10 @@ func (s *Store) listHistory(ctx context.Context, filter HistoryFilter, byteLimit
 		where = append(where, "b.id < ?")
 		args = append(args, filter.Cursor)
 	}
+	if filter.BatchID > 0 {
+		where = append(where, "b.id = ?")
+		args = append(args, filter.BatchID)
+	}
 	if filter.Collector != "" {
 		where = append(where, "EXISTS (SELECT 1 FROM events e WHERE e.batch_id=b.id AND e.collector=?)")
 		args = append(args, filter.Collector)

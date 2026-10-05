@@ -20,6 +20,13 @@ type outboxScanner interface {
 	Scan(dest ...any) error
 }
 
+// EnqueueMessage queues a system notification (health, update) for every
+// enabled destination.
+func (s *Store) EnqueueMessage(ctx context.Context, message notify.Message) error {
+	return s.EnqueueSystem(ctx, notify.Markdown(message))
+}
+
+// EnqueueSystem queues pre-rendered Markdown for every enabled destination.
 func (s *Store) EnqueueSystem(ctx context.Context, payload string) error {
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	tx, err := s.db.BeginTx(ctx, nil)

@@ -181,6 +181,8 @@ type HistoryFilter struct {
 	ResourceID string
 	Cursor     int64
 	Limit      int
+	// BatchID selects exactly one batch, for notification deep links.
+	BatchID int64
 }
 
 type HistoryPage struct {

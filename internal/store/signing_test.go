@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/crypt0rr/tailstate/internal/model"
+	"github.com/crypt0rr/tailstate/internal/notify"
 	"github.com/crypt0rr/tailstate/internal/secret"
 )
 
@@ -35,11 +36,11 @@ func TestEvidenceSigningKeyPersistsAndVerifiesExports(t *testing.T) {
 		st.Close()
 		t.Fatal(err)
 	}
-	if _, err := testApplyBatch(st, ctx, generation, []model.Collected{historyResource("server", "100.64.0.1")}, func([]model.Change) string { return "baseline" }); err != nil {
+	if _, err := testApplyBatch(st, ctx, generation, []model.Collected{historyResource("server", "100.64.0.1")}, notify.TextDigest("baseline")); err != nil {
 		st.Close()
 		t.Fatal(err)
 	}
-	if _, err := testApplyBatch(st, ctx, generation, []model.Collected{historyResource("server-new", "100.64.0.2")}, func([]model.Change) string { return "changed" }); err != nil {
+	if _, err := testApplyBatch(st, ctx, generation, []model.Collected{historyResource("server-new", "100.64.0.2")}, notify.TextDigest("changed")); err != nil {
 		st.Close()
 		t.Fatal(err)
 	}
@@ -118,14 +119,14 @@ func TestFilteredEvidencePackVerifiesWithOriginalLedgerCount(t *testing.T) {
 		{ID: "device-1", Type: "device", Name: "server-1", Data: map[string]any{"hostname": "server-1"}},
 		{ID: "device-2", Type: "device", Name: "server-2", Data: map[string]any{"hostname": "server-2"}},
 	}}
-	if _, err := testApplyBatch(st, ctx, generation, []model.Collected{baseline}, func([]model.Change) string { return "baseline" }); err != nil {
+	if _, err := testApplyBatch(st, ctx, generation, []model.Collected{baseline}, notify.TextDigest("baseline")); err != nil {
 		t.Fatal(err)
 	}
 	changed := model.Collected{Collector: "devices", Resources: []model.Resource{
 		{ID: "device-1", Type: "device", Name: "server-1-new", Data: map[string]any{"hostname": "server-1-new"}},
 		{ID: "device-2", Type: "device", Name: "server-2-new", Data: map[string]any{"hostname": "server-2-new"}},
 	}}
-	if _, err := testApplyBatch(st, ctx, generation, []model.Collected{changed}, func([]model.Change) string { return "changed" }); err != nil {
+	if _, err := testApplyBatch(st, ctx, generation, []model.Collected{changed}, notify.TextDigest("changed")); err != nil {
 		t.Fatal(err)
 	}
 	encoded, err := st.ExportEvidencePack(ctx, HistoryFilter{ResourceID: "device-1"})
@@ -154,12 +155,12 @@ func TestPaginatedEvidencePacksVerifyCompleteness(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := testApplyBatch(st, ctx, generation, []model.Collected{historyResource("server", "100.64.0.1")}, func([]model.Change) string { return "baseline" }); err != nil {
+	if _, err := testApplyBatch(st, ctx, generation, []model.Collected{historyResource("server", "100.64.0.1")}, notify.TextDigest("baseline")); err != nil {
 		t.Fatal(err)
 	}
 	for i := 0; i < maxEvidenceBatches+1; i++ {
 		hostname := fmt.Sprintf("server-%03d", i)
-		if _, err := testApplyBatch(st, ctx, generation, []model.Collected{historyResource(hostname, fmt.Sprintf("100.64.0.%d", i+2))}, func([]model.Change) string { return hostname }); err != nil {
+		if _, err := testApplyBatch(st, ctx, generation, []model.Collected{historyResource(hostname, fmt.Sprintf("100.64.0.%d", i+2))}, notify.TextDigest(hostname)); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -206,7 +207,7 @@ func TestEvidenceLedgerChainAndEncryptedKeyMetadata(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, hostname := range []string{"server", "server-one", "server-two"} {
-		if _, err := testApplyBatch(st, ctx, generation, []model.Collected{historyResource(hostname, "100.64.0.1")}, func([]model.Change) string { return hostname }); err != nil {
+		if _, err := testApplyBatch(st, ctx, generation, []model.Collected{historyResource(hostname, "100.64.0.1")}, notify.TextDigest(hostname)); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -244,13 +245,13 @@ func TestEvidenceLedgerSurvivesHistoryRetention(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := testApplyBatch(st, ctx, generation, []model.Collected{historyResource("server", "100.64.0.1")}, func([]model.Change) string { return "baseline" }); err != nil {
+	if _, err := testApplyBatch(st, ctx, generation, []model.Collected{historyResource("server", "100.64.0.1")}, notify.TextDigest("baseline")); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := testApplyBatch(st, ctx, generation, []model.Collected{historyResource("server-one", "100.64.0.2")}, func([]model.Change) string { return "old" }); err != nil {
+	if _, err := testApplyBatch(st, ctx, generation, []model.Collected{historyResource("server-one", "100.64.0.2")}, notify.TextDigest("old")); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := testApplyBatch(st, ctx, generation, []model.Collected{historyResource("server-two", "100.64.0.3")}, func([]model.Change) string { return "new" }); err != nil {
+	if _, err := testApplyBatch(st, ctx, generation, []model.Collected{historyResource("server-two", "100.64.0.3")}, notify.TextDigest("new")); err != nil {
 		t.Fatal(err)
 	}
 	page, err := st.ListHistory(ctx, HistoryFilter{Limit: 10})
@@ -300,13 +301,13 @@ func TestEvidenceLedgerEntrySignaturesVerifyIndependently(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := testApplyBatch(st, ctx, generation, []model.Collected{historyResource("server", "100.64.0.1")}, func([]model.Change) string { return "baseline" }); err != nil {
+	if _, err := testApplyBatch(st, ctx, generation, []model.Collected{historyResource("server", "100.64.0.1")}, notify.TextDigest("baseline")); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := testApplyBatch(st, ctx, generation, []model.Collected{historyResource("server-new", "100.64.0.2")}, func([]model.Change) string { return "changed" }); err != nil {
+	if _, err := testApplyBatch(st, ctx, generation, []model.Collected{historyResource("server-new", "100.64.0.2")}, notify.TextDigest("changed")); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := testApplyBatch(st, ctx, generation, []model.Collected{historyResource("server-newer", "100.64.0.3")}, func([]model.Change) string { return "changed-again" }); err != nil {
+	if _, err := testApplyBatch(st, ctx, generation, []model.Collected{historyResource("server-newer", "100.64.0.3")}, notify.TextDigest("changed-again")); err != nil {
 		t.Fatal(err)
 	}
 	data, err := st.ExportEvidencePack(ctx, HistoryFilter{Limit: 10})
@@ -353,15 +354,15 @@ func TestEvidenceLedgerGenesisCheckpointHasNoPredecessor(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := testApplyBatch(st, ctx, generation, []model.Collected{historyResource("server", "100.64.0.1")}, func([]model.Change) string { return "baseline" }); err != nil {
+	if _, err := testApplyBatch(st, ctx, generation, []model.Collected{historyResource("server", "100.64.0.1")}, notify.TextDigest("baseline")); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := testApplyBatch(st, ctx, generation, []model.Collected{historyResource("server-new", "100.64.0.2")}, func([]model.Change) string { return "changed" }); err != nil {
+	if _, err := testApplyBatch(st, ctx, generation, []model.Collected{historyResource("server-new", "100.64.0.2")}, notify.TextDigest("changed")); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := testApplyBatch(st, ctx, generation, []model.Collected{{Collector: "devices", Resources: []model.Resource{{
 		ID: "device-2", Type: "device", Name: "server-newer", Data: map[string]any{"hostname": "server-newer", "addresses": []any{"100.64.0.3"}},
-	}}}}, func([]model.Change) string { return "changed-again" }); err != nil {
+	}}}}, notify.TextDigest("changed-again")); err != nil {
 		t.Fatal(err)
 	}
 	data, err := st.ExportEvidencePack(ctx, HistoryFilter{ResourceID: "device-2"})
@@ -388,10 +389,10 @@ func TestVerifyLedgerPayloadProjectionBinding(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := testApplyBatch(st, ctx, generation, []model.Collected{historyResource("server", "100.64.0.1")}, func([]model.Change) string { return "baseline" }); err != nil {
+	if _, err := testApplyBatch(st, ctx, generation, []model.Collected{historyResource("server", "100.64.0.1")}, notify.TextDigest("baseline")); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := testApplyBatch(st, ctx, generation, []model.Collected{historyResource("server-new", "100.64.0.2")}, func([]model.Change) string { return "changed" }); err != nil {
+	if _, err := testApplyBatch(st, ctx, generation, []model.Collected{historyResource("server-new", "100.64.0.2")}, notify.TextDigest("changed")); err != nil {
 		t.Fatal(err)
 	}
 	data, err := st.ExportEvidencePack(ctx, HistoryFilter{Limit: 10})

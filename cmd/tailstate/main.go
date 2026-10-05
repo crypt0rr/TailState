@@ -141,7 +141,15 @@ func serveContext(ctx context.Context) error {
 		}
 		slog.Warn("installation is unclaimed; open /setup and use the one-time setup token", "setup_token", token)
 	}
-	notified, err := st.TrackAppVersion(ctx, version, notify.Update)
+	// The tailnet is only needed for the update notification's context; an
+	// unconfigured installation queues no notification.
+	messages := notify.Context{Label: config.InstanceLabel, PublicURL: config.PublicURL, Version: version}
+	if settings, settingsErr := st.Settings(ctx); settingsErr == nil {
+		messages.Tailnet = settings.Tailnet
+	}
+	notified, err := st.TrackAppVersion(ctx, version, func(previous, current string) notify.Message {
+		return messages.Update(previous, current, time.Now())
+	})
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
 			return nil
@@ -152,6 +160,7 @@ func serveContext(ctx context.Context) error {
 		slog.Info("TailState update notification queued", "version", version)
 	}
 	engine := monitor.New(st, config.TailscaleBase, config.OAuthTokenURL, version)
+	engine.ConfigureNotifications(config.InstanceLabel, config.PublicURL)
 	engine.Run(ctx)
 	defer func() {
 		cancel()

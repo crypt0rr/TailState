@@ -18,6 +18,7 @@ import (
 	"github.com/crypt0rr/tailstate/internal/boot"
 	"github.com/crypt0rr/tailstate/internal/model"
 	"github.com/crypt0rr/tailstate/internal/monitor"
+	"github.com/crypt0rr/tailstate/internal/notify"
 	"github.com/crypt0rr/tailstate/internal/secret"
 	"github.com/crypt0rr/tailstate/internal/store"
 	"github.com/crypt0rr/tailstate/internal/webhook"
@@ -438,7 +439,7 @@ func TestReadyDegradesWhenASecondCollectorStaysUnbaselined(t *testing.T) {
 	if _, _, err := st.RecordCollectorFailure(ctx, generation, "users", "upstream unavailable"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.ApplyBatchWithBatch(ctx, generation, []model.Collected{{Collector: "devices", Resources: []model.Resource{{ID: "device-1", Type: "device", Name: "server", Data: map[string]any{"hostname": "server"}}}}}, func([]model.Change) string { return "baseline" }); err != nil {
+	if _, err := st.ApplyBatchWithBatch(ctx, generation, []model.Collected{{Collector: "devices", Resources: []model.Resource{{ID: "device-1", Type: "device", Name: "server", Data: map[string]any{"hostname": "server"}}}}}, notify.TextDigest("baseline")); err != nil {
 		t.Fatal(err)
 	}
 
@@ -474,7 +475,7 @@ func TestReadyReportsPostBaselineCollectorDegradation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.ApplyBatchWithBatch(ctx, generation, []model.Collected{{Collector: "devices", Resources: []model.Resource{{ID: "device-1", Type: "device", Name: "server", Data: map[string]any{"hostname": "server"}}}}}, func([]model.Change) string { return "baseline" }); err != nil {
+	if _, err := st.ApplyBatchWithBatch(ctx, generation, []model.Collected{{Collector: "devices", Resources: []model.Resource{{ID: "device-1", Type: "device", Name: "server", Data: map[string]any{"hostname": "server"}}}}}, notify.TextDigest("baseline")); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, err := st.RecordCollectorFailure(ctx, generation, "devices", "provider secret must stay private"); err != nil {
@@ -539,10 +540,10 @@ func TestHistoryRequiresAuthenticationAndShowsExplainableChanges(t *testing.T) {
 	}
 	baseline := []model.Collected{{Collector: "devices", Resources: []model.Resource{{ID: "device-1", Type: "device", Name: "server", Data: map[string]any{"hostname": "server"}}}}}
 	changed := []model.Collected{{Collector: "devices", Resources: []model.Resource{{ID: "device-1", Type: "device", Name: "server", Data: map[string]any{"hostname": "server-new"}}}}}
-	if _, err := st.ApplyBatchWithBatch(ctx, generation, baseline, func([]model.Change) string { return "baseline" }); err != nil {
+	if _, err := st.ApplyBatchWithBatch(ctx, generation, baseline, notify.TextDigest("baseline")); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.ApplyBatchWithBatch(ctx, generation, changed, func([]model.Change) string { return "digest" }); err != nil {
+	if _, err := st.ApplyBatchWithBatch(ctx, generation, changed, notify.TextDigest("digest")); err != nil {
 		t.Fatal(err)
 	}
 	authenticated := httptest.NewRequest(http.MethodGet, "/history?event_type=changed&resource=device-1", nil)

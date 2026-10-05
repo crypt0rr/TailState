@@ -19,6 +19,7 @@ import (
 	"github.com/crypt0rr/tailstate/internal/boot"
 	"github.com/crypt0rr/tailstate/internal/diagnostics"
 	"github.com/crypt0rr/tailstate/internal/model"
+	"github.com/crypt0rr/tailstate/internal/notify"
 	"github.com/crypt0rr/tailstate/internal/secret"
 	"github.com/crypt0rr/tailstate/internal/store"
 )
@@ -487,11 +488,11 @@ func TestEvidenceAuditCommandUsesReadOnlyDatabaseAndTrustedKey(t *testing.T) {
 	}
 	baseline := []model.Collected{{Collector: "devices", Resources: []model.Resource{{ID: "device-1", Type: "device", Name: "server", Data: map[string]any{"hostname": "server"}}}}}
 	changed := []model.Collected{{Collector: "devices", Resources: []model.Resource{{ID: "device-1", Type: "device", Name: "server-new", Data: map[string]any{"hostname": "server-new"}}}}}
-	if _, err := st.ApplyBatchWithBatch(context.Background(), generation, baseline, func([]model.Change) string { return "baseline" }); err != nil {
+	if _, err := st.ApplyBatchWithBatch(context.Background(), generation, baseline, notify.TextDigest("baseline")); err != nil {
 		st.Close()
 		t.Fatal(err)
 	}
-	if _, err := st.ApplyBatchWithBatch(context.Background(), generation, changed, func([]model.Change) string { return "changed" }); err != nil {
+	if _, err := st.ApplyBatchWithBatch(context.Background(), generation, changed, notify.TextDigest("changed")); err != nil {
 		st.Close()
 		t.Fatal(err)
 	}

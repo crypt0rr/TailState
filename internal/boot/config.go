@@ -11,6 +11,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+
+	"github.com/crypt0rr/tailstate/internal/notify"
 )
 
 type Config struct {
@@ -28,6 +30,12 @@ type Config struct {
 	// Container is set by the official image (TAILSTATE_CONTAINER=1). Its
 	// wildcard listener is then bounded by Docker/Compose port publishing.
 	Container bool
+	// PublicURL is the optional external https base URL used to link
+	// notifications to History and Status. It never has a trailing slash.
+	PublicURL string
+	// InstanceLabel optionally names this TailState instance in every
+	// notification title.
+	InstanceLabel string
 }
 
 // StorageLimits contains operator-selected byte ceilings. A zero field keeps
@@ -90,6 +98,12 @@ func Load(version string) (Config, error) {
 	}
 	if _, _, err := net.SplitHostPort(c.ListenAddr); err != nil {
 		return Config{}, fmt.Errorf("TAILSTATE_LISTEN_ADDR must be host:port: %w", err)
+	}
+	if c.PublicURL, err = notify.ValidatePublicURL(env("TAILSTATE_PUBLIC_URL", "")); err != nil {
+		return Config{}, fmt.Errorf("TAILSTATE_PUBLIC_URL: %w", err)
+	}
+	if c.InstanceLabel, err = notify.ValidateInstanceLabel(env("TAILSTATE_INSTANCE_LABEL", "")); err != nil {
+		return Config{}, fmt.Errorf("TAILSTATE_INSTANCE_LABEL: %w", err)
 	}
 	if err := validateEndpoint("TAILSTATE_TS_API_URL", c.TailscaleBase); err != nil {
 		return Config{}, err

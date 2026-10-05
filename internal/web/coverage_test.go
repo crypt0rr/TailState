@@ -17,6 +17,7 @@ import (
 	"github.com/crypt0rr/tailstate/internal/boot"
 	"github.com/crypt0rr/tailstate/internal/model"
 	"github.com/crypt0rr/tailstate/internal/monitor"
+	"github.com/crypt0rr/tailstate/internal/notify"
 	"github.com/crypt0rr/tailstate/internal/secret"
 	"github.com/crypt0rr/tailstate/internal/store"
 	"github.com/crypt0rr/tailstate/internal/webhook"
@@ -213,7 +214,7 @@ func TestHealthReadyMetricsAndSecurityHeaders(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.ApplyBatchWithBatch(context.Background(), generation, []model.Collected{{Collector: "devices", Resources: []model.Resource{{ID: "device-1", Type: "device", Name: "server", Data: map[string]any{"hostname": "server"}}}}}, func([]model.Change) string { return "baseline" }); err != nil {
+	if _, err := st.ApplyBatchWithBatch(context.Background(), generation, []model.Collected{{Collector: "devices", Resources: []model.Resource{{ID: "device-1", Type: "device", Name: "server", Data: map[string]any{"hostname": "server"}}}}}, notify.TextDigest("baseline")); err != nil {
 		t.Fatal(err)
 	}
 	ready = httptest.NewRecorder()

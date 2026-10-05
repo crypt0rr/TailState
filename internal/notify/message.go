@@ -1,0 +1,261 @@
+package notify
+
+import (
+	"fmt"
+	"net/url"
+	"regexp"
+	"strings"
+	"time"
+)
+
+// Message is a format-neutral notification. Spans carry a style instead of
+// pre-rendered markup, so one message can be rendered for each destination's
+// service (see the renderers) without re-escaping untrusted values.
+//
+// Text is the escape hatch for a pre-rendered Markdown payload: a message
+// whose Text is set is delivered exactly as written and its other fields are
+// ignored.
+type Message struct {
+	Icon  string `json:"icon,omitempty"`
+	Title string `json:"title,omitempty"`
+	// Scope identifies the instance and tailnet and is appended to the title.
+	Scope string `json:"scope,omitempty"`
+	Lines []Line `json:"lines,omitempty"`
+	Text  string `json:"text,omitempty"`
+}
+
+// Line kinds. A plain line is a paragraph line, an item is a bulleted detail
+// below the previous line, and a note is an indented, emphasised remark.
+const (
+	LinePlain = ""
+	LineItem  = "item"
+	LineNote  = "note"
+)
+
+// Line is one rendered line. Every line is complete on its own in every
+// format, so a message is only ever shortened at line boundaries.
+type Line struct {
+	Kind  string `json:"kind,omitempty"`
+	Spans []Span `json:"spans,omitempty"`
+}
+
+// Span styles. Literal and emphasis spans are trusted text written by
+// TailState itself; text, bold, and code spans may contain tenant-controlled
+// values and are always escaped by the renderer. Link URLs are built only from
+// the validated public URL.
+const (
+	SpanLiteral = "lit"
+	SpanText    = "text"
+	SpanBold    = "bold"
+	SpanCode    = "code"
+	SpanEmph    = "em"
+	SpanLink    = "link"
+	// SpanStrong is trusted bold text such as a field label.
+	SpanStrong = "strong"
+)
+
+// Span is a styled run of text within a line.
+type Span struct {
+	Style string `json:"s"`
+	Text  string `json:"t"`
+	URL   string `json:"u,omitempty"`
+}
+
+// Text returns a message that is delivered as the given pre-rendered
+// Markdown, unchanged by any renderer.
+func Text(markdown string) Message { return Message{Text: markdown} }
+
+// IsText reports whether the message is a pre-rendered Markdown payload.
+func (m Message) IsText() bool { return m.Text != "" || (m.Title == "" && len(m.Lines) == 0) }
+
+func lit(text string) Span      { return Span{Style: SpanLiteral, Text: text} }
+func txt(text string) Span      { return Span{Style: SpanText, Text: text} }
+func bold(text string) Span     { return Span{Style: SpanBold, Text: text} }
+func code(text string) Span     { return Span{Style: SpanCode, Text: text} }
+func strong(text string) Span   { return Span{Style: SpanStrong, Text: text} }
+func emph(text string) Span     { return Span{Style: SpanEmph, Text: text} }
+func link(label, u string) Span { return Span{Style: SpanLink, Text: label, URL: u} }
+func line(spans ...Span) Line   { return Line{Spans: spans} }
+func item(spans ...Span) Line   { return Line{Kind: LineItem, Spans: spans} }
+func note(text string) Line     { return Line{Kind: LineNote, Spans: []Span{emph(text)}} }
+func blank() Line               { return Line{} }
+func observedLine(at time.Time) Line {
+	return line(lit("Observed at "), lit(at.UTC().Format(time.RFC3339)))
+}
+
+// Context is the instance identity added to every notification: the
+// optional operator-chosen instance label, the monitored tailnet, the
+// optional public URL used for links, and the running TailState version.
+type Context struct {
+	Label     string
+	Tailnet   string
+	PublicURL string
+	Version   string
+}
+
+// TailnetDisplay is the tailnet as shown to operators. "-" (the OAuth
+// credential's own tailnet) is spelled out.
+func (c Context) TailnetDisplay() string {
+	tailnet := strings.TrimSpace(c.Tailnet)
+	if tailnet == "" || tailnet == "-" {
+		return "default tailnet"
+	}
+	return tailnet
+}
+
+// Scope is the identity shown in every message title: the tailnet, prefixed
+// by the instance label when one is configured.
+func (c Context) Scope() string {
+	if label := strings.TrimSpace(c.Label); label != "" {
+		return label + " (" + c.TailnetDisplay() + ")"
+	}
+	return c.TailnetDisplay()
+}
+
+// HistoryBatchURL returns the History link for one batch, or "" when no
+// public URL is configured.
+func (c Context) HistoryBatchURL(batchID int64) string {
+	if c.PublicURL == "" || batchID <= 0 {
+		return ""
+	}
+	return c.PublicURL + "/history?batch=" + fmt.Sprint(batchID)
+}
+
+// StatusURL returns the Status page link, or "" when no public URL is
+// configured.
+func (c Context) StatusURL() string {
+	if c.PublicURL == "" {
+		return ""
+	}
+	return c.PublicURL + "/status"
+}
+
+// publicPathPattern restricts the public URL path to characters that are
+// inert in every renderer's link syntax (no parentheses, pipes, brackets,
+// angle brackets, quotes, or whitespace).
+var (
+	publicPathPattern = regexp.MustCompile(`^[A-Za-z0-9._~/-]*$`)
+	publicHostPattern = regexp.MustCompile(`^(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9.-]+)(:[0-9]{1,5})?$`)
+)
+
+// ValidatePublicURL checks an operator-supplied public base URL and returns
+// it without a trailing slash. Only absolute https URLs with a host and an
+// optional plain path are accepted: credentials, queries, fragments, and
+// characters that could break out of a link are rejected.
+func ValidatePublicURL(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", nil
+	}
+	if len(raw) > 512 {
+		return "", fmt.Errorf("public URL must be at most 512 bytes")
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.Opaque != "" {
+		return "", fmt.Errorf("public URL must be an absolute https URL with a host")
+	}
+	if parsed.User != nil || parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" || strings.Contains(raw, "#") {
+		return "", fmt.Errorf("public URL must not contain credentials, a query, or a fragment")
+	}
+	if !publicHostPattern.MatchString(parsed.Host) {
+		return "", fmt.Errorf("public URL host is invalid")
+	}
+	if !publicPathPattern.MatchString(parsed.Path) || parsed.RawPath != "" {
+		return "", fmt.Errorf("public URL path may contain only letters, digits, and . _ ~ / -")
+	}
+	return strings.TrimRight(parsed.Scheme+"://"+parsed.Host+parsed.Path, "/"), nil
+}
+
+// ValidateInstanceLabel checks the optional instance label: at most 64 bytes
+// of printable text.
+func ValidateInstanceLabel(raw string) (string, error) {
+	label := strings.TrimSpace(raw)
+	if len(label) > 64 {
+		return "", fmt.Errorf("instance label must be at most 64 bytes")
+	}
+	if stripControl(label) != label {
+		return "", fmt.Errorf("instance label must not contain control characters")
+	}
+	return label, nil
+}
+
+func (c Context) message(icon, title string, lines ...Line) Message {
+	return Message{Icon: icon, Title: title, Scope: c.Scope(), Lines: lines}
+}
+
+// CollectorHealth is one collector transition reported in a grouped health
+// message. Reason is a bounded category, never upstream error text.
+type CollectorHealth struct {
+	Collector string
+	Reason    string
+}
+
+// CollectorsUnhealthy groups every collector that crossed the failure
+// threshold in one poll into a single message.
+func (c Context) CollectorsUnhealthy(collectors []CollectorHealth, observedAt time.Time) Message {
+	title := "Tailscale API collector unhealthy"
+	summary := "1 collector failed three consecutive polls. TailState will keep retrying."
+	if len(collectors) != 1 {
+		title = "Tailscale API collectors unhealthy"
+		summary = fmt.Sprintf("%d collectors failed three consecutive polls. TailState will keep retrying.", len(collectors))
+	}
+	lines := []Line{line(lit(summary))}
+	for _, collector := range collectors {
+		reason := strings.TrimSpace(collector.Reason)
+		if reason == "" {
+			reason = "request failed"
+		}
+		lines = append(lines, item(code(collector.Collector), lit(": "), txt(reason)))
+	}
+	lines = append(lines, observedLine(observedAt))
+	if statusURL := c.StatusURL(); statusURL != "" {
+		lines = append(lines, line(link("Open TailState status", statusURL)))
+	}
+	return c.message("⚠️", title, lines...)
+}
+
+// CollectorsRecovered groups every collector that recovered in one poll into
+// a single message.
+func (c Context) CollectorsRecovered(collectors []string, observedAt time.Time) Message {
+	title := "Tailscale API collector recovered"
+	summary := "1 collector is responding successfully again."
+	if len(collectors) != 1 {
+		title = "Tailscale API collectors recovered"
+		summary = fmt.Sprintf("%d collectors are responding successfully again.", len(collectors))
+	}
+	lines := []Line{line(lit(summary))}
+	for _, collector := range collectors {
+		lines = append(lines, item(code(collector)))
+	}
+	lines = append(lines, observedLine(observedAt))
+	if statusURL := c.StatusURL(); statusURL != "" {
+		lines = append(lines, line(link("Open TailState status", statusURL)))
+	}
+	return c.message("✅", title, lines...)
+}
+
+// Update reports that a different TailState release started.
+func (c Context) Update(previous, current string, observedAt time.Time) Message {
+	return c.message("🚀", "TailState updated",
+		line(strong("Previous version:"), lit(" "), code(previous)),
+		line(strong("Current version:"), lit(" "), code(current)),
+		observedLine(observedAt),
+	)
+}
+
+// Test is the message sent by the Settings "Send test" action. It names the
+// instance, tailnet, and version so an operator can confirm which TailState
+// sent it.
+func (c Context) Test(observedAt time.Time) Message {
+	lines := []Line{line(strong("TailState test:"), lit(" notifications are configured correctly."))}
+	if label := strings.TrimSpace(c.Label); label != "" {
+		lines = append(lines, line(strong("Instance:"), lit(" "), txt(label)))
+	}
+	lines = append(lines, line(strong("Tailnet:"), lit(" "), txt(c.TailnetDisplay())))
+	version := strings.TrimSpace(c.Version)
+	if version == "" {
+		version = "unknown"
+	}
+	lines = append(lines, line(strong("Version:"), lit(" "), code(version)), observedLine(observedAt))
+	return c.message("🧪", "TailState test", lines...)
+}

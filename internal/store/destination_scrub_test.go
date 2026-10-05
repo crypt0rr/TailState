@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/crypt0rr/tailstate/internal/model"
+	"github.com/crypt0rr/tailstate/internal/notify"
 	"github.com/crypt0rr/tailstate/internal/secret"
 )
 
@@ -41,10 +42,10 @@ func TestDeletedDestinationScrubsEncryptedURL(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if _, err := st.ApplyBatchWithBatch(ctx, generation, []model.Collected{historyResource("server", "100.64.0.1")}, func([]model.Change) string { return "baseline" }); err != nil {
+	if _, err := st.ApplyBatchWithBatch(ctx, generation, []model.Collected{historyResource("server", "100.64.0.1")}, notify.TextDigest("baseline")); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.ApplyBatchWithBatch(ctx, generation, []model.Collected{historyResource("server-new", "100.64.0.1")}, func([]model.Change) string { return "changed" }); err != nil {
+	if _, err := st.ApplyBatchWithBatch(ctx, generation, []model.Collected{historyResource("server-new", "100.64.0.1")}, notify.TextDigest("changed")); err != nil {
 		t.Fatal(err)
 	}
 	var ciphertext string

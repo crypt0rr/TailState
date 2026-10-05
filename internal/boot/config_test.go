@@ -14,6 +14,9 @@ func TestLoadRejectsInvalidBootstrapValues(t *testing.T) {
 		{name: "listen address", set: map[string]string{"TAILSTATE_LISTEN_ADDR": "127.0.0.1"}},
 		{name: "API URL", set: map[string]string{"TAILSTATE_TS_API_URL": "file:///tmp/api"}},
 		{name: "OAuth URL credentials", set: map[string]string{"TAILSTATE_TS_OAUTH_URL": "https://user:pass@example.com/token"}},
+		{name: "plaintext public URL", set: map[string]string{"TAILSTATE_PUBLIC_URL": "http://tailstate.example"}},
+		{name: "public URL with query", set: map[string]string{"TAILSTATE_PUBLIC_URL": "https://tailstate.example/?next=1"}},
+		{name: "instance label control", set: map[string]string{"TAILSTATE_INSTANCE_LABEL": "prod\nlab"}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -54,5 +57,17 @@ func TestTrustedProxyConfiguration(t *testing.T) {
 		if _, err := Load("test"); err == nil {
 			t.Fatalf("invalid trusted proxy %q was accepted", value)
 		}
+	}
+}
+
+func TestLoadNormalizesNotificationContext(t *testing.T) {
+	t.Setenv("TAILSTATE_PUBLIC_URL", "https://tailstate.example/ops/")
+	t.Setenv("TAILSTATE_INSTANCE_LABEL", "  prod-eu ")
+	config, err := Load("test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.PublicURL != "https://tailstate.example/ops" || config.InstanceLabel != "prod-eu" {
+		t.Fatalf("public URL=%q label=%q", config.PublicURL, config.InstanceLabel)
 	}
 }

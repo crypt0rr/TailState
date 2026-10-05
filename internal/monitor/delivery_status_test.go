@@ -34,7 +34,7 @@ func deliverToProvider(t *testing.T, respond http.HandlerFunc, done func(store.H
 	baseline := []model.Collected{{Collector: "devices", Resources: []model.Resource{{ID: "device-1", Type: "device", Name: "server", Data: map[string]any{"hostname": "server"}}}}}
 	changed := []model.Collected{{Collector: "devices", Resources: []model.Resource{{ID: "device-1", Type: "device", Name: "server", Data: map[string]any{"hostname": "server-new"}}}}}
 	for _, batch := range [][]model.Collected{baseline, changed} {
-		if _, err := st.ApplyBatchWithBatch(ctx, settings.Generation, batch, notify.Digest); err != nil {
+		if _, err := st.ApplyBatchWithBatch(ctx, settings.Generation, batch, notify.Context{}.Digest); err != nil {
 			t.Fatal(err)
 		}
 	}

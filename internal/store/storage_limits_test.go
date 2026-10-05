@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/crypt0rr/tailstate/internal/model"
+	"github.com/crypt0rr/tailstate/internal/notify"
 	"github.com/crypt0rr/tailstate/internal/secret"
 )
 
@@ -230,14 +231,14 @@ func TestBoundedSnapshotsRetainHashAndTruncationMetadata(t *testing.T) {
 	baseline := []model.Collected{{Collector: "devices", Resources: []model.Resource{{
 		ID: "device-1", Type: "device", Name: "server", Data: map[string]any{"hostname": "small"},
 	}}}}
-	if _, err := testApplyBatch(st, ctx, generation, baseline, func([]model.Change) string { return "baseline" }); err != nil {
+	if _, err := testApplyBatch(st, ctx, generation, baseline, notify.TextDigest("baseline")); err != nil {
 		t.Fatal(err)
 	}
 	large := strings.Repeat("secret-free-value-", 500)
 	changed := []model.Collected{{Collector: "devices", Resources: []model.Resource{{
 		ID: "device-1", Type: "device", Name: "server", Data: map[string]any{"hostname": large},
 	}}}}
-	if _, err := testApplyBatch(st, ctx, generation, changed, func([]model.Change) string { return "changed" }); err != nil {
+	if _, err := testApplyBatch(st, ctx, generation, changed, notify.TextDigest("changed")); err != nil {
 		t.Fatal(err)
 	}
 	var stored []byte
@@ -306,11 +307,11 @@ func TestHistoryPageReportsByteBudget(t *testing.T) {
 			ID: "device-1", Type: "device", Name: value, Data: map[string]any{"hostname": value},
 		}}}}
 	}
-	if _, err := testApplyBatch(st, ctx, generation, resource("baseline"), func([]model.Change) string { return "baseline" }); err != nil {
+	if _, err := testApplyBatch(st, ctx, generation, resource("baseline"), notify.TextDigest("baseline")); err != nil {
 		t.Fatal(err)
 	}
 	for i := 0; i < 8; i++ {
-		if _, err := testApplyBatch(st, ctx, generation, resource(strings.Repeat("change", i+1)), func([]model.Change) string { return "changed" }); err != nil {
+		if _, err := testApplyBatch(st, ctx, generation, resource(strings.Repeat("change", i+1)), notify.TextDigest("changed")); err != nil {
 			t.Fatal(err)
 		}
 	}

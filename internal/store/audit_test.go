@@ -16,6 +16,7 @@ import (
 	"testing"
 
 	"github.com/crypt0rr/tailstate/internal/model"
+	"github.com/crypt0rr/tailstate/internal/notify"
 	"github.com/crypt0rr/tailstate/internal/secret"
 )
 
@@ -28,7 +29,7 @@ func auditFixture(t *testing.T) (*Store, context.Context) {
 		t.Fatal(err)
 	}
 	for _, hostname := range []string{"server", "server-new", "server-latest", "server-final"} {
-		if _, err := st.ApplyBatchWithBatch(ctx, generation, []model.Collected{historyResource(hostname, "100.64.0.1")}, func([]model.Change) string { return hostname }); err != nil {
+		if _, err := st.ApplyBatchWithBatch(ctx, generation, []model.Collected{historyResource(hostname, "100.64.0.1")}, notify.TextDigest(hostname)); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -514,7 +515,7 @@ func TestEvidenceAuditHeadReadsShareOneSnapshot(t *testing.T) {
 			return
 		}
 		appended = true
-		batch, applyErr := st.ApplyBatchWithBatch(ctx, settingsRow.Generation, []model.Collected{historyResource("server-concurrent", "100.64.0.9")}, func([]model.Change) string { return "concurrent" })
+		batch, applyErr := st.ApplyBatchWithBatch(ctx, settingsRow.Generation, []model.Collected{historyResource("server-concurrent", "100.64.0.9")}, notify.TextDigest("concurrent"))
 		if applyErr != nil || batch.ID == 0 {
 			t.Errorf("concurrent append batch=%+v err=%v", batch, applyErr)
 		}

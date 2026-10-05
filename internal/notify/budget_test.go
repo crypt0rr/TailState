@@ -26,7 +26,7 @@ func largeDigest(changes int) string {
 			},
 		})
 	}
-	return Digest(list)
+	return digestText(list)
 }
 
 // TestDigestFitsEveryServiceBudget guards the regression where digests up to
@@ -59,7 +59,7 @@ func TestDigestMarksFieldsDroppedAtTheBudget(t *testing.T) {
 	for i := range fields {
 		fields[i] = model.FieldChange{Field: "field", Old: strings.Repeat("o", 180), New: strings.Repeat("n", 180)}
 	}
-	message := Digest([]model.Change{{Kind: "changed", Collector: "devices", Name: "server", Fields: fields}})
+	message := digestText([]model.Change{{Kind: "changed", Collector: "devices", Name: "server", Fields: fields}})
 	if !strings.Contains(message, "Additional field changes omitted; total: 100") {
 		t.Fatalf("dropped field lines were not marked: %s", message[len(message)-300:])
 	}

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/crypt0rr/tailstate/internal/model"
+	"github.com/crypt0rr/tailstate/internal/notify"
 )
 
 type recordedChange struct {
@@ -54,7 +55,7 @@ const (
 	usersSharedScopeMeta = "users_shared_scope_generation"
 )
 
-func (s *Store) ApplyBatchWithBatch(ctx context.Context, generation int64, results []model.Collected, digest func([]model.Change) string, triggerIDs ...int64) (batchResult ChangeBatchResult, err error) {
+func (s *Store) ApplyBatchWithBatch(ctx context.Context, generation int64, results []model.Collected, digest notify.DigestFunc, triggerIDs ...int64) (batchResult ChangeBatchResult, err error) {
 	defer func() { err = storageWriteError(err) }()
 	triggerIDs = uniquePositiveIDs(triggerIDs)
 	// Canonicalise every resource before opening the write transaction. The
@@ -399,7 +400,7 @@ func (s *Store) ApplyBatchWithBatch(ctx context.Context, generation int64, resul
 				return ChangeBatchResult{}, err
 			}
 		}
-		payload := digest(changes)
+		payload := notify.Markdown(digest(notify.DigestInput{BatchID: batchID, ObservedAt: now, Changes: changes}))
 		if err = enqueueOutboxTx(ctx, tx, payload, observedAt, batchID); err != nil {
 			return ChangeBatchResult{}, err
 		}

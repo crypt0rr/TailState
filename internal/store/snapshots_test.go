@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/crypt0rr/tailstate/internal/model"
+	"github.com/crypt0rr/tailstate/internal/notify"
 )
 
 // snapshotWriteCounter installs test-only triggers that count every row
@@ -55,7 +56,7 @@ func TestIdenticalPollDoesNotRewriteSnapshots(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	digest := func([]model.Change) string { return "digest" }
+	digest := notify.TextDigest("digest")
 	if _, err := st.ApplyBatchWithBatch(ctx, generation, snapshotPollResources("server-", 3), digest); err != nil {
 		t.Fatal(err)
 	}
@@ -137,7 +138,7 @@ func TestRaisingSnapshotLimitRewritesTruncatedSnapshot(t *testing.T) {
 	large := []model.Collected{{Collector: "devices", Resources: []model.Resource{{
 		ID: "device-1", Type: "device", Name: "server", Data: map[string]any{"hostname": strings.Repeat("x", 4096)},
 	}}}}
-	digest := func([]model.Change) string { return "digest" }
+	digest := notify.TextDigest("digest")
 	if _, err := st.ApplyBatchWithBatch(ctx, generation, large, digest); err != nil {
 		t.Fatal(err)
 	}

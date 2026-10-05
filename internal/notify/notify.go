@@ -249,9 +249,11 @@ func (s *SenderImpl) Send(ctx context.Context, serviceURL, message string) error
 	return nil
 }
 
-// Test validates and sends a small explicit message to a destination.
+// Test validates and sends a small explicit message to a destination. The
+// Settings page sends Context.Test instead, which also names the instance,
+// tailnet, and version.
 func (s *SenderImpl) Test(ctx context.Context, serviceURL string) error {
-	return s.Send(ctx, serviceURL, "**TailState test**: notifications are configured correctly.")
+	return s.Send(ctx, serviceURL, Markdown(Context{}.Test(time.Now())))
 }
 
 // DeliveryError is a transport error. Retryable errors are retried by the

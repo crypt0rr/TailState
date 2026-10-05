@@ -541,11 +541,19 @@ func historyFilter(r *http.Request) store.HistoryFilter {
 	if cursor, err := strconv.ParseInt(r.URL.Query().Get("cursor"), 10, 64); err == nil && cursor > 0 {
 		filter.Cursor = cursor
 	}
+	if batch, err := strconv.ParseInt(strings.TrimSpace(r.URL.Query().Get("batch")), 10, 64); err == nil && batch > 0 {
+		filter.BatchID = batch
+	}
 	return filter
 }
 
-func historyURL(filter store.HistoryFilter, cursor int64) string {
+// historyFilterValues encodes the filters shared by History pagination and
+// evidence export links.
+func historyFilterValues(filter store.HistoryFilter) url.Values {
 	values := url.Values{}
+	if filter.BatchID > 0 {
+		values.Set("batch", strconv.FormatInt(filter.BatchID, 10))
+	}
 	if filter.Collector != "" {
 		values.Set("collector", filter.Collector)
 	}
@@ -555,21 +563,17 @@ func historyURL(filter store.HistoryFilter, cursor int64) string {
 	if filter.ResourceID != "" {
 		values.Set("resource", filter.ResourceID)
 	}
+	return values
+}
+
+func historyURL(filter store.HistoryFilter, cursor int64) string {
+	values := historyFilterValues(filter)
 	values.Set("cursor", strconv.FormatInt(cursor, 10))
 	return "/history?" + values.Encode()
 }
 
 func historyExportURL(filter store.HistoryFilter) string {
-	values := url.Values{}
-	if filter.Collector != "" {
-		values.Set("collector", filter.Collector)
-	}
-	if filter.EventType != "" {
-		values.Set("event_type", filter.EventType)
-	}
-	if filter.ResourceID != "" {
-		values.Set("resource", filter.ResourceID)
-	}
+	values := historyFilterValues(filter)
 	if filter.Cursor > 0 {
 		values.Set("cursor", strconv.FormatInt(filter.Cursor, 10))
 	}
@@ -855,7 +859,7 @@ func (s *Server) destinationPost(w http.ResponseWriter, r *http.Request) {
 		testCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 		defer cancel()
 		data := s.currentSettingsData(ctx, csrf, r)
-		if err := notify.New().Test(testCtx, serviceURL); err != nil {
+		if err := notify.New().Send(testCtx, serviceURL, notify.Markdown(s.notificationContext(ctx).Test(time.Now()))); err != nil {
 			data.Error = "Notification test failed: " + notify.SafeTestError(err, serviceURL)
 		} else {
 			data.Message = "Notification test sent."
@@ -886,6 +890,16 @@ func (s *Server) destinationPost(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.Error(w, "unknown destination action", http.StatusBadRequest)
 	}
+}
+
+// notificationContext identifies this instance in notifications sent from the
+// web UI. An unconfigured installation is shown as the default tailnet.
+func (s *Server) notificationContext(ctx context.Context) notify.Context {
+	messages := notify.Context{Label: s.config.InstanceLabel, PublicURL: s.config.PublicURL, Version: s.config.Version}
+	if settings, err := s.store.Settings(ctx); err == nil {
+		messages.Tailnet = settings.Tailnet
+	}
+	return messages
 }
 
 func destinationMutationMessage(action string, err error) string {

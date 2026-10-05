@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/crypt0rr/tailstate/internal/model"
+	"github.com/crypt0rr/tailstate/internal/notify"
 	"github.com/crypt0rr/tailstate/internal/secret"
 )
 
@@ -961,11 +962,11 @@ func TestUnsupportedCollectorSilentlyBaselinesWhenItReturns(t *testing.T) {
 		t.Fatal(err)
 	}
 	unsupported := []model.Collected{{Collector: "contacts", Unsupported: true}}
-	if changes, err := testApplyBatch(st, ctx, generation, unsupported, func([]model.Change) string { return "digest" }); err != nil || len(changes) != 0 {
+	if changes, err := testApplyBatch(st, ctx, generation, unsupported, notify.TextDigest("digest")); err != nil || len(changes) != 0 {
 		t.Fatalf("unsupported collector produced changes: %#v %v", changes, err)
 	}
 	returned := []model.Collected{{Collector: "contacts", Resources: []model.Resource{{ID: "contacts", Type: "contacts", Name: "Tailnet contacts", Data: map[string]any{"email": "owner@example.com"}}}}}
-	changes, err := testApplyBatch(st, ctx, generation, returned, func([]model.Change) string { return "digest" })
+	changes, err := testApplyBatch(st, ctx, generation, returned, notify.TextDigest("digest"))
 	if err != nil || len(changes) != 0 {
 		t.Fatalf("returning collector did not silently baseline: %#v %v", changes, err)
 	}
@@ -995,10 +996,10 @@ func TestBaselinedCollectorRequiresConsecutiveUnsupportedResponses(t *testing.T)
 		t.Fatal(err)
 	}
 	baseline := []model.Collected{{Collector: "contacts", Resources: []model.Resource{{ID: "contacts", Type: "contacts", Name: "Tailnet contacts", Data: map[string]any{"email": "owner@example.com"}}}}}
-	if _, err := testApplyBatch(st, ctx, generation, baseline, func([]model.Change) string { return "baseline" }); err != nil {
+	if _, err := testApplyBatch(st, ctx, generation, baseline, notify.TextDigest("baseline")); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := testApplyBatch(st, ctx, generation, []model.Collected{{Collector: "contacts", Unsupported: true}}, func([]model.Change) string { return "first unsupported" }); err != nil {
+	if _, err := testApplyBatch(st, ctx, generation, []model.Collected{{Collector: "contacts", Unsupported: true}}, notify.TextDigest("first unsupported")); err != nil {
 		t.Fatal(err)
 	}
 	var supported, baselineFlag int
@@ -1013,7 +1014,7 @@ func TestBaselinedCollectorRequiresConsecutiveUnsupportedResponses(t *testing.T)
 	if supported != 1 || baselineFlag != 1 || lastError != unsupportedConfirmationMessage || time.Until(firstRetry) <= 0 || time.Until(firstRetry) > time.Hour {
 		t.Fatalf("first unsupported response demoted a valid baseline: supported=%d baseline=%d error=%q next=%q", supported, baselineFlag, lastError, nextPoll)
 	}
-	if _, err := testApplyBatch(st, ctx, generation, []model.Collected{{Collector: "contacts", Unsupported: true}}, func([]model.Change) string { return "second unsupported" }); err != nil {
+	if _, err := testApplyBatch(st, ctx, generation, []model.Collected{{Collector: "contacts", Unsupported: true}}, notify.TextDigest("second unsupported")); err != nil {
 		t.Fatal(err)
 	}
 	if err := st.db.QueryRowContext(ctx, "SELECT supported,baseline,last_error,next_poll FROM collector_state WHERE generation=? AND collector='contacts'", generation).Scan(&supported, &baselineFlag, &lastError, &nextPoll); err != nil {
@@ -1040,13 +1041,13 @@ func TestDriftAcrossUnsupportedWindowIsReported(t *testing.T) {
 			"id": "device-1", "hostname": "server", "authorized": authorized,
 		}}}
 	}
-	if _, err := testApplyBatch(st, ctx, generation, []model.Collected{{Collector: "devices", Resources: resource(false)}}, func([]model.Change) string { return "baseline" }); err != nil {
+	if _, err := testApplyBatch(st, ctx, generation, []model.Collected{{Collector: "devices", Resources: resource(false)}}, notify.TextDigest("baseline")); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := testApplyBatch(st, ctx, generation, []model.Collected{{Collector: "devices", Unsupported: true}}, func([]model.Change) string { return "unsupported" }); err != nil {
+	if _, err := testApplyBatch(st, ctx, generation, []model.Collected{{Collector: "devices", Unsupported: true}}, notify.TextDigest("unsupported")); err != nil {
 		t.Fatal(err)
 	}
-	changes, err := testApplyBatch(st, ctx, generation, []model.Collected{{Collector: "devices", Resources: resource(true)}}, func([]model.Change) string { return "recovered" })
+	changes, err := testApplyBatch(st, ctx, generation, []model.Collected{{Collector: "devices", Resources: resource(true)}}, notify.TextDigest("recovered"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1063,16 +1064,16 @@ func TestUnsupportedWindowPreservesRemovalDetection(t *testing.T) {
 		t.Fatal(err)
 	}
 	resource := []model.Resource{{Collector: "devices", ID: "device-1", Type: "device", Name: "server", Data: map[string]any{"hostname": "server"}}}
-	if _, err := testApplyBatch(st, ctx, generation, []model.Collected{{Collector: "devices", Resources: resource}}, func([]model.Change) string { return "baseline" }); err != nil {
+	if _, err := testApplyBatch(st, ctx, generation, []model.Collected{{Collector: "devices", Resources: resource}}, notify.TextDigest("baseline")); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := testApplyBatch(st, ctx, generation, []model.Collected{{Collector: "devices", Unsupported: true}}, func([]model.Change) string { return "unsupported" }); err != nil {
+	if _, err := testApplyBatch(st, ctx, generation, []model.Collected{{Collector: "devices", Unsupported: true}}, notify.TextDigest("unsupported")); err != nil {
 		t.Fatal(err)
 	}
-	if changes, err := testApplyBatch(st, ctx, generation, []model.Collected{{Collector: "devices"}}, func([]model.Change) string { return "first recovery" }); err != nil || len(changes) != 0 {
+	if changes, err := testApplyBatch(st, ctx, generation, []model.Collected{{Collector: "devices"}}, notify.TextDigest("first recovery")); err != nil || len(changes) != 0 {
 		t.Fatalf("first recovery unexpectedly changed state: %#v err=%v", changes, err)
 	}
-	changes, err := testApplyBatch(st, ctx, generation, []model.Collected{{Collector: "devices"}}, func([]model.Change) string { return "second recovery" })
+	changes, err := testApplyBatch(st, ctx, generation, []model.Collected{{Collector: "devices"}}, notify.TextDigest("second recovery"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1089,7 +1090,7 @@ func TestCredentialRotationPreservesInventory(t *testing.T) {
 		t.Fatal(err)
 	}
 	baseline := []model.Collected{{Collector: "devices", Resources: []model.Resource{{ID: "1", Type: "device", Name: "server", Data: map[string]any{"hostname": "server"}}}}}
-	if _, err := testApplyBatch(st, ctx, firstGeneration, baseline, func([]model.Change) string { return "digest" }); err != nil {
+	if _, err := testApplyBatch(st, ctx, firstGeneration, baseline, notify.TextDigest("digest")); err != nil {
 		t.Fatal(err)
 	}
 	rotated := settings()
@@ -1109,7 +1110,7 @@ func TestCredentialRotationPreservesInventory(t *testing.T) {
 		t.Fatalf("baseline snapshot was lost after credential rotation: %d", count)
 	}
 	changed := []model.Collected{{Collector: "devices", Resources: []model.Resource{{ID: "1", Type: "device", Name: "server", Data: map[string]any{"hostname": "server-new"}}}}}
-	changes, err := testApplyBatch(st, ctx, secondGeneration, changed, func([]model.Change) string { return "digest" })
+	changes, err := testApplyBatch(st, ctx, secondGeneration, changed, notify.TextDigest("digest"))
 	if err != nil || len(changes) != 1 || changes[0].Kind != "changed" {
 		t.Fatalf("change after credential rotation was not detected: %#v %v", changes, err)
 	}
@@ -1124,10 +1125,10 @@ func TestIdentityChangeDeadLettersPendingEventNotifications(t *testing.T) {
 	}
 	baseline := []model.Collected{{Collector: "devices", Resources: []model.Resource{{ID: "1", Type: "device", Name: "server", Data: map[string]any{"hostname": "server"}}}}}
 	changed := []model.Collected{{Collector: "devices", Resources: []model.Resource{{ID: "1", Type: "device", Name: "server", Data: map[string]any{"hostname": "new-server"}}}}}
-	if _, err := st.ApplyBatchWithBatch(ctx, firstGeneration, baseline, func([]model.Change) string { return "baseline" }); err != nil {
+	if _, err := st.ApplyBatchWithBatch(ctx, firstGeneration, baseline, notify.TextDigest("baseline")); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.ApplyBatchWithBatch(ctx, firstGeneration, changed, func([]model.Change) string { return "changed" }); err != nil {
+	if _, err := st.ApplyBatchWithBatch(ctx, firstGeneration, changed, notify.TextDigest("changed")); err != nil {
 		t.Fatal(err)
 	}
 	if err := st.EnqueueSystem(ctx, "release notification"); err != nil {
@@ -1180,10 +1181,10 @@ func TestIdentityChangeDeadLettersClaimedEventNotifications(t *testing.T) {
 			}
 			baseline := []model.Collected{{Collector: "devices", Resources: []model.Resource{{ID: "1", Type: "device", Name: "server", Data: map[string]any{"hostname": "server"}}}}}
 			changed := []model.Collected{{Collector: "devices", Resources: []model.Resource{{ID: "1", Type: "device", Name: "server", Data: map[string]any{"hostname": "new-server"}}}}}
-			if _, err := st.ApplyBatchWithBatch(ctx, firstGeneration, baseline, func([]model.Change) string { return "baseline" }); err != nil {
+			if _, err := st.ApplyBatchWithBatch(ctx, firstGeneration, baseline, notify.TextDigest("baseline")); err != nil {
 				t.Fatal(err)
 			}
-			if _, err := st.ApplyBatchWithBatch(ctx, firstGeneration, changed, func([]model.Change) string { return "old identity" }); err != nil {
+			if _, err := st.ApplyBatchWithBatch(ctx, firstGeneration, changed, notify.TextDigest("old identity")); err != nil {
 				t.Fatal(err)
 			}
 			claimed, err := st.ClaimDueOutbox(ctx, 10)
@@ -1374,8 +1375,8 @@ func TestStatusReportsPostBaselineCollectorDegradation(t *testing.T) {
 func TestTrackAppVersionQueuesConfiguredUpdatesOnce(t *testing.T) {
 	ctx := context.Background()
 	st := testStore(t)
-	format := func(previous, current string) string {
-		return "updated " + previous + " to " + current
+	format := func(previous, current string) notify.Message {
+		return notify.Text("updated " + previous + " to " + current)
 	}
 
 	notified, err := st.TrackAppVersion(ctx, "0.3.0", format)
@@ -1408,7 +1409,7 @@ func TestTrackAppVersionIgnoresDevelopmentBuild(t *testing.T) {
 	if _, err := st.SaveSettings(ctx, settings()); err != nil {
 		t.Fatal(err)
 	}
-	format := func(previous, current string) string { return previous + " to " + current }
+	format := func(previous, current string) notify.Message { return notify.Text(previous + " to " + current) }
 	if notified, err := st.TrackAppVersion(ctx, "0.3.0", format); err != nil || notified {
 		t.Fatalf("first tracked version should be silent: notified=%v err=%v", notified, err)
 	}
@@ -1435,12 +1436,12 @@ func TestBaselineIsSilent(t *testing.T) {
 		t.Fatal(err)
 	}
 	first := []model.Collected{{Collector: "devices", Resources: []model.Resource{{ID: "1", Type: "device", Name: "server", Collector: "devices", Data: map[string]any{"addresses": []any{"100.64.0.1"}}}}}}
-	changes, err := testApplyBatch(st, ctx, generation, first, func([]model.Change) string { return "digest" })
+	changes, err := testApplyBatch(st, ctx, generation, first, notify.TextDigest("digest"))
 	if err != nil || len(changes) != 0 {
 		t.Fatalf("baseline emitted changes: %#v %v", changes, err)
 	}
 	second := []model.Collected{{Collector: "devices", Resources: []model.Resource{{ID: "1", Type: "device", Name: "server", Collector: "devices", Data: map[string]any{"addresses": []any{"100.64.0.2"}}}}}}
-	changes, err = testApplyBatch(st, ctx, generation, second, func([]model.Change) string { return "digest" })
+	changes, err = testApplyBatch(st, ctx, generation, second, notify.TextDigest("digest"))
 	if err != nil || len(changes) != 1 || changes[0].Kind != "changed" {
 		t.Fatalf("change not detected: %#v %v", changes, err)
 	}
@@ -1457,7 +1458,7 @@ func TestCollectorPollTelemetryIsVisibleInStatus(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := testApplyBatch(st, ctx, generation, []model.Collected{{Collector: "devices", Resources: []model.Resource{{ID: "1", Type: "device", Name: "server", Collector: "devices", Data: map[string]any{"hostname": "server"}}}}}, func([]model.Change) string { return "baseline" }); err != nil {
+	if _, err := testApplyBatch(st, ctx, generation, []model.Collected{{Collector: "devices", Resources: []model.Resource{{ID: "1", Type: "device", Name: "server", Collector: "devices", Data: map[string]any{"hostname": "server"}}}}}, notify.TextDigest("baseline")); err != nil {
 		t.Fatal(err)
 	}
 	if err := st.RecordCollectorPoll(ctx, generation, "devices", 1234*time.Millisecond, true); err != nil {
@@ -1479,7 +1480,7 @@ func TestCollectorPollTelemetryClampsNegativeDuration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := testApplyBatch(st, ctx, generation, []model.Collected{{Collector: "devices", Resources: []model.Resource{{ID: "1", Type: "device", Name: "server", Collector: "devices", Data: map[string]any{"hostname": "server"}}}}}, func([]model.Change) string { return "baseline" }); err != nil {
+	if _, err := testApplyBatch(st, ctx, generation, []model.Collected{{Collector: "devices", Resources: []model.Resource{{ID: "1", Type: "device", Name: "server", Collector: "devices", Data: map[string]any{"hostname": "server"}}}}}, notify.TextDigest("baseline")); err != nil {
 		t.Fatal(err)
 	}
 	if err := st.RecordCollectorPoll(ctx, generation, "devices", -time.Second, false); err != nil {
@@ -1502,18 +1503,18 @@ func TestRemovalRequiresTwoPolls(t *testing.T) {
 		t.Fatal(err)
 	}
 	first := []model.Collected{{Collector: "devices", Resources: []model.Resource{{ID: "1", Type: "device", Name: "server", Collector: "devices", Data: map[string]any{"addresses": []any{"100.64.0.1"}}}}}}
-	if _, err := testApplyBatch(st, ctx, generation, first, func([]model.Change) string { return "digest" }); err != nil {
+	if _, err := testApplyBatch(st, ctx, generation, first, notify.TextDigest("digest")); err != nil {
 		t.Fatal(err)
 	}
 	empty := []model.Collected{{Collector: "devices", Resources: nil}}
-	changes, err := testApplyBatch(st, ctx, generation, empty, func([]model.Change) string { return "digest" })
+	changes, err := testApplyBatch(st, ctx, generation, empty, notify.TextDigest("digest"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(changes) != 0 {
 		t.Fatal("removed after one missing poll")
 	}
-	changes, err = testApplyBatch(st, ctx, generation, empty, func([]model.Change) string { return "digest" })
+	changes, err = testApplyBatch(st, ctx, generation, empty, notify.TextDigest("digest"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1534,10 +1535,10 @@ func TestMassRemovalGuardPreservesSnapshots(t *testing.T) {
 		id := fmt.Sprintf("device-%d", i)
 		resources[i] = model.Resource{ID: id, Type: "device", Name: id, Collector: "devices", Data: map[string]any{"hostname": id}}
 	}
-	if _, err := testApplyBatch(st, ctx, generation, []model.Collected{{Collector: "devices", Resources: resources}}, func([]model.Change) string { return "baseline" }); err != nil {
+	if _, err := testApplyBatch(st, ctx, generation, []model.Collected{{Collector: "devices", Resources: resources}}, notify.TextDigest("baseline")); err != nil {
 		t.Fatal(err)
 	}
-	changes, err := testApplyBatch(st, ctx, generation, []model.Collected{{Collector: "devices"}}, func([]model.Change) string { return "degraded" })
+	changes, err := testApplyBatch(st, ctx, generation, []model.Collected{{Collector: "devices"}}, notify.TextDigest("degraded"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1562,7 +1563,7 @@ func TestMassRemovalGuardPreservesSnapshots(t *testing.T) {
 	// removals suppressed forever. The first two suspicious responses are
 	// guarded; the next normal poll starts the ordinary two-poll confirmation.
 	for poll := 0; poll < 2; poll++ {
-		changes, err = testApplyBatch(st, ctx, generation, []model.Collected{{Collector: "devices"}}, func([]model.Change) string { return "degraded" })
+		changes, err = testApplyBatch(st, ctx, generation, []model.Collected{{Collector: "devices"}}, notify.TextDigest("degraded"))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1570,7 +1571,7 @@ func TestMassRemovalGuardPreservesSnapshots(t *testing.T) {
 			t.Fatalf("mass removal guard emitted changes on confirmation poll %d: %#v", poll, changes)
 		}
 	}
-	changes, err = testApplyBatch(st, ctx, generation, []model.Collected{{Collector: "devices"}}, func([]model.Change) string { return "degraded" })
+	changes, err = testApplyBatch(st, ctx, generation, []model.Collected{{Collector: "devices"}}, notify.TextDigest("degraded"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1588,7 +1589,7 @@ func TestMassRemovalGuardDoesNotLoadSnapshotValuesBeforeGuardDecision(t *testing
 	}
 	if _, err := testApplyBatch(st, ctx, generation, []model.Collected{{Collector: "devices", Resources: []model.Resource{{
 		ID: "device-1", Type: "device", Name: "server", Data: map[string]any{"hostname": "server"},
-	}}}}, func([]model.Change) string { return "baseline" }); err != nil {
+	}}}}, notify.TextDigest("baseline")); err != nil {
 		t.Fatal(err)
 	}
 	// A guarded response only needs identifiers and missing counters. Recreate
@@ -1609,7 +1610,7 @@ CREATE TABLE snapshots(
 			t.Fatal(err)
 		}
 	}
-	changes, err := st.ApplyBatchWithBatch(ctx, generation, []model.Collected{{Collector: "devices"}}, func([]model.Change) string { return "degraded" })
+	changes, err := st.ApplyBatchWithBatch(ctx, generation, []model.Collected{{Collector: "devices"}}, notify.TextDigest("degraded"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1637,13 +1638,13 @@ func TestMassRemovalGuardProtectsMajorityDisappearance(t *testing.T) {
 		id := fmt.Sprintf("device-%d", i)
 		resources[i] = model.Resource{ID: id, Type: "device", Name: id, Collector: "devices", Data: map[string]any{"hostname": id}}
 	}
-	if _, err := testApplyBatch(st, ctx, generation, []model.Collected{{Collector: "devices", Resources: resources}}, func([]model.Change) string { return "baseline" }); err != nil {
+	if _, err := testApplyBatch(st, ctx, generation, []model.Collected{{Collector: "devices", Resources: resources}}, notify.TextDigest("baseline")); err != nil {
 		t.Fatal(err)
 	}
 	// Three of five resources disappearing at once is a majority loss, but it
 	// is still more likely to be a truncated upstream response than three real
 	// deletions. The guard must preserve all five snapshots for confirmation.
-	changes, err := testApplyBatch(st, ctx, generation, []model.Collected{{Collector: "devices", Resources: resources[:2]}}, func([]model.Change) string { return "degraded" })
+	changes, err := testApplyBatch(st, ctx, generation, []model.Collected{{Collector: "devices", Resources: resources[:2]}}, notify.TextDigest("degraded"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1671,9 +1672,9 @@ func TestFailedCollectorCannotRemoveSnapshots(t *testing.T) {
 	st := testStore(t)
 	generation, _ := st.SaveSettings(ctx, settings())
 	baseline := []model.Collected{{Collector: "devices", Resources: []model.Resource{{ID: "1", Type: "device", Name: "server", Data: map[string]any{"hostname": "server"}}}}}
-	_, _ = testApplyBatch(st, ctx, generation, baseline, func([]model.Change) string { return "" })
+	_, _ = testApplyBatch(st, ctx, generation, baseline, notify.TextDigest(""))
 	failed := []model.Collected{{Collector: "devices", Error: context.DeadlineExceeded}}
-	changes, err := testApplyBatch(st, ctx, generation, failed, func([]model.Change) string { return "" })
+	changes, err := testApplyBatch(st, ctx, generation, failed, notify.TextDigest(""))
 	if err != nil || len(changes) != 0 {
 		t.Fatalf("failed poll changed state: %#v %v", changes, err)
 	}
@@ -1692,13 +1693,13 @@ func TestPartialCollectorCannotRemoveSnapshots(t *testing.T) {
 		{ID: "1", Type: "device", Name: "server", Data: map[string]any{"hostname": "server"}},
 		{ID: "2", Type: "device", Name: "router", Data: map[string]any{"hostname": "router"}},
 	}}}
-	if _, err := testApplyBatch(st, ctx, generation, baseline, func([]model.Change) string { return "" }); err != nil {
+	if _, err := testApplyBatch(st, ctx, generation, baseline, notify.TextDigest("")); err != nil {
 		t.Fatal(err)
 	}
 	partial := []model.Collected{{Collector: "devices", Partial: true, PartialError: "detail request failed", PartialErrorCount: 2, Resources: []model.Resource{
 		{ID: "1", Type: "device", Name: "server", Data: map[string]any{"hostname": "server-new"}},
 	}}}
-	changes, err := testApplyBatch(st, ctx, generation, partial, func([]model.Change) string { return "" })
+	changes, err := testApplyBatch(st, ctx, generation, partial, notify.TextDigest(""))
 	if err != nil || len(changes) != 1 || changes[0].Kind != "changed" {
 		t.Fatalf("partial change not recorded: %#v %v", changes, err)
 	}
@@ -1739,10 +1740,10 @@ func TestOutboxSurvivesRestart(t *testing.T) {
 	}
 	baseline := []model.Collected{{Collector: "devices", Resources: []model.Resource{{ID: "1", Type: "device", Name: "server", Data: map[string]any{"addresses": []any{"100.64.0.1"}}}}}}
 	changed := []model.Collected{{Collector: "devices", Resources: []model.Resource{{ID: "1", Type: "device", Name: "server", Data: map[string]any{"addresses": []any{"100.64.0.2"}}}}}}
-	if _, err := testApplyBatch(st, ctx, generation, baseline, func([]model.Change) string { return "baseline" }); err != nil {
+	if _, err := testApplyBatch(st, ctx, generation, baseline, notify.TextDigest("baseline")); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := testApplyBatch(st, ctx, generation, changed, func([]model.Change) string { return "durable digest" }); err != nil {
+	if _, err := testApplyBatch(st, ctx, generation, changed, notify.TextDigest("durable digest")); err != nil {
 		t.Fatal(err)
 	}
 	if err := st.Close(); err != nil {
@@ -1790,7 +1791,7 @@ func TestNewIgnoredFieldsSilentlyRenormalizeExistingSnapshots(t *testing.T) {
 			},
 		},
 	}}}}
-	if _, err := testApplyBatch(st, ctx, generation, baseline, func([]model.Change) string { return "digest" }); err != nil {
+	if _, err := testApplyBatch(st, ctx, generation, baseline, notify.TextDigest("digest")); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1812,7 +1813,7 @@ func TestNewIgnoredFieldsSilentlyRenormalizeExistingSnapshots(t *testing.T) {
 			},
 		},
 	}}}}
-	changes, err := testApplyBatch(st, ctx, generation, current, func([]model.Change) string { return "digest" })
+	changes, err := testApplyBatch(st, ctx, generation, current, notify.TextDigest("digest"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1855,7 +1856,7 @@ func TestStoredInviteURLFingerprintMigratesWithoutChange(t *testing.T) {
 	baseline := []model.Collected{{Collector: "device_details", Resources: []model.Resource{{
 		ID: "1", Type: "device_details", Name: "server", Data: currentData,
 	}}}}
-	if _, err := testApplyBatch(st, ctx, generation, baseline, func([]model.Change) string { return "digest" }); err != nil {
+	if _, err := testApplyBatch(st, ctx, generation, baseline, notify.TextDigest("digest")); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1870,7 +1871,7 @@ func TestStoredInviteURLFingerprintMigratesWithoutChange(t *testing.T) {
 	current := []model.Collected{{Collector: "device_details", Resources: []model.Resource{{
 		ID: "1", Type: "device_details", Name: "server", Data: currentData,
 	}}}}
-	changes, err := testApplyBatch(st, ctx, generation, current, func([]model.Change) string { return "digest" })
+	changes, err := testApplyBatch(st, ctx, generation, current, notify.TextDigest("digest"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1898,7 +1899,7 @@ func TestDeviceRuntimeMigrationKeepsClientUpdateAlert(t *testing.T) {
 			"hostname": "server", "multipleConnections": false, "machineKey": "machine:old", "nodeKey": "node:old", "updateAvailable": false,
 		},
 	}}}}
-	if _, err := testApplyBatch(st, ctx, generation, baseline, func([]model.Change) string { return "digest" }); err != nil {
+	if _, err := testApplyBatch(st, ctx, generation, baseline, notify.TextDigest("digest")); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1911,7 +1912,7 @@ func TestDeviceRuntimeMigrationKeepsClientUpdateAlert(t *testing.T) {
 			"hostname": "server", "multipleConnections": true, "machineKey": "machine:new", "nodeKey": "node:new", "updateAvailable": false,
 		},
 	}}}}
-	changes, err := testApplyBatch(st, ctx, generation, runtimeOnly, func([]model.Change) string { return "digest" })
+	changes, err := testApplyBatch(st, ctx, generation, runtimeOnly, notify.TextDigest("digest"))
 	if err != nil || len(changes) != 0 {
 		t.Fatalf("device runtime migration emitted changes: %#v %v", changes, err)
 	}
@@ -1921,7 +1922,7 @@ func TestDeviceRuntimeMigrationKeepsClientUpdateAlert(t *testing.T) {
 			"hostname": "server", "multipleConnections": true, "machineKey": "machine:new", "nodeKey": "node:new", "updateAvailable": true,
 		},
 	}}}}
-	changes, err = testApplyBatch(st, ctx, generation, clientUpdate, func([]model.Change) string { return "digest" })
+	changes, err = testApplyBatch(st, ctx, generation, clientUpdate, notify.TextDigest("digest"))
 	if err != nil || len(changes) != 1 || len(changes[0].Fields) != 1 || changes[0].Fields[0].Field != "updateAvailable" {
 		t.Fatalf("client update availability was not preserved: %#v %v", changes, err)
 	}

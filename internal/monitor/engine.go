@@ -30,6 +30,7 @@ type Engine struct {
 	dueErrors                  atomic.Uint64
 	deliveryStats              deliveryStats
 	cleanupStats               cleanupTelemetry
+	instanceLabel, publicURL   string
 }
 
 const (
@@ -152,6 +153,19 @@ func New(st *store.Store, baseURL, tokenURL, version string, senders ...notify.S
 	}
 	return &Engine{store: st, baseURL: baseURL, tokenURL: tokenURL, version: version, sender: sender, wake: make(chan struct{}, 1), trigger: make(chan ReconcileRequest, 4)}
 }
+
+// ConfigureNotifications sets the instance label and public URL added to
+// every notification. Call it before Run.
+func (e *Engine) ConfigureNotifications(instanceLabel, publicURL string) {
+	e.instanceLabel, e.publicURL = instanceLabel, publicURL
+}
+
+// notificationContext is the identity shown in notifications for one
+// settings generation.
+func (e *Engine) notificationContext(settings store.Settings) notify.Context {
+	return notify.Context{Label: e.instanceLabel, Tailnet: settings.Tailnet, PublicURL: e.publicURL, Version: e.version}
+}
+
 func (e *Engine) Wake() {
 	select {
 	case e.wake <- struct{}{}:
@@ -498,6 +512,8 @@ func (e *Engine) pollWithOutcomes(ctx context.Context, client *tailscale.Client,
 		partial   bool
 	}
 	measurements := make([]measurement, 0, len(collectors))
+	var unhealthy []notify.CollectorHealth
+	var recovered []string
 	for _, collector := range collectors {
 		if !force {
 			due, dueErr := e.store.CollectorDueWithError(ctx, settings.Generation, collector)
@@ -556,25 +572,35 @@ func (e *Engine) pollWithOutcomes(ctx context.Context, client *tailscale.Client,
 				slog.Error("record collector failure", "collector", collector, "error", storeErr)
 			}
 			if shouldNotify {
-				if enqueueErr := e.store.EnqueueSystem(ctx, notify.SourceHealth(collector, false)); enqueueErr != nil {
-					slog.Error("enqueue collector health notification", "collector", collector, "error", enqueueErr)
-				}
+				unhealthy = append(unhealthy, notify.CollectorHealth{Collector: collector, Reason: tailscale.FailureCategory(err)})
 			}
 			slog.Warn("collector failed", "collector", collector, "error", safeError)
 		} else if wasUnhealthy {
-			if enqueueErr := e.store.EnqueueSystem(ctx, notify.SourceHealth(collector, true)); enqueueErr != nil {
-				slog.Error("enqueue collector recovery notification", "collector", collector, "error", enqueueErr)
-			}
+			recovered = append(recovered, collector)
 		}
 		outcome.collectors[collector] = collectorSuccess
 		results = append(results, result)
 		measurements = append(measurements, measurement{collector: collector, duration: duration, partial: result.Partial})
 	}
+	// Health transitions from one poll are grouped into one message per
+	// direction, so a revoked credential produces one alert instead of one per
+	// collector.
+	messages := e.notificationContext(settings)
+	if len(unhealthy) > 0 {
+		if enqueueErr := e.store.EnqueueMessage(ctx, messages.CollectorsUnhealthy(unhealthy, time.Now())); enqueueErr != nil {
+			slog.Error("enqueue collector health notification", "collectors", len(unhealthy), "error", enqueueErr)
+		}
+	}
+	if len(recovered) > 0 {
+		if enqueueErr := e.store.EnqueueMessage(ctx, messages.CollectorsRecovered(recovered, time.Now())); enqueueErr != nil {
+			slog.Error("enqueue collector recovery notification", "collectors", len(recovered), "error", enqueueErr)
+		}
+	}
 	if len(polled) == 0 {
 		outcome.success = success
 		return outcome
 	}
-	batch, err := e.store.ApplyBatchWithBatch(ctx, settings.Generation, results, notify.Digest, triggerIDs...)
+	batch, err := e.store.ApplyBatchWithBatch(ctx, settings.Generation, results, messages.Digest, triggerIDs...)
 	if err != nil {
 		slog.Error("apply collected inventory", "error", err)
 		if retryErr := e.store.SetNextPollErr(ctx, settings.Generation, polled, time.Now().Add(collectorRetryInterval)); retryErr != nil {

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/crypt0rr/tailstate/internal/model"
+	"github.com/crypt0rr/tailstate/internal/notify"
 	"github.com/crypt0rr/tailstate/internal/secret"
 )
 
@@ -46,11 +47,11 @@ func TestRekeyPreservesEncryptedStateAndEvidenceIdentity(t *testing.T) {
 	changed := model.Collected{Collector: "devices", Resources: []model.Resource{{
 		ID: "device-1", Type: "device", Name: "server", Data: map[string]any{"hostname": "server-new"},
 	}}}
-	if _, err := testApplyBatch(st, ctx, generation, []model.Collected{baseline}, func([]model.Change) string { return "baseline" }); err != nil {
+	if _, err := testApplyBatch(st, ctx, generation, []model.Collected{baseline}, notify.TextDigest("baseline")); err != nil {
 		st.Close()
 		t.Fatal(err)
 	}
-	if _, err := testApplyBatch(st, ctx, generation, []model.Collected{changed}, func([]model.Change) string { return "changed" }); err != nil {
+	if _, err := testApplyBatch(st, ctx, generation, []model.Collected{changed}, notify.TextDigest("changed")); err != nil {
 		st.Close()
 		t.Fatal(err)
 	}

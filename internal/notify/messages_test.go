@@ -1,6 +1,7 @@
 package notify
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -33,7 +34,7 @@ func TestDigestRendersEscapedChangesAndCounts(t *testing.T) {
 func TestDigestBoundsLargePayload(t *testing.T) {
 	changes := make([]model.Change, 0, 500)
 	for i := 0; i < cap(changes); i++ {
-		changes = append(changes, model.Change{Kind: "changed", Collector: "devices", Name: strings.Repeat("x", 40), Fields: []model.FieldChange{{Field: "description", Old: strings.Repeat("o", 180), New: strings.Repeat("n", 180)}}})
+		changes = append(changes, model.Change{Kind: "changed", Collector: "devices", Name: strings.Repeat("x", 40), Fields: []model.FieldChange{{Field: "description", Old: strings.Repeat("o", 180), New: fmt.Sprintf("%s-%d", strings.Repeat("n", 175), i)}}})
 	}
 	message := digestText(changes)
 	if len(message) > 12000 {

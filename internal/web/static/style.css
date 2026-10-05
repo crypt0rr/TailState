@@ -242,3 +242,5 @@ select { width: 100%; border: 1px solid var(--border); border-radius: 6px; backg
 .routing legend{font-weight:600;padding:0 .3rem}
 .check-row{display:flex;flex-wrap:wrap;gap:.9rem;align-items:center;margin-top:.5rem}
 .destination-routing{margin:.25rem 0 .5rem}
+.muted-flag{display:inline-block;margin-left:.4rem;padding:.05rem .45rem;border-radius:999px;font-size:.75rem;background:#eceff3;color:#4a5361;border:1px dashed #9aa3af}
+.mute-rule .destination-identity{display:flex;gap:.5rem;align-items:center}

@@ -21,6 +21,7 @@ var v14Columns = []struct{ table, column string }{
 	{"notification_destinations", "route_exclude_collectors"},
 	{"notification_destinations", "route_change_kinds"},
 	{"events", "severity"},
+	{"events", "muted"},
 }
 
 func downgradeToV13(t *testing.T, db *sql.DB) {
@@ -29,6 +30,9 @@ func downgradeToV13(t *testing.T, db *sql.DB) {
 		if _, err := db.Exec(fmt.Sprintf("ALTER TABLE %s DROP COLUMN %s", column.table, column.column)); err != nil {
 			t.Fatalf("drop %s.%s: %v", column.table, column.column, err)
 		}
+	}
+	if _, err := db.Exec("DROP TABLE mute_rules"); err != nil {
+		t.Fatal(err)
 	}
 	if _, err := db.Exec("UPDATE schema_version SET version=13"); err != nil {
 		t.Fatal(err)

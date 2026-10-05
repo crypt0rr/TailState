@@ -794,11 +794,12 @@ func migrateSchemaV12ToV13(db *sql.DB) error {
 	return nil
 }
 
-// migrateSchemaV13ToV14 adds notification routing and classification
-// state. Every new column defaults to the pre-upgrade behaviour: destinations
-// route all changes. Existing events are classified in bounded, resumable
-// chunks; severity is derived data and is not part of the signed evidence
-// ledger payload, so backfilling it cannot change a ledger digest.
+// migrateSchemaV13ToV14 adds notification routing, classification, and noise
+// control state. Every new column defaults to the pre-upgrade behaviour:
+// destinations route all changes and no event is muted. Existing events are
+// classified in bounded, resumable chunks; severity is derived data and is
+// not part of the signed evidence ledger payload, and the ledger records the
+// muted flag only when it is set, so neither can change an existing digest.
 func migrateSchemaV13ToV14(db *sql.DB) error {
 	tx, err := db.Begin()
 	if err != nil {
@@ -813,6 +814,7 @@ func migrateSchemaV13ToV14(db *sql.DB) error {
 		{table: "notification_destinations", name: "route_exclude_collectors", definition: "TEXT NOT NULL DEFAULT ''"},
 		{table: "notification_destinations", name: "route_change_kinds", definition: "TEXT NOT NULL DEFAULT ''"},
 		{table: "events", name: "severity", definition: "TEXT NOT NULL DEFAULT ''"},
+		{table: "events", name: "muted", definition: "INTEGER NOT NULL DEFAULT 0"},
 	} {
 		if err := addColumnIfMissing(tx, column.table, column.name, column.definition); err != nil {
 			return err
@@ -837,6 +839,15 @@ func migrateSchemaV13ToV14(db *sql.DB) error {
 		return fmt.Errorf("begin notification routing migration completion: %w", err)
 	}
 	defer finalTx.Rollback()
+	if _, err := finalTx.Exec(`CREATE TABLE IF NOT EXISTS mute_rules (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		kind TEXT NOT NULL CHECK(kind IN ('collector','field','tag','resource')),
+		value TEXT NOT NULL,
+		created_at TEXT NOT NULL,
+		UNIQUE(kind, value)
+	)`); err != nil {
+		return fmt.Errorf("create mute rules: %w", err)
+	}
 	if _, err := finalTx.Exec("UPDATE schema_version SET version=14"); err != nil {
 		return fmt.Errorf("record notification routing migration: %w", err)
 	}

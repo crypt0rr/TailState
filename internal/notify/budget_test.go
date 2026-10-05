@@ -21,8 +21,10 @@ func largeDigest(changes int) string {
 		list = append(list, model.Change{
 			Kind: "changed", Collector: "devices", Name: fmt.Sprintf("server-%03d", i),
 			Fields: []model.FieldChange{
-				{Field: "tags", Old: []any{"tag:prod"}, New: []any{"tag:prod", "tag:db"}},
-				{Field: "clientVersion", Old: "1.80.0", New: "1.82.1"},
+				// Values differ per device so fleet summarisation does not
+				// collapse the fixture into one line.
+				{Field: "tags", Old: []any{"tag:prod"}, New: []any{"tag:prod", fmt.Sprintf("tag:db-%03d", i)}},
+				{Field: "clientVersion", Old: fmt.Sprintf("1.80.%d", i), New: "1.82.1"},
 			},
 		})
 	}

@@ -94,6 +94,7 @@ type pageData struct {
 	HistoryEventTypes               []string
 	HistorySeverities               []string
 	Collectors                      []string
+	MuteRules                       []store.MuteRule
 	HistoryNextURL                  string
 	HistoryExportURL                string
 	EvidenceSigningKeyID            string
@@ -255,6 +256,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /settings/destinations/disable", s.destinationPost)
 	mux.HandleFunc("POST /settings/destinations/delete", s.destinationPost)
 	mux.HandleFunc("POST /settings/destinations/remove", s.destinationPost)
+	mux.HandleFunc("POST /settings/mutes", s.mutePost)
 	return s.security(mux)
 }
 
@@ -836,6 +838,11 @@ func (s *Server) settingsData(ctx context.Context, csrf string, configured bool,
 		data.NotificationState = diagnostics.NotificationStateFor(configured, len(data.Destinations), enabled)
 		data.NotificationsPaused = data.NotificationState.Paused()
 	}
+	if rules, err := s.store.ListMuteRules(ctx); err == nil {
+		data.MuteRules = rules
+	} else {
+		slog.Error("load mute rules", "error", err)
+	}
 	return data
 }
 
@@ -996,6 +1003,57 @@ func (s *Server) destinationPost(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.Error(w, "unknown destination action", http.StatusBadRequest)
 	}
+}
+
+// mutePost adds or removes a mute rule. Collector and field rules must name
+// a collector this release monitors.
+func (s *Server) mutePost(w http.ResponseWriter, r *http.Request) {
+	csrf, ok := s.requireAuth(w, r, true)
+	if !ok {
+		return
+	}
+	ctx := r.Context()
+	switch r.FormValue("action") {
+	case "add":
+		kind, value := strings.TrimSpace(r.FormValue("kind")), strings.TrimSpace(r.FormValue("value"))
+		if kind == store.MuteCollector || kind == store.MuteField {
+			collector, _, _ := strings.Cut(value, ".")
+			if _, err := splitCollectorList(collector); err != nil || collector == "" {
+				data := s.currentSettingsData(ctx, csrf, r)
+				data.Error = "Mute rule was not saved: unknown collector."
+				s.render(w, "settings", data)
+				return
+			}
+		}
+		if _, err := s.store.AddMuteRule(ctx, kind, value); err != nil {
+			data := s.currentSettingsData(ctx, csrf, r)
+			data.Error = "Mute rule was not saved: " + muteRuleMessage(err) + "."
+			s.render(w, "settings", data)
+			return
+		}
+	case "delete":
+		id, _ := strconv.ParseInt(r.FormValue("id"), 10, 64)
+		if err := s.store.DeleteMuteRule(ctx, id); err != nil {
+			http.Error(w, "Mute rule not found.", http.StatusBadRequest)
+			return
+		}
+	default:
+		http.Error(w, "unknown mute rule action", http.StatusBadRequest)
+		return
+	}
+	http.Redirect(w, r, "/settings", http.StatusSeeOther)
+}
+
+// muteRuleMessage keeps validation messages and hides storage details.
+func muteRuleMessage(err error) string {
+	if errors.Is(err, store.ErrMuteRuleExists) {
+		return "an identical rule already exists"
+	}
+	if errors.Is(err, store.ErrInvalidMuteRule) {
+		return err.Error()
+	}
+	slog.Error("save mute rule", "error", err)
+	return "the rule could not be stored"
 }
 
 // notificationContext identifies this instance in notifications sent from the

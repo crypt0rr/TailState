@@ -151,6 +151,7 @@ type HistoryEvent struct {
 	BeforeTruncated bool
 	AfterTruncated  bool
 	Severity        string
+	Muted           bool
 }
 
 type HistoryDelivery struct {

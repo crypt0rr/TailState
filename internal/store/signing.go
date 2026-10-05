@@ -123,6 +123,9 @@ type evidenceLedgerEvent struct {
 	Changes    string `json:"changes,omitempty"`
 	Before     string `json:"before,omitempty"`
 	After      string `json:"after,omitempty"`
+	// Muted is recorded only when set, so entries signed before mute rules
+	// existed (and unmuted entries) keep their original payload bytes.
+	Muted bool `json:"muted,omitempty"`
 }
 
 func loadOrCreateEvidenceSigningKey(ctx context.Context, db *sql.DB, box *secret.Box) (evidenceSigningKey, error) {
@@ -465,18 +468,20 @@ func evidenceLedgerPayload(ctx context.Context, queryer ledgerQueryer, batchID i
 	if len(batch.TriggerIDs) == 0 && batch.TriggerID > 0 {
 		batch.TriggerIDs = []int64{batch.TriggerID}
 	}
-	eventRows, err := queryer.QueryContext(ctx, `SELECT id,generation,observed_at,collector,event_type,resource_id,name,changes_json,before_json,after_json FROM events WHERE batch_id=? ORDER BY id`, batchID)
+	eventRows, err := queryer.QueryContext(ctx, `SELECT id,generation,observed_at,collector,event_type,resource_id,name,changes_json,before_json,after_json,muted FROM events WHERE batch_id=? ORDER BY id`, batchID)
 	if err != nil {
 		return nil, evidenceLedgerBatch{}, err
 	}
 	for eventRows.Next() {
 		var event evidenceLedgerEvent
 		var changes, before, after []byte
-		if err := eventRows.Scan(&event.ID, &event.Generation, &event.ObservedAt, &event.Collector, &event.EventType, &event.ResourceID, &event.Name, &changes, &before, &after); err != nil {
+		var muted int
+		if err := eventRows.Scan(&event.ID, &event.Generation, &event.ObservedAt, &event.Collector, &event.EventType, &event.ResourceID, &event.Name, &changes, &before, &after, &muted); err != nil {
 			eventRows.Close()
 			return nil, evidenceLedgerBatch{}, err
 		}
 		event.Changes, event.Before, event.After = string(changes), string(before), string(after)
+		event.Muted = muted == 1
 		batch.Events = append(batch.Events, event)
 	}
 	if err := eventRows.Err(); err != nil {

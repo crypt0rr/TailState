@@ -124,6 +124,12 @@ func normalizeFor(collector string, value any, root, tenantKeys bool, path strin
 			if collector == "device_details" && devicePostureDuplicate(path, compact) {
 				continue
 			}
+			if collector == "device_details" && postureExpiries(path, compact) {
+				// The attributes endpoint returns per-attribute expiry
+				// timestamps next to the values. Integrations refresh them
+				// on every sync, so they would report drift on each poll.
+				continue
+			}
 			if collector == "log_streaming" && root && legacyUnsupportedLogStream(child) {
 				// Releases before v0.11.16 stored a 404 ("not configured")
 				// as {"unsupported": true}; read it as the current
@@ -198,6 +204,12 @@ func devicePostureDuplicate(path, key string) bool {
 	}
 	section, _, _ := strings.Cut(path, ".")
 	return strings.EqualFold(section, "postureAttributes")
+}
+
+// postureExpiries reports the expiries map of a device's posture attributes
+// response, which holds {"attributes": ..., "expiries": ...}.
+func postureExpiries(path, key string) bool {
+	return key == "expiries" && strings.EqualFold(path, "postureAttributes")
 }
 
 func tenantKeySection(collector, key string) bool {

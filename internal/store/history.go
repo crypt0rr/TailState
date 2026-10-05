@@ -239,7 +239,7 @@ func (s *Store) loadHistoryBatch(ctx context.Context, batch HistoryBatch, filter
 		eventWhere = append(eventWhere, "severity=?")
 		eventArgs = append(eventArgs, filter.Severity)
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT id,batch_id,generation,observed_at,collector,event_type,resource_id,name,changes_json,before_json,after_json,before_hash,after_hash,before_bytes,after_bytes,before_truncated,after_truncated,severity
+	rows, err := s.db.QueryContext(ctx, `SELECT id,batch_id,generation,observed_at,collector,event_type,resource_id,name,changes_json,before_json,after_json,before_hash,after_hash,before_bytes,after_bytes,before_truncated,after_truncated,severity,muted
 		FROM events WHERE `+strings.Join(eventWhere, " AND ")+` ORDER BY id`, eventArgs...)
 	if err != nil {
 		return HistoryBatch{}, err
@@ -250,10 +250,11 @@ func (s *Store) loadHistoryBatch(ctx context.Context, batch HistoryBatch, filter
 		var event HistoryEvent
 		var observed string
 		var fieldsRaw, beforeRaw, afterRaw []byte
-		var beforeTruncated, afterTruncated int
-		if err := rows.Scan(&event.ID, &event.BatchID, &event.Generation, &observed, &event.Collector, &event.EventType, &event.ResourceID, &event.Name, &fieldsRaw, &beforeRaw, &afterRaw, &event.BeforeHash, &event.AfterHash, &event.BeforeBytes, &event.AfterBytes, &beforeTruncated, &afterTruncated, &event.Severity); err != nil {
+		var beforeTruncated, afterTruncated, muted int
+		if err := rows.Scan(&event.ID, &event.BatchID, &event.Generation, &observed, &event.Collector, &event.EventType, &event.ResourceID, &event.Name, &fieldsRaw, &beforeRaw, &afterRaw, &event.BeforeHash, &event.AfterHash, &event.BeforeBytes, &event.AfterBytes, &beforeTruncated, &afterTruncated, &event.Severity, &muted); err != nil {
 			return HistoryBatch{}, err
 		}
+		event.Muted = muted == 1
 		event.BeforeTruncated = beforeTruncated == 1
 		event.AfterTruncated = afterTruncated == 1
 		if marker, ok := parseTruncationMarker(beforeRaw); ok {

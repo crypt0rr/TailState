@@ -433,7 +433,7 @@ func evidenceVerify(args []string) error {
 	} else if err := store.VerifyEvidencePack(data); err != nil {
 		return err
 	}
-	// Verification only accepts the signed v3 format. Keep the success output
+	// Verification only accepts the signed v3 and v4 formats. Keep the success output
 	// explicit so operators and scripts cannot confuse it with an unsigned
 	// legacy export (which this command deliberately rejects).
 	fmt.Println("signed evidence pack verified")

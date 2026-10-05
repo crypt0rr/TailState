@@ -191,6 +191,8 @@ func enqueueDigestTx(ctx context.Context, tx *sql.Tx, digest notify.DigestFunc, 
 		if !rendered {
 			filtered := input
 			filtered.Changes = make([]model.Change, 0, len(input.Changes))
+			// Muted changes are counted only when the digest is sent at all;
+			// a batch of only muted changes produces no digest.
 			for index, change := range input.Changes {
 				if destination.rules.Matches(change, severities[index]) {
 					filtered.Changes = append(filtered.Changes, change)

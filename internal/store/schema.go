@@ -162,7 +162,15 @@ CREATE TABLE IF NOT EXISTS events (
   after_bytes INTEGER NOT NULL DEFAULT 0,
   before_truncated INTEGER NOT NULL DEFAULT 0,
   after_truncated INTEGER NOT NULL DEFAULT 0,
-  severity TEXT NOT NULL DEFAULT ''
+  severity TEXT NOT NULL DEFAULT '',
+  muted INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS mute_rules (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  kind TEXT NOT NULL CHECK(kind IN ('collector','field','tag','resource')),
+  value TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  UNIQUE(kind, value)
 );
 CREATE TABLE IF NOT EXISTS evidence_ledger (
   sequence INTEGER PRIMARY KEY AUTOINCREMENT,

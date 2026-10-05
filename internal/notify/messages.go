@@ -20,6 +20,12 @@ type DigestInput struct {
 	BatchID    int64
 	ObservedAt time.Time
 	Changes    []model.Change
+	// MutedCount is the number of changes in the batch left out by mute
+	// rules; they remain in History.
+	MutedCount int
+	// ResourceCounts is the number of resources each collector returned in
+	// this poll, used to recognise upstream schema changes.
+	ResourceCounts map[string]int
 }
 
 // DigestFunc builds the notification for one digest.
@@ -56,7 +62,11 @@ func (c Context) Digest(in DigestInput) Message {
 	if batchURL := c.HistoryBatchURL(in.BatchID); batchURL != "" {
 		message.Lines = append(message.Lines, line(link(fmt.Sprintf("View batch #%d in TailState History", in.BatchID), batchURL)))
 	}
+	if in.MutedCount > 0 {
+		message.Lines = append(message.Lines, line(emph(fmt.Sprintf("%d muted change(s) not shown; they are recorded in TailState History.", in.MutedCount))))
+	}
 	message.Lines = append(message.Lines, blank())
+	schema, fleet, listed := summarize(in)
 	// Every line is complete on its own, so the digest is only ever shortened
 	// at line boundaries and each omission is stated explicitly. The budget is
 	// measured in Markdown, the most verbose rendering.
@@ -71,10 +81,17 @@ func (c Context) Digest(in DigestInput) Message {
 		size += rendered
 		return true
 	}
-	for index, change := range in.Changes {
-		severity := severities[index]
+	// Summaries come first: they are short and stand for many resources.
+	for _, change := range schema {
+		add(c.schemaLine(change, in.BatchID))
+	}
+	for _, transition := range fleet {
+		add(c.fleetLine(transition, in.BatchID))
+	}
+	for index, change := range listed {
+		severity := model.Classify(change)
 		if !add(line(lit(severityIcons[severity]+" "+changeIcons[change.Kind]+" "), bold(change.Name), lit(" "), code(change.Kind), lit(" ("), txt(change.Collector), lit(", "+string(severity)+")"))) {
-			message.Lines = append(message.Lines, blank(), line(emph(fmt.Sprintf("%d more change(s) omitted; total: %d. See TailState History for the full batch.", len(in.Changes)-index, len(in.Changes)))))
+			message.Lines = append(message.Lines, blank(), line(emph(fmt.Sprintf("%d more change(s) omitted; total: %d. See TailState History for the full batch.", len(listed)-index, len(in.Changes)))))
 			break
 		}
 		omittedFields := 0

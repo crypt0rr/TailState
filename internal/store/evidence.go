@@ -19,8 +19,11 @@ import (
 )
 
 const (
-	evidencePackFormat        = "tailstate-drift-evidence"
-	evidencePackVersion       = 3
+	evidencePackFormat  = "tailstate-drift-evidence"
+	evidencePackVersion = 4
+	// evidencePackVersionV3 packs predate per-event severity and mute
+	// flags. They are still verified with their original signature domain.
+	evidencePackVersionV3     = 3
 	maxEvidenceBatches        = 100
 	maxEvidenceEvents         = 2000
 	maxEvidenceBytes          = 5 << 20
@@ -40,8 +43,9 @@ const EvidencePublicKeyLimitBytes = maxEvidencePublicKeyBytes
 var ErrEvidencePackTooLarge = errors.New("history evidence pack exceeds the size limit")
 
 // EvidencePack is a redacted, portable representation of explainable drift
-// history. Version 3 packs include an Ed25519 signature over the content hash,
-// ledger head, generation timestamp, and signing-key fingerprint.
+// history. Packs include an Ed25519 signature over the content hash, ledger
+// head, generation timestamp, and signing-key fingerprint. Version 4 adds the
+// per-event severity and muted flag; version 3 packs remain verifiable.
 type EvidencePack struct {
 	Format           string               `json:"format"`
 	Version          int                  `json:"version"`
@@ -127,6 +131,13 @@ type EvidenceEvent struct {
 	AfterBytes      int64           `json:"after_bytes,omitempty"`
 	BeforeTruncated bool            `json:"before_truncated,omitempty"`
 	AfterTruncated  bool            `json:"after_truncated,omitempty"`
+	// Severity is the built-in classification recorded with the event
+	// (version 4). It is covered by the pack signature; the ledger payload
+	// does not carry it because it is derived from the signed change.
+	Severity string `json:"severity,omitempty"`
+	// Muted marks a change left out of notifications by a mute rule
+	// (version 4). It is bound to the signed ledger payload.
+	Muted bool `json:"muted,omitempty"`
 }
 
 // EvidenceField is a machine-readable field-level diff. Missing old or new
@@ -263,8 +274,17 @@ func verifyEvidencePack(data, trustedPublic []byte) error {
 	if pack.Format != evidencePackFormat {
 		return fmt.Errorf("unsupported evidence pack format %q version %d", pack.Format, pack.Version)
 	}
-	if pack.Version != evidencePackVersion {
+	if pack.Version != evidencePackVersion && pack.Version != evidencePackVersionV3 {
 		return fmt.Errorf("unsupported evidence pack format %q version %d", pack.Format, pack.Version)
+	}
+	if pack.Version == evidencePackVersionV3 {
+		for _, batch := range pack.Batches {
+			for _, event := range batch.Events {
+				if event.Severity != "" || event.Muted {
+					return fmt.Errorf("evidence pack version %d cannot carry severity or muted flags (event %d)", pack.Version, event.ID)
+				}
+			}
+		}
 	}
 	if pack.Truncated {
 		if pack.NextCursor <= 0 {
@@ -313,8 +333,11 @@ func verifyEvidencePack(data, trustedPublic []byte) error {
 	return nil
 }
 
+// evidenceSignaturePayload is the signed statement for a pack. The domain
+// names the pack version so a signature can never be replayed across
+// versions.
 func evidenceSignaturePayload(pack EvidencePack) []byte {
-	return []byte("tailstate-evidence-pack-v3\n" + pack.ContentSHA256 + "\n" + pack.LedgerHead + "\n" + pack.GeneratedAt + "\n" + pack.SigningKeyID)
+	return []byte(fmt.Sprintf("tailstate-evidence-pack-v%d\n", pack.Version) + pack.ContentSHA256 + "\n" + pack.LedgerHead + "\n" + pack.GeneratedAt + "\n" + pack.SigningKeyID)
 }
 
 func validateLedgerBatchState(batches []EvidenceBatch) error {
@@ -399,6 +422,9 @@ func verifyLedgerEventBinding(event EvidenceEvent, ledgerEvent evidenceLedgerEve
 	fields, fieldsTruncated, totalFields, err := evidenceFieldsFromLedger([]byte(ledgerEvent.Changes))
 	if err != nil {
 		return fmt.Errorf("decode ledger event fields for event %d in batch %d: %w", event.ID, batchID, err)
+	}
+	if event.Muted != ledgerEvent.Muted {
+		return fmt.Errorf("ledger payload event muted flag mismatch for event %d in batch %d", event.ID, batchID)
 	}
 	if fieldsTruncated != event.FieldsTruncated || totalFields != event.TotalFields || !equalEvidenceFields(fields, event.Fields) {
 		return fmt.Errorf("ledger payload event fields mismatch for event %d in batch %d", event.ID, batchID)
@@ -730,6 +756,8 @@ func evidenceBatch(batch HistoryBatch) EvidenceBatch {
 			AfterBytes:      event.AfterBytes,
 			BeforeTruncated: event.BeforeTruncated,
 			AfterTruncated:  event.AfterTruncated,
+			Severity:        event.Severity,
+			Muted:           event.Muted,
 			Fields:          make([]EvidenceField, 0, len(event.Fields)),
 		}
 		for _, field := range event.Fields {

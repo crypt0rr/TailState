@@ -503,6 +503,33 @@ func TestDeviceDetailsExcludeDuplicatedCoreDevice(t *testing.T) {
 	}
 }
 
+// TestPostureAttributeExpiriesAreIgnored keeps refreshed posture expiry
+// timestamps from reporting drift while the attribute values stay monitored.
+func TestPostureAttributeExpiriesAreIgnored(t *testing.T) {
+	snapshot := func(expiry, tier string) []byte {
+		raw, _, err := CanonicalFor("device_details", map[string]any{"postureAttributes": map[string]any{
+			"attributes": map[string]any{"custom:tier": tier},
+			"expiries":   map[string]any{"custom:tier": expiry},
+		}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return raw
+	}
+	first, refreshed := snapshot("2026-10-05T12:00:00Z", "prod"), snapshot("2026-10-06T12:00:00Z", "prod")
+	if string(first) != string(refreshed) || strings.Contains(string(first), "expiries") {
+		t.Fatalf("posture expiries changed the snapshot: %s vs %s", first, refreshed)
+	}
+	if diff := Diff(first, snapshot("2026-10-06T12:00:00Z", "dev")); len(diff) != 1 || diff[0].Field != "postureAttributes.attributes.custom:tier" {
+		t.Fatalf("attribute value change was not reported: %+v", diff)
+	}
+	// An "expiries" key elsewhere is ordinary data.
+	raw, _, err := CanonicalFor("device_details", map[string]any{"deviceInvites": []any{map[string]any{"expiries": "x"}}})
+	if err != nil || !strings.Contains(string(raw), "expiries") {
+		t.Fatalf("unrelated expiries key was dropped: %s err=%v", raw, err)
+	}
+}
+
 func TestLegacyUnsupportedLogStreamNormalizesToNotConfigured(t *testing.T) {
 	legacy := map[string]any{
 		"configuration": map[string]any{"unsupported": true},

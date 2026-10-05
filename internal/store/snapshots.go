@@ -362,6 +362,14 @@ func (s *Store) ApplyBatchWithBatch(ctx context.Context, generation int64, resul
 			}
 		}
 	}
+	// Schema-change detection compares a field transition with the number of
+	// resources each collector returned in this poll.
+	resourceCounts := make(map[string]int, len(results))
+	for _, result := range results {
+		if result.Error == nil && !result.Unsupported {
+			resourceCounts[result.Collector] = len(result.Resources)
+		}
+	}
 	var triggerID int64
 	if len(triggerIDs) > 0 && triggerIDs[0] > 0 {
 		triggerID = triggerIDs[0]
@@ -386,9 +394,26 @@ func (s *Store) ApplyBatchWithBatch(ctx context.Context, generation int64, resul
 				return ChangeBatchResult{}, err
 			}
 		}
-		severities := make([]model.Severity, len(recorded))
-		for index, entry := range recorded {
-			severities[index] = model.Classify(entry.Change)
+		muteRules, muteErr := listMuteRules(ctx, tx)
+		if muteErr != nil {
+			return ChangeBatchResult{}, muteErr
+		}
+		mutes := newMuteSet(muteRules)
+		// The digest receives only unmuted changes, with muted fields removed
+		// and severities computed on what is actually shown; History and the
+		// ledger keep every change and field, flagged when muted.
+		notifiable := make([]model.Change, 0, len(recorded))
+		severities := make([]model.Severity, 0, len(recorded))
+		mutedCount := 0
+		for _, entry := range recorded {
+			severity := model.Classify(entry.Change)
+			muted, shown := mutes.evaluate(entry.Change, entry.Before.raw, entry.After.raw)
+			if muted {
+				mutedCount++
+			} else {
+				notifiable = append(notifiable, shown)
+				severities = append(severities, model.Classify(shown))
+			}
 			fields, marshalErr := json.Marshal(persistedFields{Fields: entry.Change.Fields, FieldsTruncated: entry.Change.FieldsTruncated, TotalFields: entry.Change.TotalFields})
 			if marshalErr != nil {
 				return ChangeBatchResult{}, marshalErr
@@ -397,12 +422,13 @@ func (s *Store) ApplyBatchWithBatch(ctx context.Context, generation int64, resul
 			after := boundedValue(entry.After.raw, entry.After.hash, limits.EventValueBytes, limits.RejectBytes)
 			noteTruncation(entry.Change.Collector, entry.Change.ResourceID, before, limits.EventValueBytes, false)
 			noteTruncation(entry.Change.Collector, entry.Change.ResourceID, after, limits.EventValueBytes, false)
-			_, err = tx.ExecContext(ctx, `INSERT INTO events(batch_id,generation,observed_at,collector,event_type,resource_id,name,changes_json,before_json,after_json,before_hash,after_hash,before_bytes,after_bytes,before_truncated,after_truncated,severity) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, batchID, generation, observedAt, entry.Change.Collector, entry.Change.Kind, entry.Change.ResourceID, entry.Change.Name, fields, nullableJSON(before.raw), nullableJSON(after.raw), before.hash, after.hash, before.bytes, after.bytes, boolInt(before.truncated), boolInt(after.truncated), string(severities[index]))
+			_, err = tx.ExecContext(ctx, `INSERT INTO events(batch_id,generation,observed_at,collector,event_type,resource_id,name,changes_json,before_json,after_json,before_hash,after_hash,before_bytes,after_bytes,before_truncated,after_truncated,severity,muted) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, batchID, generation, observedAt, entry.Change.Collector, entry.Change.Kind, entry.Change.ResourceID, entry.Change.Name, fields, nullableJSON(before.raw), nullableJSON(after.raw), before.hash, after.hash, before.bytes, after.bytes, boolInt(before.truncated), boolInt(after.truncated), string(severity), boolInt(muted))
 			if err != nil {
 				return ChangeBatchResult{}, err
 			}
 		}
-		if err = enqueueDigestTx(ctx, tx, digest, notify.DigestInput{BatchID: batchID, ObservedAt: now, Changes: changes}, severities, observedAt); err != nil {
+		input := notify.DigestInput{BatchID: batchID, ObservedAt: now, Changes: notifiable, MutedCount: mutedCount, ResourceCounts: resourceCounts}
+		if err = enqueueDigestTx(ctx, tx, digest, input, severities, observedAt); err != nil {
 			return ChangeBatchResult{}, err
 		}
 		if err = s.appendEvidenceLedgerTx(ctx, tx, batchID); err != nil {

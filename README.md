@@ -14,7 +14,19 @@ of truth and the safety net for missed events.
 - Policy section fingerprints without storing policy contents.
 - Credential metadata, webhook configuration inventory, log-streaming configuration/status, contacts, posture integrations, and tailnet settings.
 
-The REST API does not expose authoritative online state. TailState therefore does **not** generate online/offline notifications and ignores `lastSeen`, `connectedToControl`, live user/device connectivity, public endpoints, connectivity metadata, profile-picture URLs, internal rotating node keys, operational status counters, response timestamps, ordering in set-like arrays, and unknown fields outside its monitored schema. DNS nameserver and search-path ordering is preserved because position determines resolver behavior. Tailscale client-version and `updateAvailable` changes remain alertable.
+The REST API does not expose authoritative online state. TailState therefore does **not** generate online/offline notifications. What is ignored depends on the collector:
+
+| Collector | Monitored fields | Always ignored |
+| --- | --- | --- |
+| Every collector | (see below) | `lastSeen`, `connectedToControl`, `clientConnectivity`, `endpoints`, `lastUpdated`, `createdAt`, `updatedAt`, `timestamp`, `requestedAt`, `profilePicUrl`, and the order of set-like arrays. Secret values (for example `secret`, `token`, `password`, `clientSecret`, `s3SecretAccessKey`, `gcsCredentials`) and URL fields are replaced by SHA-256 fingerprints |
+| `devices` | Allowlist: `addresses`, `id`, `nodeId`, `user`, `name`, `hostname`, `clientVersion`, `updateAvailable`, `os`, `created`, `keyExpiryDisabled`, `expires`, `authorized`, `isExternal`, `blocksIncomingConnections`, `enabledRoutes`, `advertisedRoutes`, `tags`, `tailnetLockError`, `tailnetLockKey`, `sshEnabled`, `postureIdentity`, `isEphemeral`, `distro` | Any other top-level field, including `multipleConnections`, `machineKey`, and `nodeKey` (rotating keys) |
+| `users` | Allowlist: `id`, `displayName`, `loginName`, `tailnetId`, `created`, `type`, `role`, `status` (`active` and `idle` are both recorded as `enabled`) | Any other top-level field, including `currentlyConnected` and `deviceCount` |
+| `device_details` | Allowlist: `postureAttributes` and `deviceInvites` | Posture attribute `expiries` timestamps, and the `node:os`, `node:osVersion`, and `node:tsVersion` attributes (reported by `devices`) |
+| `posture` | Allowlist: `provider`, `cloudId`, `clientId`, `tenantId`, `id`, `configUpdated`, `status` (reduced to `healthy` or `error`) | Any other top-level field, such as synchronization counters |
+| `log_streaming` | Allowlist: `configuration`, `network`; stream status is reduced to `healthy`, `error`, or `unavailable` | Any other top-level field |
+| `keys`, `webhooks`, `user_invites`, `settings`, `contacts`, `dns`, `policy` | Open schema: every field except the global ignore list (policy is stored as section fingerprints) | Only the global ignore list |
+
+Because the last group has an open schema, a field that Tailscale adds to its API response appears on every resource of that collector at once. TailState reports that as one "upstream schema change" line in the digest (see [Noise controls](#noise-controls)); History still lists every resource. DNS nameserver and search-path ordering is preserved because position determines resolver behavior. Tailscale client-version and `updateAvailable` changes remain alertable.
 
 ## Quick start
 
@@ -388,7 +400,7 @@ in a disposable project before relying on the procedure for an outage.
 - Single-object endpoints (tailnet settings, contacts, policy, each DNS sub-endpoint, and log-streaming configuration and status) must return a JSON object. A `null`, empty, array, or scalar body is treated as an invalid upstream response: the collector fails, no events are recorded, and the last snapshot is kept.
 - Multiple changes in one poll become one digest, fanned out into one durable outbox item per enabled destination. Each digest is fitted to the receiving service's message limit (for example 4,096 bytes for Telegram, Lark, WeCom, and ntfy, 1,024 for Pushover, and 10,000 for Zulip) by dropping whole lines from the end and adding an explicit "lines omitted, see History" note. A provider that still rejects a message as too large (or with HTTP 413) dead-letters it immediately instead of retrying for 24 hours.
 - Every change batch is also recorded in the authenticated History page with field-level diffs and redacted normalized before/after snapshots. Filters support collector, change type, severity, resource name or ID, and a single batch (`/history?batch=<id>`, the target of notification links); history is retained for 30 days. Normalized snapshots are capped at 1 MiB and each event before/after value at 512 KiB. Larger values retain their SHA-256, original byte count, configured limit, and a bounded truncation marker instead of the provider body; the authenticated UI calls this out explicitly. A normal history page reads at most 2 MiB of stored event data and displays a truncation notice with a cursor when that budget is reached. The hard 4 MiB raw-write ceiling prevents an unusually large normalized value from entering SQLite unbounded; the small marker remains queryable for audit.
-- The History page can download a filtered, redacted JSON evidence pack for incident reports and offline review. Packs include normalized snapshots, field diffs, destination delivery outcomes, a SHA-256 content hash, and an Ed25519 signature over a hash-linked event ledger; exports are limited to 100 batches, 2,000 events, and 5 MiB. A changed export fails verification.
+- The History page can download a filtered, redacted JSON evidence pack for incident reports and offline review. Packs (format version 4) include normalized snapshots, field diffs, each event's severity and `muted` flag, destination delivery outcomes, a SHA-256 content hash, and an Ed25519 signature over a hash-linked event ledger; exports are limited to 100 batches, 2,000 events, and 5 MiB. A changed export fails verification.
 - Verify an export offline with `tailstate evidence verify --file tailstate-drift-evidence.json`. Verification checks the content hash, embedded public key fingerprint, signature, and included ledger links; packs and public-key files are bounded before decoding (5 MiB and 4 KiB respectively). For independent trust, print the instance public key with `tailstate evidence public-key`, save it as a base64 file, and pass it with `--public-key public.key`. `evidence public-key` opens the database read-only and fails if the database, the current schema, or the stored signing key is missing; it never creates a database or a new key.
 - Audit the persisted evidence ledger explicitly with `tailstate evidence audit`. The command opens the existing database read-only, verifies sequence continuity, predecessor hashes, signatures, key IDs, stored head, and canonical payload digests, then resumes through bounded pages until the chain is complete. Pass `--public-key public.key` to anchor verification to an independently trusted Ed25519 key; entries whose event snapshots have aged out are reported as cryptographically verified but payload-unverifiable. The audit never creates a database, runs migrations, generates keys, or changes metadata, and can run while TailState is serving from SQLite WAL mode.
 - Shoutrrr deliveries retry independently for up to 24 hours across restarts, then remain visible as dead letters until the 30-day operational retention window expires. Delivery is at-least-once: each outbox row is leased while a sender is in flight, and if the process stops after a provider accepts a message but before the durable bookkeeping update commits, that message may be sent again after the lease expires. Per-lease fencing prevents a stale worker from changing a newer retry attempt. Disabling or removing a destination dead-letters its pending or in-flight items; newly added destinations receive only future notifications. Removing a destination also erases its encrypted URL (and overwrites the freed database space), so a leaked webhook credential is not carried into later backups; History keeps the destination name for past deliveries.
@@ -451,6 +463,31 @@ batch of client upgrades, while a default destination still receives it.
 Destinations created before routing existed, and new destinations, receive all
 changes. Collector health and release notifications are not inventory changes
 and always reach every enabled destination.
+
+### Noise controls
+
+Predictable noise is reduced in the digest without losing the audit trail:
+
+- **Mute rules** are managed under **Noise controls** in Settings (CSRF
+  protected). A rule mutes a collector (`dns`), one field path of a collector
+  (`devices.clientVersion`, which also covers nested paths below it), every
+  device carrying a tag (`tag:ci`, matched in the before or after snapshot), or
+  one resource by ID or exact name. Muted changes are still recorded in History
+  and in the signed evidence ledger, flagged `muted` in the History page and in
+  evidence exports, but are left out of digests; the digest states how many
+  muted changes it omitted, and a batch of only muted changes sends nothing. A
+  change whose fields are only partly muted is notified with its remaining
+  fields. Rules apply to batches recorded after they are added; at most 200
+  rules are kept.
+- **Fleet summarisation:** when the same field transition (for example
+  `updateAvailable` false→true) affects at least 5 resources of a collector in
+  one batch, the digest shows one line such as
+  "`updateAvailable`: `false` → `true` on 143 resources (devices)" with a
+  History link when `TAILSTATE_PUBLIC_URL` is set.
+- **Schema-change detection:** when a field becomes newly present (or absent)
+  on every resource a collector returned in one batch (at least 2 resources),
+  the digest shows one "upstream schema change" line instead of one diff per
+  resource.
 
 Version tracking is introduced in v0.3.0. Its first startup records the release silently because earlier releases did not persist their version; subsequent upgrades include both exact versions in the notification.
 
@@ -518,12 +555,16 @@ unique batch constraint) and adds `outbox_dead_retention` and
 `auth_tokens_kind`, so every retention statement reaches its rows through an
 index search and a pass with nothing to delete stays cheap on large databases.
 
-Schema v14 adds per-destination routing rules and a built-in severity on every
-history event. Existing destinations default to receiving all changes, so the
-upgrade does not change delivery. Existing events are classified in bounded,
-resumable 64-row transactions during the migration; severity is derived data
-and is not part of the signed ledger payload, so previously signed evidence and
-exported packs still verify.
+Schema v14 adds per-destination routing rules, a built-in severity and a
+`muted` flag on every history event, and the mute rule table. Existing
+destinations default to receiving all changes and no existing event is muted,
+so the upgrade does not change delivery. Existing events are classified in
+bounded, resumable 64-row transactions during the migration; severity is
+derived data and is not part of the signed ledger payload, and the ledger
+payload records `muted` only when it is set, so the existing chain and every
+previously exported pack still verify. New exports use evidence format version
+4, which adds per-event `severity` and `muted`; `tailstate evidence verify`
+accepts both version 3 and version 4 packs.
 
 ## Runtime configuration
 

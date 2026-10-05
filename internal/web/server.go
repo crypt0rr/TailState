@@ -679,6 +679,7 @@ func (s *Server) diagnosticReport(ctx context.Context, request *http.Request) di
 			EventValueTruncations:   metrics.EventValueTruncations,
 			HistoryPageTruncations:  metrics.HistoryPageTruncations,
 			OversizedWritesRejected: metrics.OversizedWritesRejected,
+			LimitNotEnforced:        !metrics.LimitEnforced(),
 		}
 	}
 	return diagnostics.Build(s.config, runtime, request)
@@ -970,7 +971,7 @@ func (s *Server) metrics(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	limits := s.store.StorageLimits()
-	fmt.Fprintf(w, "# TYPE tailstate_storage_bytes gauge\ntailstate_storage_bytes %d\n# TYPE tailstate_storage_limit_bytes gauge\ntailstate_storage_limit_bytes %d\n# TYPE tailstate_storage_pressure_ratio gauge\ntailstate_storage_pressure_ratio %.6f\n# HELP tailstate_storage_database_file_bytes Physical bytes used by the main SQLite database file.\n# TYPE tailstate_storage_database_file_bytes gauge\ntailstate_storage_database_file_bytes %d\n# HELP tailstate_storage_wal_bytes Physical bytes used by the SQLite WAL sidecar.\n# TYPE tailstate_storage_wal_bytes gauge\ntailstate_storage_wal_bytes %d\n# HELP tailstate_storage_shm_bytes Physical bytes used by the SQLite shared-memory sidecar.\n# TYPE tailstate_storage_shm_bytes gauge\ntailstate_storage_shm_bytes %d\n# HELP tailstate_storage_physical_bytes Total physical bytes used by the SQLite database and sidecars.\n# TYPE tailstate_storage_physical_bytes gauge\ntailstate_storage_physical_bytes %d\n# TYPE tailstate_snapshot_truncations_total counter\ntailstate_snapshot_truncations_total %d\n# TYPE tailstate_event_value_truncations_total counter\ntailstate_event_value_truncations_total %d\n# TYPE tailstate_history_page_truncations_total counter\ntailstate_history_page_truncations_total %d\n# TYPE tailstate_oversized_writes_rejected_total counter\ntailstate_oversized_writes_rejected_total %d\n", storage.DatabaseBytes, storage.DatabaseLimitBytes, storage.PressureRatio(), storage.DatabaseFileBytes, storage.DatabaseWALBytes, storage.DatabaseSHMBytes, storage.DatabasePhysicalBytes, storage.SnapshotTruncations, storage.EventValueTruncations, storage.HistoryPageTruncations, storage.OversizedWritesRejected)
+	fmt.Fprintf(w, "# TYPE tailstate_storage_bytes gauge\ntailstate_storage_bytes %d\n# TYPE tailstate_storage_limit_bytes gauge\ntailstate_storage_limit_bytes %d\n# TYPE tailstate_storage_pressure_ratio gauge\ntailstate_storage_pressure_ratio %.6f\n# HELP tailstate_storage_enforced_limit_bytes Page ceiling SQLite enforces on the active connection.\n# TYPE tailstate_storage_enforced_limit_bytes gauge\ntailstate_storage_enforced_limit_bytes %d\n# HELP tailstate_storage_limit_enforced Whether the enforced page ceiling is within the configured database budget.\n# TYPE tailstate_storage_limit_enforced gauge\ntailstate_storage_limit_enforced %d\n# HELP tailstate_storage_database_file_bytes Physical bytes used by the main SQLite database file.\n# TYPE tailstate_storage_database_file_bytes gauge\ntailstate_storage_database_file_bytes %d\n# HELP tailstate_storage_wal_bytes Physical bytes used by the SQLite WAL sidecar.\n# TYPE tailstate_storage_wal_bytes gauge\ntailstate_storage_wal_bytes %d\n# HELP tailstate_storage_shm_bytes Physical bytes used by the SQLite shared-memory sidecar.\n# TYPE tailstate_storage_shm_bytes gauge\ntailstate_storage_shm_bytes %d\n# HELP tailstate_storage_physical_bytes Total physical bytes used by the SQLite database and sidecars.\n# TYPE tailstate_storage_physical_bytes gauge\ntailstate_storage_physical_bytes %d\n# TYPE tailstate_snapshot_truncations_total counter\ntailstate_snapshot_truncations_total %d\n# TYPE tailstate_event_value_truncations_total counter\ntailstate_event_value_truncations_total %d\n# TYPE tailstate_history_page_truncations_total counter\ntailstate_history_page_truncations_total %d\n# TYPE tailstate_oversized_writes_rejected_total counter\ntailstate_oversized_writes_rejected_total %d\n", storage.DatabaseBytes, storage.DatabaseLimitBytes, storage.PressureRatio(), storage.DatabaseEnforcedLimitBytes, boolMetric(storage.LimitEnforced()), storage.DatabaseFileBytes, storage.DatabaseWALBytes, storage.DatabaseSHMBytes, storage.DatabasePhysicalBytes, storage.SnapshotTruncations, storage.EventValueTruncations, storage.HistoryPageTruncations, storage.OversizedWritesRejected)
 	fmt.Fprintf(w, "# TYPE tailstate_snapshot_limit_bytes gauge\ntailstate_snapshot_limit_bytes %d\n# TYPE tailstate_event_value_limit_bytes gauge\ntailstate_event_value_limit_bytes %d\n# TYPE tailstate_history_page_limit_bytes gauge\ntailstate_history_page_limit_bytes %d\n# TYPE tailstate_reject_limit_bytes gauge\ntailstate_reject_limit_bytes %d\n", limits.SnapshotBytes, limits.EventValueBytes, limits.HistoryPageBytes, limits.RejectBytes)
 	fmt.Fprintf(w, "# TYPE tailstate_webhook_triggers_pending gauge\ntailstate_webhook_triggers_pending %d\n# TYPE tailstate_webhook_triggers_processing gauge\ntailstate_webhook_triggers_processing %d\n# TYPE tailstate_webhook_triggers_dead gauge\ntailstate_webhook_triggers_dead %d\n", status.WebhookPending, status.WebhookProcessing, status.WebhookDead)
 	paused := 0
@@ -1186,4 +1187,11 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(value)
+}
+
+func boolMetric(value bool) int {
+	if value {
+		return 1
+	}
+	return 0
 }

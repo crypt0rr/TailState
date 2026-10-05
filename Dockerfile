@@ -1,18 +1,27 @@
 # syntax=docker/dockerfile:1.27.1
 # Keep this compiler aligned with the `go` directive in go.mod. CI checks the
 # two declarations so the tested and published binaries use the same toolchain.
-FROM golang:1.27.1-alpine3.24@sha256:8a5910f31396cd4d89662f56c68b3ae31d374308270a1c3bd96672ee5ed43414 AS builder
+# The builder runs on the build host's native platform and cross-compiles the
+# pure-Go binary for each target, so multi-architecture builds do not compile
+# under QEMU emulation.
+FROM --platform=$BUILDPLATFORM golang:1.27.1-alpine3.24@sha256:8a5910f31396cd4d89662f56c68b3ae31d374308270a1c3bd96672ee5ed43414 AS builder
 ARG VERSION=dev
-ARG GO_VERSION=1.27.1
-ARG BUILD_COMMIT=unknown
+ARG TARGETOS
+ARG TARGETARCH
+ARG TARGETVARIANT
 WORKDIR /source
 COPY go.mod go.sum ./
-RUN go mod download
+RUN --mount=type=cache,target=/go/pkg/mod go mod download
 COPY cmd ./cmd
 COPY internal ./internal
-RUN CGO_ENABLED=0 go build -trimpath -buildvcs=false -ldflags="-s -w -buildid= -X main.version=${VERSION}" -o /out/tailstate ./cmd/tailstate
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    GOARM="${TARGETVARIANT#v}" CGO_ENABLED=0 GOOS="$TARGETOS" GOARCH="$TARGETARCH" \
+    go build -trimpath -buildvcs=false -ldflags="-s -w -buildid= -X main.version=${VERSION}" -o /out/tailstate ./cmd/tailstate
 
-FROM alpine:3.24@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6 AS runtime-files
+# CA certificates and the empty /data directory are architecture-independent,
+# so this stage also runs natively on the build platform.
+FROM --platform=$BUILDPLATFORM alpine:3.24@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6 AS runtime-files
 # The data volume holds the SQLite database and its WAL; keep it private to
 # the service user so a fresh named volume is not readable by other users.
 RUN mkdir -p /data \
@@ -26,12 +35,13 @@ ARG BUILD_COMMIT=unknown
 ARG TARGETOS
 ARG TARGETARCH
 ARG TARGETVARIANT
+# The runtime base is scratch, so no base-image labels are set. The exact builder image digest is recorded in the BuildKit
+# provenance attestation; GO_VERSION is checked against go.mod and the FROM
+# line by scripts/check-go-toolchain.sh.
 LABEL org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.revision="${BUILD_COMMIT}" \
       org.opencontainers.image.source="https://github.com/crypt0rr/tailstate" \
       org.opencontainers.image.build.go="${GO_VERSION}" \
-      org.opencontainers.image.base.name="golang:1.27.1-alpine3.24" \
-      org.opencontainers.image.base.digest="sha256:3f6d04dc61331ee3c2fbbaad62d54412a84680f6a041d269a20a5270a078515b" \
       org.opencontainers.image.build.target.os="${TARGETOS}" \
       org.opencontainers.image.build.target.architecture="${TARGETARCH}" \
       org.opencontainers.image.build.target.variant="${TARGETVARIANT}"

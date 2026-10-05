@@ -2,8 +2,9 @@
 set -euo pipefail
 
 usage() {
-    echo "usage: $0 ARCHIVE.tar.gz --yes [COMPOSE_SERVICE]" >&2
+    echo "usage: $0 ARCHIVE.tar.gz --yes [--no-checksum] [COMPOSE_SERVICE]" >&2
     echo "       A pre-restore archive is created beside ARCHIVE before replacement." >&2
+    echo "       ARCHIVE.sha256 is required unless --no-checksum is given." >&2
     echo "       TAILSTATE_BACKUP_IMAGE may override the pinned BusyBox sidecar" >&2
 }
 
@@ -11,13 +12,32 @@ if [[ ${1:-} == "-h" || ${1:-} == "--help" ]]; then
     usage
     exit 0
 fi
-if [[ $# -lt 2 || $# -gt 3 || ${2:-} != "--yes" ]]; then
+if [[ $# -lt 2 || ${2:-} != "--yes" ]]; then
     usage
     exit 2
 fi
+source_archive="$1"
+shift 2
+verify_checksum=true
+service=tailstate
+service_set=false
+for argument in "$@"; do
+    case "$argument" in
+        --no-checksum) verify_checksum=false ;;
+        -*) usage; exit 2 ;;
+        *)
+            if [[ "$service_set" == true ]]; then
+                usage
+                exit 2
+            fi
+            service="$argument"
+            service_set=true
+            ;;
+    esac
+done
+set -- "$source_archive"
 
 archive="$(cd "$(dirname "$1")" && pwd -P)/$(basename "$1")"
-service="${3:-tailstate}"
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 backup_image="$(bash "$script_dir/backup-image.sh")"
 host_uid="$(id -u)"
@@ -32,6 +52,11 @@ archive_name="$(basename "$archive")"
 checksum="$archive.sha256"
 if [[ -f "$checksum" ]]; then
     (cd "$archive_dir" && sha256sum -c "$(basename "$checksum")")
+elif [[ "$verify_checksum" == true ]]; then
+    echo "checksum file not found: $checksum (pass --no-checksum to restore an archive without one)" >&2
+    exit 1
+else
+    echo "warning: restoring $archive without checksum verification" >&2
 fi
 
 # The successful path writes a pre-restore archive beside the source archive.
@@ -51,6 +76,7 @@ if [[ ${#containers[@]} -ne 1 || -z "${containers[0]}" ]]; then
 fi
 container="${containers[0]}"
 running="$(docker inspect --format '{{.State.Running}}' "$container")"
+data_source="$(bash "$script_dir/data-volume.sh" "$container")"
 
 # The pre-restore archive is written after the service is stopped. Refuse to
 # enter that state when the destination filesystem cannot conservatively hold
@@ -59,7 +85,7 @@ running="$(docker inspect --format '{{.State.Running}}' "$container")"
 # atomic swap and rollback still handle space exhaustion that occurs later.
 available_kib="$(df -Pk "$archive_dir" | awk 'NR == 2 { print $4; exit }')"
 if [[ "$available_kib" =~ ^[0-9]+$ ]]; then
-    if ! data_kib="$(docker run --rm --volumes-from "$container" "$backup_image" du -sk /data | awk 'NR == 1 { print $1; exit }')"; then
+    if ! data_kib="$(docker run --rm --network none --volume "$data_source:/data:ro" "$backup_image" du -sk /data | awk 'NR == 1 { print $1; exit }')"; then
         echo "could not measure the data volume before restore" >&2
         exit 1
     fi
@@ -72,7 +98,7 @@ if [[ "$available_kib" =~ ^[0-9]+$ ]]; then
     fi
 fi
 
-if ! entries="$(docker run --rm --volume "$archive_dir:/backup:ro" "$backup_image" tar tzf "/backup/$archive_name")"; then
+if ! entries="$(docker run --rm --network none --volume "$archive_dir:/backup:ro" "$backup_image" tar tzf "/backup/$archive_name")"; then
     echo "archive cannot be listed: $archive" >&2
     exit 1
 fi
@@ -80,13 +106,27 @@ if printf '%s\n' "$entries" | grep -Eq '(^/|(^|/)\.\.(\/|$))'; then
     echo "archive contains an unsafe absolute or parent-directory path" >&2
     exit 1
 fi
-if ! entry_types="$(docker run --rm --volume "$archive_dir:/backup:ro" "$backup_image" tar tvzf "/backup/$archive_name")"; then
+if ! entry_types="$(docker run --rm --network none --volume "$archive_dir:/backup:ro" "$backup_image" tar tvzf "/backup/$archive_name")"; then
     echo "archive metadata cannot be inspected: $archive" >&2
     exit 1
 fi
 unsafe_type="$(printf '%s\n' "$entry_types" | awk 'substr($1, 1, 1) ~ /^[lbcpsh]$/ { print; exit }')"
 if [[ -n "$unsafe_type" ]]; then
     echo "archive contains an unsafe link or special file: $unsafe_type" >&2
+    exit 1
+fi
+
+# Refuse an archive that is not a TailState data volume before the service is
+# stopped; restoring an unrelated archive would otherwise start TailState as a
+# fresh, unclaimed installation.
+if ! printf '%s\n' "$entries" | grep -Eqx '(\./)?tailstate\.db'; then
+    echo "archive does not contain tailstate.db; it is not a TailState data backup" >&2
+    exit 1
+fi
+db_entry="$(printf '%s\n' "$entries" | grep -Ex '(\./)?tailstate\.db' | head -n 1)"
+if ! docker run --rm --network none --volume "$archive_dir:/backup:ro" "$backup_image" \
+    sh -ec 'tar xzf "/backup/$1" -O "$2" | head -c 15 | grep -q "^SQLite format 3$"' -- "$archive_name" "$db_entry"; then
+    echo "archive tailstate.db is not an SQLite database" >&2
     exit 1
 fi
 
@@ -113,7 +153,8 @@ if [[ "$running" == "true" ]]; then
 fi
 
 docker run --rm \
-    --volumes-from "$container" \
+    --network none \
+    --volume "$data_source:/data:ro" \
     --volume "$archive_dir:/backup" \
     "$backup_image" \
     sh -ec 'umask 077; tar czf "/backup/$1" -C /data .; chown "$2:$3" "/backup/$1"' -- "$pre_restore_name" "$host_uid" "$host_gid"
@@ -123,7 +164,8 @@ docker run --rm \
 )
 
 docker run --rm \
-    --volumes-from "$container" \
+    --network none \
+    --volume "$data_source:/data" \
     --volume "$archive_dir:/backup:ro" \
     "$backup_image" \
     sh -ec '

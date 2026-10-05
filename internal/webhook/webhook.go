@@ -13,6 +13,29 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
+
+	"github.com/crypt0rr/tailstate/internal/textutil"
+)
+
+// Verification errors are classified so the HTTP handler can answer with the
+// right status: ErrUnauthenticated (401) for signature or timestamp failures,
+// ErrBodyTooLarge (413), and ErrMalformedBody (400) for an empty body or one
+// that is not a JSON event array.
+var (
+	ErrUnauthenticated = errors.New("webhook signature verification failed")
+	ErrBodyTooLarge    = errors.New("webhook body is too large")
+	ErrMalformedBody   = errors.New("webhook body is malformed")
+)
+
+// Content fallback reasons. A delivery whose signature is valid but whose
+// content falls outside TailState's bounds is still accepted; it requests a
+// full reconciliation instead of a targeted one.
+const (
+	FallbackEventCount       = "event_count"
+	FallbackEventTypeMissing = "event_type_missing"
+	FallbackEventTypeLength  = "event_type_length"
+	FallbackEventTypeInvalid = "event_type_invalid"
 )
 
 const (
@@ -41,6 +64,10 @@ type Delivery struct {
 	BodyHash   string
 	EventTypes []string
 	Collectors []string
+	// FallbackReason is set when the authentic content exceeded TailState's
+	// bounds. Collectors is then nil (a full reconciliation) and EventTypes
+	// holds only bounded, sanitized metadata.
+	FallbackReason string
 }
 
 // Verify validates a Tailscale-Webhook-Signature header, parses the documented
@@ -49,22 +76,22 @@ type Delivery struct {
 // the persisted body hash prevents replaying an already accepted body.
 func Verify(body []byte, signature, secret string, now time.Time) (Delivery, error) {
 	if len(body) == 0 {
-		return Delivery{}, errors.New("webhook body is empty")
+		return Delivery{}, fmt.Errorf("%w: webhook body is empty", ErrMalformedBody)
 	}
 	if len(body) > MaxBodyBytes {
-		return Delivery{}, errors.New("webhook body is too large")
+		return Delivery{}, ErrBodyTooLarge
 	}
 	secret = strings.TrimSpace(secret)
 	if secret == "" {
-		return Delivery{}, errors.New("webhook secret is not configured")
+		return Delivery{}, fmt.Errorf("%w: webhook secret is not configured", ErrUnauthenticated)
 	}
 	timestamp, signatures, err := parseSignature(signature)
 	if err != nil {
-		return Delivery{}, err
+		return Delivery{}, fmt.Errorf("%w: %w", ErrUnauthenticated, err)
 	}
 	when := time.Unix(timestamp, 0)
 	if when.After(now.Add(maxFutureSkew)) || now.Sub(when) > maxSignatureAge {
-		return Delivery{}, errors.New("webhook signature timestamp is outside the accepted window")
+		return Delivery{}, fmt.Errorf("%w: webhook signature timestamp is outside the accepted window", ErrUnauthenticated)
 	}
 	message := strconv.FormatInt(timestamp, 10) + "." + string(body)
 	mac := hmac.New(sha256.New, []byte(secret))
@@ -79,34 +106,53 @@ func Verify(body []byte, signature, secret string, now time.Time) (Delivery, err
 		}
 	}
 	if !valid {
-		return Delivery{}, errors.New("webhook signature is invalid")
+		return Delivery{}, fmt.Errorf("%w: webhook signature is invalid", ErrUnauthenticated)
 	}
 
+	// From here on the request is authentic. Content TailState cannot map to
+	// a targeted reconciliation is not an authentication failure: it is
+	// accepted and falls back to a full reconciliation.
 	var events []Event
 	if err := json.Unmarshal(body, &events); err != nil {
-		return Delivery{}, errors.New("webhook body is not a JSON event array")
-	}
-	if len(events) == 0 || len(events) > maxEvents {
-		return Delivery{}, fmt.Errorf("webhook event count must be between 1 and %d", maxEvents)
-	}
-	eventTypes := make([]string, 0, len(events))
-	for i := range events {
-		events[i].Type = strings.TrimSpace(events[i].Type)
-		if events[i].Type == "" {
-			return Delivery{}, errors.New("webhook event type is missing")
-		}
-		if len(events[i].Type) > maxEventTypeLen {
-			return Delivery{}, fmt.Errorf("webhook event type exceeds %d bytes", maxEventTypeLen)
-		}
-		eventTypes = append(eventTypes, events[i].Type)
+		return Delivery{}, fmt.Errorf("%w: webhook body is not a JSON event array", ErrMalformedBody)
 	}
 	sum := sha256.Sum256(body)
-	return Delivery{
-		Events:     events,
-		BodyHash:   hex.EncodeToString(sum[:]),
-		EventTypes: uniqueSorted(eventTypes),
-		Collectors: CollectorsFor(events),
-	}, nil
+	delivery := Delivery{Events: events, BodyHash: hex.EncodeToString(sum[:])}
+	if len(events) == 0 || len(events) > maxEvents {
+		delivery.FallbackReason = FallbackEventCount
+	}
+	eventTypes := make([]string, 0, min(len(events), maxEvents))
+	for i := range events {
+		events[i].Type = strings.TrimSpace(events[i].Type)
+		eventType := events[i].Type
+		switch {
+		case eventType == "":
+			if delivery.FallbackReason == "" {
+				delivery.FallbackReason = FallbackEventTypeMissing
+			}
+			continue
+		case strings.IndexFunc(eventType, unicode.IsControl) >= 0:
+			if delivery.FallbackReason == "" {
+				delivery.FallbackReason = FallbackEventTypeInvalid
+			}
+			continue
+		case len(eventType) > maxEventTypeLen:
+			if delivery.FallbackReason == "" {
+				delivery.FallbackReason = FallbackEventTypeLength
+			}
+			eventType = textutil.Truncate(eventType, maxEventTypeLen)
+		}
+		eventTypes = append(eventTypes, eventType)
+	}
+	eventTypes = uniqueSorted(eventTypes)
+	if len(eventTypes) > maxEvents {
+		eventTypes = eventTypes[:maxEvents]
+	}
+	delivery.EventTypes = eventTypes
+	if delivery.FallbackReason == "" {
+		delivery.Collectors = CollectorsFor(events)
+	}
+	return delivery, nil
 }
 
 func parseSignature(value string) (int64, []string, error) {

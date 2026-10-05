@@ -52,6 +52,7 @@ type Server struct {
 	metricsMu            sync.Mutex
 	challengeCounts      map[credentialChallengeMetric]uint64
 	credentialRejections map[string]uint64
+	webhookOutcomes      map[string]uint64
 }
 
 const (
@@ -142,6 +143,7 @@ func New(config boot.Config, st *store.Store, engine *monitor.Engine) (*Server, 
 		consumedChallenges:   map[string]time.Time{},
 		challengeCounts:      map[credentialChallengeMetric]uint64{},
 		credentialRejections: map[string]uint64{},
+		webhookOutcomes:      map[string]uint64{},
 	}, nil
 }
 
@@ -902,6 +904,42 @@ func destinationMutationMessage(action string, err error) string {
 	}
 }
 
+// Webhook request outcomes, exported as tailstate_webhook_requests_total.
+// Signature failures and content-bounds fallbacks are deliberately distinct.
+const (
+	webhookOutcomeAccepted         = "accepted"
+	webhookOutcomeContentFallback  = "content_fallback"
+	webhookOutcomeDuplicate        = "duplicate"
+	webhookOutcomeInvalidSignature = "invalid_signature"
+	webhookOutcomeMalformed        = "malformed"
+	webhookOutcomeTooLarge         = "too_large"
+	webhookOutcomeNotConfigured    = "not_configured"
+	webhookOutcomeUnavailable      = "unavailable"
+)
+
+var webhookOutcomes = []string{
+	webhookOutcomeAccepted,
+	webhookOutcomeContentFallback,
+	webhookOutcomeDuplicate,
+	webhookOutcomeInvalidSignature,
+	webhookOutcomeMalformed,
+	webhookOutcomeTooLarge,
+	webhookOutcomeNotConfigured,
+	webhookOutcomeUnavailable,
+}
+
+func (s *Server) recordWebhookOutcome(outcome string) {
+	s.metricsMu.Lock()
+	s.webhookOutcomes[outcome]++
+	s.metricsMu.Unlock()
+}
+
+func (s *Server) webhookOutcomeCount(outcome string) uint64 {
+	s.metricsMu.Lock()
+	defer s.metricsMu.Unlock()
+	return s.webhookOutcomes[outcome]
+}
+
 func (s *Server) tailscaleWebhook(w http.ResponseWriter, r *http.Request) {
 	if !webhook.Method(r.Method) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -910,30 +948,52 @@ func (s *Server) tailscaleWebhook(w http.ResponseWriter, r *http.Request) {
 	secret, err := s.store.WebhookSecret(r.Context())
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
+			s.recordWebhookOutcome(webhookOutcomeNotConfigured)
 			http.Error(w, "webhook not configured", http.StatusNotFound)
 			return
 		}
+		s.recordWebhookOutcome(webhookOutcomeUnavailable)
 		http.Error(w, "webhook unavailable", http.StatusServiceUnavailable)
 		return
 	}
 	if secret == "" {
+		s.recordWebhookOutcome(webhookOutcomeNotConfigured)
 		http.Error(w, "webhook not configured", http.StatusNotFound)
 		return
 	}
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		http.Error(w, "invalid webhook body", http.StatusRequestEntityTooLarge)
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			s.recordWebhookOutcome(webhookOutcomeTooLarge)
+			http.Error(w, "webhook body too large", http.StatusRequestEntityTooLarge)
+			return
+		}
+		s.recordWebhookOutcome(webhookOutcomeMalformed)
+		http.Error(w, "invalid webhook body", http.StatusBadRequest)
 		return
 	}
 	delivery, err := webhook.Verify(body, r.Header.Get("Tailscale-Webhook-Signature"), secret, time.Now().UTC())
 	if err != nil {
-		// Keep verification details out of responses and logs; callers only need
-		// to know that Tailscale should not retry this malformed delivery.
-		http.Error(w, "invalid webhook signature or body", http.StatusUnauthorized)
+		// Keep verification details out of responses and logs. 401 is reserved
+		// for signature and timestamp failures; size and shape problems get
+		// their own status so operators debug the right thing.
+		switch {
+		case errors.Is(err, webhook.ErrBodyTooLarge):
+			s.recordWebhookOutcome(webhookOutcomeTooLarge)
+			http.Error(w, "webhook body too large", http.StatusRequestEntityTooLarge)
+		case errors.Is(err, webhook.ErrMalformedBody):
+			s.recordWebhookOutcome(webhookOutcomeMalformed)
+			http.Error(w, "invalid webhook body", http.StatusBadRequest)
+		default:
+			s.recordWebhookOutcome(webhookOutcomeInvalidSignature)
+			http.Error(w, "invalid webhook signature", http.StatusUnauthorized)
+		}
 		return
 	}
 	trigger, created, err := s.store.RecordWebhookTrigger(r.Context(), delivery.BodyHash, delivery.EventTypes, delivery.Collectors)
 	if err != nil {
+		s.recordWebhookOutcome(webhookOutcomeUnavailable)
 		http.Error(w, "record webhook", http.StatusInternalServerError)
 		return
 	}
@@ -942,10 +1002,24 @@ func (s *Server) tailscaleWebhook(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Cache-Control", "no-store")
 	status := "accepted"
+	outcome := webhookOutcomeAccepted
+	if delivery.FallbackReason != "" {
+		outcome = webhookOutcomeContentFallback
+		// The reason is a fixed vocabulary; no provider content is logged.
+		slog.Warn("authentic webhook content exceeded TailState bounds; requesting full reconciliation", "reason", delivery.FallbackReason, "events", len(delivery.Events), "trigger_id", trigger.ID)
+	}
 	if !created {
 		status = "duplicate"
+		outcome = webhookOutcomeDuplicate
 	}
-	writeJSON(w, http.StatusAccepted, map[string]any{"status": status, "trigger_id": trigger.ID})
+	s.recordWebhookOutcome(outcome)
+	response := map[string]any{"status": status, "trigger_id": trigger.ID}
+	if len(delivery.Collectors) == 0 {
+		response["reconciliation"] = "full"
+	} else {
+		response["reconciliation"] = "targeted"
+	}
+	writeJSON(w, http.StatusAccepted, response)
 }
 
 func (s *Server) health(w http.ResponseWriter, r *http.Request) {
@@ -1142,6 +1216,10 @@ func (s *Server) writeMetrics(b *bytes.Buffer, status store.Status, storage stor
 	metricValue(b, "tailstate_webhook_triggers_pending", "gauge", "Verified webhook deliveries waiting for reconciliation.", status.WebhookPending)
 	metricValue(b, "tailstate_webhook_triggers_processing", "gauge", "Verified webhook deliveries currently being reconciled.", status.WebhookProcessing)
 	metricValue(b, "tailstate_webhook_triggers_dead", "gauge", "Verified webhook deliveries that exhausted their retry window.", status.WebhookDead)
+	metricFamily(b, "tailstate_webhook_requests_total", "counter", "Tailscale webhook requests by outcome; content_fallback is an authentic delivery outside TailState's bounds that requested a full reconciliation.")
+	for _, outcome := range webhookOutcomes {
+		fmt.Fprintf(b, "tailstate_webhook_requests_total{outcome=%q} %d\n", outcome, s.webhookOutcomeCount(outcome))
+	}
 	state := diagnostics.NotificationStateFor(status.Configured, status.Destinations, status.EnabledDestinations)
 	metricValue(b, "tailstate_notification_destinations", "gauge", "Notification destinations configured.", status.Destinations)
 	metricValue(b, "tailstate_notification_destinations_enabled", "gauge", "Notification destinations enabled.", status.EnabledDestinations)

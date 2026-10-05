@@ -766,7 +766,7 @@ func TestWebAdditionalErrorAndMetricsBranches(t *testing.T) {
 	webhookBody.Body = webFailingBody{}
 	webhookResponse := httptest.NewRecorder()
 	server.tailscaleWebhook(webhookResponse, webhookBody)
-	if webhookResponse.Code != http.StatusRequestEntityTooLarge {
+	if webhookResponse.Code != http.StatusBadRequest {
 		t.Fatalf("failing webhook body status=%d body=%s", webhookResponse.Code, webhookResponse.Body.String())
 	}
 	if err := st.Close(); err != nil {

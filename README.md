@@ -97,6 +97,25 @@ event types trigger a complete reconciliation. The normal TailState poll
 interval remains the fallback if the endpoint is unavailable; accepted webhook
 triggers are never lost between the HTTP response and reconciliation.
 
+Once the signature is valid the delivery is authentic, so content outside
+TailState's own bounds (more than 100 events, an empty batch, or an event type
+that is missing, longer than 128 bytes, or contains control characters) is
+still recorded with capped metadata, answered with `202`, and queued as a
+complete reconciliation rather than dropped. Response codes are:
+
+| Status | Meaning |
+| --- | --- |
+| `202` | Accepted (or a duplicate of an accepted body); the JSON body reports `"reconciliation": "targeted"` or `"full"` |
+| `400` | Empty body, or a correctly signed body that is not a JSON event array |
+| `401` | Missing or invalid signature, or a timestamp outside the accepted window |
+| `404` | No webhook secret is configured |
+| `413` | Body larger than 1 MiB |
+
+`tailstate_webhook_requests_total{outcome=...}` counts `accepted`,
+`content_fallback`, `duplicate`, `invalid_signature`, `malformed`, `too_large`,
+`not_configured`, and `unavailable` separately, so a burst that fell back to a
+full reconciliation is never mistaken for a signature problem.
+
 Shoutrrr supports Mattermost natively, for example:
 
 ```text

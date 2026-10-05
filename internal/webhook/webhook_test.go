@@ -1,6 +1,7 @@
 package webhook
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -119,13 +120,41 @@ func TestVerifyRejectsMalformedHeadersAndEvents(t *testing.T) {
 	}
 }
 
-func TestVerifyRejectsEmptyAndUntypedEvents(t *testing.T) {
+func TestVerifyFallsBackForOutOfBoundsAuthenticContent(t *testing.T) {
 	now := time.Unix(1_786_000_000, 0)
-	for _, body := range [][]byte{[]byte(`[]`), []byte(`[{"type":"   "}]`)} {
-		signature := SignatureForTest(body, "secret", now.Unix())
-		if _, err := Verify(body, signature, "secret", now); err == nil {
-			t.Fatalf("invalid event body %s was accepted", body)
-		}
+	many := make([]string, maxEvents+1)
+	for i := range many {
+		many[i] = `{"type":"nodeCreated"}`
+	}
+	cases := []struct {
+		name, body, reason string
+		types              []string
+	}{
+		{"empty array", `[]`, FallbackEventCount, []string{}},
+		{"too many events", "[" + strings.Join(many, ",") + "]", FallbackEventCount, []string{"nodeCreated"}},
+		{"missing type", `[{"type":"   "},{"type":"policyUpdate"}]`, FallbackEventTypeMissing, []string{"policyUpdate"}},
+		{"long type", `[{"type":"` + strings.Repeat("x", maxEventTypeLen+1) + `"}]`, FallbackEventTypeLength, []string{strings.Repeat("x", maxEventTypeLen-3) + "…"}},
+		{"control character", `[{"type":"node\u0001Created"},{"type":"policyUpdate"}]`, FallbackEventTypeInvalid, []string{"policyUpdate"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			body := []byte(tc.body)
+			delivery, err := Verify(body, SignatureForTest(body, "secret", now.Unix()), "secret", now)
+			if err != nil {
+				t.Fatalf("authentic out-of-bounds content was rejected: %v", err)
+			}
+			if delivery.FallbackReason != tc.reason || delivery.Collectors != nil || delivery.BodyHash == "" {
+				t.Fatalf("delivery=%#v, want fallback %q with full reconciliation", delivery, tc.reason)
+			}
+			if strings.Join(delivery.EventTypes, ",") != strings.Join(tc.types, ",") {
+				t.Fatalf("event types=%q, want %q", delivery.EventTypes, tc.types)
+			}
+			for _, eventType := range delivery.EventTypes {
+				if len(eventType) > maxEventTypeLen {
+					t.Fatalf("event type metadata exceeds %d bytes", maxEventTypeLen)
+				}
+			}
+		})
 	}
 	valid := []byte(`[{"type":"nodeCreated"}]`)
 	signature := "garbage," + SignatureForTest(valid, "secret", now.Unix())
@@ -134,10 +163,24 @@ func TestVerifyRejectsEmptyAndUntypedEvents(t *testing.T) {
 	}
 }
 
-func TestVerifyRejectsOversizedEventType(t *testing.T) {
+func TestVerifyClassifiesErrors(t *testing.T) {
 	now := time.Unix(1_786_000_000, 0)
-	body := []byte(`[{"type":"` + strings.Repeat("x", maxEventTypeLen+1) + `"}]`)
-	if _, err := Verify(body, SignatureForTest(body, "secret", now.Unix()), "secret", now); err == nil || !strings.Contains(err.Error(), "exceeds") {
-		t.Fatalf("oversized event type was accepted: %v", err)
+	body := []byte(`[{"type":"nodeCreated"}]`)
+	if _, err := Verify(body, "t=1,v1=00", "secret", now); !errors.Is(err, ErrUnauthenticated) {
+		t.Fatalf("bad signature error=%v", err)
+	}
+	if _, err := Verify(make([]byte, MaxBodyBytes+1), "", "secret", now); !errors.Is(err, ErrBodyTooLarge) {
+		t.Fatalf("oversized body error=%v", err)
+	}
+	object := []byte(`{"type":"nodeCreated"}`)
+	if _, err := Verify(object, SignatureForTest(object, "secret", now.Unix()), "secret", now); !errors.Is(err, ErrMalformedBody) {
+		t.Fatalf("non-array body error=%v", err)
+	}
+	if _, err := Verify(nil, "", "secret", now); !errors.Is(err, ErrMalformedBody) {
+		t.Fatalf("empty body error=%v", err)
+	}
+	// Unauthenticated content must never be parsed or classified as malformed.
+	if _, err := Verify(object, "t=1,v1=00", "secret", now); !errors.Is(err, ErrUnauthenticated) {
+		t.Fatalf("unsigned malformed body error=%v", err)
 	}
 }

@@ -13,6 +13,9 @@ rollback requires restoring the backup taken before the upgrade. See
 
 ## [Unreleased]
 
+### Changed
+- `oauth_apps` changes (created, removed, or changed) are classified as high severity, like keys, because OAuth applications grant API access. Events recorded earlier keep their stored severity (#174).
+
 ### Fixed
 - Each destination receives notifications in creation order after an outage, and a failing or hanging destination delays the others by at most one send timeout per delivery pass (#159).
 - Large histories export as a chain of signed evidence packs instead of failing: a pack that reaches the read, event, ledger-link, or size budget carries the batches that fit with `truncated` and `next_cursor`, and the History page offers **Download next part** (#155).

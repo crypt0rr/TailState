@@ -46,12 +46,14 @@ func ParseSeverity(value string) (Severity, bool) {
 }
 
 // highImpactCollectors are collectors whose every change is high severity:
-// the access policy, log streaming, tailnet settings, and webhook endpoints.
+// the access policy, log streaming, tailnet settings, webhook endpoints, and
+// OAuth applications (which, like keys, grant API access).
 var highImpactCollectors = map[string]struct{}{
 	"policy":        {},
 	"log_streaming": {},
 	"settings":      {},
 	"webhooks":      {},
+	"oauth_apps":    {},
 }
 
 // lowImpactDeviceFields are device fields that change during routine client
@@ -66,8 +68,8 @@ var lowImpactDeviceFields = map[string]struct{}{
 // Classify returns the built-in severity of a change. The table is
 // documented in the README ("Severity and routing") and is evaluated as:
 //
-//   - high: any policy, log_streaming, settings, or webhooks change; a keys
-//     resource created; a users change touching role; a devices change to
+//   - high: any policy, log_streaming, settings, webhooks, or oauth_apps
+//     change; a keys resource created; a users change touching role; a devices change to
 //     tags, authorized false→true, or keyExpiryDisabled false→true.
 //   - low: a devices change whose fields are all clientVersion,
 //     updateAvailable, os, or distro.

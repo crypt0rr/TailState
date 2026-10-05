@@ -602,9 +602,9 @@ collector, and History can be filtered by severity.
 
 | Severity | Changes |
 | --- | --- |
-| High | Any `policy`, `log_streaming`, `settings` (tailnet settings), or `webhooks` change; a `keys` resource created; a `users` change to `role`; a `devices` change to `tags`, `authorized` false→true, or `keyExpiryDisabled` false→true |
+| High | Any `policy`, `log_streaming`, `settings` (tailnet settings), `webhooks`, or `oauth_apps` change (OAuth applications grant API access, like keys); a `keys` resource created; a `users` change to `role`; a `devices` change to `tags`, `authorized` false→true, or `keyExpiryDisabled` false→true |
 | Low | A `devices` change whose changed fields are all `clientVersion`, `updateAvailable`, `os`, or `distro` |
-| Medium | Everything else, for example devices created or removed, route changes (`enabledRoutes`, `advertisedRoutes`), user invites, users created or removed, keys removed, DNS, contacts, posture, `services`, and `oauth_apps` changes |
+| Medium | Everything else, for example devices created or removed, route changes (`enabledRoutes`, `advertisedRoutes`), user invites, users created or removed, keys removed, DNS, contacts, posture, and `services` changes |
 
 A changed resource takes the highest severity of its changed fields; a change
 whose field list was truncated is at least medium, because the omitted fields

@@ -289,6 +289,42 @@ func (s *Store) EarliestCollectorDue(ctx context.Context, generation int64, coll
 	return deadline, found, nil
 }
 
+// CollectorFailureCounts returns the consecutive failure count persisted for
+// each supplied collector. Collectors without state are omitted. The monitor
+// uses these counts to back off retries of collectors that keep failing or
+// returning partial results.
+func (s *Store) CollectorFailureCounts(ctx context.Context, generation int64, collectors []string) (map[string]int, error) {
+	ordered := sortedUnique(collectors)
+	counts := make(map[string]int, len(ordered))
+	if len(ordered) == 0 {
+		return counts, nil
+	}
+	placeholders := make([]string, 0, len(ordered))
+	args := make([]any, 0, len(ordered)+1)
+	args = append(args, generation)
+	for _, collector := range ordered {
+		placeholders = append(placeholders, "?")
+		args = append(args, collector)
+	}
+	rows, err := s.db.QueryContext(ctx, "SELECT collector,failure_count FROM collector_state WHERE generation=? AND collector IN ("+strings.Join(placeholders, ",")+")", args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var collector string
+		var failures int
+		if err := rows.Scan(&collector, &failures); err != nil {
+			return nil, err
+		}
+		counts[collector] = failures
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return counts, nil
+}
+
 // CollectorDueWithError reports whether a collector is due and preserves
 // database errors for callers that need to surface a degraded scheduler.
 func (s *Store) CollectorDueWithError(ctx context.Context, generation int64, collector string) (bool, error) {

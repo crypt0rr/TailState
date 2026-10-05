@@ -625,11 +625,48 @@ func (e *Engine) pollWithOutcomes(ctx context.Context, client *tailscale.Client,
 	if err := e.store.SetNextPollErr(ctx, settings.Generation, inventoryCollectors, time.Now().Add(settings.InventoryInterval)); err != nil {
 		slog.Error("schedule inventory collectors", "error", err)
 	}
-	if err := e.store.SetNextPollErr(ctx, settings.Generation, retryCollectors, time.Now().Add(collectorRetryInterval)); err != nil {
-		slog.Error("schedule collector retry", "error", err)
-	}
+	e.scheduleCollectorRetries(ctx, settings, retryCollectors)
 	outcome.success = success
 	return outcome
+}
+
+// scheduleCollectorRetries reschedules failed or partial collectors with an
+// exponential backoff based on their persisted consecutive failure count. The
+// delay starts at collectorRetryInterval and is capped at the collector's
+// configured interval, so a permanently broken endpoint (or one device whose
+// detail request keeps failing) settles back to the normal cadence instead of
+// repeating a full fan-out every 30 seconds.
+func (e *Engine) scheduleCollectorRetries(ctx context.Context, settings store.Settings, collectors []string) {
+	if len(collectors) == 0 {
+		return
+	}
+	failures, err := e.store.CollectorFailureCounts(ctx, settings.Generation, collectors)
+	if err != nil {
+		slog.Error("read collector failure counts", "error", err)
+	}
+	now := time.Now()
+	for _, collector := range collectors {
+		interval := settings.InventoryInterval
+		if collector == "devices" {
+			interval = settings.DeviceInterval
+		}
+		next := now.Add(collectorRetryDelay(failures[collector], interval))
+		if err := e.store.SetNextPollErr(ctx, settings.Generation, []string{collector}, next); err != nil {
+			slog.Error("schedule collector retry", "collector", collector, "error", err)
+		}
+	}
+}
+
+// collectorRetryDelay doubles collectorRetryInterval for each consecutive
+// failure after the first and caps the result at the configured interval. An
+// interval shorter than the base retry keeps the base retry.
+func collectorRetryDelay(failures int, interval time.Duration) time.Duration {
+	limit := max(interval, collectorRetryInterval)
+	delay := collectorRetryInterval
+	for attempt := 1; attempt < failures && delay < limit; attempt++ {
+		delay *= 2
+	}
+	return min(delay, limit)
 }
 
 func (e *Engine) processDurableTriggers(ctx context.Context, client *tailscale.Client, settings store.Settings) bool {
@@ -649,39 +686,22 @@ func (e *Engine) processDurableTriggers(ctx context.Context, client *tailscale.C
 	if len(triggers) == 0 {
 		return false
 	}
-	type triggerGroup struct {
-		claims     []store.WebhookTrigger
-		collectors []string
-	}
-	groups := make(map[string]*triggerGroup, len(triggers))
+	// Coalesce every trigger claimed in this pass into one poll of the union
+	// of their collectors, so overlapping webhook scopes poll each collector at
+	// most once. Outcomes stay per collector: each claim is completed or
+	// retried only on the collectors it requested.
+	var collectors []string
 	for _, trigger := range triggers {
-		collectors := normalizeCollectors(trigger.Collectors)
-		key := strings.Join(collectors, "\x00")
-		if len(collectors) == 0 {
-			key = "*"
+		scope := normalizeCollectors(trigger.Collectors)
+		if len(scope) == 0 {
+			collectors = allCollectors()
+			break
 		}
-		group := groups[key]
-		if group == nil {
-			group = &triggerGroup{collectors: collectors}
-			if key == "*" {
-				group.collectors = allCollectors()
-			}
-			groups[key] = group
-		}
-		group.claims = append(group.claims, trigger)
+		collectors = append(collectors, scope...)
 	}
-	keys := make([]string, 0, len(groups))
-	for key := range groups {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	for _, key := range keys {
-		group := groups[key]
-		triggerIDs := webhookTriggerIDs(group.claims)
-		outcome := e.pollWithOutcomes(ctx, client, settings, group.collectors, true, triggerIDs...)
-		for _, claim := range group.claims {
-			e.finishClaimedTriggers(ctx, []store.WebhookTrigger{claim}, outcome.succeeds(claim.Collectors), claim.Attempts)
-		}
+	outcome := e.pollWithOutcomes(ctx, client, settings, normalizeCollectors(collectors), true, webhookTriggerIDs(triggers)...)
+	for _, claim := range triggers {
+		e.finishClaimedTriggers(ctx, []store.WebhookTrigger{claim}, outcome.succeeds(claim.Collectors), claim.Attempts)
 	}
 	return true
 }

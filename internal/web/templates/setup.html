@@ -10,10 +10,11 @@
       <input id="setup-token" name="token" autocomplete="one-time-code" spellcheck="false" required>
     </label>
     <label for="setup-password">Administrator password
-      <input id="setup-password" type="password" name="password" minlength="12" autocomplete="new-password" required>
+      <input id="setup-password" type="password" name="password" minlength="{{.MinPasswordLength}}" autocomplete="new-password" aria-describedby="setup-password-help" required>
+      <small id="setup-password-help">At least {{.MinPasswordLength}} characters; common passwords are rejected. A passphrase of several words works well.</small>
     </label>
     <label for="setup-confirm">Confirm password
-      <input id="setup-confirm" type="password" name="confirm" minlength="12" autocomplete="new-password" required>
+      <input id="setup-confirm" type="password" name="confirm" minlength="{{.MinPasswordLength}}" autocomplete="new-password" required>
     </label>
     <button type="submit">Claim installation</button>
   </form>

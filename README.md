@@ -96,7 +96,7 @@ The authenticated **History** page keeps a 30-day, searchable ledger of semantic
 
 The interface follows the browser's light or dark preference and works down to 320-pixel-wide screens: the header wraps instead of overlapping, and on narrow screens table rows stack with every value labelled by its column name. Field differences carry "Old" and "New" text markers, so they do not depend on red/green colour. Errors are announced to screen readers, the current page is marked in the navigation, and repeated destination buttons are labelled with the destination name. The pages load no scripts and no inline styles, so the strict Content-Security-Policy stays unchanged.
 
-Destination actions (add, edit including routing and message format, enable, disable, send test, remove), mute rule changes, and the status page actions use Post/Redirect/Get: the result is shown once as a message on the page you return to, so reloading never sends another test notification or repeats an action. **Remove** opens a confirmation step that states how many pending notifications will be dead-lettered; the server refuses a removal that was not confirmed. If your session expired or was reset while a page was open, submitting a form clears the stale cookies and opens the login page, which then returns you to the page you were on; opening a bookmarked page while signed out returns you to it the same way. The return target must be one of TailState's own Status, History, or Settings pages: absolute, scheme-relative (`//host`), backslash, and percent-encoded variants are ignored and you land on the default page. A form submitted with a valid session but a missing or wrong CSRF token is refused with `403` and keeps the session.
+Destination actions (add, edit including routing and message format, enable, disable, send test, remove), mute rule changes, password changes, **Sign out all other sessions**, and the status page actions use Post/Redirect/Get: the result is shown once as a message on the page you return to, so reloading never sends another test notification or repeats an action. **Remove** opens a confirmation step that states how many pending notifications will be dead-lettered; the server refuses a removal that was not confirmed. If your session expired (including the idle timeout described in [Administrator accounts and sessions](#administrator-accounts-and-sessions)) or was reset while a page was open, submitting a form clears the stale cookies and opens the login page, which then returns you to the page you were on; opening a bookmarked page while signed out returns you to it the same way. The return target must be one of TailState's own Status, History, or Settings pages: absolute, scheme-relative (`//host`), backslash, and percent-encoded variants are ignored and you land on the default page. A form submitted with a valid session but a missing or wrong CSRF token is refused with `403` and keeps the session.
 
 ### OAuth scopes
 
@@ -390,6 +390,44 @@ an address already in use exits (code `1`) before any poll or notification.
 The image `HEALTHCHECK` and the Compose healthcheck run `tailstate healthcheck`
 without arguments, so they follow a custom `TAILSTATE_LISTEN_ADDR` port.
 
+### Administrator accounts and sessions
+
+New administrator passwords (setup, reset, and the Settings change form) must
+be at least 15 characters, counted as characters rather than bytes, at most
+256 characters, free of control characters, not a single repeated character
+or short pattern, and not on a small embedded list of common passwords
+(compared case-insensitively, ignoring spaces, hyphens, underscores, and
+dots). The policy is checked first and a failure names the rule that was
+broken, so a short password is never reported as a setup or reset token
+problem. Existing passwords are not re-evaluated: an administrator whose
+password predates the 15-character minimum can still sign in, and the policy
+applies the next time the password is changed.
+
+The **Account security** section of Settings changes the password (the
+current password is required, wrong current passwords are throttled like
+logins, and every other session is signed out in the same transaction),
+lists active sessions with their sign-in, last-activity, and expiry times,
+and offers **Sign out all other sessions**. A session lasts at most 12 hours
+and ends after 60 minutes without activity. The status page's 30-second
+automatic refresh requests `/status?refresh=1`; those requests are
+authenticated but do not count as activity, so an unattended status tab
+cannot keep a session alive. Sessions are identified in the list (and in the
+administrative audit log) by a short prefix of their stored token hash, which
+cannot be used to authenticate.
+
+`Strict-Transport-Security: max-age=31536000` is sent only on requests that
+reached TailState over HTTPS: directly over TLS, or through a peer listed in
+`TAILSTATE_TRUSTED_PROXIES` whose `X-Forwarded-Proto` says `https`. A
+forwarded-proto header from any other peer is ignored. With
+`TAILSTATE_COOKIE_SECURE=true` the session and CSRF cookies are named
+`__Host-tailstate_session` and `__Host-tailstate_csrf` (Secure, `Path=/`, no
+`Domain`), so another host in the same site cannot set or shadow them.
+Sessions issued under the unprefixed names before the upgrade (or before
+secure cookies were enabled) keep working until they expire; the next
+sign-in replaces them, and the two namings are never combined. The
+short-lived credential-form challenge cookies keep their page-scoped paths
+and therefore their existing names.
+
 ### Deployment diagnostics
 
 When a deployment reports a proxy or readiness issue, run the doctor command in
@@ -430,7 +468,9 @@ docker compose exec tailstate /tailstate admin reset
 ```
 
 Then open `/reset`. Resetting the password invalidates existing sessions and any
-outstanding reset token. Reset tokens expire after 30 minutes; generate another
+outstanding reset token. A signed-in administrator who knows the current
+password can instead use **Change password** under **Account security** in
+Settings, which needs no shell access. Reset tokens expire after 30 minutes; generate another
 token if one expires.
 
 `admin reset` is safe to run while the service is serving: it opens the
@@ -728,6 +768,13 @@ previously exported pack still verify. New exports use evidence format version
 4, which adds per-event `severity` and `muted`; `tailstate evidence verify`
 accepts both version 3 and version 4 packs.
 
+Schema v15 adds administrative security state. Sessions gain a last-activity
+time for the 60-minute idle timeout; existing sessions are backfilled with
+their sign-in time, so a session that has been idle for longer than the
+timeout must sign in again after the upgrade, and every other session keeps
+working. The migration runs in one transaction and changes no existing
+setting, destination, history, or evidence row.
+
 ## Runtime configuration
 
 Only bootstrap settings use environment variables; application credentials and
@@ -739,7 +786,7 @@ the optional webhook secret are entered in the authenticated UI.
 | `TAILSTATE_DATA_DIR` | `/data` | SQLite directory |
 | `TAILSTATE_MASTER_KEY_FILE` | `/run/secrets/tailstate_master_key` | 32-byte or base64 master key |
 | `TAILSTATE_MEMORY_LIMIT` | `512m` | Compose-only container memory ceiling; increase only after sizing for the deployment |
-| `TAILSTATE_COOKIE_SECURE` | `false` | Require HTTPS for session cookies |
+| `TAILSTATE_COOKIE_SECURE` | `false` | Require HTTPS for session cookies and name them with the `__Host-` prefix |
 | `TAILSTATE_METRICS_TOKEN` | empty | Loopback-only `/metrics` when empty; bearer token for remote scrapes |
 | `TAILSTATE_TRUSTED_PROXIES` | empty | Comma-separated proxy IPs/CIDRs allowed to supply `X-Forwarded-For` and `X-Forwarded-Proto` |
 | `TAILSTATE_LOG_LEVEL` | `info` | `info` or `debug` structured logging |

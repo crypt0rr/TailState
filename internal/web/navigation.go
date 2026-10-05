@@ -67,6 +67,21 @@ func postReturnPage(path string) string {
 	return ""
 }
 
+// returnTarget is the page to return to after login. The status page's
+// auto-refresh marker is dropped: the page the operator returns to after
+// signing in is user activity, not an automatic refresh.
+func returnTarget(u *url.URL) string {
+	if u.Path != "/status" || !u.Query().Has(refreshParameter) {
+		return u.RequestURI()
+	}
+	query := u.Query()
+	query.Del(refreshParameter)
+	if encoded := query.Encode(); encoded != "" {
+		return u.Path + "?" + encoded
+	}
+	return u.Path
+}
+
 // rejectUnauthenticated answers a request whose session or form token did
 // not validate.
 //
@@ -80,14 +95,18 @@ func postReturnPage(path string) string {
 //     cookie; SameSite=Strict withholds it from cross-site requests.
 func (s *Server) rejectUnauthenticated(w http.ResponseWriter, r *http.Request, csrf bool) {
 	if r.Method == http.MethodGet || r.Method == http.MethodHead {
-		http.Redirect(w, r, loginURL(r.URL.RequestURI()), http.StatusSeeOther)
+		http.Redirect(w, r, loginURL(returnTarget(r.URL)), http.StatusSeeOther)
 		return
 	}
-	if csrf && s.authenticated(r, false) {
-		http.Error(w, "This form has expired or is invalid. Reload the page and try again.", http.StatusForbidden)
-		return
+	if csrf {
+		// The probe is not user activity: a forged cross-site form must
+		// not extend the idle timeout.
+		if _, valid := s.session(r, false, false); valid {
+			http.Error(w, "This form has expired or is invalid. Reload the page and try again.", http.StatusForbidden)
+			return
+		}
 	}
-	if _, err := r.Cookie("tailstate_session"); err == nil {
+	if s.hasSessionCookie(r) {
 		s.clearCookies(w)
 	}
 	http.Redirect(w, r, loginURL(postReturnPage(r.URL.Path)), http.StatusSeeOther)

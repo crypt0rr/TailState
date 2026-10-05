@@ -10,10 +10,11 @@
       <input id="reset-token" name="token" autocomplete="one-time-code" spellcheck="false" required>
     </label>
     <label for="reset-password">New password
-      <input id="reset-password" type="password" name="password" minlength="12" autocomplete="new-password" required>
+      <input id="reset-password" type="password" name="password" minlength="{{.MinPasswordLength}}" autocomplete="new-password" aria-describedby="reset-password-help" required>
+      <small id="reset-password-help">At least {{.MinPasswordLength}} characters; common passwords are rejected. A passphrase of several words works well.</small>
     </label>
     <label for="reset-confirm">Confirm password
-      <input id="reset-confirm" type="password" name="confirm" minlength="12" autocomplete="new-password" required>
+      <input id="reset-confirm" type="password" name="confirm" minlength="{{.MinPasswordLength}}" autocomplete="new-password" required>
     </label>
     <button type="submit">Reset password</button>
   </form>

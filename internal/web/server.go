@@ -30,6 +30,7 @@ import (
 	"github.com/crypt0rr/tailstate/internal/model"
 	"github.com/crypt0rr/tailstate/internal/monitor"
 	"github.com/crypt0rr/tailstate/internal/notify"
+	"github.com/crypt0rr/tailstate/internal/secret"
 	"github.com/crypt0rr/tailstate/internal/store"
 	"github.com/crypt0rr/tailstate/internal/tailscale"
 	"github.com/crypt0rr/tailstate/internal/webhook"
@@ -127,6 +128,9 @@ type pageData struct {
 	Webhook                         store.WebhookState
 	WebhookUnavailable              bool
 	DestinationDeliveries           []store.DestinationDelivery
+	Sessions                        []store.SessionInfo
+	SessionIdleMinutes              int
+	MinPasswordLength               int
 }
 
 // expiringResource is one row of the status page's "Expiring soon" card.
@@ -300,6 +304,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /settings/destinations/delete", s.destinationPost)
 	mux.HandleFunc("POST /settings/destinations/remove", s.destinationPost)
 	mux.HandleFunc("POST /settings/mutes", s.mutePost)
+	mux.HandleFunc("POST /settings/password", s.passwordPost)
+	mux.HandleFunc("POST /settings/sessions/revoke-others", s.sessionsPost)
 	return s.security(mux)
 }
 
@@ -374,6 +380,9 @@ func (s *Server) security(next http.Handler) http.Handler {
 		w.Header().Set("X-Frame-Options", "DENY")
 		w.Header().Set("Referrer-Policy", "no-referrer")
 		w.Header().Set("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+		if s.requestIsHTTPS(r) {
+			w.Header().Set("Strict-Transport-Security", hstsValue)
+		}
 		if !strings.HasPrefix(r.URL.Path, "/static/") {
 			w.Header().Set("Cache-Control", "no-store")
 		}
@@ -391,6 +400,7 @@ func (s *Server) renderStatus(w http.ResponseWriter, name string, data pageData,
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	data.Version = s.config.Version
 	data.Page = name
+	data.MinPasswordLength = secret.MinPasswordRunes
 	if data.Now.IsZero() {
 		data.Now = time.Now().UTC()
 	}
@@ -473,6 +483,13 @@ func (s *Server) claim(w http.ResponseWriter, r *http.Request) {
 		s.recordFailure(credentialActionSetup, ip)
 		s.recordCredentialRejection(credentialActionSetup)
 		s.renderCredential(w, r, "setup", credentialActionSetup, pageData{Error: "Passwords do not match."})
+		return
+	}
+	// The policy is checked before the token so a weak password gets a
+	// specific explanation instead of the generic token error. It reveals
+	// nothing about the token.
+	if err := secret.CheckPasswordPolicy(r.FormValue("password")); err != nil {
+		s.renderCredential(w, r, "setup", credentialActionSetup, pageData{Error: secret.PasswordPolicyMessage(err)})
 		return
 	}
 	if err := s.store.Claim(r.Context(), r.FormValue("token"), r.FormValue("password")); err != nil {
@@ -565,8 +582,8 @@ func (s *Server) logout(w http.ResponseWriter, r *http.Request) {
 		s.rejectUnauthenticated(w, r, true)
 		return
 	}
-	if cookie, err := r.Cookie("tailstate_session"); err == nil {
-		s.store.DeleteSession(r.Context(), cookie.Value)
+	if session, _, ok := s.sessionCookies(r); ok {
+		s.store.DeleteSession(r.Context(), session.Value)
 	}
 	s.clearCookies(w)
 	http.Redirect(w, r, "/login", http.StatusSeeOther)
@@ -601,6 +618,10 @@ func (s *Server) resetPost(w http.ResponseWriter, r *http.Request) {
 		s.renderCredential(w, r, "reset", credentialActionReset, pageData{Error: "Passwords do not match."})
 		return
 	}
+	if err := secret.CheckPasswordPolicy(r.FormValue("password")); err != nil {
+		s.renderCredential(w, r, "reset", credentialActionReset, pageData{Error: secret.PasswordPolicyMessage(err)})
+		return
+	}
 	if err := s.store.ResetWithToken(r.Context(), r.FormValue("token"), r.FormValue("password")); err != nil {
 		s.recordFailure(credentialActionReset, ip)
 		s.recordCredentialRejection(credentialActionReset)
@@ -617,10 +638,13 @@ func (s *Server) resetPost(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/login", http.StatusSeeOther)
 }
 func (s *Server) status(w http.ResponseWriter, r *http.Request) {
-	csrf, ok := s.requireAuth(w, r, false)
+	// The page's meta refresh adds ?refresh=1. That request is not user
+	// activity, so an unattended status tab cannot defeat the idle timeout.
+	auth, ok := s.requireSession(w, r, false, r.URL.Query().Get(refreshParameter) != "1")
 	if !ok {
 		return
 	}
+	csrf := auth.csrf
 	status, err := s.store.Status(r.Context())
 	if err != nil {
 		http.Error(w, "load status", 500)
@@ -1204,7 +1228,7 @@ func joinInts(values []int) string {
 }
 
 func (s *Server) settingsData(ctx context.Context, csrf string, configured bool, settings store.Settings, request *http.Request) pageData {
-	data := pageData{CSRF: csrf, Configured: configured, Settings: settings, DeviceSeconds: int64(settings.DeviceInterval.Seconds()), InventorySeconds: int64(settings.InventoryInterval.Seconds()), Diagnostics: s.diagnosticReport(ctx, request), Collectors: knownCollectors(), HistoryEventTypes: []string{"created", "changed", "removed"}}
+	data := pageData{CSRF: csrf, Configured: configured, Settings: settings, DeviceSeconds: int64(settings.DeviceInterval.Seconds()), InventorySeconds: int64(settings.InventoryInterval.Seconds()), Diagnostics: s.diagnosticReport(ctx, request), Collectors: knownCollectors(), HistoryEventTypes: []string{"created", "changed", "removed"}, SessionIdleMinutes: int(store.SessionIdleTimeout / time.Minute)}
 	expiryDays := settings.ExpiryWarningDays
 	if expiryDays == nil {
 		expiryDays = store.DefaultExpiryWarningDays()
@@ -1222,6 +1246,17 @@ func (s *Server) settingsData(ctx context.Context, csrf string, configured bool,
 	} else {
 		slog.Error("load webhook acceleration state", "error", err)
 		data.WebhookUnavailable = true
+	}
+	if request != nil {
+		current := ""
+		if session, _, ok := s.sessionCookies(request); ok {
+			current = session.Value
+		}
+		if sessions, err := s.store.ListSessions(ctx, current); err == nil {
+			data.Sessions = sessions
+		} else {
+			slog.Error("load sessions", "error", err)
+		}
 	}
 	destinations, err := s.store.ListDestinations(ctx)
 	if err == nil {
@@ -1947,40 +1982,36 @@ func (s *Server) startSession(w http.ResponseWriter, r *http.Request) bool {
 		http.Error(w, "create session", http.StatusInternalServerError)
 		return false
 	}
-	http.SetCookie(w, &http.Cookie{Name: "tailstate_session", Value: token, Path: "/", MaxAge: 43200, HttpOnly: true, Secure: s.config.CookieSecure, SameSite: http.SameSiteStrictMode})
-	http.SetCookie(w, &http.Cookie{Name: "tailstate_csrf", Value: csrf, Path: "/", MaxAge: 43200, HttpOnly: false, Secure: s.config.CookieSecure, SameSite: http.SameSiteStrictMode})
+	// With secure cookies a sign-in expires the unprefixed cookies of an
+	// earlier sign-in, so the browser holds one generation only.
+	if s.config.CookieSecure {
+		for _, name := range []string{sessionCookieBase, csrfCookieBase} {
+			http.SetCookie(w, &http.Cookie{Name: name, Path: "/", MaxAge: -1, HttpOnly: name == sessionCookieBase, Secure: true, SameSite: http.SameSiteStrictMode})
+		}
+	}
+	maxAge := int(store.SessionLifetime / time.Second)
+	http.SetCookie(w, &http.Cookie{Name: s.cookieName(sessionCookieBase), Value: token, Path: "/", MaxAge: maxAge, HttpOnly: true, Secure: s.config.CookieSecure, SameSite: http.SameSiteStrictMode})
+	http.SetCookie(w, &http.Cookie{Name: s.cookieName(csrfCookieBase), Value: csrf, Path: "/", MaxAge: maxAge, HttpOnly: false, Secure: s.config.CookieSecure, SameSite: http.SameSiteStrictMode})
 	return true
 }
+
+// clearCookies expires the session cookies under both namings.
 func (s *Server) clearCookies(w http.ResponseWriter) {
-	for _, name := range []string{"tailstate_session", "tailstate_csrf"} {
-		http.SetCookie(w, &http.Cookie{Name: name, Path: "/", MaxAge: -1, HttpOnly: name == "tailstate_session", Secure: s.config.CookieSecure, SameSite: http.SameSiteStrictMode})
+	names := []string{sessionCookieBase, csrfCookieBase}
+	if s.config.CookieSecure {
+		names = append(names, hostCookiePrefix+sessionCookieBase, hostCookiePrefix+csrfCookieBase)
+	}
+	for _, name := range names {
+		http.SetCookie(w, &http.Cookie{Name: name, Path: "/", MaxAge: -1, HttpOnly: strings.HasSuffix(name, sessionCookieBase), Secure: s.config.CookieSecure, SameSite: http.SameSiteStrictMode})
 	}
 }
 func (s *Server) authenticated(r *http.Request, requireCSRF bool) bool {
-	session, err1 := r.Cookie("tailstate_session")
-	csrf, err2 := r.Cookie("tailstate_csrf")
-	if err1 != nil || err2 != nil {
-		return false
-	}
-	provided := csrf.Value
-	if requireCSRF {
-		provided = r.FormValue("_csrf")
-		if provided == "" || provided != csrf.Value {
-			return false
-		}
-	}
-	return s.store.ValidateSession(r.Context(), session.Value, provided, requireCSRF)
+	_, ok := s.session(r, requireCSRF, true)
+	return ok
 }
 func (s *Server) requireAuth(w http.ResponseWriter, r *http.Request, csrf bool) (string, bool) {
-	if csrf {
-		_ = r.ParseForm()
-	}
-	if !s.authenticated(r, csrf) {
-		s.rejectUnauthenticated(w, r, csrf)
-		return "", false
-	}
-	cookie, _ := r.Cookie("tailstate_csrf")
-	return cookie.Value, true
+	auth, ok := s.requireSession(w, r, csrf, true)
+	return auth.csrf, ok
 }
 
 // throttleKey returns the per-client limiter bucket for action. IPv6 clients

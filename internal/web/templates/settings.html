@@ -269,4 +269,60 @@
     <button type="submit">Add mute rule</button>
   </form>
 </section>
+
+<section class="card account-card" id="account" aria-labelledby="account-heading">
+  <div class="section-heading">
+    <div>
+      <h2 id="account-heading">Account security</h2>
+      <p>Sessions end 12 hours after sign-in or after {{.SessionIdleMinutes}} minutes without activity; the status page's automatic refresh does not count as activity.</p>
+    </div>
+  </div>
+  <h3 id="password-heading">Change password</h3>
+  <form method="post" action="/settings/password" aria-labelledby="password-heading">
+    <input type="hidden" name="_csrf" value="{{.CSRF}}">
+    <div class="grid">
+      <label for="current-password">Current password
+        <input id="current-password" type="password" name="current_password" autocomplete="current-password" required>
+      </label>
+      <label for="new-password">New password
+        <input id="new-password" type="password" name="password" minlength="{{.MinPasswordLength}}" autocomplete="new-password" aria-describedby="new-password-help" required>
+        <small id="new-password-help">At least {{.MinPasswordLength}} characters; common passwords are rejected.</small>
+      </label>
+      <label for="confirm-password">Confirm new password
+        <input id="confirm-password" type="password" name="confirm" minlength="{{.MinPasswordLength}}" autocomplete="new-password" required>
+      </label>
+    </div>
+    <p class="muted">Changing the password signs out every other session.</p>
+    <button type="submit">Change password</button>
+  </form>
+  <h3 id="sessions-heading">Active sessions</h3>
+  {{if .Sessions}}
+  <table class="data-table session-table" aria-labelledby="sessions-heading">
+    <thead>
+      <tr>
+        <th scope="col">Session</th>
+        <th scope="col">Signed in</th>
+        <th scope="col">Last activity</th>
+        <th scope="col">Expires</th>
+      </tr>
+    </thead>
+    <tbody>
+      {{- range .Sessions}}
+      <tr{{if .Current}} aria-current="true"{{end}}>
+        <th scope="row" data-label="Session"><code>{{.Ref}}</code>{{if .Current}} <span class="status-pill status-enabled">This session</span>{{end}}</th>
+        <td data-label="Signed in">{{template "when" (when .CreatedAt $.Now)}}</td>
+        <td data-label="Last activity">{{template "when" (when .LastSeenAt $.Now)}}</td>
+        <td data-label="Expires">{{template "when" (when .ExpiresAt $.Now)}}</td>
+      </tr>
+      {{- end}}
+    </tbody>
+  </table>
+  {{else}}
+  <p class="muted">No active sessions.</p>
+  {{end}}
+  <form method="post" action="/settings/sessions/revoke-others">
+    <input type="hidden" name="_csrf" value="{{.CSRF}}">
+    <button class="button-danger" type="submit">Sign out all other sessions</button>
+  </form>
+</section>
 {{end}}

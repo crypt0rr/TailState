@@ -68,7 +68,8 @@ stale or failing entry with its manifest line. Add a regression test that
 expresses the operator guarantee, not only a branch-coverage test.
 
 The persistence package is split by responsibility: `auth.go` owns setup,
-password, session, and token state; `settings.go` owns encrypted application
+password and setup/reset token state; `sessions.go` owns sessions, the idle
+timeout, and password changes; `settings.go` owns encrypted application
 settings; `snapshots.go` owns collector application and baseline transitions;
 `outbox.go` owns notification delivery bookkeeping; `status.go` owns health,
 scheduling, and retention queries; and `history.go`, `destinations.go`,

@@ -1,6 +1,8 @@
 {{define "title"}}TailState status{{end}}
 {{define "head"}}
-  <meta http-equiv="refresh" content="30">
+  {{- /* The ?refresh=1 marker tells the server this reload is automatic, so
+       it does not count as activity for the session idle timeout. */}}
+  <meta http-equiv="refresh" content="30;url=/status?refresh=1">
 {{- end}}
 {{define "content"}}
 <h1 class="visually-hidden">Status</h1>

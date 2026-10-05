@@ -134,9 +134,12 @@ func (b *Box) seal(version string, additional []byte, plaintext string) (string,
 	return version + ":" + base64.RawURLEncoding.EncodeToString(append(nonce, sealed...)), nil
 }
 
+// PasswordHash hashes a new password after enforcing CheckPasswordPolicy.
+// Verification (PasswordMatches) never applies the policy, so passwords set
+// under an older, shorter minimum keep working.
 func PasswordHash(password string) (string, error) {
-	if len(password) < 12 {
-		return "", errors.New("password must be at least 12 characters")
+	if err := CheckPasswordPolicy(password); err != nil {
+		return "", err
 	}
 	salt := make([]byte, 16)
 	if _, err := io.ReadFull(rand.Reader, salt); err != nil {

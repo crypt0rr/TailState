@@ -101,7 +101,7 @@ func TestSchemaV14MigrationKeepsDefaultsAndEvidence(t *testing.T) {
 	}
 	defer st.Close()
 	var schemaVersion int
-	if err := st.db.QueryRow("SELECT version FROM schema_version").Scan(&schemaVersion); err != nil || schemaVersion != 14 {
+	if err := st.db.QueryRow("SELECT version FROM schema_version").Scan(&schemaVersion); err != nil || schemaVersion != currentSchemaVersion {
 		t.Fatalf("schema version=%d err=%v", schemaVersion, err)
 	}
 	destinations, err := st.ListDestinations(ctx)

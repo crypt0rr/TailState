@@ -43,7 +43,7 @@ func TestMonitoringOptionsPersistInMetaWithoutSchemaChange(t *testing.T) {
 		t.Fatal("changing an option did not change the settings revision")
 	}
 	var version int
-	if err := st.db.QueryRow("SELECT version FROM schema_version").Scan(&version); err != nil || version != 14 {
+	if err := st.db.QueryRow("SELECT version FROM schema_version").Scan(&version); err != nil || version != currentSchemaVersion {
 		t.Fatalf("schema version=%d err=%v", version, err)
 	}
 

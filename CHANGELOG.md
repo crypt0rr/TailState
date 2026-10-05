@@ -20,6 +20,9 @@ rollback requires restoring the backup taken before the upgrade. See
 - Each destination receives notifications in creation order after an outage, and a failing or hanging destination delays the others by at most one send timeout per delivery pass (#159).
 - Large histories export as a chain of signed evidence packs instead of failing: a pack that reaches the read, event, ledger-link, or size budget carries the batches that fit with `truncated` and `next_cursor`, and the History page offers **Download next part** (#155).
 
+### Security
+- Administrator passwords follow a length-first policy with a common-password blocklist; Settings can change the password, list sessions, and sign out other sessions; sessions end after 60 minutes idle (the status auto-refresh does not count); HSTS on HTTPS requests only; `__Host-` session cookies when cookies are secure. Schema 15 adds `sessions.last_seen_at` (#189).
+
 ## [0.13.0] - 2026-10-06
 
 - **Schema:** 14 (migrates from 13)

@@ -3,7 +3,7 @@ package store
 const schema = `
 PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);
-INSERT INTO schema_version(version) SELECT 14 WHERE NOT EXISTS (SELECT 1 FROM schema_version);
+INSERT INTO schema_version(version) SELECT 15 WHERE NOT EXISTS (SELECT 1 FROM schema_version);
 
 CREATE TABLE IF NOT EXISTS meta (
   key TEXT PRIMARY KEY,
@@ -26,7 +26,8 @@ CREATE TABLE IF NOT EXISTS sessions (
   token_hash TEXT PRIMARY KEY,
   csrf_hash TEXT NOT NULL,
   expires_at TEXT NOT NULL,
-  created_at TEXT NOT NULL
+  created_at TEXT NOT NULL,
+  last_seen_at TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS sessions_expires_at ON sessions(expires_at);
 CREATE TABLE IF NOT EXISTS settings (

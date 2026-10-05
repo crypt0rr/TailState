@@ -268,6 +268,12 @@ func migrateSchema(db *sql.DB, box *secret.Box) error {
 		}
 		return migrateSchema(db, box)
 	}
+	if version == 14 {
+		if err := migrateSchemaV14ToV15(db); err != nil {
+			return err
+		}
+		return migrateSchema(db, box)
+	}
 	if version != 1 {
 		return fmt.Errorf("database schema version %d requires a newer migration path", version)
 	}
@@ -859,6 +865,31 @@ func migrateSchemaV13ToV14(db *sql.DB) error {
 	}
 	if err := finalTx.Commit(); err != nil {
 		return fmt.Errorf("commit notification routing migration: %w", err)
+	}
+	return nil
+}
+
+// migrateSchemaV14ToV15 adds administrative security state: a last-seen
+// time on sessions for the idle timeout. Existing sessions are backfilled
+// with their creation time, so a session idle for longer than the timeout
+// before the upgrade must sign in again; nothing else changes behaviour.
+func migrateSchemaV14ToV15(db *sql.DB) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin administrative security migration: %w", err)
+	}
+	defer tx.Rollback()
+	if err := addColumnIfMissing(tx, "sessions", "last_seen_at", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if _, err := tx.Exec("UPDATE sessions SET last_seen_at=created_at WHERE last_seen_at=''"); err != nil {
+		return fmt.Errorf("backfill session activity: %w", err)
+	}
+	if _, err := tx.Exec("UPDATE schema_version SET version=15"); err != nil {
+		return fmt.Errorf("record administrative security migration: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit administrative security migration: %w", err)
 	}
 	return nil
 }

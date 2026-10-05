@@ -193,7 +193,7 @@ type HistoryPage struct {
 	TruncationReason string
 }
 
-const currentSchemaVersion = 12
+const currentSchemaVersion = 13
 
 const (
 	webhookTriggerRetryWindow = 24 * time.Hour
@@ -221,6 +221,9 @@ func OpenWithLimits(path string, box *secret.Box, configuredLimits StorageLimits
 		return nil, errors.New("master key is required")
 	}
 	if err := os.MkdirAll(filepathDir(path), 0o700); err != nil {
+		return nil, err
+	}
+	if err := ensurePrivateDatabaseFile(path); err != nil {
 		return nil, err
 	}
 	// _txlock=immediate makes every transaction take the write lock when it
@@ -311,6 +314,14 @@ func OpenWithLimits(path string, box *secret.Box, configuredLimits StorageLimits
 		db.Close()
 		return nil, fmt.Errorf("database migration failed while creating outbox retention index; stop TailState and restore the verified pre-upgrade backup before retrying: %w", err)
 	}
+	if _, err := db.Exec("CREATE INDEX IF NOT EXISTS outbox_dead_retention ON outbox(status, created_at)"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("database migration failed while creating outbox dead-letter retention index; stop TailState and restore the verified pre-upgrade backup before retrying: %w", err)
+	}
+	if _, err := db.Exec("CREATE INDEX IF NOT EXISTS auth_tokens_kind ON auth_tokens(kind)"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("database migration failed while creating authentication token kind index; stop TailState and restore the verified pre-upgrade backup before retrying: %w", err)
+	}
 	st := &Store{db: db, connector: connector, databasePath: path, box: box}
 	st.limits.Store(limits)
 	present, err = verifyExistingMasterKey(db, box)
@@ -319,7 +330,7 @@ func OpenWithLimits(path string, box *secret.Box, configuredLimits StorageLimits
 		return nil, err
 	}
 	if !present {
-		encrypted, encryptErr := box.Encrypt("tailstate-master-key-check")
+		encrypted, encryptErr := box.Seal(metaBinding(masterKeyCheckMeta), "tailstate-master-key-check")
 		if encryptErr != nil {
 			db.Close()
 			return nil, encryptErr
@@ -342,7 +353,7 @@ func OpenWithLimits(path string, box *secret.Box, configuredLimits StorageLimits
 		db.Close()
 		return nil, err
 	}
-	if err := os.Chmod(path, 0o600); err != nil {
+	if err := restrictDatabaseSidecars(path); err != nil {
 		db.Close()
 		return nil, err
 	}
@@ -412,6 +423,36 @@ func OpenExisting(path string, box *secret.Box) (*Store, error) {
 	return st, nil
 }
 
+// ensurePrivateDatabaseFile creates the database file with owner-only
+// permissions before SQLite opens it, and tightens an existing file. SQLite
+// creates the -wal and -shm sidecars with the main file's permission bits, so
+// this keeps recent history, session hashes and encrypted settings in the WAL
+// from being created world-readable on a fresh database.
+func ensurePrivateDatabaseFile(path string) error {
+	file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		return err
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	return os.Chmod(path, 0o600)
+}
+
+// restrictDatabaseSidecars tightens the database and any sidecar left by an
+// earlier release or an unclean shutdown, which SQLite reuses as-is.
+func restrictDatabaseSidecars(path string) error {
+	if err := os.Chmod(path, 0o600); err != nil {
+		return err
+	}
+	for _, suffix := range []string{"-wal", "-shm"} {
+		if err := os.Chmod(path+suffix, 0o600); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
+	return nil
+}
+
 func verifyExistingMasterKey(db *sql.DB, box *secret.Box) (bool, error) {
 	var keyCheck string
 	err := db.QueryRow("SELECT value FROM meta WHERE key='master_key_check'").Scan(&keyCheck)
@@ -424,7 +465,7 @@ func verifyExistingMasterKey(db *sql.DB, box *secret.Box) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	plain, decryptErr := box.Decrypt(keyCheck)
+	plain, decryptErr := box.Open(metaBinding(masterKeyCheckMeta), keyCheck)
 	if decryptErr != nil || plain != "tailstate-master-key-check" {
 		return true, errors.New("master key does not match this TailState database")
 	}

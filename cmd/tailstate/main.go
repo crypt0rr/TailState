@@ -28,6 +28,7 @@ import (
 var version = "dev"
 
 func main() {
+	restrictFileCreationMask()
 	if err := run(); err != nil {
 		slog.Error("TailState stopped", "error", err)
 		os.Exit(1)

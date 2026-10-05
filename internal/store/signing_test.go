@@ -261,6 +261,9 @@ func TestEvidenceLedgerSurvivesHistoryRetention(t *testing.T) {
 	if _, err := st.db.ExecContext(ctx, "UPDATE events SET observed_at=? WHERE batch_id=?", oldObservedAt, page.Batches[1].ID); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := st.db.ExecContext(ctx, "UPDATE event_batches SET observed_at=? WHERE id=?", oldObservedAt, page.Batches[1].ID); err != nil {
+		t.Fatal(err)
+	}
 	if err := st.Cleanup(ctx, 24*time.Hour); err != nil {
 		t.Fatal(err)
 	}

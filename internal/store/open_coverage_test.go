@@ -204,11 +204,11 @@ func TestOpenRejectsWrongKeyBeforeLegacyBootstrapDDL(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	oauth, err := firstBox.Encrypt("oauth-secret")
+	oauth, err := firstBox.EncryptLegacy("oauth-secret")
 	if err != nil {
 		t.Fatal(err)
 	}
-	mattermost, err := firstBox.Encrypt("https://mattermost.example/hooks/token")
+	mattermost, err := firstBox.EncryptLegacy("https://mattermost.example/hooks/token")
 	if err != nil {
 		t.Fatal(err)
 	}

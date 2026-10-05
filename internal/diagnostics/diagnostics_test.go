@@ -164,6 +164,13 @@ func TestBuildReportsStoragePressureWithoutPayloads(t *testing.T) {
 	if !strings.Contains(string(encoded), `"DatabasePhysicalBytes":95`) {
 		t.Fatalf("physical storage diagnostics missing: %s", encoded)
 	}
+	if _, ok := finding(report, "storage_limit_not_enforced"); ok {
+		t.Fatalf("enforced storage limit reported as unenforced: %#v", report)
+	}
+	unenforced := Build(boot.Config{ListenAddr: "127.0.0.1:8080"}, Runtime{Configured: true, Storage: StorageRuntime{DatabaseLimitBytes: 100, LimitNotEnforced: true}}, nil)
+	if finding, ok := finding(unenforced, "storage_limit_not_enforced"); !ok || finding.Severity != SeverityError || unenforced.State != "error" {
+		t.Fatalf("unenforced storage limit finding missing: %#v", unenforced)
+	}
 	errorReport := Build(boot.Config{ListenAddr: "127.0.0.1:8080"}, Runtime{Configured: true, Storage: StorageRuntime{DatabaseLimitBytes: 100, DatabaseBytes: 100, StoragePressure: 1}}, nil)
 	if finding, ok := finding(errorReport, "storage_pressure"); !ok || finding.Severity != SeverityError || errorReport.State != "error" {
 		t.Fatalf("storage pressure error finding missing: %#v", errorReport)

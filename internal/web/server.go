@@ -40,6 +40,7 @@ type Server struct {
 	templates            map[string]*template.Template
 	loginMu              sync.Mutex
 	loginAttempts        map[string][]time.Time
+	globalFailures       map[credentialAction][]time.Time
 	authWork             chan struct{}
 	challengeKey         []byte
 	challengeMu          sync.Mutex
@@ -50,7 +51,22 @@ type Server struct {
 	credentialRejections map[string]uint64
 }
 
-const maxTrackedLoginIPs = 4096
+const (
+	maxTrackedLoginIPs = 4096
+	// loginFailureWindow and loginFailuresPerClient define the per-client
+	// credential throttle.
+	loginFailureWindow     = 15 * time.Minute
+	loginFailuresPerClient = 5
+	// loginIPv6PrefixBits aggregates IPv6 clients by network rather than by
+	// address, because one host can usually choose any address in its /64.
+	loginIPv6PrefixBits = 64
+	// loginGlobalFailureBudget failures per action and window from any mix of
+	// sources engage an exponential backoff of loginGlobalBackoffBase,
+	// doubling per further failure up to loginGlobalBackoffMax.
+	loginGlobalFailureBudget = 30
+	loginGlobalBackoffBase   = time.Second
+	loginGlobalBackoffMax    = 5 * time.Minute
+)
 
 type pageData struct {
 	Error, Message, CSRF, Challenge string
@@ -108,6 +124,7 @@ func New(config boot.Config, st *store.Store, engine *monitor.Engine) (*Server, 
 		engine:               engine,
 		templates:            templates,
 		loginAttempts:        map[string][]time.Time{},
+		globalFailures:       map[credentialAction][]time.Time{},
 		authWork:             make(chan struct{}, 2),
 		challengeKey:         challengeKey,
 		consumedChallenges:   map[string]time.Time{},
@@ -245,9 +262,9 @@ func (s *Server) claim(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "installation already claimed", http.StatusConflict)
 		return
 	}
-	ip := "setup:" + s.clientIP(r)
-	if s.rateLimited(ip) {
-		s.renderCredential(w, r, "setup", credentialActionSetup, pageData{Error: "Too many setup attempts. Try again later."})
+	ip := s.throttleKey(credentialActionSetup, s.clientIP(r))
+	if retry, limited := s.throttled(credentialActionSetup, ip); limited {
+		s.renderThrottled(w, r, "setup", credentialActionSetup, "Too many setup attempts. Try again later.", retry)
 		return
 	}
 	if err := r.ParseForm(); err != nil {
@@ -269,13 +286,13 @@ func (s *Server) claim(w http.ResponseWriter, r *http.Request) {
 		// Password confirmation is part of the unauthenticated setup surface.
 		// Count mismatches as failed claims so an attacker cannot bypass the
 		// endpoint throttle by repeatedly submitting different confirmations.
-		s.recordFailure(ip)
+		s.recordFailure(credentialActionSetup, ip)
 		s.recordCredentialRejection(credentialActionSetup)
 		s.renderCredential(w, r, "setup", credentialActionSetup, pageData{Error: "Passwords do not match."})
 		return
 	}
 	if err := s.store.Claim(r.Context(), r.FormValue("token"), r.FormValue("password")); err != nil {
-		s.recordFailure(ip)
+		s.recordFailure(credentialActionSetup, ip)
 		s.recordCredentialRejection(credentialActionSetup)
 		// Setup is unauthenticated. Keep storage, token, and migration details
 		// out of the response so this endpoint cannot become an oracle.
@@ -317,9 +334,9 @@ func (s *Server) adminExists(w http.ResponseWriter, r *http.Request) (bool, bool
 }
 
 func (s *Server) loginPost(w http.ResponseWriter, r *http.Request) {
-	ip := s.clientIP(r)
-	if s.rateLimited(ip) {
-		s.renderCredential(w, r, "login", credentialActionLogin, pageData{Error: "Too many login attempts. Try again later."})
+	ip := s.throttleKey(credentialActionLogin, s.clientIP(r))
+	if retry, limited := s.throttled(credentialActionLogin, ip); limited {
+		s.renderThrottled(w, r, "login", credentialActionLogin, "Too many login attempts. Try again later.", retry)
 		return
 	}
 	if err := r.ParseForm(); err != nil {
@@ -338,7 +355,7 @@ func (s *Server) loginPost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !s.store.Authenticate(r.Context(), r.FormValue("password")) {
-		s.recordFailure(ip)
+		s.recordFailure(credentialActionLogin, ip)
 		s.recordCredentialRejection(credentialActionLogin)
 		s.renderCredential(w, r, "login", credentialActionLogin, pageData{Error: "Invalid password."})
 		return
@@ -366,9 +383,9 @@ func (s *Server) reset(w http.ResponseWriter, r *http.Request) {
 	s.renderCredential(w, r, "reset", credentialActionReset, pageData{})
 }
 func (s *Server) resetPost(w http.ResponseWriter, r *http.Request) {
-	ip := "reset:" + s.clientIP(r)
-	if s.rateLimited(ip) {
-		s.renderCredential(w, r, "reset", credentialActionReset, pageData{Error: "Too many reset attempts. Try again later."})
+	ip := s.throttleKey(credentialActionReset, s.clientIP(r))
+	if retry, limited := s.throttled(credentialActionReset, ip); limited {
+		s.renderThrottled(w, r, "reset", credentialActionReset, "Too many reset attempts. Try again later.", retry)
 		return
 	}
 	if err := r.ParseForm(); err != nil {
@@ -387,13 +404,13 @@ func (s *Server) resetPost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.FormValue("password") != r.FormValue("confirm") {
-		s.recordFailure(ip)
+		s.recordFailure(credentialActionReset, ip)
 		s.recordCredentialRejection(credentialActionReset)
 		s.renderCredential(w, r, "reset", credentialActionReset, pageData{Error: "Passwords do not match."})
 		return
 	}
 	if err := s.store.ResetWithToken(r.Context(), r.FormValue("token"), r.FormValue("password")); err != nil {
-		s.recordFailure(ip)
+		s.recordFailure(credentialActionReset, ip)
 		s.recordCredentialRejection(credentialActionReset)
 		// Do not disclose whether a reset token is missing, invalid, expired,
 		// or temporarily unreadable. The token is deliberately a single
@@ -1083,47 +1100,98 @@ func (s *Server) requireAuth(w http.ResponseWriter, r *http.Request, csrf bool) 
 	cookie, _ := r.Cookie("tailstate_csrf")
 	return cookie.Value, true
 }
-func (s *Server) rateLimited(ip string) bool {
+
+// throttleKey returns the per-client limiter bucket for action. IPv6 clients
+// are aggregated by their /64, which a single host or customer site usually
+// controls in full; IPv4 (including IPv4-mapped IPv6) keeps one bucket per
+// address.
+func (s *Server) throttleKey(action credentialAction, client string) string {
+	return string(action) + ":" + limiterAddress(client)
+}
+
+func limiterAddress(client string) string {
+	addr, err := netip.ParseAddr(strings.TrimSpace(client))
+	if err != nil {
+		return client
+	}
+	addr = addr.Unmap().WithZone("")
+	if addr.Is4() {
+		return addr.String()
+	}
+	prefix, err := addr.Prefix(loginIPv6PrefixBits)
+	if err != nil {
+		return addr.String()
+	}
+	return prefix.String()
+}
+
+// throttled reports whether a credential submission must be refused, and for
+// how long. Two independent limits apply: each client bucket allows
+// loginFailuresPerClient failures per loginFailureWindow, and every action has
+// a global failure budget across all sources. Once the global budget is spent,
+// each further failure doubles the wait (capped at loginGlobalBackoffMax), so
+// distributed guessing slows down exponentially instead of being bounded only
+// by the password hash cost.
+func (s *Server) throttled(action credentialAction, key string) (time.Duration, bool) {
 	s.loginMu.Lock()
 	defer s.loginMu.Unlock()
 	now := time.Now()
-	cutoff := now.Add(-15 * time.Minute)
-	s.pruneLoginAttemptsLocked(cutoff)
-	attempts, exists := s.loginAttempts[ip]
-	if !exists {
-		return false
+	s.pruneLoginAttemptsLocked(now.Add(-loginFailureWindow))
+	var retry time.Duration
+	if attempts := s.loginAttempts[key]; len(attempts) >= loginFailuresPerClient {
+		// The bucket reopens when its oldest counted failure leaves the window.
+		retry = attempts[len(attempts)-loginFailuresPerClient].Add(loginFailureWindow).Sub(now)
 	}
-	kept := attempts[:0]
-	for _, at := range attempts {
-		if at.After(cutoff) {
-			kept = append(kept, at)
+	if global := s.globalFailures[action]; len(global) >= loginGlobalFailureBudget {
+		until := global[len(global)-1].Add(globalBackoff(len(global) - loginGlobalFailureBudget))
+		if wait := until.Sub(now); wait > retry {
+			retry = wait
 		}
 	}
-	if len(kept) == 0 {
-		delete(s.loginAttempts, ip)
-	} else {
-		s.loginAttempts[ip] = kept
-	}
-	return len(kept) >= 5
+	return retry, retry > 0
 }
-func (s *Server) recordFailure(ip string) {
+
+// globalBackoff returns the delay after the excess-th failure beyond the
+// global budget: 1s, 2s, 4s, ... capped at loginGlobalBackoffMax.
+func globalBackoff(excess int) time.Duration {
+	if excess > 16 {
+		excess = 16
+	}
+	delay := loginGlobalBackoffBase << excess
+	if delay > loginGlobalBackoffMax {
+		delay = loginGlobalBackoffMax
+	}
+	return delay
+}
+
+func (s *Server) recordFailure(action credentialAction, key string) {
 	s.loginMu.Lock()
 	defer s.loginMu.Unlock()
 	now := time.Now()
-	s.pruneLoginAttemptsLocked(now.Add(-15 * time.Minute))
-	s.loginAttempts[ip] = append(s.loginAttempts[ip], now)
+	s.pruneLoginAttemptsLocked(now.Add(-loginFailureWindow))
+	s.loginAttempts[key] = append(s.loginAttempts[key], now)
+	global := append(s.globalFailures[action], now)
+	// Beyond the budget only the count up to the backoff cap matters.
+	if limit := loginGlobalFailureBudget + 17; len(global) > limit {
+		global = append(global[:0:0], global[len(global)-limit:]...)
+	}
+	s.globalFailures[action] = global
 	// Keep the map bounded even when this is called without a preceding
-	// rateLimited check (for example, from a future authentication flow).
-	s.pruneLoginAttemptsLocked(now.Add(-15 * time.Minute))
+	// throttled check (for example, from a future authentication flow).
+	s.pruneLoginAttemptsLocked(now.Add(-loginFailureWindow))
 }
-func (s *Server) clearFailures(ip string) {
+
+// clearFailures resets one client bucket after a successful submission. The
+// global budget is deliberately left alone: it measures failures from every
+// source and must not be reset by the success it is protecting.
+func (s *Server) clearFailures(key string) {
 	s.loginMu.Lock()
 	defer s.loginMu.Unlock()
-	delete(s.loginAttempts, ip)
+	delete(s.loginAttempts, key)
 }
 
 func (s *Server) pruneLoginAttemptsLocked(cutoff time.Time) {
-	for ip, attempts := range s.loginAttempts {
+	for key, attempts := range s.loginAttempts {
 		kept := attempts[:0]
 		for _, at := range attempts {
 			if at.After(cutoff) {
@@ -1131,23 +1199,49 @@ func (s *Server) pruneLoginAttemptsLocked(cutoff time.Time) {
 			}
 		}
 		if len(kept) == 0 {
-			delete(s.loginAttempts, ip)
+			delete(s.loginAttempts, key)
 			continue
 		}
-		s.loginAttempts[ip] = kept
+		s.loginAttempts[key] = kept
 	}
 	for len(s.loginAttempts) > maxTrackedLoginIPs {
-		var oldestIP string
+		var oldestKey string
 		var oldest time.Time
-		for ip, attempts := range s.loginAttempts {
+		for key, attempts := range s.loginAttempts {
 			candidate := attempts[0]
-			if oldestIP == "" || candidate.Before(oldest) {
-				oldestIP, oldest = ip, candidate
+			if oldestKey == "" || candidate.Before(oldest) {
+				oldestKey, oldest = key, candidate
 			}
 		}
-		delete(s.loginAttempts, oldestIP)
+		delete(s.loginAttempts, oldestKey)
+	}
+	for action, failures := range s.globalFailures {
+		kept := failures[:0]
+		for _, at := range failures {
+			if at.After(cutoff) {
+				kept = append(kept, at)
+			}
+		}
+		if len(kept) == 0 {
+			delete(s.globalFailures, action)
+			continue
+		}
+		s.globalFailures[action] = kept
 	}
 }
+
+// renderThrottled answers a throttled credential submission with 429 and a
+// Retry-After header (whole seconds, rounded up) while still rendering the
+// form so a browser user sees the reason.
+func (s *Server) renderThrottled(w http.ResponseWriter, r *http.Request, name string, action credentialAction, message string, retry time.Duration) {
+	seconds := int64((retry + time.Second - 1) / time.Second)
+	if seconds < 1 {
+		seconds = 1
+	}
+	w.Header().Set("Retry-After", strconv.FormatInt(seconds, 10))
+	s.renderCredentialStatus(w, r, name, action, pageData{Error: message}, http.StatusTooManyRequests)
+}
+
 func remoteIP(r *http.Request) string {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {

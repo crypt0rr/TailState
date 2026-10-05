@@ -188,8 +188,21 @@ unauthenticated page loads cannot evict a pending form, and several tabs in the
 same browser can each submit their own form. Only submitted challenges are
 remembered (until they expire) so they cannot be replayed. Challenges expire
 after five minutes and are invalidated when TailState restarts; reload the page
-if a challenge expires or a bookmarked form was opened before a restart. Setup and reset still require one-time tokens, login
-is rate limited, and authenticated state-changing forms require CSRF tokens.
+if a challenge expires or a bookmarked form was opened before a restart. Setup
+and reset still require one-time tokens, and authenticated state-changing forms
+require CSRF tokens.
+
+Setup, login, and reset submissions are throttled. Each client may fail five
+times per action in 15 minutes; IPv6 clients are grouped by their /64 network
+because one host can usually use any address in it, while IPv4 clients are
+tracked per address. Independently, each action has a global budget of 30
+failures per 15 minutes from any mix of sources; beyond it every further
+failure doubles the wait (1 s, 2 s, 4 s, ... up to five minutes). A throttled
+submission receives `429 Too Many Requests` with a `Retry-After` header (in
+seconds) and the form explains the delay. Behind a reverse proxy, list the
+proxy in `TAILSTATE_TRUSTED_PROXIES` so clients are throttled individually;
+otherwise every user shares the proxy's bucket, and the Settings diagnostics
+report `untrusted_forwarded_headers`.
 Challenge and credential failures are exposed only through low-cardinality
 route/outcome metrics; secrets, tokens, cookies, and request headers are never
 logged.

@@ -148,8 +148,8 @@ func TestLoginAttemptTrackingIsBoundedAndPruned(t *testing.T) {
 		server.loginAttempts["ip-"+strconv.Itoa(i)] = []time.Time{now}
 	}
 	server.loginAttempts["stale"] = []time.Time{now.Add(-16 * time.Minute)}
-	server.rateLimited("new-ip")
-	server.recordFailure("new-ip")
+	server.throttled(credentialActionLogin, "new-ip")
+	server.recordFailure(credentialActionLogin, "new-ip")
 	if _, ok := server.loginAttempts["stale"]; ok {
 		t.Fatal("stale login attempt state was retained")
 	}
@@ -169,7 +169,7 @@ func TestSetupPasswordMismatchConsumesThrottleBudget(t *testing.T) {
 	}
 
 	response := coverageCredentialPost(t, server, "/setup/claim", form, nil, "", "198.51.100.25:1234", nil)
-	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "Too many setup attempts") {
+	if response.Code != http.StatusTooManyRequests || !strings.Contains(response.Body.String(), "Too many setup attempts") {
 		t.Fatalf("sixth mismatch was not throttled: status=%d body=%s", response.Code, response.Body.String())
 	}
 }

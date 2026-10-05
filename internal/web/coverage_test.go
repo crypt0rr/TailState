@@ -367,14 +367,14 @@ func TestLoginLogoutAndResetBranches(t *testing.T) {
 	cookies := correct.Result().Cookies()
 	ip := "192.0.2.1"
 	for i := 0; i < 5; i++ {
-		server.recordFailure(ip)
+		server.recordFailure(credentialActionLogin, server.throttleKey(credentialActionLogin, ip))
 	}
 	rateLimited := httptest.NewRequest(http.MethodPost, "/login", strings.NewReader("password=wrong"))
 	rateLimited.RemoteAddr = ip + ":1234"
 	rateLimited.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	rateLimitedResponse := httptest.NewRecorder()
 	server.Handler().ServeHTTP(rateLimitedResponse, rateLimited)
-	if rateLimitedResponse.Code != http.StatusOK || !strings.Contains(rateLimitedResponse.Body.String(), "Too many login attempts") {
+	if rateLimitedResponse.Code != http.StatusTooManyRequests || rateLimitedResponse.Header().Get("Retry-After") == "" || !strings.Contains(rateLimitedResponse.Body.String(), "Too many login attempts") {
 		t.Fatalf("rate limited login response %d: %s", rateLimitedResponse.Code, rateLimitedResponse.Body.String())
 	}
 
@@ -1001,7 +1001,7 @@ func TestWebCSRFAndFormBoundaryBranches(t *testing.T) {
 		t.Fatalf("authenticated status did not explain partial collector errors: status=%d body=%s", authStatus.Code, authStatus.Body.String())
 	}
 	server.loginAttempts["stale"] = []time.Time{time.Now().Add(-16 * time.Minute)}
-	if server.rateLimited("stale") {
+	if _, limited := server.throttled(credentialActionLogin, "stale"); limited {
 		t.Fatal("stale login attempts were rate limited")
 	}
 	if _, ok := server.loginAttempts["stale"]; ok {
@@ -1132,7 +1132,7 @@ func TestWebOperationalFailureBranches(t *testing.T) {
 	server, st, _, _ := webServerWithDatabase(t)
 	defer st.Close()
 	server.loginAttempts["recent"] = []time.Time{time.Now()}
-	if server.rateLimited("recent") {
+	if _, limited := server.throttled(credentialActionLogin, "recent"); limited {
 		t.Fatal("a single recent login attempt was rate limited")
 	}
 	if len(server.loginAttempts["recent"]) != 1 {

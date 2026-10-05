@@ -255,25 +255,93 @@ jobs:
           gh api --method DELETE "/user/packages/container/$package_name/versions/$version_id" 2>/dev/null || \
             gh api --method DELETE "/orgs/$owner/packages/container/$package_name/versions/$version_id"
 
+  binaries:
+    name: Build standalone binaries
+    needs: quality
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          # Release artifacts are built without a restored cache.
+          cache: false
+      - name: Build reproducible archives
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          mkdir -p build dist
+          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 freebsd/amd64; do
+            os="${target%/*}"
+            arch="${target#*/}"
+            name="tailstate_${version}_${os}_${arch}"
+            mkdir -p "build/$name/contrib/systemd"
+            CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" go build -trimpath -buildvcs=false \
+              -ldflags="-s -w -buildid= -X main.version=${version}" \
+              -o "build/$name/tailstate" ./cmd/tailstate
+            cp LICENSE README.md "build/$name/"
+            if [[ -f SECURITY.md ]]; then cp SECURITY.md "build/$name/"; fi
+            cp contrib/systemd/tailstate.service "build/$name/contrib/systemd/"
+            tar -C build --sort=name --owner=0 --group=0 --numeric-owner --mtime=@0 -cf - "$name" \
+              | gzip -n -9 > "dist/$name.tar.gz"
+          done
+          (cd dist && sha256sum ./*.tar.gz | sed 's| \./| |' > SHA256SUMS)
+          cat dist/SHA256SUMS
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+      - name: Generate SBOM
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        with:
+          path: .
+          format: spdx-json
+          output-file: dist/tailstate_${{ env.VERSION }}.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+      - name: Sign build provenance for the archives
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-checksums: dist/SHA256SUMS
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-binaries
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
   github-release:
     name: Create GitHub release
-    needs: image
+    needs: [image, binaries]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     # Only this job can write repository contents (the release itself).
     permissions:
       contents: write
     steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-binaries
+          path: dist
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
           if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "GitHub release $GITHUB_REF_NAME already exists"
+            echo "GitHub release $GITHUB_REF_NAME already exists; uploading missing assets"
+            gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --clobber dist/*
           else
             gh release create "$GITHUB_REF_NAME" \
               --repo "$GITHUB_REPOSITORY" \
               --verify-tag \
               --title "$GITHUB_REF_NAME" \
-              --generate-notes
+              --generate-notes \
+              dist/*
           fi

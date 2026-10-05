@@ -458,7 +458,25 @@ go test -race ./...
 docker build -t tailstate:dev .
 ```
 
-For a local binary, generate a master key and point TailState at a writable data directory:
+### Standalone binary (systemd)
+
+Each GitHub Release also ships reproducible `tailstate_<version>_<os>_<arch>.tar.gz`
+archives for Linux (amd64, arm64), macOS (amd64, arm64), and FreeBSD (amd64),
+plus `SHA256SUMS`, an SPDX SBOM, and a signed build-provenance attestation:
+
+```console
+sha256sum -c SHA256SUMS --ignore-missing
+gh attestation verify tailstate_<version>_linux_amd64.tar.gz --owner crypt0rr
+```
+
+The archive contains a hardened systemd unit in
+`contrib/systemd/tailstate.service` (dynamic user, private state directory,
+master key passed as a systemd credential, `systemd-analyze security` score
+1.1). Its header lists the install steps; the standalone binary listens on
+`127.0.0.1:8080` and prints the one-time setup token to the journal
+(`journalctl -u tailstate`).
+
+For a local development binary, generate a master key and point TailState at a writable data directory:
 
 ```console
 mkdir -p .local-data secrets

@@ -223,6 +223,9 @@ func OpenWithLimits(path string, box *secret.Box, configuredLimits StorageLimits
 	if err := os.MkdirAll(filepathDir(path), 0o700); err != nil {
 		return nil, err
 	}
+	if err := ensurePrivateDatabaseFile(path); err != nil {
+		return nil, err
+	}
 	dsn := "file:" + path + "?_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)&_pragma=synchronous(FULL)"
 	connector := newPageLimitedConnector(dsn)
 	db := sql.OpenDB(connector)
@@ -346,11 +349,41 @@ func OpenWithLimits(path string, box *secret.Box, configuredLimits StorageLimits
 		db.Close()
 		return nil, err
 	}
-	if err := os.Chmod(path, 0o600); err != nil {
+	if err := restrictDatabaseSidecars(path); err != nil {
 		db.Close()
 		return nil, err
 	}
 	return st, nil
+}
+
+// ensurePrivateDatabaseFile creates the database file with owner-only
+// permissions before SQLite opens it, and tightens an existing file. SQLite
+// creates the -wal and -shm sidecars with the main file's permission bits, so
+// this keeps recent history, session hashes and encrypted settings in the WAL
+// from being created world-readable on a fresh database.
+func ensurePrivateDatabaseFile(path string) error {
+	file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		return err
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	return os.Chmod(path, 0o600)
+}
+
+// restrictDatabaseSidecars tightens the database and any sidecar left by an
+// earlier release or an unclean shutdown, which SQLite reuses as-is.
+func restrictDatabaseSidecars(path string) error {
+	if err := os.Chmod(path, 0o600); err != nil {
+		return err
+	}
+	for _, suffix := range []string{"-wal", "-shm"} {
+		if err := os.Chmod(path+suffix, 0o600); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
+	return nil
 }
 
 func verifyExistingMasterKey(db *sql.DB, box *secret.Box) (bool, error) {

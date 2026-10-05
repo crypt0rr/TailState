@@ -13,8 +13,11 @@ COPY internal ./internal
 RUN CGO_ENABLED=0 go build -trimpath -buildvcs=false -ldflags="-s -w -buildid= -X main.version=${VERSION}" -o /out/tailstate ./cmd/tailstate
 
 FROM alpine:3.24@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6 AS runtime-files
+# The data volume holds the SQLite database and its WAL; keep it private to
+# the service user so a fresh named volume is not readable by other users.
 RUN mkdir -p /data \
-    && chown 10001:10001 /data
+    && chown 10001:10001 /data \
+    && chmod 0700 /data
 
 FROM scratch
 ARG VERSION=dev
@@ -33,7 +36,7 @@ LABEL org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.build.target.architecture="${TARGETARCH}" \
       org.opencontainers.image.build.target.variant="${TARGETVARIANT}"
 COPY --from=runtime-files /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
-COPY --from=runtime-files --chown=10001:10001 /data /data
+COPY --from=runtime-files --chown=10001:10001 --chmod=0700 /data /data
 COPY --from=builder /out/tailstate /tailstate
 USER 10001:10001
 VOLUME ["/data"]

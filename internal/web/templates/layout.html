@@ -1,0 +1,44 @@
+{{/*
+  Shared page layout. Every page template defines "title" and "content" and
+  may define "head" for extra head elements. Pages are rendered by executing
+  "layout". Authenticated pages (status, history, settings) get the primary
+  navigation and the logout form; credential pages (setup, login, reset) get
+  the same header without navigation. No inline scripts or styles: the
+  Content-Security-Policy forbids them.
+*/}}
+{{define "layout"}}<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>{{template "title" .}}</title>
+  <link rel="stylesheet" href="/static/style.css">
+  {{- block "head" .}}{{end}}
+</head>
+<body>
+<header class="site-header">
+  <div class="brand">
+    <strong class="brand-name">TailState</strong>
+    <span class="app-version">Version {{.Version}}</span>
+  </div>
+  {{- if eq .Page "status" "history" "settings"}}
+  <nav class="site-nav" aria-label="Primary">
+    <ul class="nav-links">
+      <li><a href="/status"{{if eq .Page "status"}} class="active" aria-current="page"{{end}}>Status</a></li>
+      <li><a href="/history"{{if eq .Page "history"}} class="active" aria-current="page"{{end}}>History</a></li>
+      <li><a href="/settings"{{if eq .Page "settings"}} class="active" aria-current="page"{{end}}>Settings</a></li>
+    </ul>
+    <form class="logout-form" method="post" action="/logout">
+      <input type="hidden" name="_csrf" value="{{.CSRF}}">
+      <button class="link" type="submit">Log out</button>
+    </form>
+  </nav>
+  {{- end}}
+</header>
+<main{{if eq .Page "setup" "login" "reset"}} class="narrow"{{end}}>
+{{template "content" .}}
+</main>
+</body>
+</html>
+{{end}}

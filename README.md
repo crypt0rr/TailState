@@ -94,6 +94,8 @@ Add destinations on the authenticated Settings page, then save monitoring settin
 
 The authenticated **History** page keeps a 30-day, searchable ledger of semantic inventory changes. Each poll is grouped into a batch with the affected collector, resource, previous/current normalized snapshots, field-level differences, and the delivery state for every destination. Use it to investigate a notification without exposing credentials or volatile API fields. The page shows the fingerprint of the Ed25519 key used to sign evidence exports.
 
+The interface follows the browser's light or dark preference and works down to 320-pixel-wide screens: the header wraps instead of overlapping, and on narrow screens table rows stack with every value labelled by its column name. Field differences carry "Old" and "New" text markers, so they do not depend on red/green colour. Errors are announced to screen readers, the current page is marked in the navigation, and repeated destination buttons are labelled with the destination name. The pages load no scripts and no inline styles, so the strict Content-Security-Policy stays unchanged.
+
 ### OAuth scopes
 
 TailState requests `all:read` by default. To run with a least-privilege OAuth

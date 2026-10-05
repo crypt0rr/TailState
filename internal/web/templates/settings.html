@@ -1,16 +1,256 @@
-<!doctype html>
-<html lang="en">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>TailState settings</title><link rel="stylesheet" href="/static/style.css"></head>
-<body><header><div class="brand"><strong>TailState</strong><span class="app-version">Version {{.Version}}</span></div><nav><a href="/status">Status</a><a href="/history">History</a><a class="active" href="/settings">Settings</a><form method="post" action="/logout"><input type="hidden" name="_csrf" value="{{.CSRF}}"><button class="link" type="submit">Log out</button></form></nav></header>
-<main>
-<section class="card"><h1>Monitoring settings</h1><p>Save Tailscale access separately from notification destinations. Notification URLs are encrypted and only their scheme and host are shown here.</p>{{if .Message}}<div class="success">{{.Message}}</div>{{end}}{{if .Error}}<div class="error">{{.Error}}</div>{{end}}{{if eq .NotificationState "no_destinations"}}<div class="error">Notifications are paused because no destination is configured. Add a destination below. Monitoring continues.</div>{{else if eq .NotificationState "paused"}}<div class="error">Notifications are paused because every destination is disabled. Monitoring continues.</div>{{end}}
-<form method="post" action="/settings"><input type="hidden" name="_csrf" value="{{.CSRF}}"><div class="grid"><label>Tailnet<input name="tailnet" value="{{.Settings.Tailnet}}" placeholder="-" required><small>Use <code>-</code> for the OAuth credential's tailnet.</small></label><label>OAuth client ID<input name="client_id" value="{{.Settings.OAuthClientID}}" required></label><label>OAuth client secret<input type="password" name="client_secret" {{if not .Configured}}required{{end}} placeholder="{{if .Configured}}Leave blank to keep current secret{{end}}" autocomplete="new-password"></label><label>OAuth scopes<input name="oauth_scopes" value="{{.OAuthScopes}}" placeholder="all:read"><small>Read scopes requested for the access token (space-separated). <code>devices:core:read</code> is required; collectors without a granted scope are shown as unsupported.</small></label><label>Tailscale webhook secret<input type="password" name="webhook_secret" placeholder="{{if .Configured}}Leave blank to keep current secret{{else}}Optional{{end}}" autocomplete="new-password"><small>Paste the secret shown when you create a Tailscale webhook. TailState verifies signed deliveries at <code>/webhooks/tailscale</code>.</small></label><label>Device poll interval (seconds)<input type="number" min="15" max="86400" name="device_interval" value="{{.DeviceSeconds}}" required></label><label>Inventory poll interval (seconds)<input type="number" min="30" max="86400" name="inventory_interval" value="{{.InventorySeconds}}" required></label><label>Expiry warning windows (days)<input name="expiry_warning_days" value="{{.ExpiryDays}}" placeholder="14, 3" inputmode="numeric"><small>One grouped warning per window when a device node key or auth key will expire within that many days. Leave blank to disable.</small></label><label>Expiry tag filter<input name="expiry_tag_filter" value="{{.ExpiryTags}}" placeholder="tag:server"><small>Optional. Only warn for devices and auth keys with one of these tags (comma-separated).</small></label></div>{{if .Configured}}<label class="check-label"><input type="checkbox" name="clear_webhook_secret"> Remove the configured webhook secret</label>{{end}}<button type="submit">Test and save monitoring</button></form></section>
-<section class="card diagnostics-card"><div class="section-heading"><div><h2>Deployment diagnostics</h2><p>These checks explain listener, HTTPS proxy, cookie, readiness, and storage assumptions without displaying secrets or raw request headers.</p></div><span class="status-pill status-{{.Diagnostics.State}}">{{.Diagnostics.State}}</span></div><div class="diagnostics-meta"><div><span>Listener</span><code>{{.Diagnostics.Listener}}</code></div><div><span>Cookies</span><strong>{{if .Diagnostics.CookieSecure}}Secure{{else}}HTTP-compatible{{end}}</strong></div><div><span>Trusted proxies</span><strong>{{.Diagnostics.TrustedProxyCount}}</strong></div><div><span>Database storage</span><strong>{{.Diagnostics.Storage.DatabaseBytes}} / {{.Diagnostics.Storage.DatabaseLimitBytes}} bytes</strong></div><div><span>Snapshot / event limits</span><strong>{{.Diagnostics.Storage.SnapshotLimitBytes}} / {{.Diagnostics.Storage.EventValueLimitBytes}} bytes</strong></div><div><span>History page limit</span><strong>{{.Diagnostics.Storage.HistoryPageLimitBytes}} bytes</strong></div>{{if .Diagnostics.Request.Origin}}<div><span>Current request origin</span><code>{{.Diagnostics.Request.Origin}}</code></div><div><span>Forwarded scheme</span><strong>{{if .Diagnostics.Request.ForwardedProto}}{{.Diagnostics.Request.ForwardedProto}}{{else}}not set{{end}}</strong></div><div><span>Proxy peer</span><strong>{{if .Diagnostics.Request.PeerTrustedProxy}}Trusted{{else}}Not trusted{{end}}</strong></div>{{end}}</div>{{if .Diagnostics.Findings}}<div class="diagnostics-list">{{range .Diagnostics.Findings}}<article class="diagnostic diagnostic-{{.Severity}}"><strong>{{.Summary}}</strong><span>{{.Remediation}}</span></article>{{end}}</div>{{else}}<p class="diagnostics-ok">No deployment findings.</p>{{end}}</section>
-<section class="card destinations-card"><div class="section-heading"><div><h2>Notification destinations</h2><p>Send alerts to one or more services. Each destination is delivered independently, so one unavailable service will not block the others.</p></div>{{if .Configured}}{{if .NotificationsPaused}}<span class="status-pill status-paused">Paused</span>{{else}}<span class="status-pill status-enabled">Active</span>{{end}}{{else}}<span class="status-pill status-neutral">Setup required</span>{{end}}</div>
-<div class="info-callout"><strong>Supported services</strong><span>Any <a href="https://containrrr.dev/shoutrrr/" target="_blank" rel="noopener noreferrer">Shoutrrr service URL</a> is accepted, including Mattermost: <code>mattermost://TailState@host/token?icon=satellite</code>.</span><span class="muted">Credentials are encrypted and never shown again. Only the service and host are displayed below.</span></div>
-{{if .Destinations}}<div class="destination-list">{{range .Destinations}}<article class="destination"><div class="destination-top"><div class="destination-identity"><h3>{{.Name}}</h3><code class="destination-url">{{.DisplayURL}}</code></div><span class="status-pill {{if .Enabled}}status-enabled{{else}}status-disabled{{end}}">{{if .Enabled}}Enabled{{else}}Disabled{{end}}</span></div><p class="muted destination-routing">Routing: {{.RoutingSummary}} · Format: {{.EffectiveFormat}}{{if not .Format}} (automatic){{end}}</p><div class="destination-actions"><form method="post" action="/settings/destinations/toggle"><input type="hidden" name="_csrf" value="{{$.CSRF}}"><input type="hidden" name="id" value="{{.ID}}"><input type="hidden" name="enabled" value="{{if .Enabled}}false{{else}}true{{end}}"><button class="button-secondary" type="submit">{{if .Enabled}}Disable{{else}}Enable{{end}}</button></form><form method="post" action="/settings/destinations/test"><input type="hidden" name="_csrf" value="{{$.CSRF}}"><input type="hidden" name="id" value="{{.ID}}"><button type="submit">Send test</button></form><form method="post" action="/settings/destinations/delete"><input type="hidden" name="_csrf" value="{{$.CSRF}}"><input type="hidden" name="id" value="{{.ID}}"><button class="button-danger" type="submit">Remove</button></form></div><details class="destination-edit"><summary>Edit destination</summary><form method="post" action="/settings/destinations"><input type="hidden" name="_csrf" value="{{$.CSRF}}"><input type="hidden" name="action" value="save"><input type="hidden" name="id" value="{{.ID}}"><input type="hidden" name="enabled" value="{{if .Enabled}}on{{end}}"><div class="grid"><label for="destination-name-{{.ID}}">Name<input id="destination-name-{{.ID}}" name="name" value="{{.Name}}" required></label><label for="destination-url-{{.ID}}">New Shoutrrr URL <small>Leave blank to keep the current endpoint.</small><input id="destination-url-{{.ID}}" type="password" name="service_url" autocomplete="new-password" placeholder="Paste a new service URL"></label></div><input type="hidden" name="routing" value="1"><fieldset class="routing"><legend>Routing</legend><p class="muted">Choose which inventory changes this destination receives. Health, expiry, and release notifications always reach every enabled destination.</p><div class="grid"><label for="destination-severity-{{.ID}}">Minimum severity<select id="destination-severity-{{.ID}}" name="min_severity"><option value="" {{if eq .MinSeverity ""}}selected{{end}}>All changes</option><option value="medium" {{if eq .MinSeverity "medium"}}selected{{end}}>Medium and high</option><option value="high" {{if eq .MinSeverity "high"}}selected{{end}}>High only</option></select></label><label for="destination-include-{{.ID}}">Only these collectors<input id="destination-include-{{.ID}}" name="include_collectors" value="{{.IncludeCollectors}}" placeholder="All collectors"></label><label for="destination-exclude-{{.ID}}">Never these collectors<input id="destination-exclude-{{.ID}}" name="exclude_collectors" value="{{.ExcludeCollectors}}" placeholder="None"></label><label for="destination-format-{{.ID}}">Message format<select id="destination-format-{{.ID}}" name="message_format"><option value="" {{if eq .Format ""}}selected{{end}}>Automatic (by service)</option><option value="markdown" {{if eq .Format "markdown"}}selected{{end}}>Markdown</option><option value="slack" {{if eq .Format "slack"}}selected{{end}}>Slack mrkdwn</option><option value="plain" {{if eq .Format "plain"}}selected{{end}}>Plain text</option></select></label></div><small>Collectors: {{range $index, $collector := $.Collectors}}{{if $index}}, {{end}}<code>{{$collector}}</code>{{end}}. Separate several with commas.</small><div class="check-row"><span>Change kinds</span>{{$kinds := .ChangeKinds}}{{range $kind := $.HistoryEventTypes}}<label class="check-label"><input type="checkbox" name="change_kinds" value="{{$kind}}" {{if or (not $kinds) (index $kinds $kind)}}checked{{end}}> {{$kind}}</label>{{end}}</div></fieldset><button type="submit">Save changes</button></form></details></article>{{end}}</div>{{else}}<div class="empty-state"><strong>No destinations yet</strong><span>Add a destination below to start receiving notifications.</span></div>{{end}}
-<div class="add-destination"><div class="section-heading"><div><h3>Add a destination</h3><p>Give it a recognizable name, then paste the service URL from your provider.</p></div></div><form method="post" action="/settings/destinations"><input type="hidden" name="_csrf" value="{{.CSRF}}"><input type="hidden" name="action" value="save"><div class="grid"><label for="new-destination-name">Name<input id="new-destination-name" name="name" placeholder="Mattermost" required></label><label for="new-destination-url">Shoutrrr URL<input id="new-destination-url" type="password" name="service_url" placeholder="mattermost://TailState@host/token?icon=satellite" required autocomplete="new-password"></label></div><label class="check-label" for="new-destination-enabled"><input id="new-destination-enabled" type="checkbox" name="enabled" checked> <span>Enable this destination</span></label><button type="submit">Add destination</button></form></div></section>
-<section class="card mutes-card"><div class="section-heading"><div><h2>Noise controls</h2><p>Mute predictable changes. Muted changes are still recorded in History and the signed evidence ledger, flagged as muted, but are left out of notifications. Rules apply to changes recorded after they are added.</p></div></div>
-{{if .MuteRules}}<div class="destination-list">{{range .MuteRules}}<article class="destination mute-rule"><div class="destination-top"><div class="destination-identity"><span class="status-pill status-neutral">{{.Kind}}</span> <code>{{.Value}}</code></div><form method="post" action="/settings/mutes"><input type="hidden" name="_csrf" value="{{$.CSRF}}"><input type="hidden" name="action" value="delete"><input type="hidden" name="id" value="{{.ID}}"><button class="button-danger" type="submit">Remove</button></form></div></article>{{end}}</div>{{else}}<div class="empty-state"><strong>No mute rules</strong><span>Every recorded change is notified.</span></div>{{end}}
-<form method="post" action="/settings/mutes" class="add-mute"><input type="hidden" name="_csrf" value="{{.CSRF}}"><input type="hidden" name="action" value="add"><div class="grid"><label for="mute-kind">Mute by<select id="mute-kind" name="kind"><option value="field">Field (collector.field)</option><option value="collector">Collector</option><option value="tag">Device tag</option><option value="resource">Resource ID or name</option></select></label><label for="mute-value">Value<input id="mute-value" name="value" required placeholder="devices.clientVersion, keys, tag:ci, or a device name"></label></div><button type="submit">Add mute rule</button></form></section>
-</main></body></html>
+{{define "title"}}TailState settings{{end}}
+{{define "content"}}
+<section class="card" aria-labelledby="settings-heading">
+  <h1 id="settings-heading">Monitoring settings</h1>
+  <p>Save Tailscale access separately from notification destinations. Notification URLs are encrypted and only their scheme and host are shown here.</p>
+  {{if .Message}}<div class="success" role="status">{{.Message}}</div>{{end}}
+  {{if .Error}}<div class="error" role="alert">{{.Error}}</div>{{end}}
+  {{if eq .NotificationState "no_destinations"}}<div class="error" role="alert">Notifications are paused because no destination is configured. Add a destination below. Monitoring continues.</div>
+  {{- else if eq .NotificationState "paused"}}<div class="error" role="alert">Notifications are paused because every destination is disabled. Monitoring continues.</div>{{end}}
+  <form method="post" action="/settings">
+    <input type="hidden" name="_csrf" value="{{.CSRF}}">
+    <div class="grid">
+      <label for="settings-tailnet">Tailnet
+        <input id="settings-tailnet" name="tailnet" value="{{.Settings.Tailnet}}" placeholder="-" autocomplete="off" spellcheck="false" required>
+        <small>Use <code>-</code> for the OAuth credential's tailnet.</small>
+      </label>
+      <label for="settings-client-id">OAuth client ID
+        <input id="settings-client-id" name="client_id" value="{{.Settings.OAuthClientID}}" autocomplete="off" spellcheck="false" required>
+      </label>
+      <label for="settings-client-secret">OAuth client secret
+        <input id="settings-client-secret" type="password" name="client_secret"{{if not .Configured}} required{{end}} placeholder="{{if .Configured}}Leave blank to keep current secret{{end}}" autocomplete="new-password">
+      </label>
+      <label for="settings-oauth-scopes">OAuth scopes
+        <input id="settings-oauth-scopes" name="oauth_scopes" value="{{.OAuthScopes}}" placeholder="all:read" autocomplete="off" spellcheck="false" aria-describedby="settings-oauth-scopes-help">
+        <small id="settings-oauth-scopes-help">Read scopes requested for the access token (space-separated). <code>devices:core:read</code> is required; collectors without a granted scope are shown as unsupported.</small>
+      </label>
+      <label for="settings-webhook-secret">Tailscale webhook secret
+        <input id="settings-webhook-secret" type="password" name="webhook_secret" placeholder="{{if .Configured}}Leave blank to keep current secret{{else}}Optional{{end}}" autocomplete="new-password">
+        <small>Paste the secret shown when you create a Tailscale webhook. TailState verifies signed deliveries at <code>/webhooks/tailscale</code>.</small>
+      </label>
+      <label for="settings-device-interval">Device poll interval (seconds)
+        <input id="settings-device-interval" type="number" min="15" max="86400" name="device_interval" value="{{.DeviceSeconds}}" inputmode="numeric" required>
+      </label>
+      <label for="settings-inventory-interval">Inventory poll interval (seconds)
+        <input id="settings-inventory-interval" type="number" min="30" max="86400" name="inventory_interval" value="{{.InventorySeconds}}" inputmode="numeric" required>
+      </label>
+      <label for="settings-expiry-days">Expiry warning windows (days)
+        <input id="settings-expiry-days" name="expiry_warning_days" value="{{.ExpiryDays}}" placeholder="14, 3" inputmode="numeric" autocomplete="off" aria-describedby="settings-expiry-days-help">
+        <small id="settings-expiry-days-help">One grouped warning per window when a device node key or auth key will expire within that many days. Leave blank to disable.</small>
+      </label>
+      <label for="settings-expiry-tags">Expiry tag filter
+        <input id="settings-expiry-tags" name="expiry_tag_filter" value="{{.ExpiryTags}}" placeholder="tag:server" autocomplete="off" spellcheck="false" aria-describedby="settings-expiry-tags-help">
+        <small id="settings-expiry-tags-help">Optional. Only warn for devices and auth keys with one of these tags (comma-separated).</small>
+      </label>
+    </div>
+    {{if .Configured}}<label class="check-label" for="settings-clear-webhook"><input id="settings-clear-webhook" type="checkbox" name="clear_webhook_secret"> <span>Remove the configured webhook secret</span></label>{{end}}
+    <button type="submit">Test and save monitoring</button>
+  </form>
+</section>
+
+<section class="card diagnostics-card" aria-labelledby="diagnostics-heading">
+  <div class="section-heading">
+    <div>
+      <h2 id="diagnostics-heading">Deployment diagnostics</h2>
+      <p>These checks explain listener, HTTPS proxy, cookie, readiness, and storage assumptions without displaying secrets or raw request headers.</p>
+    </div>
+    <span class="status-pill status-{{.Diagnostics.State}}">{{.Diagnostics.State}}</span>
+  </div>
+  <dl class="diagnostics-meta">
+    <div><dt>Listener</dt><dd><code>{{.Diagnostics.Listener}}</code></dd></div>
+    <div><dt>Cookies</dt><dd><strong>{{if .Diagnostics.CookieSecure}}Secure{{else}}HTTP-compatible{{end}}</strong></dd></div>
+    <div><dt>Trusted proxies</dt><dd><strong>{{.Diagnostics.TrustedProxyCount}}</strong></dd></div>
+    <div><dt>Database storage</dt><dd><strong>{{.Diagnostics.Storage.DatabaseBytes}} / {{.Diagnostics.Storage.DatabaseLimitBytes}} bytes</strong></dd></div>
+    <div><dt>Snapshot / event limits</dt><dd><strong>{{.Diagnostics.Storage.SnapshotLimitBytes}} / {{.Diagnostics.Storage.EventValueLimitBytes}} bytes</strong></dd></div>
+    <div><dt>History page limit</dt><dd><strong>{{.Diagnostics.Storage.HistoryPageLimitBytes}} bytes</strong></dd></div>
+    {{- if .Diagnostics.Request.Origin}}
+    <div><dt>Current request origin</dt><dd><code>{{.Diagnostics.Request.Origin}}</code></dd></div>
+    <div><dt>Forwarded scheme</dt><dd><strong>{{if .Diagnostics.Request.ForwardedProto}}{{.Diagnostics.Request.ForwardedProto}}{{else}}not set{{end}}</strong></dd></div>
+    <div><dt>Proxy peer</dt><dd><strong>{{if .Diagnostics.Request.PeerTrustedProxy}}Trusted{{else}}Not trusted{{end}}</strong></dd></div>
+    {{- end}}
+  </dl>
+  {{if .Diagnostics.Findings}}
+  <div class="diagnostics-list">
+    {{- range .Diagnostics.Findings}}
+    <article class="diagnostic diagnostic-{{.Severity}}"><strong>{{.Summary}}</strong><span>{{.Remediation}}</span></article>
+    {{- end}}
+  </div>
+  {{else}}
+  <p class="diagnostics-ok">No deployment findings.</p>
+  {{end}}
+</section>
+
+<section class="card destinations-card" aria-labelledby="destinations-heading">
+  <div class="section-heading">
+    <div>
+      <h2 id="destinations-heading">Notification destinations</h2>
+      <p>Send alerts to one or more services. Each destination is delivered independently, so one unavailable service will not block the others.</p>
+    </div>
+    {{if .Configured}}{{if .NotificationsPaused}}<span class="status-pill status-paused">Paused</span>{{else}}<span class="status-pill status-enabled">Active</span>{{end}}{{else}}<span class="status-pill status-neutral">Setup required</span>{{end}}
+  </div>
+  <div class="info-callout">
+    <strong>Supported services</strong>
+    <span>Any <a href="https://containrrr.dev/shoutrrr/" target="_blank" rel="noopener noreferrer">Shoutrrr service URL</a> is accepted, including Mattermost: <code>mattermost://TailState@host/token?icon=satellite</code>.</span>
+    <span class="muted">Credentials are encrypted and never shown again. Only the service and host are displayed below.</span>
+  </div>
+  {{if .Destinations}}
+  <div class="destination-list">
+    {{- range .Destinations}}
+    <article class="destination" aria-labelledby="destination-{{.ID}}">
+      <div class="destination-top">
+        <div class="destination-identity">
+          <h3 id="destination-{{.ID}}">{{.Name}}</h3>
+          <code class="destination-url">{{.DisplayURL}}</code>
+        </div>
+        <span class="status-pill {{if .Enabled}}status-enabled{{else}}status-disabled{{end}}">{{if .Enabled}}Enabled{{else}}Disabled{{end}}</span>
+      </div>
+      <p class="muted destination-routing">Routing: {{.RoutingSummary}} · Format: {{.EffectiveFormat}}{{if not .Format}} (automatic){{end}}</p>
+      <div class="destination-actions">
+        <form method="post" action="/settings/destinations/toggle">
+          <input type="hidden" name="_csrf" value="{{$.CSRF}}">
+          <input type="hidden" name="id" value="{{.ID}}">
+          <input type="hidden" name="enabled" value="{{if .Enabled}}false{{else}}true{{end}}">
+          <button class="button-secondary" type="submit" aria-label="{{if .Enabled}}Disable{{else}}Enable{{end}} {{.Name}}">{{if .Enabled}}Disable{{else}}Enable{{end}}</button>
+        </form>
+        <form method="post" action="/settings/destinations/test">
+          <input type="hidden" name="_csrf" value="{{$.CSRF}}">
+          <input type="hidden" name="id" value="{{.ID}}">
+          <button type="submit" aria-label="Send test to {{.Name}}">Send test</button>
+        </form>
+        <form method="post" action="/settings/destinations/delete">
+          <input type="hidden" name="_csrf" value="{{$.CSRF}}">
+          <input type="hidden" name="id" value="{{.ID}}">
+          <button class="button-danger" type="submit" aria-label="Remove {{.Name}}">Remove</button>
+        </form>
+      </div>
+      <details class="destination-edit">
+        <summary>Edit destination<span class="visually-hidden"> {{.Name}}</span></summary>
+        <form method="post" action="/settings/destinations">
+          <input type="hidden" name="_csrf" value="{{$.CSRF}}">
+          <input type="hidden" name="action" value="save">
+          <input type="hidden" name="id" value="{{.ID}}">
+          <input type="hidden" name="enabled" value="{{if .Enabled}}on{{end}}">
+          <div class="grid">
+            <label for="destination-name-{{.ID}}">Name
+              <input id="destination-name-{{.ID}}" name="name" value="{{.Name}}" autocomplete="off" required>
+            </label>
+            <label for="destination-url-{{.ID}}">New Shoutrrr URL <small>Leave blank to keep the current endpoint.</small>
+              <input id="destination-url-{{.ID}}" type="password" name="service_url" autocomplete="new-password" placeholder="Paste a new service URL">
+            </label>
+          </div>
+          <input type="hidden" name="routing" value="1">
+          <fieldset class="routing">
+            <legend>Routing<span class="visually-hidden"> for {{.Name}}</span></legend>
+            <p class="muted">Choose which inventory changes this destination receives. Health, expiry, and release notifications always reach every enabled destination.</p>
+            <div class="grid">
+              <label for="destination-severity-{{.ID}}">Minimum severity
+                <select id="destination-severity-{{.ID}}" name="min_severity">
+                  <option value=""{{if eq .MinSeverity ""}} selected{{end}}>All changes</option>
+                  <option value="medium"{{if eq .MinSeverity "medium"}} selected{{end}}>Medium and high</option>
+                  <option value="high"{{if eq .MinSeverity "high"}} selected{{end}}>High only</option>
+                </select>
+              </label>
+              <label for="destination-include-{{.ID}}">Only these collectors
+                <input id="destination-include-{{.ID}}" name="include_collectors" value="{{.IncludeCollectors}}" placeholder="All collectors" autocomplete="off" spellcheck="false" aria-describedby="destination-collectors-help-{{.ID}}">
+              </label>
+              <label for="destination-exclude-{{.ID}}">Never these collectors
+                <input id="destination-exclude-{{.ID}}" name="exclude_collectors" value="{{.ExcludeCollectors}}" placeholder="None" autocomplete="off" spellcheck="false" aria-describedby="destination-collectors-help-{{.ID}}">
+              </label>
+              <label for="destination-format-{{.ID}}">Message format
+                <select id="destination-format-{{.ID}}" name="message_format">
+                  <option value=""{{if eq .Format ""}} selected{{end}}>Automatic (by service)</option>
+                  <option value="markdown"{{if eq .Format "markdown"}} selected{{end}}>Markdown</option>
+                  <option value="slack"{{if eq .Format "slack"}} selected{{end}}>Slack mrkdwn</option>
+                  <option value="plain"{{if eq .Format "plain"}} selected{{end}}>Plain text</option>
+                </select>
+              </label>
+            </div>
+            <small id="destination-collectors-help-{{.ID}}">Collectors: {{range $index, $collector := $.Collectors}}{{if $index}}, {{end}}<code>{{$collector}}</code>{{end}}. Separate several with commas.</small>
+            <fieldset class="check-row">
+              <legend>Change kinds</legend>
+              {{- $id := .ID}}{{$kinds := .ChangeKinds}}{{range $kind := $.HistoryEventTypes}}
+              <label class="check-label" for="destination-kind-{{$id}}-{{$kind}}"><input id="destination-kind-{{$id}}-{{$kind}}" type="checkbox" name="change_kinds" value="{{$kind}}"{{if or (not $kinds) (index $kinds $kind)}} checked{{end}}> <span>{{$kind}}</span></label>
+              {{- end}}
+            </fieldset>
+          </fieldset>
+          <button type="submit" aria-label="Save changes to {{.Name}}">Save changes</button>
+        </form>
+      </details>
+    </article>
+    {{- end}}
+  </div>
+  {{else}}
+  <div class="empty-state"><strong>No destinations yet</strong><span>Add a destination below to start receiving notifications.</span></div>
+  {{end}}
+  <div class="add-destination">
+    <div class="section-heading">
+      <div>
+        <h3>Add a destination</h3>
+        <p>Give it a recognizable name, then paste the service URL from your provider.</p>
+      </div>
+    </div>
+    <form method="post" action="/settings/destinations">
+      <input type="hidden" name="_csrf" value="{{.CSRF}}">
+      <input type="hidden" name="action" value="save">
+      <div class="grid">
+        <label for="new-destination-name">Name
+          <input id="new-destination-name" name="name" placeholder="Mattermost" autocomplete="off" required>
+        </label>
+        <label for="new-destination-url">Shoutrrr URL
+          <input id="new-destination-url" type="password" name="service_url" placeholder="mattermost://TailState@host/token?icon=satellite" required autocomplete="new-password">
+        </label>
+      </div>
+      <label class="check-label" for="new-destination-enabled"><input id="new-destination-enabled" type="checkbox" name="enabled" checked> <span>Enable this destination</span></label>
+      <button type="submit">Add destination</button>
+    </form>
+  </div>
+</section>
+
+<section class="card mutes-card" aria-labelledby="mutes-heading">
+  <div class="section-heading">
+    <div>
+      <h2 id="mutes-heading">Noise controls</h2>
+      <p>Mute predictable changes. Muted changes are still recorded in History and the signed evidence ledger, flagged as muted, but are left out of notifications. Rules apply to changes recorded after they are added.</p>
+    </div>
+  </div>
+  {{if .MuteRules}}
+  <div class="destination-list">
+    {{- range .MuteRules}}
+    <article class="destination mute-rule">
+      <div class="destination-top">
+        <div class="destination-identity">
+          <span class="status-pill status-neutral">{{.Kind}}</span> <code>{{.Value}}</code>
+        </div>
+        <form method="post" action="/settings/mutes">
+          <input type="hidden" name="_csrf" value="{{$.CSRF}}">
+          <input type="hidden" name="action" value="delete">
+          <input type="hidden" name="id" value="{{.ID}}">
+          <button class="button-danger" type="submit" aria-label="Remove mute rule {{.Kind}} {{.Value}}">Remove</button>
+        </form>
+      </div>
+    </article>
+    {{- end}}
+  </div>
+  {{else}}
+  <div class="empty-state"><strong>No mute rules</strong><span>Every recorded change is notified.</span></div>
+  {{end}}
+  <form method="post" action="/settings/mutes" class="add-mute">
+    <input type="hidden" name="_csrf" value="{{.CSRF}}">
+    <input type="hidden" name="action" value="add">
+    <div class="grid">
+      <label for="mute-kind">Mute by
+        <select id="mute-kind" name="kind">
+          <option value="field">Field (collector.field)</option>
+          <option value="collector">Collector</option>
+          <option value="tag">Device tag</option>
+          <option value="resource">Resource ID or name</option>
+        </select>
+      </label>
+      <label for="mute-value">Value
+        <input id="mute-value" name="value" required placeholder="devices.clientVersion, keys, tag:ci, or a device name" autocomplete="off" spellcheck="false">
+      </label>
+    </div>
+    <button type="submit">Add mute rule</button>
+  </form>
+</section>
+{{end}}

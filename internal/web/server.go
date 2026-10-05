@@ -85,6 +85,9 @@ const (
 type pageData struct {
 	Error, Message, CSRF, Challenge string
 	Version                         string
+	// Page names the template being rendered. The shared layout uses it to
+	// choose the navigation and mark the active link.
+	Page                            string
 	Configured                      bool
 	Settings                        store.Settings
 	DeviceSeconds, InventorySeconds int64
@@ -212,7 +215,7 @@ type readinessCollector struct {
 func New(config boot.Config, st *store.Store, engine *monitor.Engine) (*Server, error) {
 	templates := map[string]*template.Template{}
 	for _, name := range []string{"setup", "login", "reset", "settings", "status", "history"} {
-		parsed, err := template.ParseFS(assets, "templates/"+name+".html")
+		parsed, err := template.ParseFS(assets, "templates/layout.html", "templates/"+name+".html")
 		if err != nil {
 			return nil, err
 		}
@@ -339,10 +342,11 @@ func (s *Server) render(w http.ResponseWriter, name string, data pageData) {
 func (s *Server) renderStatus(w http.ResponseWriter, name string, data pageData, code int) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	data.Version = s.config.Version
+	data.Page = name
 	if code != http.StatusOK {
 		w.WriteHeader(code)
 	}
-	if err := s.templates[name].Execute(w, data); err != nil {
+	if err := s.templates[name].ExecuteTemplate(w, "layout", data); err != nil {
 		slog.Error("render template", "template", name, "error", err)
 	}
 }

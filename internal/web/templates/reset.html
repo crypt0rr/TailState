@@ -1,1 +1,22 @@
-<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Reset TailState password</title><link rel="stylesheet" href="/static/style.css"></head><body><main class="narrow"><section class="card"><h1>Reset administrator password <span class="app-version">Version {{.Version}}</span></h1><p>Generate a reset token with <code>tailstate admin reset</code>. Tokens expire after 30 minutes and are single-use.</p>{{if .Error}}<div class="error">{{.Error}}</div>{{end}}<form method="post" action="/reset"><input type="hidden" name="_challenge" value="{{.Challenge}}"><label>Reset token<input name="token" required></label><label>New password<input type="password" name="password" minlength="12" required></label><label>Confirm password<input type="password" name="confirm" minlength="12" required></label><button type="submit">Reset password</button></form><a href="/login">Back to login</a></section></main></body></html>
+{{define "title"}}Reset TailState password{{end}}
+{{define "content"}}
+<section class="card">
+  <h1>Reset administrator password</h1>
+  <p>Generate a reset token with <code>tailstate admin reset</code>. Tokens expire after 30 minutes and are single-use.</p>
+  {{if .Error}}<div class="error" role="alert">{{.Error}}</div>{{end}}
+  <form method="post" action="/reset">
+    <input type="hidden" name="_challenge" value="{{.Challenge}}">
+    <label for="reset-token">Reset token
+      <input id="reset-token" name="token" autocomplete="one-time-code" spellcheck="false" required>
+    </label>
+    <label for="reset-password">New password
+      <input id="reset-password" type="password" name="password" minlength="12" autocomplete="new-password" required>
+    </label>
+    <label for="reset-confirm">Confirm password
+      <input id="reset-confirm" type="password" name="confirm" minlength="12" autocomplete="new-password" required>
+    </label>
+    <button type="submit">Reset password</button>
+  </form>
+  <p><a href="/login">Back to login</a></p>
+</section>
+{{end}}

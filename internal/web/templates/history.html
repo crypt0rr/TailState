@@ -1,36 +1,147 @@
-<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>TailState history</title>
-  <link rel="stylesheet" href="/static/style.css">
-</head>
-<body>
-<header><div class="brand"><strong>TailState</strong><span class="app-version">Version {{.Version}}</span></div><nav><a href="/status">Status</a><a class="active" href="/history">History</a><a href="/settings">Settings</a><form method="post" action="/logout"><input type="hidden" name="_csrf" value="{{.CSRF}}"><button class="link" type="submit">Log out</button></form></nav></header>
-<main>
-<section class="card history-card">
-  <div class="section-heading"><div><h1>Change history</h1><p>Review normalized Tailscale inventory changes and see whether each notification was delivered.</p></div><span class="retention-note">Events retained for 30 days{{if .EvidenceSigningKeyID}} · Signed key <code>{{.EvidenceSigningKeyID}}</code>{{end}}</span></div>
-  {{if .HistoryFilter.BatchID}}<div class="notice">Showing batch #{{.HistoryFilter.BatchID}} only. <a href="/history">Show all batches</a></div>{{end}}
-  <form class="history-filters" method="get" action="/history">{{if .HistoryFilter.BatchID}}<input type="hidden" name="batch" value="{{.HistoryFilter.BatchID}}">{{end}}<label for="history-collector">Collector<select id="history-collector" name="collector"><option value="">All collectors</option>{{range .HistoryCollectors}}<option value="{{.}}" {{if eq . $.HistoryFilter.Collector}}selected{{end}}>{{.}}</option>{{end}}</select></label><label for="history-type">Change type<select id="history-type" name="event_type"><option value="">All change types</option>{{range .HistoryEventTypes}}<option value="{{.}}" {{if eq . $.HistoryFilter.EventType}}selected{{end}}>{{.}}</option>{{end}}</select></label><label for="history-severity">Severity<select id="history-severity" name="severity"><option value="">All severities</option>{{range .HistorySeverities}}<option value="{{.}}" {{if eq . $.HistoryFilter.Severity}}selected{{end}}>{{.}}</option>{{end}}</select></label><label for="history-resource">Resource or ID<input id="history-resource" name="resource" value="{{.HistoryFilter.ResourceID}}" placeholder="Search names and IDs"></label><div class="filter-actions"><button type="submit">Filter history</button><a class="button-link" href="/history">Clear</a><a class="button-link" href="{{.HistoryExportURL}}">Download evidence pack</a></div></form>
-  {{if .History.Truncated}}<div class="notice">This page reached its {{.History.ByteLimit}}-byte history read budget. Older batches were not loaded{{if .History.TruncationReason}} ({{.History.TruncationReason}}){{end}}. Narrow the filters to inspect more detail.</div>{{end}}
+{{define "title"}}TailState history{{end}}
+{{define "content"}}
+<section class="card history-card" aria-labelledby="history-heading">
+  <div class="section-heading">
+    <div>
+      <h1 id="history-heading">Change history</h1>
+      <p>Review normalized Tailscale inventory changes and see whether each notification was delivered.</p>
+    </div>
+    <span class="retention-note">Events retained for 30 days{{if .EvidenceSigningKeyID}} · Signed key <code>{{.EvidenceSigningKeyID}}</code>{{end}}</span>
+  </div>
+
+  {{if .HistoryFilter.BatchID}}<div class="notice" role="status">Showing batch #{{.HistoryFilter.BatchID}} only. <a href="/history">Show all batches</a></div>{{end}}
+
+  <form class="history-filters" method="get" action="/history" role="search" aria-label="Filter history">
+    {{- if .HistoryFilter.BatchID}}
+    <input type="hidden" name="batch" value="{{.HistoryFilter.BatchID}}">
+    {{- end}}
+    <label for="history-collector">Collector
+      <select id="history-collector" name="collector">
+        <option value="">All collectors</option>
+        {{- range .HistoryCollectors}}
+        <option value="{{.}}"{{if eq . $.HistoryFilter.Collector}} selected{{end}}>{{.}}</option>
+        {{- end}}
+      </select>
+    </label>
+    <label for="history-type">Change type
+      <select id="history-type" name="event_type">
+        <option value="">All change types</option>
+        {{- range .HistoryEventTypes}}
+        <option value="{{.}}"{{if eq . $.HistoryFilter.EventType}} selected{{end}}>{{.}}</option>
+        {{- end}}
+      </select>
+    </label>
+    <label for="history-severity">Severity
+      <select id="history-severity" name="severity">
+        <option value="">All severities</option>
+        {{- range .HistorySeverities}}
+        <option value="{{.}}"{{if eq . $.HistoryFilter.Severity}} selected{{end}}>{{.}}</option>
+        {{- end}}
+      </select>
+    </label>
+    <label for="history-resource">Resource or ID
+      <input id="history-resource" name="resource" value="{{.HistoryFilter.ResourceID}}" placeholder="Search names and IDs" autocomplete="off" spellcheck="false">
+    </label>
+    <div class="filter-actions">
+      <button type="submit">Filter history</button>
+      <a class="button-link" href="/history">Clear</a>
+      <a class="button-link" href="{{.HistoryExportURL}}">Download evidence pack</a>
+    </div>
+  </form>
+
+  {{if .History.Truncated}}<div class="notice" role="status">This page reached its {{.History.ByteLimit}}-byte history read budget. Older batches were not loaded{{if .History.TruncationReason}} ({{.History.TruncationReason}}){{end}}. Narrow the filters to inspect more detail.</div>{{end}}
+
   {{if .History.Batches}}
   <div class="history-list">
-    {{range .History.Batches}}
-    <article class="history-batch">
-      <div class="history-batch-heading"><div><time datetime="{{.ObservedAt.Format "2006-01-02T15:04:05Z07:00"}}">{{.ObservedAt.Format "02 Jan 2006 15:04 UTC"}}</time><span class="history-count">{{.ChangeCount}} change{{if ne .ChangeCount 1}}s{{end}}</span></div><span class="history-batch-id">Batch #{{.ID}}{{if .TriggerIDs}} · webhooks {{range $index,$triggerID := .TriggerIDs}}{{if $index}}, {{end}}#{{$triggerID}}{{end}}{{else if .TriggerID}} · webhook #{{.TriggerID}}{{end}}</span></div>
-      <div class="history-events">
-        {{range .Events}}<details class="history-event" open><summary><span class="event-type event-type-{{.EventType}}">{{.EventType}}</span>{{if .Severity}}<span class="severity severity-{{.Severity}}">{{.Severity}}</span>{{end}}{{if .Muted}}<span class="muted-flag" title="Left out of notifications by a mute rule">muted</span>{{end}}<span><strong>{{.Name}}</strong> <code>{{.Collector}} / {{.ResourceID}}</code></span></summary>{{if .Fields}}<div class="field-diff"><div class="diff-heading"><span>Field</span><span>Previous</span><span>Current</span></div>{{range .Fields}}<div class="diff-row"><code>{{.Field}}</code><span>{{if .HasOld}}<code class="diff-old">{{.Old}}</code>{{else}}<span class="diff-empty">—</span>{{end}}</span><span>{{if .HasNew}}<code class="diff-new">{{.New}}</code>{{else}}<span class="diff-empty">—</span>{{end}}</span></div>{{end}}</div>{{end}}{{if .FieldsTruncated}}<p class="muted">Additional field changes omitted; {{.TotalFields}} total field changes.</p>{{end}}{{if .BeforeTruncated}}<p class="muted">Previous snapshot is represented by a bounded marker ({{.BeforeBytes}} bytes; SHA-256 <code>{{.BeforeHash}}</code>).</p>{{end}}{{if .AfterTruncated}}<p class="muted">Current snapshot is represented by a bounded marker ({{.AfterBytes}} bytes; SHA-256 <code>{{.AfterHash}}</code>).</p>{{end}}{{if .BeforeJSON}}<details class="snapshot"><summary>Previous normalized snapshot</summary><pre><code>{{.BeforeJSON}}</code></pre></details>{{end}}{{if .AfterJSON}}<details class="snapshot"><summary>Current normalized snapshot</summary><pre><code>{{.AfterJSON}}</code></pre></details>{{end}}</details>{{end}}
+    {{- range .History.Batches}}
+    <article class="history-batch" aria-labelledby="batch-{{.ID}}">
+      <div class="history-batch-heading">
+        <div>
+          <h2 class="history-batch-title" id="batch-{{.ID}}"><time datetime="{{.ObservedAt.UTC.Format "2006-01-02T15:04:05Z07:00"}}">{{.ObservedAt.UTC.Format "02 Jan 2006 15:04 UTC"}}</time></h2>
+          <span class="history-count">{{.ChangeCount}} change{{if ne .ChangeCount 1}}s{{end}}</span>
+        </div>
+        <span class="history-batch-id">Batch #{{.ID}}{{if .TriggerIDs}} · webhooks {{range $index, $triggerID := .TriggerIDs}}{{if $index}}, {{end}}#{{$triggerID}}{{end}}{{else if .TriggerID}} · webhook #{{.TriggerID}}{{end}}</span>
       </div>
-      <div class="delivery-summary"><h3>Notification delivery</h3>{{if .Deliveries}}<div class="delivery-list">{{range .Deliveries}}<div class="delivery-row"><span class="delivery-status delivery-status-{{.Status}}">{{.Status}}</span><strong>{{.Destination}}</strong>{{if eq .Status "dead"}}<span class="delivery-error">{{.LastError}}</span>{{else if eq .Status "pending"}}<span class="muted">Retry {{if .NextAttempt}}{{.NextAttempt.Format "02 Jan 15:04 UTC"}}{{else}}scheduled{{end}}</span>{{else}}<span class="muted">Delivered{{if .DeliveredAt}} {{.DeliveredAt.Format "02 Jan 15:04 UTC"}}{{end}}</span>{{end}}</div>{{end}}</div>{{else}}<p class="muted">No destination delivery was queued for this batch.</p>{{end}}</div>
+      <div class="history-events">
+        {{- range .Events}}
+        <details class="history-event" open>
+          <summary>
+            <span class="event-type event-type-{{.EventType}}">{{.EventType}}</span>
+            {{- if .Severity}}
+            <span class="severity severity-{{.Severity}}"><span class="visually-hidden">Severity: </span>{{.Severity}}</span>
+            {{- end}}
+            {{- if .Muted}}
+            <span class="muted-flag" title="Left out of notifications by a mute rule">muted<span class="visually-hidden"> (left out of notifications by a mute rule)</span></span>
+            {{- end}}
+            <span><strong>{{.Name}}</strong> <code>{{.Collector}} / {{.ResourceID}}</code></span>
+          </summary>
+          {{- if .Fields}}
+          <table class="data-table field-diff">
+            <caption class="visually-hidden">Field changes for {{.Name}}</caption>
+            <thead>
+              <tr>
+                <th scope="col">Field</th>
+                <th scope="col">Previous</th>
+                <th scope="col">Current</th>
+              </tr>
+            </thead>
+            <tbody>
+              {{- range .Fields}}
+              <tr>
+                <th scope="row" data-label="Field"><code>{{.Field}}</code></th>
+                <td data-label="Previous"><span class="diff-marker diff-marker-old">Old</span>{{if .HasOld}}<code class="diff-old">{{.Old}}</code>{{else}}<span class="diff-empty">(absent)</span>{{end}}</td>
+                <td data-label="Current"><span class="diff-marker diff-marker-new">New</span>{{if .HasNew}}<code class="diff-new">{{.New}}</code>{{else}}<span class="diff-empty">(absent)</span>{{end}}</td>
+              </tr>
+              {{- end}}
+            </tbody>
+          </table>
+          {{- end}}
+          {{- if .FieldsTruncated}}<p class="muted">Additional field changes omitted; {{.TotalFields}} total field changes.</p>{{end}}
+          {{- if .BeforeTruncated}}<p class="muted">Previous snapshot is represented by a bounded marker ({{.BeforeBytes}} bytes; SHA-256 <code>{{.BeforeHash}}</code>).</p>{{end}}
+          {{- if .AfterTruncated}}<p class="muted">Current snapshot is represented by a bounded marker ({{.AfterBytes}} bytes; SHA-256 <code>{{.AfterHash}}</code>).</p>{{end}}
+          {{- if .BeforeJSON}}
+          <details class="snapshot">
+            <summary>Previous normalized snapshot</summary>
+            <pre><code>{{.BeforeJSON}}</code></pre>
+          </details>
+          {{- end}}
+          {{- if .AfterJSON}}
+          <details class="snapshot">
+            <summary>Current normalized snapshot</summary>
+            <pre><code>{{.AfterJSON}}</code></pre>
+          </details>
+          {{- end}}
+        </details>
+        {{- end}}
+      </div>
+      <div class="delivery-summary">
+        <h3>Notification delivery</h3>
+        {{- if .Deliveries}}
+        <ul class="delivery-list">
+          {{- range .Deliveries}}
+          <li class="delivery-row">
+            <span class="delivery-status delivery-status-{{.Status}}">{{.Status}}</span>
+            <strong>{{.Destination}}</strong>
+            {{- if eq .Status "dead"}}
+            <span class="delivery-error">{{.LastError}}</span>
+            {{- else if eq .Status "pending"}}
+            <span class="muted">Retry {{if .NextAttempt}}{{.NextAttempt.UTC.Format "02 Jan 15:04 UTC"}}{{else}}scheduled{{end}}</span>
+            {{- else}}
+            <span class="muted">Delivered{{if .DeliveredAt}} {{.DeliveredAt.UTC.Format "02 Jan 15:04 UTC"}}{{end}}</span>
+            {{- end}}
+          </li>
+          {{- end}}
+        </ul>
+        {{- else}}
+        <p class="muted">No destination delivery was queued for this batch.</p>
+        {{- end}}
+      </div>
     </article>
-    {{end}}
+    {{- end}}
   </div>
-  {{if .History.HasNext}}<div class="history-pagination"><a class="button-link" href="{{.HistoryNextURL}}">Load older changes</a></div>{{end}}
+  {{if .History.HasNext}}<nav class="history-pagination" aria-label="History pages"><a class="button-link" href="{{.HistoryNextURL}}">Load older changes</a></nav>{{end}}
   {{else}}
   <div class="empty-state"><strong>No changes match these filters</strong><span>TailState keeps changes quiet during the initial baseline. New additions, modifications, and removals will appear here after polling.</span></div>
   {{end}}
 </section>
-</main>
-</body>
-</html>
+{{end}}

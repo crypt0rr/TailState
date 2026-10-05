@@ -52,7 +52,7 @@ func TestSettingsConfigureOAuthScopesAndStatusLabelsInsufficientScope(t *testing
 		t.Fatal(err)
 	}
 	status := authenticatedGet(t, server, "/status", cookies).Body.String()
-	if !strings.Contains(status, "<code>oauth_apps</code></span><span>Unsupported</span>") || !strings.Contains(status, "insufficient OAuth scope or plan") {
+	if !strings.Contains(status, "<code>oauth_apps</code></th>") || !strings.Contains(status, `<td data-label="State">Unsupported</td>`) || !strings.Contains(status, "insufficient OAuth scope or plan") {
 		t.Fatalf("status page does not label the insufficient scope: %s", status)
 	}
 }

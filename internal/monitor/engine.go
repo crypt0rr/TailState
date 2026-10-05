@@ -37,7 +37,6 @@ const (
 	deliveryLeaseRenewalFraction    = 3
 	minDeliveryLeaseRenewalInterval = 100 * time.Millisecond
 	deliveryDurationBucketCount     = 9
-	cleanupContinuationInterval     = time.Second
 )
 
 var deliveryDurationBucketBounds = [deliveryDurationBucketCount]float64{0.1, 0.5, 1, 5, 15, 30, 60, 120, 300}
@@ -136,8 +135,12 @@ var (
 	schedulerWaitInterval      = 5 * time.Second
 	deliveryPollInterval       = 2 * time.Second
 	cleanupPollInterval        = time.Hour
-	collectorPollTimeout       = 2 * time.Minute
-	collectorRetryInterval     = 30 * time.Second
+	// cleanupContinuationInterval is used only when a successful bounded
+	// cleanup pass stopped with work remaining, and as the first retry after
+	// a cleanup error.
+	cleanupContinuationInterval = time.Second
+	collectorPollTimeout        = 2 * time.Minute
+	collectorRetryInterval      = 30 * time.Second
 )
 
 const maxTriggerOverflow = 1024
@@ -1017,8 +1020,34 @@ func (e *Engine) recordCleanup(stats store.CleanupStats, err error) {
 	e.cleanupStats.deadOutboxDeleted.Add(uint64(max(stats.DeadOutboxDeleted, 0)))
 }
 
+// cleanupBackoff schedules retention passes. Genuine leftover work continues
+// after cleanupContinuationInterval; consecutive errors back off
+// exponentially from that interval up to cleanupPollInterval so a persistent
+// failure (corruption, a full disk, a storage limit) does not open a write
+// transaction and log an error every second forever. A successful pass
+// resets the backoff.
+type cleanupBackoff struct {
+	failures int
+}
+
+func (b *cleanupBackoff) next(remaining bool, err error) time.Duration {
+	if err != nil {
+		b.failures++
+		delay := cleanupContinuationInterval
+		for attempt := 1; attempt < b.failures && delay < cleanupPollInterval; attempt++ {
+			delay *= 2
+		}
+		return min(delay, cleanupPollInterval)
+	}
+	b.failures = 0
+	if remaining && cleanupPollInterval > cleanupContinuationInterval {
+		return cleanupContinuationInterval
+	}
+	return cleanupPollInterval
+}
+
 func (e *Engine) cleanup(ctx context.Context) {
-	run := func(initial bool) bool {
+	run := func(initial bool) (bool, error) {
 		stats, err := e.store.CleanupWithOptions(ctx, store.CleanupOptions{Retention: 30 * 24 * time.Hour})
 		e.recordCleanup(stats, err)
 		if err != nil {
@@ -1029,32 +1058,23 @@ func (e *Engine) cleanup(ctx context.Context) {
 					slog.Error("retention cleanup failed", "phase", stats.FailedPhase, "error", err)
 				}
 			}
-			// A transient lock or I/O error should be retried on the early
-			// continuation schedule instead of waiting a full hour.
-			return true
+			// A transient lock or I/O error is retried soon, with backoff for
+			// consecutive failures (see cleanupBackoff).
+			return stats.Remaining, err
 		}
 		slog.Info("retention cleanup completed", "duration_ms", stats.Duration.Milliseconds(), "transactions", stats.Transactions, "sessions_deleted", stats.SessionsDeleted, "auth_tokens_deleted", stats.AuthTokensDeleted, "meta_deleted", stats.MetaDeleted, "outbox_dead_lettered", stats.OutboxDeadLettered, "webhook_dead_lettered", stats.WebhookDeadLettered, "events_deleted", stats.EventsDeleted, "event_batches_deleted", stats.EventBatchesDeleted, "event_batch_triggers_deleted", stats.EventBatchTriggersDeleted, "webhook_triggers_deleted", stats.WebhookTriggersDeleted, "delivered_outbox_deleted", stats.DeliveredOutboxDeleted, "dead_outbox_deleted", stats.DeadOutboxDeleted, "remaining", stats.Remaining)
-		return stats.Remaining
+		return stats.Remaining, nil
 	}
 
-	remaining := run(true)
-	wait := cleanupPollInterval
-	if remaining && wait > cleanupContinuationInterval {
-		wait = cleanupContinuationInterval
-	}
-	timer := time.NewTimer(wait)
+	var backoff cleanupBackoff
+	timer := time.NewTimer(backoff.next(run(true)))
 	defer timer.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-timer.C:
-			remaining = run(false)
-			wait := cleanupPollInterval
-			if remaining && wait > cleanupContinuationInterval {
-				wait = cleanupContinuationInterval
-			}
-			timer.Reset(wait)
+			timer.Reset(backoff.next(run(false)))
 		}
 	}
 }

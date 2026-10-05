@@ -330,6 +330,14 @@ in a disposable project before relying on the procedure for an outage.
   instead of silently rebasing. A later non-403/404 failure is recorded as a
   transient supported collector failure rather than retaining the unsupported
   label.
+- Log streaming is the exception to the 404 rule: Tailscale returns `404` from
+  `/logging/{kind}/stream` when no stream is configured, so TailState records
+  that kind as `{"configured": false}` and diffs it like any other state.
+  Deleting a configuration or network log stream, or configuring the first one,
+  is reported as a change. Only a `403` for both kinds marks the collector
+  unsupported. When a stream's status endpoint returns `404`, `403`, or `502`,
+  the stream configuration is kept and its status is recorded as
+  `unavailable`.
 - Collection endpoints must return the documented array field. TailState treats
   an omitted, `null`, or wrong-typed `userInvites` or `webhooks` field as an
   invalid upstream response and preserves the last known snapshots; an

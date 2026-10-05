@@ -47,6 +47,13 @@ func TestHealthzRespondsDuringLongWriteTransaction(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// API tokens and their status/history reads use the read-only pool;
+	// the first use's last-used touch is bounded and best effort.
+	_, apiToken, err := st.CreateAPIToken(context.Background(), "SIEM", []string{store.ScopeStatusRead, store.ScopeHistoryRead}, 24*time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	locker, err := sql.Open("sqlite", "file:"+path+"?_pragma=busy_timeout(5000)&_txlock=immediate")
 	if err != nil {
 		t.Fatal(err)
@@ -68,7 +75,7 @@ func TestHealthzRespondsDuringLongWriteTransaction(t *testing.T) {
 	// Give the write time to take the writer connection and start waiting.
 	time.Sleep(100 * time.Millisecond)
 
-	for _, route := range []string{"/healthz", "/readyz", "/metrics", "/history", "/status"} {
+	for _, route := range []string{"/healthz", "/readyz", "/metrics", "/history", "/status", "/api/v1/status", "/api/v1/history"} {
 		started := time.Now()
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		request := httptest.NewRequest(http.MethodGet, route, nil).WithContext(ctx)
@@ -77,6 +84,9 @@ func TestHealthzRespondsDuringLongWriteTransaction(t *testing.T) {
 			for _, cookie := range cookies {
 				request.AddCookie(cookie)
 			}
+		}
+		if strings.HasPrefix(route, "/api/") {
+			request.Header.Set("Authorization", "Bearer "+apiToken)
 		}
 		response := httptest.NewRecorder()
 		server.Handler().ServeHTTP(response, request)

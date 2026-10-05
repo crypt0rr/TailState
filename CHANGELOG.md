@@ -23,6 +23,7 @@ rollback requires restoring the backup taken before the upgrade. See
 ### Security
 - Administrator passwords follow a length-first policy with a common-password blocklist; Settings can change the password, list sessions, and sign out other sessions; sessions end after 60 minutes idle (the status auto-refresh does not count); HSTS on HTTPS requests only; `__Host-` session cookies when cookies are secure. Schema 15 adds `sessions.last_seen_at` (#189).
 - Administrative audit trail (`admin_audit`, schema 15, 365-day retention) for sign-ins, password and session changes, settings (including OAuth scopes and expiry warnings), destinations, mute rules, Reconcile now, and Retry dead letters, with a "TailState configuration changed" notice to previously enabled destinations for high-risk changes (#177).
+- Scoped, read-only API tokens (`status:read`, `history:read`, `evidence:read`; hashed in schema 15, shown once after Post/Redirect/Get) and `GET /api/v1/status`, `/api/v1/history` (NDJSON, History filters including dates, bidirectional cursors), and `/api/v1/evidence` (#196).
 
 ## [0.13.0] - 2026-10-06
 

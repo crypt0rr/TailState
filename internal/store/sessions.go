@@ -24,7 +24,20 @@ const (
 	// shown in the session list and recorded in the administrative audit log.
 	sessionRefLength  = 12
 	maxListedSessions = 200
+	// bookkeepingWriteTimeout bounds the best-effort writes made while
+	// authenticating a request (the last-seen touch and the removal of an
+	// idle session), so a request that only reads is never held for the
+	// whole busy timeout while another writer owns the database.
+	bookkeepingWriteTimeout = 250 * time.Millisecond
 )
+
+// bookkeepingWrite runs a best-effort write with bookkeepingWriteTimeout.
+func (s *Store) bookkeepingWrite(ctx context.Context, query string, args ...any) error {
+	ctx, cancel := context.WithTimeout(ctx, bookkeepingWriteTimeout)
+	defer cancel()
+	_, err := s.db.ExecContext(ctx, query, args...)
+	return err
+}
 
 // SessionInfo describes one active session without its secret material. Ref
 // is a prefix of the stored token hash: enough to tell sessions apart and to
@@ -93,7 +106,7 @@ func (s *Store) AuthenticateSession(ctx context.Context, token, csrf string, req
 		return SessionInfo{}, false
 	}
 	if !info.IdleUntil.After(now) {
-		_, _ = s.db.ExecContext(ctx, "DELETE FROM sessions WHERE token_hash=?", hash)
+		_ = s.bookkeepingWrite(ctx, "DELETE FROM sessions WHERE token_hash=?", hash)
 		return SessionInfo{}, false
 	}
 	if requireCSRF && subtle.ConstantTimeCompare([]byte(secret.HashToken(csrf)), []byte(csrfHash)) != 1 {
@@ -102,7 +115,7 @@ func (s *Store) AuthenticateSession(ctx context.Context, token, csrf string, req
 	if activity && now.Sub(info.LastSeenAt) >= sessionTouchInterval {
 		// A failed touch only shortens the idle window; it never grants
 		// access, so the error is not surfaced to the request.
-		if _, err := s.db.ExecContext(ctx, "UPDATE sessions SET last_seen_at=? WHERE token_hash=?", now.Format(time.RFC3339Nano), hash); err == nil {
+		if err := s.bookkeepingWrite(ctx, "UPDATE sessions SET last_seen_at=? WHERE token_hash=?", now.Format(time.RFC3339Nano), hash); err == nil {
 			info.LastSeenAt = now
 			info.IdleUntil = now.Add(SessionIdleTimeout)
 		}

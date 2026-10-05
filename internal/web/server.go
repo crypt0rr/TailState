@@ -64,6 +64,12 @@ type Server struct {
 	// destination before a change disables, removes, or redirects it.
 	noticeSender  notify.Sender
 	noticeTimeout time.Duration
+	// apiWindows holds each API token's current rate-limit window.
+	apiMu      sync.Mutex
+	apiWindows map[int64]apiWindow
+	// tokenReveals holds newly created API token secrets, in memory only,
+	// until the Settings page that follows the creation shows them once.
+	tokenReveals *revealStore
 }
 
 const (
@@ -134,6 +140,10 @@ type pageData struct {
 	DestinationDeliveries           []store.DestinationDelivery
 	Sessions                        []store.SessionInfo
 	AdminActivity                   []store.AdminAuditEntry
+	APITokens                       []store.APIToken
+	APIScopes                       []string
+	APITokenLifetimes               []int
+	NewAPIToken                     string
 	SessionIdleMinutes              int
 	MinPasswordLength               int
 }
@@ -270,6 +280,8 @@ func New(config boot.Config, st *store.Store, engine *monitor.Engine) (*Server, 
 		reconcileCooldown:    defaultReconcileCooldown,
 		noticeSender:         notify.New(),
 		noticeTimeout:        defaultNoticeTimeout,
+		apiWindows:           map[int64]apiWindow{},
+		tokenReveals:         newRevealStore(),
 	}, nil
 }
 
@@ -313,6 +325,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /settings/mutes", s.mutePost)
 	mux.HandleFunc("POST /settings/password", s.passwordPost)
 	mux.HandleFunc("POST /settings/sessions/revoke-others", s.sessionsPost)
+	mux.HandleFunc("POST /settings/api-tokens", s.apiTokenPost)
+	mux.HandleFunc("GET /api/v1/status", s.apiStatus)
+	mux.HandleFunc("GET /api/v1/history", s.apiHistory)
+	mux.HandleFunc("GET /api/v1/evidence", s.apiEvidence)
 	return s.security(mux)
 }
 
@@ -935,6 +951,21 @@ func historyDateError(r *http.Request) string {
 	return ""
 }
 
+// historyDatesValid reports whether every supplied from/to date parses. The
+// History page ignores an invalid date and explains why; the API refuses it,
+// because a client would otherwise silently receive an unfiltered page.
+func historyDatesValid(r *http.Request) bool {
+	query := r.URL.Query()
+	for _, name := range []string{"from", "to"} {
+		if value := strings.TrimSpace(query.Get(name)); value != "" {
+			if _, err := time.Parse(historyDateLayout, value); err != nil {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 // historyDateValues returns the from/to form values for a filter.
 func historyDateValues(filter store.HistoryFilter) (string, string) {
 	var from, to string
@@ -1333,6 +1364,12 @@ func (s *Server) settingsData(ctx context.Context, csrf string, configured bool,
 		data.MuteRules = rules
 	} else {
 		slog.Error("load mute rules", "error", err)
+	}
+	data.APIScopes, data.APITokenLifetimes = store.APIScopes, apiTokenLifetimes
+	if tokens, err := s.store.ListAPITokens(ctx); err == nil {
+		data.APITokens = tokens
+	} else {
+		slog.Error("load API tokens", "error", err)
 	}
 	if activity, err := s.store.RecentAdminAudit(ctx, recentAdminActivity); err == nil {
 		data.AdminActivity = activity
@@ -1945,6 +1982,7 @@ func (s *Server) writeMetrics(b *bytes.Buffer, status store.Status, storage stor
 			{"delivered_outbox", cleanup.DeliveredOutboxDeleted},
 			{"dead_outbox", cleanup.DeadOutboxDeleted},
 			{"admin_audit", cleanup.AdminAuditDeleted},
+			{"api_tokens", cleanup.APITokensDeleted},
 		} {
 			fmt.Fprintf(b, "tailstate_cleanup_rows_total{table=%q} %d\n", row.table, row.count)
 		}

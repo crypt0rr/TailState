@@ -326,6 +326,88 @@
   </form>
 </section>
 
+<section class="card api-card" id="api-tokens" aria-labelledby="api-tokens-heading">
+  <div class="section-heading">
+    <div>
+      <h2 id="api-tokens-heading">API tokens</h2>
+      <p>Read-only tokens for SIEM, SOAR, and compliance tooling. Send a token as <code>Authorization: Bearer &lt;token&gt;</code> to <code>/api/v1/status</code> (<code>status:read</code>), <code>/api/v1/history</code> (<code>history:read</code>), or <code>/api/v1/evidence</code> (<code>evidence:read</code>). Tokens are stored hashed, shown only once, expire, and can be revoked at any time.</p>
+    </div>
+  </div>
+  {{if .NewAPIToken}}
+  <div class="success new-token" id="new-api-token" role="group" aria-labelledby="new-api-token-heading">
+    <h3 id="new-api-token-heading">New API token</h3>
+    <label for="new-api-token-value">Token value
+      <input id="new-api-token-value" class="token-value" value="{{.NewAPIToken}}" readonly autocomplete="off" spellcheck="false" aria-describedby="new-api-token-help">
+    </label>
+    <small id="new-api-token-help">Copy it now. It is not stored and will not be shown again, not even after reloading this page.</small>
+  </div>
+  {{end}}
+  {{if .APITokens}}
+  <table class="data-table api-token-table">
+    <caption class="visually-hidden">API tokens</caption>
+    <thead>
+      <tr>
+        <th scope="col">Name</th>
+        <th scope="col">Scopes</th>
+        <th scope="col">Expires</th>
+        <th scope="col">Last used</th>
+        <th scope="col">Status</th>
+        <th scope="col">Action</th>
+      </tr>
+    </thead>
+    <tbody>
+      {{- range .APITokens}}
+      <tr>
+        <th scope="row" data-label="Name">{{.Name}}</th>
+        <td data-label="Scopes">{{range $index, $scope := .Scopes}}{{if $index}}, {{end}}<code>{{$scope}}</code>{{end}}</td>
+        <td data-label="Expires">{{template "when" (when .ExpiresAt $.Now)}}</td>
+        <td data-label="Last used">{{if .LastUsedAt}}{{template "when" (when .LastUsedAt $.Now)}}{{else}}Never{{end}}</td>
+        <td data-label="Status">{{.Status}}</td>
+        <td data-label="Action">
+          {{- if eq .Status "active"}}
+          <form method="post" action="/settings/api-tokens">
+            <input type="hidden" name="_csrf" value="{{$.CSRF}}">
+            <input type="hidden" name="action" value="revoke">
+            <input type="hidden" name="id" value="{{.ID}}">
+            <button class="button-danger" type="submit" aria-label="Revoke API token {{.Name}}">Revoke</button>
+          </form>
+          {{- else}}
+          <span class="muted">—</span>
+          {{- end}}
+        </td>
+      </tr>
+      {{- end}}
+    </tbody>
+  </table>
+  {{else}}
+  <p class="muted">No API tokens.</p>
+  {{end}}
+  <h3 id="create-api-token-heading">Create an API token</h3>
+  <form method="post" action="/settings/api-tokens" aria-labelledby="create-api-token-heading">
+    <input type="hidden" name="_csrf" value="{{.CSRF}}">
+    <input type="hidden" name="action" value="create">
+    <div class="grid">
+      <label for="api-token-name">Name
+        <input id="api-token-name" name="name" maxlength="64" required placeholder="SIEM export" autocomplete="off" spellcheck="false">
+      </label>
+      <label for="api-token-expiry">Expires after
+        <select id="api-token-expiry" name="expires_days">
+          {{- range .APITokenLifetimes}}
+          <option value="{{.}}"{{if eq . 90}} selected{{end}}>{{.}} days</option>
+          {{- end}}
+        </select>
+      </label>
+    </div>
+    <fieldset class="check-row">
+      <legend>Scopes</legend>
+      {{- range .APIScopes}}
+      <label class="check-label" for="api-token-scope-{{.}}"><input id="api-token-scope-{{.}}" type="checkbox" name="scopes" value="{{.}}"> <span>{{.}}</span></label>
+      {{- end}}
+    </fieldset>
+    <button type="submit">Create API token</button>
+  </form>
+</section>
+
 <section class="card activity-card" id="activity" aria-labelledby="activity-heading">
   <div class="section-heading">
     <div>

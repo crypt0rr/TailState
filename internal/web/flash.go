@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"net/http"
 	"strings"
+	"time"
 
+	"github.com/crypt0rr/tailstate/internal/store"
 	"github.com/crypt0rr/tailstate/internal/textutil"
 )
 
@@ -25,6 +27,10 @@ const (
 type flashMessage struct {
 	Kind    string `json:"k"`
 	Message string `json:"m"`
+	// Reveal is an opaque reference to a one-time secret held in server
+	// memory (a newly created API token); the secret itself is never put in
+	// the cookie.
+	Reveal string `json:"r,omitempty"`
 }
 
 func (s *Server) flashSignature(payload string) []byte {
@@ -33,7 +39,13 @@ func (s *Server) flashSignature(payload string) []byte {
 
 // setFlash stores one message for the next page view.
 func (s *Server) setFlash(w http.ResponseWriter, kind, message string) {
-	encoded, _ := json.Marshal(flashMessage{Kind: kind, Message: textutil.Truncate(message, flashMaxMessage)})
+	s.setFlashWith(w, flashMessage{Kind: kind, Message: message})
+}
+
+// setFlashWith stores a complete flash message for the next page view.
+func (s *Server) setFlashWith(w http.ResponseWriter, message flashMessage) {
+	message.Message = textutil.Truncate(message.Message, flashMaxMessage)
+	encoded, _ := json.Marshal(message)
 	payload := base64.RawURLEncoding.EncodeToString(encoded)
 	value := payload + "." + base64.RawURLEncoding.EncodeToString(s.flashSignature(payload))
 	http.SetCookie(w, &http.Cookie{Name: flashCookieName, Value: value, Path: "/", MaxAge: flashMaxAge, HttpOnly: true, Secure: s.config.CookieSecure, SameSite: http.SameSiteStrictMode})
@@ -66,11 +78,24 @@ func (s *Server) takeFlash(w http.ResponseWriter, r *http.Request) (flashMessage
 	return message, true
 }
 
-// applyFlash moves a pending flash message into the page data.
+// applyFlash moves a pending flash message into the page data. A reveal
+// reference is redeemed only by the session that created it.
 func (s *Server) applyFlash(w http.ResponseWriter, r *http.Request, data *pageData) {
 	message, ok := s.takeFlash(w, r)
 	if !ok {
 		return
+	}
+	if message.Reveal != "" {
+		ref := ""
+		if session, _, found := s.sessionCookies(r); found {
+			ref = store.SessionRef(session.Value)
+		}
+		if secretValue, found := s.tokenReveals.take(message.Reveal, ref, time.Now()); found {
+			data.NewAPIToken = secretValue
+		} else {
+			data.Error = "The new API token can no longer be displayed. Revoke it and create another."
+			return
+		}
 	}
 	if message.Kind == flashKindError {
 		data.Error = message.Message

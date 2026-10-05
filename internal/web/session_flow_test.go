@@ -25,6 +25,8 @@ func followFlash(t *testing.T, server *Server, cookies []*http.Cookie, response 
 	if location == "" {
 		t.Fatalf("response %d is not a redirect: %s", response.Code, response.Body.String())
 	}
+	// A browser never sends the fragment.
+	location, _, _ = strings.Cut(location, "#")
 	return authGet(t, server, location, mergeCookies(cookies, response)).Body.String()
 }
 

@@ -400,6 +400,7 @@ type CleanupStats struct {
 	DeliveredOutboxDeleted    int64
 	DeadOutboxDeleted         int64
 	AdminAuditDeleted         int64
+	APITokensDeleted          int64
 	Transactions              int
 	Duration                  time.Duration
 	Remaining                 bool
@@ -414,7 +415,7 @@ type CleanupStats struct {
 
 // TotalRowsChanged returns the total number of rows changed by the pass.
 func (c CleanupStats) TotalRowsChanged() int64 {
-	return c.SessionsDeleted + c.AuthTokensDeleted + c.MetaDeleted + c.OutboxDeadLettered + c.WebhookDeadLettered + c.EventsDeleted + c.EventBatchesDeleted + c.EventBatchTriggersDeleted + c.WebhookTriggersDeleted + c.DeliveredOutboxDeleted + c.DeadOutboxDeleted + c.AdminAuditDeleted
+	return c.SessionsDeleted + c.AuthTokensDeleted + c.MetaDeleted + c.OutboxDeadLettered + c.WebhookDeadLettered + c.EventsDeleted + c.EventBatchesDeleted + c.EventBatchTriggersDeleted + c.WebhookTriggersDeleted + c.DeliveredOutboxDeleted + c.DeadOutboxDeleted + c.AdminAuditDeleted + c.APITokensDeleted
 }
 
 // Cleanup expires short-lived authentication/session state, bounds pending
@@ -542,6 +543,9 @@ func cleanupPhases(stats *CleanupStats, now time.Time, retention time.Duration) 
 		// The administrative audit trail has its own, longer retention
 		// period, independent of the history retention window.
 		{name: "admin_audit", query: `DELETE FROM admin_audit WHERE rowid IN (SELECT rowid FROM admin_audit WHERE created_at<? ORDER BY created_at,id LIMIT ?)`, args: []any{adminAuditCutoff}, add: func(n int64) { stats.AdminAuditDeleted += n }},
+		// Expired API tokens stay listed (as expired or revoked) for one
+		// retention window after their expiry, then their rows are removed.
+		{name: "api_tokens", query: `DELETE FROM api_tokens WHERE rowid IN (SELECT rowid FROM api_tokens WHERE expires_at<? ORDER BY expires_at,id LIMIT ?)`, args: []any{cutoff}, add: func(n int64) { stats.APITokensDeleted += n }},
 	}
 }
 

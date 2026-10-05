@@ -238,7 +238,7 @@ curl -fsS http://127.0.0.1:8080/readyz
 curl -fsS http://127.0.0.1:8080/metrics
 ```
 
-Only the documented routes exist: `/` redirects to the right page, unknown paths return `404`, `/static/` serves the embedded stylesheet without directory listings, and the browser's automatic `/favicon.ico` probe gets an empty, cacheable `204` without touching the database.
+Only the documented routes exist (including the bearer-token [read-only API](#read-only-api) under `/api/v1/`): `/` redirects to the right page, unknown paths return `404`, `/static/` serves the embedded stylesheet without directory listings, and the browser's automatic `/favicon.ico` probe gets an empty, cacheable `204` without touching the database.
 
 `/metrics` exposes readiness, pending/dead delivery counts, notification destination totals and enabled counts, the notification state (`tailstate_notification_state{state="unconfigured|no_destinations|paused|active"}`, exactly one is `1`) and a `tailstate_notifications_paused` gauge that is `1` when a configured installation has no destination or every destination is disabled, pending/processing/dead webhook trigger counts, resource counts, low-cardinality collector health gauges (`supported`, `baseline`, partial-result state, partial error count, failures, poll duration, last success, and next poll timestamps), the scheduler's total database-error counter (`tailstate_collector_due_errors_total`), delivery telemetry (`tailstate_outbox_delivery_attempts_total`, success/failure counters, lease renewal/loss counters, and the `tailstate_outbox_delivery_duration_seconds` histogram), and bounded storage telemetry. Storage metrics include the allocated and used database size, free pages, and the used-bytes pressure ratio, the page ceiling SQLite is actually enforcing (`tailstate_storage_enforced_limit_bytes`, plus `tailstate_storage_limit_enforced`, which drops to `0` if the active ceiling ever exceeds the configured budget), configured snapshot/event/history/rejection limits, and counters for snapshot truncation, event-value truncation, history-page truncation, and oversized raw writes represented by a metadata marker. These signals make storage pressure visible without exposing destination URLs, provider bodies, or message contents. The `device_details` collector uses a bounded eight-worker fan-out and a two-minute per-collector deadline; usable partial results are retained and marked in the status page and metrics with the number of devices whose details are missing. When `TAILSTATE_METRICS_TOKEN` is empty, only a direct loopback connection is accepted; requests from a reverse proxy (including a loopback or trusted proxy), requests with forwarded headers, and non-loopback peers receive `401`. Set that variable for Prometheus or any reverse proxy to require `Authorization: Bearer <token>` from any network location. Do not publish the endpoint without a token through a public reverse proxy. Every metric family carries `# HELP` and `# TYPE` lines (the exposition passes `promtool check metrics`), and the response is rendered in full before it is sent: if a store query fails, the scrape receives a clean `500` rather than a partial `200` body.
 
@@ -439,10 +439,11 @@ something (tailnet, OAuth client ID, OAuth secret rotation, OAuth scopes,
 either polling interval, expiry warning windows or tag filter, webhook secret
 set or cleared); for each notification destination added, edited (name, URL,
 enabled state, routing, message format), enabled, disabled, or removed (after
-the confirmation step); for each mute rule added or removed; and for the
-status page's operator actions, **Reconcile now** (when the request is
-accepted, not when the cooldown refuses it) and **Retry dead letters** (when
-it requeued at least one notification). A record holds
+the confirmation step); for each mute rule added or removed; for each
+read-only API token created or revoked; and for the status page's operator
+actions, **Reconcile now** (when the request is accepted, not when the
+cooldown refuses it) and **Retry dead letters** (when it requeued at least
+one notification). A record holds
 the event, time, outcome, the client address (taken from
 `X-Forwarded-For` only when the peer is a trusted proxy), a short reference
 to the acting session, the affected object as `kind:id`, and the **names** of
@@ -469,14 +470,81 @@ notification (action, changed field names, object, client address, time) to
 every destination that was enabled **before** the change: monitoring
 settings changes (including an OAuth identity change, which notifies every
 enabled destination and is not dead-lettered by the identity switch),
-password resets and changes, mute rules added, and destination URL, routing,
-disable, and removal changes. The notice is queued in the same transaction as
+password resets and changes, mute rules added, API tokens created, and
+destination URL, routing, disable, and removal changes. The notice is queued in the same transaction as
 the audit record. A destination that the change itself disables, removes, or
 points at a new URL is notified directly at its current URL before the
 change is applied (bounded to 10 seconds and best effort, so an unreachable
 destination can still be removed; the outcome is logged), which means
 disabling or deleting the last enabled destination still tells that
 destination first.
+
+### Read-only API
+
+Machine clients (SIEM, SOAR, compliance pipelines) read TailState through a
+small read-only API instead of scraping HTML or sharing the administrator
+password. Create a token under **API tokens** in Settings: give it a name,
+one or more scopes, and an expiry of 30, 90, 180, or 365 days. The token
+(`tsapi_...`) is shown once, on the Settings page the form returns to, and
+cannot be displayed again: the form uses Post/Redirect/Get, the secret is held
+only in server memory until that page is shown to the session that created
+it (at most 60 seconds), and it is never placed in a URL, a cookie, or the
+database. Reloading the page does not show it again. Only its SHA-256 hash is
+stored. At most 25 tokens can be active at once.
+Revoking a token takes effect on the very next request. Expired and revoked
+tokens stay listed for 30 days after their expiry and are then removed by
+retention cleanup. Creating a token is recorded in the administrative audit
+trail and notified to every enabled destination; revoking one is recorded.
+
+| Endpoint | Scope | Response |
+| --- | --- | --- |
+| `GET /api/v1/status` | `status:read` | JSON status: setup and baseline state, notification state, destination counts, outbox and webhook queue counts, resource counts, and collectors with the bounded readiness reasons |
+| `GET /api/v1/history` | `history:read` | NDJSON History page (`application/x-ndjson`) |
+| `GET /api/v1/evidence` | `evidence:read` | Signed evidence pack, identical to the History download (format version 4) |
+
+```console
+curl -fsS -H "Authorization: Bearer $TAILSTATE_API_TOKEN" https://tailstate.example/api/v1/status
+curl -fsS -H "Authorization: Bearer $TAILSTATE_API_TOKEN" \
+  "https://tailstate.example/api/v1/history?severity=high&limit=50"
+```
+
+`/api/v1/history` and `/api/v1/evidence` accept the History page's filters
+with the same meaning (`collector`, `event_type`, `resource`, `severity`,
+`batch`, and the whole-UTC-day date range `from` and `to` as `YYYY-MM-DD`,
+`to` inclusive) and its paging (`cursor` for older batches; history also
+accepts `after` for newer batches). A malformed date is refused with `400`
+(`invalid_request`) instead of being ignored. History also accepts `limit`
+(1 to 100 batches, default 20). Each history
+line is either one `{"type":"batch",...}` object (batch metadata, the ledger
+sequence and hash, events with field diffs and redacted normalized
+snapshots, and per-destination delivery status by destination ID and name)
+or the final `{"type":"page",...}` trailer with `has_next`, `next_cursor`, and
+a ready-made `next` path towards older batches; `has_prev`, `prev_cursor`, and
+a `prev` path towards newer batches (both paths keep the filters and limit);
+and the `bytes_read` and
+`byte_limit` of the History page budget (`TAILSTATE_HISTORY_PAGE_LIMIT_BYTES`).
+A page stops at that budget, so follow `next` until `has_next` is false to
+read everything without duplicates. Each response is built completely before
+it is sent. Token checks, status, history, and evidence are pure reads served
+from the read-only database pool, so the API keeps answering while a
+collector or cleanup holds the writer; the once-a-minute "last used" update
+is best effort and bounded.
+
+Only `Authorization: Bearer <token>` authenticates the API; browser session
+cookies do not. A missing, unknown, revoked, or expired token receives `401`
+with a `WWW-Authenticate: Bearer` challenge, a token without the endpoint's
+scope receives `403` (`insufficient_scope`), and errors are JSON
+(`{"error":...,"error_description":...}`). Each token may make 60 requests per
+minute; beyond that, and after five failed authentications per client in 15
+minutes, requests receive `429` with `Retry-After`. Failed guesses never
+block a valid token. Responses never include destination URLs, OAuth or
+webhook secrets, collector error text, or token values: destinations appear
+only as counts or by ID and display name.
+
+Multiple user accounts with roles (for example administrator and viewer) and
+OIDC sign-in are out of scope for this release and remain future work; the
+API tokens are the supported way to give read-only access without sharing
+the administrator password.
 
 ### Deployment diagnostics
 
@@ -823,7 +891,8 @@ time for the 60-minute idle timeout; existing sessions are backfilled with
 their sign-in time, so a session that has been idle for longer than the
 timeout must sign in again after the upgrade, and every other session keeps
 working. It also creates the `admin_audit` table and its
-retention index; the audit trail starts empty at the upgrade. The migration
+retention index, and the `api_tokens` table for hashed read-only API tokens;
+the audit trail and token list start empty at the upgrade. The migration
 runs in one transaction and changes no existing setting, destination,
 history, or evidence row.
 

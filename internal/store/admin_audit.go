@@ -39,6 +39,8 @@ const (
 	AuditMuteRemoved         = "mute_removed"
 	AuditReconcileRequested  = "reconcile_requested"
 	AuditDeadLettersRetried  = "dead_letters_retried"
+	AuditAPITokenCreated     = "api_token_created"
+	AuditAPITokenRevoked     = "api_token_revoked"
 )
 
 // Audit outcomes.
@@ -65,6 +67,8 @@ var adminAuditLabels = map[string]string{
 	AuditMuteRemoved:         "Mute rule removed",
 	AuditReconcileRequested:  "Reconciliation requested",
 	AuditDeadLettersRetried:  "Dead-lettered notifications retried",
+	AuditAPITokenCreated:     "API token created",
+	AuditAPITokenRevoked:     "API token revoked",
 }
 
 // AdminAuditLabel returns the human-readable description of an event.

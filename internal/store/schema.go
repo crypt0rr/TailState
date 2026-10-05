@@ -43,6 +43,18 @@ CREATE TABLE IF NOT EXISTS admin_audit (
   fields TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS admin_audit_created_at ON admin_audit(created_at, id);
+-- Scoped read-only API tokens. Only the SHA-256 hash of a token is stored.
+CREATE TABLE IF NOT EXISTS api_tokens (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  token_hash TEXT NOT NULL UNIQUE,
+  scopes TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  revoked_at TEXT,
+  last_used_at TEXT
+);
+CREATE INDEX IF NOT EXISTS api_tokens_expires_at ON api_tokens(expires_at, id);
 CREATE TABLE IF NOT EXISTS settings (
   id INTEGER PRIMARY KEY CHECK(id = 1),
   tailnet TEXT NOT NULL,

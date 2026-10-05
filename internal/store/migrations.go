@@ -870,7 +870,8 @@ func migrateSchemaV13ToV14(db *sql.DB) error {
 }
 
 // migrateSchemaV14ToV15 adds administrative security state: a last-seen
-// time on sessions for the idle timeout and the administrative audit table.
+// time on sessions for the idle timeout, the administrative audit table, and
+// hashed read-only API tokens.
 // Existing sessions are backfilled with their creation time, so a session
 // idle for longer than the timeout before the upgrade must sign in again;
 // nothing else changes behaviour.
@@ -901,6 +902,23 @@ func migrateSchemaV14ToV15(db *sql.DB) error {
 	} {
 		if _, err := tx.Exec(statement); err != nil {
 			return fmt.Errorf("create administrative audit table: %w", err)
+		}
+	}
+	for _, statement := range []string{
+		`CREATE TABLE IF NOT EXISTS api_tokens (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			name TEXT NOT NULL,
+			token_hash TEXT NOT NULL UNIQUE,
+			scopes TEXT NOT NULL,
+			created_at TEXT NOT NULL,
+			expires_at TEXT NOT NULL,
+			revoked_at TEXT,
+			last_used_at TEXT
+		)`,
+		"CREATE INDEX IF NOT EXISTS api_tokens_expires_at ON api_tokens(expires_at, id)",
+	} {
+		if _, err := tx.Exec(statement); err != nil {
+			return fmt.Errorf("create API token table: %w", err)
 		}
 	}
 	if _, err := tx.Exec("UPDATE schema_version SET version=15"); err != nil {

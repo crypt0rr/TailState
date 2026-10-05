@@ -18,6 +18,7 @@ func downgradeToV14(t *testing.T, db *sql.DB) {
 	for _, statement := range []string{
 		"ALTER TABLE sessions DROP COLUMN last_seen_at",
 		"DROP TABLE admin_audit",
+		"DROP TABLE api_tokens",
 		"UPDATE schema_version SET version=14",
 	} {
 		if _, err := db.Exec(statement); err != nil {
@@ -83,8 +84,13 @@ func TestSchemaV15MigrationKeepsSessionsAndAddsSecurityState(t *testing.T) {
 		t.Fatalf("administrative audit table missing after the upgrade: %v", err)
 	}
 	var indexes int
-	if err := st.db.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='admin_audit_created_at'").Scan(&indexes); err != nil || indexes != 1 {
-		t.Fatalf("audit retention index missing: %d %v", indexes, err)
+	if err := st.db.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name IN ('admin_audit_created_at','api_tokens_expires_at')").Scan(&indexes); err != nil || indexes != 2 {
+		t.Fatalf("retention indexes missing: %d %v", indexes, err)
+	}
+	if _, value, err := st.CreateAPIToken(ctx, "after upgrade", []string{ScopeStatusRead}, time.Hour); err != nil {
+		t.Fatalf("API token table missing after the upgrade: %v", err)
+	} else if _, err := st.AuthenticateAPIToken(ctx, value); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -111,6 +117,15 @@ CREATE TRIGGER fail_session_backfill BEFORE UPDATE OF last_seen_at ON sessions B
 			t.Fatal(err)
 		}
 		if err := migrateSchemaV14ToV15(db); err == nil || !strings.Contains(err.Error(), "create administrative audit table") {
+			t.Fatalf("migration error=%v", err)
+		}
+	})
+	t.Run("API token table", func(t *testing.T) {
+		db := currentSchemaMigrationDB(t, 14)
+		if _, err := db.Exec("DROP TABLE api_tokens; CREATE VIEW api_tokens AS SELECT 1 AS expires_at, 1 AS id"); err != nil {
+			t.Fatal(err)
+		}
+		if err := migrateSchemaV14ToV15(db); err == nil || !strings.Contains(err.Error(), "create API token table") {
 			t.Fatalf("migration error=%v", err)
 		}
 	})

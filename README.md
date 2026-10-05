@@ -397,7 +397,11 @@ rollback aid and are removed by cleanup once their active token record expires.
 
 Schema v13 erases the encrypted service URL of notification destinations that
 were removed before this release; removed destinations keep their name for
-History.
+History. It also drops two redundant indexes (`events_observed_at` and
+`evidence_ledger_batch_id`, which duplicate `events_retention` and the ledger's
+unique batch constraint) and adds `outbox_dead_retention` and
+`auth_tokens_kind`, so every retention statement reaches its rows through an
+index search and a pass with nothing to delete stays cheap on large databases.
 
 ## Runtime configuration
 

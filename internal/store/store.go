@@ -307,6 +307,14 @@ func OpenWithLimits(path string, box *secret.Box, configuredLimits StorageLimits
 		db.Close()
 		return nil, fmt.Errorf("database migration failed while creating outbox retention index; stop TailState and restore the verified pre-upgrade backup before retrying: %w", err)
 	}
+	if _, err := db.Exec("CREATE INDEX IF NOT EXISTS outbox_dead_retention ON outbox(status, created_at)"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("database migration failed while creating outbox dead-letter retention index; stop TailState and restore the verified pre-upgrade backup before retrying: %w", err)
+	}
+	if _, err := db.Exec("CREATE INDEX IF NOT EXISTS auth_tokens_kind ON auth_tokens(kind)"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("database migration failed while creating authentication token kind index; stop TailState and restore the verified pre-upgrade backup before retrying: %w", err)
+	}
 	st := &Store{db: db, connector: connector, databasePath: path, box: box}
 	st.limits.Store(limits)
 	present, err = verifyExistingMasterKey(db, box)

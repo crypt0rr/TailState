@@ -756,13 +756,27 @@ func migrateSchemaV11ToV12(db *sql.DB) error {
 }
 
 // migrateSchemaV12ToV13 hardens persisted state without changing any table
-// layout: it scrubs the encrypted service URL of destinations that were
-// soft-deleted before deletion started clearing it.
+// layout. It scrubs the encrypted service URL of destinations that were
+// soft-deleted before deletion started clearing it, drops two indexes that
+// duplicate another index (events_observed_at is a prefix of
+// events_retention because id is the rowid; evidence_ledger_batch_id
+// duplicates the UNIQUE constraint's index), and adds the indexes that let
+// every retention statement use an index search without a temporary sort.
 func migrateSchemaV12ToV13(db *sql.DB) error {
 	ctx := context.Background()
 	err := withSecureDelete(ctx, db, func(tx *sql.Tx) error {
 		if _, err := tx.ExecContext(ctx, "UPDATE notification_destinations SET service_url_enc='' WHERE deleted_at IS NOT NULL AND service_url_enc<>''"); err != nil {
 			return fmt.Errorf("scrub deleted notification destinations: %w", err)
+		}
+		for _, statement := range []string{
+			"DROP INDEX IF EXISTS events_observed_at",
+			"DROP INDEX IF EXISTS evidence_ledger_batch_id",
+			"CREATE INDEX IF NOT EXISTS outbox_dead_retention ON outbox(status, created_at)",
+			"CREATE INDEX IF NOT EXISTS auth_tokens_kind ON auth_tokens(kind)",
+		} {
+			if _, err := tx.ExecContext(ctx, statement); err != nil {
+				return fmt.Errorf("update retention indexes: %w", err)
+			}
 		}
 		if _, err := tx.ExecContext(ctx, "UPDATE schema_version SET version=13"); err != nil {
 			return fmt.Errorf("record persistence hardening migration: %w", err)

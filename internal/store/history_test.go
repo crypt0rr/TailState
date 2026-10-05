@@ -617,8 +617,10 @@ func TestCleanupRemovesExpiredHistoryBatches(t *testing.T) {
 		t.Fatal(err)
 	}
 	old := time.Now().UTC().Add(-48 * time.Hour).Format(time.RFC3339Nano)
-	if _, err := st.db.ExecContext(ctx, "UPDATE events SET observed_at=?", old); err != nil {
-		t.Fatal(err)
+	for _, table := range []string{"events", "event_batches"} {
+		if _, err := st.db.ExecContext(ctx, "UPDATE "+table+" SET observed_at=?", old); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if err := st.Cleanup(ctx, 24*time.Hour); err != nil {
 		t.Fatal(err)

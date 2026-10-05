@@ -41,6 +41,11 @@ const (
 	unsupportedConfirmationMessage = "unsupported response pending confirmation"
 	unsupportedRetryInterval       = 5 * time.Minute
 	unsupportedDemotionInterval    = 6 * time.Hour
+	// usersSharedScopeMeta records the generation whose users snapshot was
+	// collected with users?type=all. Older versions requested only members,
+	// so the first type=all poll of an existing users baseline would otherwise
+	// report every pre-existing shared (external) user as newly created.
+	usersSharedScopeMeta = "users_shared_scope_generation"
 )
 
 func (s *Store) ApplyBatchWithBatch(ctx context.Context, generation int64, results []model.Collected, digest func([]model.Change) string, triggerIDs ...int64) (batchResult ChangeBatchResult, err error) {
@@ -116,6 +121,22 @@ func (s *Store) ApplyBatchWithBatch(ctx context.Context, generation int64, resul
 		if stateErr != nil && !errors.Is(stateErr, sql.ErrNoRows) {
 			return ChangeBatchResult{}, stateErr
 		}
+		// When an established users baseline predates shared-user collection,
+		// absorb newly visible shared users silently on this one poll as a
+		// baseline extension. Members keep normal created events, and a shared
+		// user that appears on any later poll is reported as created.
+		absorbSharedUsers := false
+		if result.Collector == "users" {
+			var scopeGeneration string
+			scopeErr := tx.QueryRowContext(ctx, "SELECT value FROM meta WHERE key=?", usersSharedScopeMeta).Scan(&scopeGeneration)
+			if scopeErr != nil && !errors.Is(scopeErr, sql.ErrNoRows) {
+				return ChangeBatchResult{}, scopeErr
+			}
+			absorbSharedUsers = baseline == 1 && scopeGeneration != fmt.Sprint(generation)
+			if _, err = tx.ExecContext(ctx, "INSERT INTO meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", usersSharedScopeMeta, fmt.Sprint(generation)); err != nil {
+				return ChangeBatchResult{}, err
+			}
+		}
 		seen := make(map[string]struct{}, len(result.Resources))
 		for _, resource := range result.Resources {
 			seen[resource.ID] = struct{}{}
@@ -144,7 +165,7 @@ func (s *Store) ApplyBatchWithBatch(ctx context.Context, generation int64, resul
 			noteTruncation(result.Collector, resource.ID, storedSnapshot, limits.SnapshotBytes, true)
 			switch {
 			case errors.Is(err, sql.ErrNoRows):
-				if baseline == 1 {
+				if baseline == 1 && !(absorbSharedUsers && isSharedUser(resource)) {
 					record(model.Change{Kind: "created", Collector: result.Collector, ResourceID: resource.ID, Type: resource.Type, Name: resource.Name}, storedValue{}, existingStoredValue(raw, hash, int64(len(raw)), false))
 				}
 				_, err = tx.ExecContext(ctx, `INSERT INTO snapshots(generation,collector,resource_id,resource_type,name,canonical_json,content_hash,content_bytes,content_truncated,missing_count,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)`, generation, result.Collector, resource.ID, resource.Type, resource.Name, storedSnapshot.raw, hash, storedSnapshot.bytes, boolInt(storedSnapshot.truncated), 0, now.Format(time.RFC3339Nano))
@@ -382,6 +403,15 @@ func (s *Store) ApplyBatchWithBatch(ctx context.Context, generation int64, resul
 		logStorageTruncation(item.collector, item.resource, item.valueHash, item.observed, item.limit, item.reason)
 	}
 	return result, nil
+}
+
+func isSharedUser(resource model.Resource) bool {
+	data, ok := resource.Data.(map[string]any)
+	if !ok {
+		return false
+	}
+	kind, _ := data["type"].(string)
+	return strings.EqualFold(kind, "shared")
 }
 
 func nullableJSON(raw []byte) any {

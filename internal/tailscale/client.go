@@ -204,7 +204,7 @@ func (c *Client) Collect(ctx context.Context, collector string) ([]model.Resourc
 	case "device_details":
 		return c.deviceDetails(ctx)
 	case "users":
-		return c.collection(ctx, c.tailnet("users"), "users", collector, "user", []string{"id", "userId", "userID", "loginName"})
+		return c.collection(ctx, c.tailnet("users?type=all"), "users", collector, "user", []string{"id", "userId", "userID", "loginName"})
 	case "user_invites":
 		return c.collection(ctx, c.tailnet("user-invites"), "userInvites", collector, "user_invite", []string{"id", "inviteId", "inviteID"})
 	case "keys":

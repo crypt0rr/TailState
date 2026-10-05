@@ -493,7 +493,7 @@ The workflow also creates the matching GitHub Release with generated notes. Use 
 TAILSTATE_IMAGE=ghcr.io/crypt0rr/tailstate@sha256:<known-good-digest>
 ```
 
-The builder and runtime base images are pinned by digest and updated by Renovate, so a release is reproducible until an explicit dependency update changes those pins. Release images carry OCI labels for the compiler version, base-image digest, target platform, source commit, and release version; BuildKit's max-level provenance and the SBOM provide the corresponding attestation metadata.
+The builder and runtime base images are pinned by digest and updated by Renovate, so a release is reproducible until an explicit dependency update changes those pins. Release images carry OCI labels for the compiler version, target platform, source commit, and release version. The image is built `FROM scratch`, so it has no base-image labels; the exact digest-pinned builder image is recorded in BuildKit's max-level provenance attestation alongside the SBOM. The builder stage runs on the build host's native platform and cross-compiles the static binary for each target architecture.
 
 ## License
 

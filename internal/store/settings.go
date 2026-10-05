@@ -130,10 +130,13 @@ func (s *Store) SaveSettings(ctx context.Context, in Settings) (int64, error) {
 		// Event-linked notifications describe the previous Tailnet/OAuth
 		// identity. Keep their history for audit, but do not deliver them after
 		// the monitor has switched identities. System/version notifications use a
-		// NULL batch_id and intentionally remain eligible for delivery.
+		// NULL batch_id and intentionally remain eligible for delivery. Rows that
+		// are in flight (or were left 'processing' by a crash) are included and
+		// lose their lease so a stale worker's completion or retry is fenced off
+		// instead of re-queuing the old-identity payload.
 		if _, err := tx.ExecContext(ctx, `UPDATE outbox
-			SET status='dead',next_attempt=?,last_error='monitoring identity changed'
-			WHERE status='pending' AND batch_id IS NOT NULL AND batch_id IN (
+			SET status='dead',next_attempt=?,last_error='monitoring identity changed',lease_until=NULL,lease_token=''
+			WHERE status IN ('pending','processing') AND batch_id IS NOT NULL AND batch_id IN (
 				SELECT id FROM event_batches WHERE generation<>?
 			)`, now, generation); err != nil {
 			return 0, err

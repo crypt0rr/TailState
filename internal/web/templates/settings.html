@@ -64,7 +64,9 @@
     <div><dt>Listener</dt><dd><code>{{.Diagnostics.Listener}}</code></dd></div>
     <div><dt>Cookies</dt><dd><strong>{{if .Diagnostics.CookieSecure}}Secure{{else}}HTTP-compatible{{end}}</strong></dd></div>
     <div><dt>Trusted proxies</dt><dd><strong>{{.Diagnostics.TrustedProxyCount}}</strong></dd></div>
-    <div><dt>Database storage</dt><dd><strong>{{mib .Diagnostics.Storage.DatabaseBytes}} of {{mib .Diagnostics.Storage.DatabaseLimitBytes}}</strong> <span class="muted">({{percent .Diagnostics.Storage.StoragePressure}} used)</span></dd></div>
+    <div><dt>Database storage</dt><dd><strong>{{mib .Diagnostics.Storage.DatabaseUsedBytes}} of {{mib .Diagnostics.Storage.DatabaseLimitBytes}}</strong>
+      <span class="muted">({{percent .Diagnostics.Storage.StoragePressure}} used
+      {{- if gt .Diagnostics.Storage.DatabaseFreeBytes 0}}; {{mib .Diagnostics.Storage.DatabaseBytes}} allocated including {{mib .Diagnostics.Storage.DatabaseFreeBytes}} of free pages{{end}})</span></dd></div>
     <div><dt>Files on disk</dt><dd><strong>{{mib .Diagnostics.Storage.DatabasePhysicalBytes}}</strong> <span class="muted">(database {{mib .Diagnostics.Storage.DatabaseFileBytes}} · WAL {{mib .Diagnostics.Storage.DatabaseWALBytes}} · SHM {{mib .Diagnostics.Storage.DatabaseSHMBytes}})</span></dd></div>
     <div><dt>Snapshot / event limits</dt><dd><strong>{{mib .Diagnostics.Storage.SnapshotLimitBytes}} / {{mib .Diagnostics.Storage.EventValueLimitBytes}}</strong></dd></div>
     <div><dt>History page limit</dt><dd><strong>{{mib .Diagnostics.Storage.HistoryPageLimitBytes}}</strong></dd></div>

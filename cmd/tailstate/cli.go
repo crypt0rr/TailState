@@ -96,6 +96,7 @@ Commands:
   admin reset            Issue a one-time administrator password reset token
   admin rekey            Re-encrypt protected values with a new master key
   admin backup           Write a consistent online database snapshot and checksum
+  admin compact          Rewrite the database to release free pages (service stopped)
   evidence verify        Verify a signed evidence pack offline
   evidence audit         Audit the persisted evidence ledger
   evidence public-key    Print the evidence signing public key
@@ -127,11 +128,12 @@ wildcard host such as 0.0.0.0 or [::] is probed on loopback.
 Report deployment findings without creating, migrating, or writing the
 database. Exits 3 when a blocking finding is reported.
 `,
-	"admin": `Usage: tailstate admin <reset|rekey|backup> [options]
+	"admin": `Usage: tailstate admin <reset|rekey|backup|compact> [options]
 
   reset      Issue a one-time administrator password reset token
   rekey      Re-encrypt protected values with a new master key (service stopped)
   backup     Write a consistent online database snapshot and checksum
+  compact    Rewrite the database to release free pages (service stopped)
 `,
 	"admin reset": `Usage: tailstate admin reset
 
@@ -149,6 +151,14 @@ Write a transactionally consistent snapshot of the database to FILE with
 SQLite VACUUM INTO, plus FILE.sha256. Safe while the service runs; the live
 database is opened read-only and is never created or migrated. Existing
 files are never overwritten.
+`,
+	"admin compact": `Usage: tailstate admin compact [-incremental-vacuum]
+
+Rewrite the database without free pages so storage pressure and a lowered
+TAILSTATE_DATABASE_LIMIT_BYTES reflect live data. Offline: the command
+refuses to run while serve holds the data directory's service lock, and it
+never creates or migrates a database. The original file is replaced only
+after the compacted copy has been verified.
 `,
 	"evidence": `Usage: tailstate evidence <verify|audit|public-key> [options]
 
@@ -257,9 +267,10 @@ func dispatch(args []string) error {
 				}
 				return adminReset()
 			},
-			"rekey":  adminRekey,
-			"backup": adminBackup,
-		}, "missing admin subcommand (use admin reset, admin rekey, or admin backup)")
+			"rekey":   adminRekey,
+			"backup":  adminBackup,
+			"compact": adminCompact,
+		}, "missing admin subcommand (use admin reset, admin rekey, admin backup, or admin compact)")
 	case "evidence":
 		return dispatchGroup("evidence", args, map[string]func([]string) error{
 			"verify": evidenceVerify,
@@ -278,7 +289,7 @@ func dispatch(args []string) error {
 		fmt.Fprintf(os.Stdout, "tailstate %s\n", version)
 		return nil
 	default:
-		return usageError("", fmt.Errorf("unknown command %q (use serve, healthcheck, doctor, admin reset, admin rekey, admin backup, evidence audit, evidence verify, evidence public-key, version, or help)", command))
+		return usageError("", fmt.Errorf("unknown command %q (use serve, healthcheck, doctor, admin reset, admin rekey, admin backup, admin compact, evidence audit, evidence verify, evidence public-key, version, or help)", command))
 	}
 }
 

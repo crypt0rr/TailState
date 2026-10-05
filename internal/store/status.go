@@ -5,16 +5,21 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/crypt0rr/tailstate/internal/textutil"
 )
 
+// Status reads through the read-only pool so /readyz, /metrics, and the
+// status page stay responsive while a write transaction is open.
 func (s *Store) Status(ctx context.Context) (Status, error) {
+	db := s.readDB()
 	out := Status{ResourceCounts: map[string]int{}}
 	var baseline, configured string
-	err := s.db.QueryRowContext(ctx, "SELECT COALESCE(baseline_at,''),configured_at FROM settings WHERE id=1").Scan(&baseline, &configured)
+	err := db.QueryRowContext(ctx, "SELECT COALESCE(baseline_at,''),configured_at FROM settings WHERE id=1").Scan(&baseline, &configured)
 	if err == nil {
 		out.Configured = true
 		if baseline != "" {
@@ -28,11 +33,11 @@ func (s *Store) Status(ctx context.Context) (Status, error) {
 		return out, err
 	}
 	if out.Configured {
-		generation, err := s.currentGeneration(ctx)
+		generation, err := currentGeneration(ctx, db)
 		if err != nil {
 			return out, fmt.Errorf("load settings generation for status: %w", err)
 		}
-		rows, err := s.db.QueryContext(ctx, "SELECT collector,COUNT(*) FROM snapshots WHERE generation=? GROUP BY collector", generation)
+		rows, err := db.QueryContext(ctx, "SELECT collector,COUNT(*) FROM snapshots WHERE generation=? GROUP BY collector", generation)
 		if err != nil {
 			return out, err
 		}
@@ -52,7 +57,7 @@ func (s *Store) Status(ctx context.Context) (Status, error) {
 		if err := rows.Close(); err != nil {
 			return out, err
 		}
-		rows, err = s.db.QueryContext(ctx, "SELECT collector,supported,baseline,COALESCE(last_success,''),last_error,failure_count,COALESCE(next_poll,''),poll_duration_ms,partial,partial_error_count FROM collector_state WHERE generation=? ORDER BY collector", generation)
+		rows, err = db.QueryContext(ctx, "SELECT collector,supported,baseline,COALESCE(last_success,''),last_error,failure_count,COALESCE(next_poll,''),poll_duration_ms,partial,partial_error_count FROM collector_state WHERE generation=? ORDER BY collector", generation)
 		if err != nil {
 			return out, err
 		}
@@ -125,28 +130,28 @@ func (s *Store) Status(ctx context.Context) (Status, error) {
 		out.BaselineGraceUntil = nil
 		out.BaselineDegraded, out.BaselineReason = postBaselineDegradation(out.Collectors)
 	}
-	if err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM outbox WHERE status='pending'").Scan(&out.Pending); err != nil {
+	if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM outbox WHERE status='pending'").Scan(&out.Pending); err != nil {
 		return out, err
 	}
-	if err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM outbox WHERE status='processing'").Scan(&out.Processing); err != nil {
+	if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM outbox WHERE status='processing'").Scan(&out.Processing); err != nil {
 		return out, err
 	}
-	if err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM outbox WHERE status='dead'").Scan(&out.Dead); err != nil {
+	if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM outbox WHERE status='dead'").Scan(&out.Dead); err != nil {
 		return out, err
 	}
-	if err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM notification_destinations WHERE deleted_at IS NULL").Scan(&out.Destinations); err != nil {
+	if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM notification_destinations WHERE deleted_at IS NULL").Scan(&out.Destinations); err != nil {
 		return out, err
 	}
-	if err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM notification_destinations WHERE deleted_at IS NULL AND enabled=1").Scan(&out.EnabledDestinations); err != nil {
+	if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM notification_destinations WHERE deleted_at IS NULL AND enabled=1").Scan(&out.EnabledDestinations); err != nil {
 		return out, err
 	}
-	if err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM webhook_triggers WHERE status='pending'").Scan(&out.WebhookPending); err != nil {
+	if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM webhook_triggers WHERE status='pending'").Scan(&out.WebhookPending); err != nil {
 		return out, err
 	}
-	if err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM webhook_triggers WHERE status='processing'").Scan(&out.WebhookProcessing); err != nil {
+	if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM webhook_triggers WHERE status='processing'").Scan(&out.WebhookProcessing); err != nil {
 		return out, err
 	}
-	if err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM webhook_triggers WHERE status='dead'").Scan(&out.WebhookDead); err != nil {
+	if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM webhook_triggers WHERE status='dead'").Scan(&out.WebhookDead); err != nil {
 		return out, err
 	}
 	return out, nil
@@ -178,8 +183,12 @@ func postBaselineDegradation(collectors []CollectorState) (bool, string) {
 }
 
 func (s *Store) currentGeneration(ctx context.Context) (int64, error) {
+	return currentGeneration(ctx, s.db)
+}
+
+func currentGeneration(ctx context.Context, db *sql.DB) (int64, error) {
 	var generation int64
-	if err := s.db.QueryRowContext(ctx, "SELECT generation FROM settings WHERE id=1").Scan(&generation); err != nil {
+	if err := db.QueryRowContext(ctx, "SELECT generation FROM settings WHERE id=1").Scan(&generation); err != nil {
 		return 0, err
 	}
 	return generation, nil
@@ -394,6 +403,12 @@ type CleanupStats struct {
 	Duration                  time.Duration
 	Remaining                 bool
 	FailedPhase               string
+	// PagesReleased counts free pages returned to the filesystem by
+	// incremental_vacuum (only on databases compacted with auto_vacuum=
+	// INCREMENTAL). WALCheckpointed reports a successful TRUNCATE
+	// checkpoint after a pass that changed rows.
+	PagesReleased   int64
+	WALCheckpointed bool
 }
 
 // TotalRowsChanged returns the total number of rows changed by the pass.
@@ -442,10 +457,43 @@ func (s *Store) CleanupWithOptions(ctx context.Context, options CleanupOptions) 
 		}
 		if !phaseDone {
 			stats.Remaining = true
-			return stats, nil
+			break
 		}
 	}
+	if stats.TotalRowsChanged() > 0 {
+		s.reclaimAfterCleanup(ctx, &stats)
+	}
 	return stats, nil
+}
+
+// incrementalVacuumPages bounds the pages one cleanup pass returns to the
+// filesystem (8 MiB at the default 4 KiB page size), keeping the write short.
+const incrementalVacuumPages = 2048
+
+// reclaimAfterCleanup runs after a pass that deleted or updated rows. On a
+// database compacted with auto_vacuum=INCREMENTAL it releases a bounded number
+// of free pages; on other databases incremental_vacuum is a no-op. It then
+// checkpoints the WAL with TRUNCATE so the log a cleanup burst produced does
+// not stay on disk. Both steps are best-effort maintenance: a busy reader or a
+// canceled context only skips them until the next pass that does work.
+func (s *Store) reclaimAfterCleanup(ctx context.Context, stats *CleanupStats) {
+	if ctx.Err() != nil {
+		return
+	}
+	var before, after int64
+	if err := s.db.QueryRowContext(ctx, "PRAGMA freelist_count").Scan(&before); err == nil {
+		if _, err := s.db.ExecContext(ctx, "PRAGMA incremental_vacuum("+strconv.Itoa(incrementalVacuumPages)+")"); err != nil {
+			slog.Warn("incremental vacuum after cleanup failed", "error", err)
+		} else if err := s.db.QueryRowContext(ctx, "PRAGMA freelist_count").Scan(&after); err == nil && after < before {
+			stats.PagesReleased = before - after
+		}
+	}
+	var busy, logFrames, checkpointed int64
+	if err := s.db.QueryRowContext(ctx, "PRAGMA wal_checkpoint(TRUNCATE)").Scan(&busy, &logFrames, &checkpointed); err != nil {
+		slog.Warn("WAL checkpoint after cleanup failed", "error", err)
+		return
+	}
+	stats.WALCheckpointed = busy == 0
 }
 
 // cleanupPhases returns the retention statements in execution order. Every

@@ -195,7 +195,10 @@ type storageCounters struct {
 
 // StorageMetrics is the bounded, low-cardinality storage signal exposed to
 // diagnostics and Prometheus. DatabaseBytes is the logical SQLite allocation
-// used by the configured page budget. The DatabaseFileBytes, DatabaseWALBytes,
+// (page_count × page_size), including free pages left by deletes.
+// DatabaseUsedBytes excludes those free pages ((page_count − freelist_count)
+// × page_size); it is the figure compared with the budget, because SQLite
+// reuses free pages before it grows the file. The DatabaseFileBytes, DatabaseWALBytes,
 // DatabaseSHMBytes, and DatabasePhysicalBytes fields are physical filesystem
 // observations and are not enforcement values. It intentionally omits
 // provider payloads and destination URLs.
@@ -205,6 +208,9 @@ type StorageMetrics struct {
 	HistoryPageTruncations  uint64
 	OversizedWritesRejected uint64
 	DatabaseBytes           int64
+	DatabaseUsedBytes       int64
+	DatabaseFreelistPages   int64
+	DatabaseFreeBytes       int64
 	DatabaseLimitBytes      int64
 	// DatabaseEnforcedLimitBytes is the page ceiling SQLite is enforcing on the
 	// connection that served this snapshot (max_page_count * page_size).
@@ -258,6 +264,14 @@ func (s *Store) SetStorageLimits(limits StorageLimits) error {
 // on the current pooled connection and records it on the connector, so every
 // later connection receives the same ceiling. A nil connector is accepted for
 // read-only callers that never reconnect for writes.
+//
+// The startup check compares the budget with used pages (page_count minus
+// freelist_count): free pages left by retention are reused before the file
+// grows, so a database whose live data fits is accepted even when its file
+// is still larger. SQLite cannot lower max_page_count below page_count, so
+// until the free pages are released with `tailstate admin compact` the
+// effective ceiling is the current file size, which StorageMetrics and the
+// storage_limit_enforced metric report.
 func configureDatabasePageLimit(db *sql.DB, connector *pageLimitedConnector, limit int64) error {
 	if db == nil || limit < 1 {
 		return errors.New("database storage limit is invalid")
@@ -276,6 +290,16 @@ func configureDatabasePageLimit(db *sql.DB, connector *pageLimitedConnector, lim
 	if maxPages < 1 {
 		maxPages = 1
 	}
+	var pageCount, freePages int64
+	if err := db.QueryRow("PRAGMA page_count").Scan(&pageCount); err != nil {
+		return fmt.Errorf("read database page count: %w", err)
+	}
+	if err := db.QueryRow("PRAGMA freelist_count").Scan(&freePages); err != nil {
+		return fmt.Errorf("read database free page count: %w", err)
+	}
+	if used := pageCount - freePages; used > maxPages {
+		return fmt.Errorf("database uses %d bytes, above configured limit %d", used*pageSize, limit)
+	}
 	if connector != nil {
 		// Record the ceiling before applying it so a connection opened
 		// concurrently with this call cannot miss it.
@@ -285,12 +309,12 @@ func configureDatabasePageLimit(db *sql.DB, connector *pageLimitedConnector, lim
 	if err := db.QueryRow("PRAGMA max_page_count = " + strconv.FormatInt(maxPages, 10)).Scan(&appliedPages); err != nil {
 		return fmt.Errorf("set database page limit: %w", err)
 	}
-	var pageCount int64
-	if err := db.QueryRow("PRAGMA page_count").Scan(&pageCount); err != nil {
-		return fmt.Errorf("read database page count: %w", err)
+	if connector != nil {
+		connector.enforcedPages.Store(appliedPages)
 	}
-	if pageCount > appliedPages || (pageSize > 0 && pageCount > limit/pageSize) {
-		return fmt.Errorf("database uses %d bytes, above configured limit %d", pageCount*pageSize, limit)
+	if appliedPages > maxPages {
+		slog.Warn("database file holds free pages beyond the configured limit; the limit is enforced at the current file size until the database is compacted with `tailstate admin compact` while TailState is stopped",
+			"configured_limit_bytes", limit, "file_pages", pageCount, "free_pages", freePages, "page_size", pageSize)
 	}
 	return nil
 }
@@ -310,21 +334,28 @@ func storageWriteError(err error) error {
 }
 
 // StorageMetrics returns a safe snapshot of storage pressure and guardrail
-// counters for diagnostics, metrics, and tests.
+// counters for diagnostics, metrics, and tests. It reads through the
+// read-only pool, so a scrape never waits behind a write transaction.
 func (s *Store) StorageMetrics(ctx context.Context) (StorageMetrics, error) {
 	if s == nil || s.db == nil {
 		return StorageMetrics{}, errors.New("storage metrics unavailable")
 	}
 	limits := s.StorageLimits()
-	var pageCount, pageSize int64
-	if err := s.db.QueryRowContext(ctx, "PRAGMA page_count").Scan(&pageCount); err != nil {
+	db := s.readDB()
+	var pageCount, pageSize, freePages int64
+	if err := db.QueryRowContext(ctx, "PRAGMA page_count").Scan(&pageCount); err != nil {
 		return StorageMetrics{}, err
 	}
-	if err := s.db.QueryRowContext(ctx, "PRAGMA page_size").Scan(&pageSize); err != nil {
+	if err := db.QueryRowContext(ctx, "PRAGMA page_size").Scan(&pageSize); err != nil {
+		return StorageMetrics{}, err
+	}
+	if err := db.QueryRowContext(ctx, "PRAGMA freelist_count").Scan(&freePages); err != nil {
 		return StorageMetrics{}, err
 	}
 	var maxPages int64
-	if err := s.db.QueryRowContext(ctx, "PRAGMA max_page_count").Scan(&maxPages); err != nil {
+	if s.connector != nil && s.connector.enforcedPages.Load() > 0 {
+		maxPages = s.connector.enforcedPages.Load()
+	} else if err := s.db.QueryRowContext(ctx, "PRAGMA max_page_count").Scan(&maxPages); err != nil {
 		return StorageMetrics{}, err
 	}
 	physical, err := s.physicalStorageMetrics(ctx)
@@ -337,6 +368,9 @@ func (s *Store) StorageMetrics(ctx context.Context) (StorageMetrics, error) {
 		HistoryPageTruncations:     s.counters.historyTruncations.Load(),
 		OversizedWritesRejected:    s.counters.oversizedWriteRejects.Load(),
 		DatabaseBytes:              pageCount * pageSize,
+		DatabaseUsedBytes:          (pageCount - freePages) * pageSize,
+		DatabaseFreelistPages:      freePages,
+		DatabaseFreeBytes:          freePages * pageSize,
 		DatabaseLimitBytes:         limits.DatabaseBytes,
 		DatabaseEnforcedLimitBytes: maxPages * pageSize,
 		DatabasePageSizeBytes:      pageSize,
@@ -407,11 +441,19 @@ func (m StorageMetrics) LimitEnforced() bool {
 	return m.DatabaseEnforcedLimitBytes <= max(m.DatabaseLimitBytes, m.DatabasePageSizeBytes)
 }
 
+// PressureRatio is used bytes (excluding free pages) divided by the budget,
+// so it falls as soon as retention frees rows. A value built without
+// free-page information (DatabaseUsedBytes and DatabaseFreelistPages both
+// zero) falls back to the allocated DatabaseBytes.
 func (m StorageMetrics) PressureRatio() float64 {
 	if m.DatabaseLimitBytes <= 0 {
 		return 0
 	}
-	return float64(m.DatabaseBytes) / float64(m.DatabaseLimitBytes)
+	used := m.DatabaseUsedBytes
+	if used == 0 && m.DatabaseFreelistPages == 0 {
+		used = m.DatabaseBytes
+	}
+	return float64(used) / float64(m.DatabaseLimitBytes)
 }
 
 func logStorageTruncation(collector, resourceID, hash string, observed, limit int64, reason string) {

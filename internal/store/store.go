@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -18,7 +19,12 @@ import (
 )
 
 type Store struct {
-	db           *sql.DB
+	db *sql.DB
+	// reader is a small query_only pool for health, readiness, metrics, and
+	// History reads. SQLite WAL readers never wait for the writer, so these
+	// paths stay responsive while db (one connection) holds a long write
+	// transaction. nil for stores opened by the administrative helpers.
+	reader       *sql.DB
 	connector    *pageLimitedConnector
 	databasePath string
 	box          *secret.Box
@@ -263,7 +269,11 @@ func OpenWithLimits(path string, box *secret.Box, configuredLimits StorageLimits
 	// begins. A deferred transaction that reads and then writes after another
 	// process (an admin command, for example) committed fails immediately
 	// with SQLITE_BUSY_SNAPSHOT; an immediate one waits for busy_timeout.
-	dsn := "file:" + path + "?_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)&_pragma=synchronous(FULL)&_txlock=immediate"
+	//
+	// journal_size_limit caps the WAL file left behind after a checkpoint
+	// resets it; without it a burst leaves a WAL as large as the burst on
+	// disk indefinitely.
+	dsn := "file:" + path + "?_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)&_pragma=synchronous(FULL)&_pragma=journal_size_limit(" + strconv.FormatInt(journalSizeLimitBytes, 10) + ")&_txlock=immediate"
 	connector := newPageLimitedConnector(dsn)
 	db := sql.OpenDB(connector)
 	db.SetMaxOpenConns(1)
@@ -390,7 +400,50 @@ func OpenWithLimits(path string, box *secret.Box, configuredLimits StorageLimits
 		db.Close()
 		return nil, err
 	}
+	reader, err := openReaderPool(path)
+	if err != nil {
+		db.Close()
+		return nil, err
+	}
+	st.reader = reader
 	return st, nil
+}
+
+// journalSizeLimitBytes is the WAL size SQLite truncates to after a
+// checkpoint resets the log (64 MiB). A variable so tests can use a small cap.
+var journalSizeLimitBytes int64 = 64 << 20
+
+const readerPoolSize = 4
+
+// openReaderPool opens the read-only pool used by health, readiness, metrics,
+// and History reads. It is opened only after OpenWithLimits has created,
+// migrated, and switched the database to WAL, so readers always see the
+// current schema. mode=ro and query_only make every connection unable to
+// write, which is why these connections need neither the page-limited
+// connector (a read cannot allocate pages) nor journal_mode (WAL is a
+// persistent property of the file). Each statement outside a transaction
+// reads the latest committed WAL snapshot, so readers observe every commit
+// made through the writer before the statement began.
+func openReaderPool(path string) (*sql.DB, error) {
+	reader, err := sql.Open("sqlite", "file:"+path+"?mode=ro&_pragma=busy_timeout(5000)&_pragma=query_only(1)")
+	if err != nil {
+		return nil, fmt.Errorf("open read-only pool: %w", err)
+	}
+	reader.SetMaxOpenConns(readerPoolSize)
+	reader.SetMaxIdleConns(readerPoolSize)
+	if err := reader.Ping(); err != nil {
+		reader.Close()
+		return nil, fmt.Errorf("open read-only pool: %w", err)
+	}
+	return reader, nil
+}
+
+// readDB returns the read-only pool when the store has one, else the writer.
+func (s *Store) readDB() *sql.DB {
+	if s.reader != nil {
+		return s.reader
+	}
+	return s.db
 }
 
 // OpenExisting opens an existing, current-schema database for a narrow
@@ -512,5 +565,20 @@ func filepathDir(path string) string {
 	}
 	return path[:i]
 }
-func (s *Store) Close() error                   { return s.db.Close() }
-func (s *Store) Ping(ctx context.Context) error { return s.db.PingContext(ctx) }
+
+// Close closes the read-only pool and the writer.
+func (s *Store) Close() error {
+	var readerErr error
+	if s.reader != nil {
+		readerErr = s.reader.Close()
+	}
+	return errors.Join(readerErr, s.db.Close())
+}
+
+// Ping checks the database through the read-only pool so /healthz answers
+// while a write transaction holds the writer connection. A trivial query is
+// used rather than a driver ping so the check reads the database file.
+func (s *Store) Ping(ctx context.Context) error {
+	var version int64
+	return s.readDB().QueryRowContext(ctx, "PRAGMA schema_version").Scan(&version)
+}

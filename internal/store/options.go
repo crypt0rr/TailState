@@ -200,11 +200,19 @@ func saveMonitoringOptionsTx(ctx context.Context, tx *sql.Tx, in Settings, gener
 // database configured by an older release) or an unreadable value selects the
 // defaults so a damaged option can never stop monitoring.
 func (s *Store) loadMonitoringOptions(ctx context.Context, out *Settings) error {
+	return loadMonitoringOptions(ctx, s.db, out)
+}
+
+type rowQueryer interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
+func loadMonitoringOptions(ctx context.Context, db rowQueryer, out *Settings) error {
 	out.ExpiryWarningDays = DefaultExpiryWarningDays()
 	out.ExpiryTagFilter = nil
 	out.OAuthScopes = DefaultOAuthScopes()
 	var raw string
-	err := s.db.QueryRowContext(ctx, "SELECT value FROM meta WHERE key=?", monitoringOptionsMeta).Scan(&raw)
+	err := db.QueryRowContext(ctx, "SELECT value FROM meta WHERE key=?", monitoringOptionsMeta).Scan(&raw)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil
 	}

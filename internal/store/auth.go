@@ -218,9 +218,13 @@ func (s *Store) CreateSession(ctx context.Context) (token, csrf string, err erro
 	return
 }
 
+// ValidateSession is a pure read and uses the read-only pool, so an
+// authenticated History or status page does not wait behind a write. Every
+// statement reads the latest committed snapshot, so a committed logout,
+// password reset, or session expiry is observed immediately.
 func (s *Store) ValidateSession(ctx context.Context, token, csrf string, requireCSRF bool) bool {
 	var csrfHash, expires string
-	if s.db.QueryRowContext(ctx, "SELECT csrf_hash,expires_at FROM sessions WHERE token_hash=?", secret.HashToken(token)).Scan(&csrfHash, &expires) != nil {
+	if s.readDB().QueryRowContext(ctx, "SELECT csrf_hash,expires_at FROM sessions WHERE token_hash=?", secret.HashToken(token)).Scan(&csrfHash, &expires) != nil {
 		return false
 	}
 	expiry, err := time.Parse(time.RFC3339Nano, expires)

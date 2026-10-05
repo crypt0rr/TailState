@@ -39,7 +39,7 @@ func TestHelpExitsZeroAtEveryLevel(t *testing.T) {
 		{"healthcheck", "-h"}, {"healthcheck", "--help"},
 		{"doctor", "-h"}, {"doctor", "--help"},
 		{"admin", "-h"}, {"admin", "--help"}, {"admin", "help"},
-		{"admin", "reset", "-h"}, {"admin", "rekey", "--help"}, {"admin", "backup", "-h"},
+		{"admin", "reset", "-h"}, {"admin", "rekey", "--help"}, {"admin", "backup", "-h"}, {"admin", "compact", "-h"}, {"help", "admin", "compact"},
 		{"evidence", "-h"}, {"evidence", "help"},
 		{"evidence", "verify", "-h"}, {"evidence", "audit", "--help"}, {"evidence", "public-key", "-h"},
 		{"version", "-h"},

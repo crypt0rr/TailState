@@ -83,9 +83,11 @@ func NormalizeMuteRule(kind, value string) (string, string, error) {
 	return kind, value, nil
 }
 
-// ListMuteRules returns every mute rule in creation order.
+// ListMuteRules returns every mute rule in creation order. It reads through
+// the read-only pool; batch application reads the rules inside its own write
+// transaction instead.
 func (s *Store) ListMuteRules(ctx context.Context) ([]MuteRule, error) {
-	return listMuteRules(ctx, s.db)
+	return listMuteRules(ctx, s.readDB())
 }
 
 type muteQueryer interface {

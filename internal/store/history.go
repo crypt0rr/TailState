@@ -16,7 +16,8 @@ import (
 
 // ListHistory returns explainable event batches in descending order. History
 // query orchestration lives in this file so the persistence and reconciliation
-// code can evolve independently from the audit presentation path.
+// code can evolve independently from the audit presentation path. History
+// reads use the read-only pool and never wait behind a write transaction.
 func (s *Store) ListHistory(ctx context.Context, filter HistoryFilter) (HistoryPage, error) {
 	return s.listHistory(ctx, filter, s.StorageLimits().HistoryPageBytes, false)
 }
@@ -44,7 +45,7 @@ func (s *Store) listHistory(ctx context.Context, filter HistoryFilter, byteLimit
 		order = "ASC"
 	}
 	args = append(args, limit+1)
-	rows, err := s.db.QueryContext(ctx, `SELECT b.id,b.generation,b.observed_at,b.change_count,COALESCE(b.trigger_id,0)
+	rows, err := s.readDB().QueryContext(ctx, `SELECT b.id,b.generation,b.observed_at,b.change_count,COALESCE(b.trigger_id,0)
 		FROM event_batches b WHERE `+strings.Join(where, " AND ")+` ORDER BY b.id `+order+` LIMIT ?`, args...)
 	if err != nil {
 		return HistoryPage{}, err
@@ -206,7 +207,7 @@ func (s *Store) historyHasBatch(ctx context.Context, filter HistoryFilter, newer
 	}
 	args = append(args, id)
 	var exists int
-	if err := s.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM event_batches b WHERE `+strings.Join(where, " AND ")+`)`, args...).Scan(&exists); err != nil {
+	if err := s.readDB().QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM event_batches b WHERE `+strings.Join(where, " AND ")+`)`, args...).Scan(&exists); err != nil {
 		return false, err
 	}
 	return exists == 1, nil
@@ -237,14 +238,14 @@ func (s *Store) historyBatchByteEstimate(ctx context.Context, batchID int64, fil
 		eventArgs = append(eventArgs, filter.Severity)
 	}
 	var eventBytes int64
-	if err := s.db.QueryRowContext(ctx, `SELECT COALESCE(SUM(
+	if err := s.readDB().QueryRowContext(ctx, `SELECT COALESCE(SUM(
 		length(COALESCE(changes_json,'')) + length(COALESCE(before_json,'')) + length(COALESCE(after_json,'')) +
 		length(collector) + length(event_type) + length(resource_id) + length(name) + 128),0)
 		FROM events WHERE `+strings.Join(eventWhere, " AND "), eventArgs...).Scan(&eventBytes); err != nil {
 		return 0, err
 	}
 	var deliveryBytes int64
-	if err := s.db.QueryRowContext(ctx, `SELECT COALESCE(SUM(length(COALESCE(o.last_error,'')) + length(COALESCE(o.status,'')) + length(COALESCE(d.name,'')) + 128),0)
+	if err := s.readDB().QueryRowContext(ctx, `SELECT COALESCE(SUM(length(COALESCE(o.last_error,'')) + length(COALESCE(o.status,'')) + length(COALESCE(d.name,'')) + 128),0)
 		FROM outbox o LEFT JOIN notification_destinations d ON d.id=o.destination_id WHERE o.batch_id=?`, batchID).Scan(&deliveryBytes); err != nil {
 		return 0, err
 	}
@@ -254,7 +255,7 @@ func (s *Store) historyBatchByteEstimate(ctx context.Context, batchID int64, fil
 		// events selected by the display filter. Include conservative framing
 		// and base64/marshal overhead before loading it so the export budget
 		// cannot be bypassed by a narrow filter.
-		if err := s.db.QueryRowContext(ctx, `SELECT COALESCE(SUM(
+		if err := s.readDB().QueryRowContext(ctx, `SELECT COALESCE(SUM(
 			length(COALESCE(changes_json,'')) + length(COALESCE(before_json,'')) + length(COALESCE(after_json,'')) +
 			length(collector) + length(event_type) + length(resource_id) + length(name) + 256),0)
 			FROM events WHERE batch_id=?`, batchID).Scan(&ledgerBytes); err != nil {
@@ -271,7 +272,7 @@ func (s *Store) historyBatchByteEstimate(ctx context.Context, batchID int64, fil
 }
 
 func (s *Store) loadHistoryBatch(ctx context.Context, batch HistoryBatch, filter HistoryFilter, includeLedgerPayload bool) (HistoryBatch, error) {
-	triggerRows, err := s.db.QueryContext(ctx, "SELECT trigger_id FROM event_batch_triggers WHERE batch_id=? ORDER BY trigger_id", batch.ID)
+	triggerRows, err := s.readDB().QueryContext(ctx, "SELECT trigger_id FROM event_batch_triggers WHERE batch_id=? ORDER BY trigger_id", batch.ID)
 	if err != nil {
 		return HistoryBatch{}, err
 	}
@@ -295,7 +296,7 @@ func (s *Store) loadHistoryBatch(ctx context.Context, batch HistoryBatch, filter
 	if len(batch.TriggerIDs) == 0 && batch.TriggerID > 0 {
 		batch.TriggerIDs = []int64{batch.TriggerID}
 	}
-	if err := s.db.QueryRowContext(ctx, "SELECT sequence,prev_hash,entry_hash,signature,key_id FROM evidence_ledger WHERE batch_id=?", batch.ID).Scan(&batch.LedgerSequence, &batch.LedgerPrevHash, &batch.LedgerHash, &batch.LedgerSignature, &batch.LedgerKeyID); err != nil && !errors.Is(err, sql.ErrNoRows) {
+	if err := s.readDB().QueryRowContext(ctx, "SELECT sequence,prev_hash,entry_hash,signature,key_id FROM evidence_ledger WHERE batch_id=?", batch.ID).Scan(&batch.LedgerSequence, &batch.LedgerPrevHash, &batch.LedgerHash, &batch.LedgerSignature, &batch.LedgerKeyID); err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return HistoryBatch{}, err
 	}
 	if includeLedgerPayload && batch.LedgerSequence > 0 {
@@ -324,7 +325,7 @@ func (s *Store) loadHistoryBatch(ctx context.Context, batch HistoryBatch, filter
 		eventWhere = append(eventWhere, "severity=?")
 		eventArgs = append(eventArgs, filter.Severity)
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT id,batch_id,generation,observed_at,collector,event_type,resource_id,name,changes_json,before_json,after_json,before_hash,after_hash,before_bytes,after_bytes,before_truncated,after_truncated,severity,muted
+	rows, err := s.readDB().QueryContext(ctx, `SELECT id,batch_id,generation,observed_at,collector,event_type,resource_id,name,changes_json,before_json,after_json,before_hash,after_hash,before_bytes,after_bytes,before_truncated,after_truncated,severity,muted
 		FROM events WHERE `+strings.Join(eventWhere, " AND ")+` ORDER BY id`, eventArgs...)
 	if err != nil {
 		return HistoryBatch{}, err
@@ -400,7 +401,7 @@ func (s *Store) loadHistoryBatch(ctx context.Context, batch HistoryBatch, filter
 	if err := rows.Close(); err != nil {
 		return HistoryBatch{}, err
 	}
-	rows, err = s.db.QueryContext(ctx, `SELECT o.id,o.destination_id,COALESCE(d.name,'Removed destination'),o.status,o.attempts,o.last_error,o.next_attempt,COALESCE(o.delivered_at,'')
+	rows, err = s.readDB().QueryContext(ctx, `SELECT o.id,o.destination_id,COALESCE(d.name,'Removed destination'),o.status,o.attempts,o.last_error,o.next_attempt,COALESCE(o.delivered_at,'')
 		FROM outbox o LEFT JOIN notification_destinations d ON d.id=o.destination_id
 		WHERE o.batch_id=? ORDER BY o.id`, batch.ID)
 	if err != nil {

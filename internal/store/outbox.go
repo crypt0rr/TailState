@@ -336,9 +336,10 @@ func retryableDeadOutbox(prefix string) string {
 }
 
 // DestinationDeliveries returns per-destination delivery counts for every
-// active destination, including destinations with an empty outbox.
+// active destination, including destinations with an empty outbox, through
+// the read-only pool so the status page never waits behind a write.
 func (s *Store) DestinationDeliveries(ctx context.Context) ([]DestinationDelivery, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT d.id,d.name,d.enabled,
+	rows, err := s.readDB().QueryContext(ctx, `SELECT d.id,d.name,d.enabled,
 		COALESCE(SUM(o.status='pending'),0),COALESCE(SUM(o.status='processing'),0),COALESCE(SUM(o.status='dead'),0),
 		COALESCE(SUM(CASE WHEN `+retryableDeadOutbox("o.")+` THEN 1 ELSE 0 END),0)
 		FROM notification_destinations d LEFT JOIN outbox o ON o.destination_id=d.id

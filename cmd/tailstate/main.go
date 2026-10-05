@@ -84,6 +84,21 @@ func serve() error {
 }
 
 func serveContext(ctx context.Context) error {
+	// Hold the service lock for the process lifetime so offline maintenance
+	// (admin compact) refuses to run while the service is up. The kernel
+	// drops it if the process dies.
+	config, err := boot.Load(version)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(config.DataDir, 0o700); err != nil {
+		return err
+	}
+	lock, err := store.LockService(config.DatabasePath())
+	if err != nil {
+		return err
+	}
+	defer lock.Release()
 	config, st, err := load()
 	if err != nil {
 		return err
@@ -272,6 +287,9 @@ func doctor(args []string) error {
 	if storage, storageErr := st.StorageMetrics(context.Background()); storageErr == nil {
 		runtime.Storage.DatabaseLimitBytes = storage.DatabaseLimitBytes
 		runtime.Storage.DatabaseBytes = storage.DatabaseBytes
+		runtime.Storage.DatabaseUsedBytes = storage.DatabaseUsedBytes
+		runtime.Storage.DatabaseFreelistPages = storage.DatabaseFreelistPages
+		runtime.Storage.DatabaseFreeBytes = storage.DatabaseFreeBytes
 		runtime.Storage.DatabaseFileBytes = storage.DatabaseFileBytes
 		runtime.Storage.DatabaseWALBytes = storage.DatabaseWALBytes
 		runtime.Storage.DatabaseSHMBytes = storage.DatabaseSHMBytes
@@ -310,7 +328,8 @@ func writeDoctorReport(report diagnostics.Report, jsonOutput bool) error {
 		} else if report.SchemaVersion > 0 {
 			fmt.Fprintf(os.Stdout, "Database schema: %d\n", report.SchemaVersion)
 		}
-		fmt.Fprintf(os.Stdout, "Storage: %d/%d bytes (snapshot limit %d, event limit %d, history page limit %d)\n", report.Storage.DatabaseBytes, report.Storage.DatabaseLimitBytes, report.Storage.SnapshotLimitBytes, report.Storage.EventValueLimitBytes, report.Storage.HistoryPageLimitBytes)
+		fmt.Fprintf(os.Stdout, "Storage: %d/%d bytes used (snapshot limit %d, event limit %d, history page limit %d)\n", report.Storage.DatabaseUsedBytes, report.Storage.DatabaseLimitBytes, report.Storage.SnapshotLimitBytes, report.Storage.EventValueLimitBytes, report.Storage.HistoryPageLimitBytes)
+		fmt.Fprintf(os.Stdout, "Allocated: %d bytes, of which %d bytes in %d free pages\n", report.Storage.DatabaseBytes, report.Storage.DatabaseFreeBytes, report.Storage.DatabaseFreelistPages)
 		if report.Storage.ConfiguredProfile != nil {
 			fmt.Fprintf(os.Stdout, "Configured storage profile: snapshot %d, event %d, history page %d, reject %d, database %d bytes\n", report.Storage.ConfiguredProfile.SnapshotLimitBytes, report.Storage.ConfiguredProfile.EventValueLimitBytes, report.Storage.ConfiguredProfile.HistoryPageLimitBytes, report.Storage.ConfiguredProfile.RejectLimitBytes, report.Storage.ConfiguredProfile.DatabaseLimitBytes)
 		}
@@ -425,6 +444,33 @@ func adminBackup(args []string) error {
 		return fmt.Errorf("admin backup: %w", err)
 	}
 	fmt.Fprintf(os.Stdout, "TailState backup written: %s (%d bytes, schema %d)\nSHA-256: %s (%s)\nKeep the matching master key; the snapshot is unusable without it.\n", result.Path, result.Bytes, result.SchemaVersion, result.SHA256, result.ChecksumPath)
+	return nil
+}
+
+func adminCompact(args []string) error {
+	flags := newFlagSet("admin compact")
+	incremental := flags.Bool("incremental-vacuum", false, "also switch the database to auto_vacuum=INCREMENTAL so later cleanup passes release free pages")
+	if done, err := parseFlags("admin compact", flags, args); done {
+		return err
+	}
+	config, err := boot.Load(version)
+	if err != nil {
+		return fmt.Errorf("admin compact configuration: %w", err)
+	}
+	key, err := config.MasterKey()
+	if err != nil {
+		return fmt.Errorf("admin compact master key: %w", err)
+	}
+	box, err := secret.NewBox(key)
+	if err != nil {
+		return fmt.Errorf("admin compact master key: %w", err)
+	}
+	result, err := store.Compact(context.Background(), config.DatabasePath(), box, store.CompactOptions{IncrementalVacuum: *incremental})
+	if err != nil {
+		return fmt.Errorf("admin compact: %w", err)
+	}
+	fmt.Fprintf(os.Stdout, "TailState database compacted: %d -> %d bytes (%d -> %d pages, %d free pages released); incremental auto-vacuum %t\n",
+		result.PagesBefore*result.PageSize, result.PagesAfter*result.PageSize, result.PagesBefore, result.PagesAfter, result.FreePagesBefore-result.FreePagesAfter, result.AutoVacuumEnabled)
 	return nil
 }
 

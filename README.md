@@ -240,7 +240,7 @@ curl -fsS http://127.0.0.1:8080/metrics
 
 Only the documented routes exist: `/` redirects to the right page, unknown paths return `404`, `/static/` serves the embedded stylesheet without directory listings, and the browser's automatic `/favicon.ico` probe gets an empty, cacheable `204` without touching the database.
 
-`/metrics` exposes readiness, pending/dead delivery counts, notification destination totals and enabled counts, the notification state (`tailstate_notification_state{state="unconfigured|no_destinations|paused|active"}`, exactly one is `1`) and a `tailstate_notifications_paused` gauge that is `1` when a configured installation has no destination or every destination is disabled, pending/processing/dead webhook trigger counts, resource counts, low-cardinality collector health gauges (`supported`, `baseline`, partial-result state, partial error count, failures, poll duration, last success, and next poll timestamps), the scheduler's total database-error counter (`tailstate_collector_due_errors_total`), delivery telemetry (`tailstate_outbox_delivery_attempts_total`, success/failure counters, lease renewal/loss counters, and the `tailstate_outbox_delivery_duration_seconds` histogram), and bounded storage telemetry. Storage metrics include the database size and pressure ratio, the page ceiling SQLite is actually enforcing (`tailstate_storage_enforced_limit_bytes`, plus `tailstate_storage_limit_enforced`, which drops to `0` if the active ceiling ever exceeds the configured budget), configured snapshot/event/history/rejection limits, and counters for snapshot truncation, event-value truncation, history-page truncation, and oversized raw writes represented by a metadata marker. These signals make storage pressure visible without exposing destination URLs, provider bodies, or message contents. The `device_details` collector uses a bounded eight-worker fan-out and a two-minute per-collector deadline; usable partial results are retained and marked in the status page and metrics with the number of devices whose details are missing. When `TAILSTATE_METRICS_TOKEN` is empty, only a direct loopback connection is accepted; requests from a reverse proxy (including a loopback or trusted proxy), requests with forwarded headers, and non-loopback peers receive `401`. Set that variable for Prometheus or any reverse proxy to require `Authorization: Bearer <token>` from any network location. Do not publish the endpoint without a token through a public reverse proxy. Every metric family carries `# HELP` and `# TYPE` lines (the exposition passes `promtool check metrics`), and the response is rendered in full before it is sent: if a store query fails, the scrape receives a clean `500` rather than a partial `200` body.
+`/metrics` exposes readiness, pending/dead delivery counts, notification destination totals and enabled counts, the notification state (`tailstate_notification_state{state="unconfigured|no_destinations|paused|active"}`, exactly one is `1`) and a `tailstate_notifications_paused` gauge that is `1` when a configured installation has no destination or every destination is disabled, pending/processing/dead webhook trigger counts, resource counts, low-cardinality collector health gauges (`supported`, `baseline`, partial-result state, partial error count, failures, poll duration, last success, and next poll timestamps), the scheduler's total database-error counter (`tailstate_collector_due_errors_total`), delivery telemetry (`tailstate_outbox_delivery_attempts_total`, success/failure counters, lease renewal/loss counters, and the `tailstate_outbox_delivery_duration_seconds` histogram), and bounded storage telemetry. Storage metrics include the allocated and used database size, free pages, and the used-bytes pressure ratio, the page ceiling SQLite is actually enforcing (`tailstate_storage_enforced_limit_bytes`, plus `tailstate_storage_limit_enforced`, which drops to `0` if the active ceiling ever exceeds the configured budget), configured snapshot/event/history/rejection limits, and counters for snapshot truncation, event-value truncation, history-page truncation, and oversized raw writes represented by a metadata marker. These signals make storage pressure visible without exposing destination URLs, provider bodies, or message contents. The `device_details` collector uses a bounded eight-worker fan-out and a two-minute per-collector deadline; usable partial results are retained and marked in the status page and metrics with the number of devices whose details are missing. When `TAILSTATE_METRICS_TOKEN` is empty, only a direct loopback connection is accepted; requests from a reverse proxy (including a loopback or trusted proxy), requests with forwarded headers, and non-loopback peers receive `401`. Set that variable for Prometheus or any reverse proxy to require `Authorization: Bearer <token>` from any network location. Do not publish the endpoint without a token through a public reverse proxy. Every metric family carries `# HELP` and `# TYPE` lines (the exposition passes `promtool check metrics`), and the response is rendered in full before it is sent: if a store query fails, the scrape receives a clean `500` rather than a partial `200` body.
 
 Retention cleanup is resumable and writer-friendly. Each table is processed in keyset batches of at most 128 rows, each autocommit transaction has a 250 ms deadline, and one pass stops after two seconds; when work remains, the monitor schedules a continuation within one second instead of waiting for the hourly sweep. A failed pass is retried after one second, and consecutive failures double that delay up to the hourly sweep interval, so a persistent error (for example a full disk) does not retry every second; the next successful pass resets the backoff. Cleanup logs include per-table row counts, transaction count, duration, failures, and the remaining-work flag. The same information is available through `tailstate_cleanup_*` metrics. Active notification and webhook leases are never dead-lettered until their lease has expired, and evidence-ledger rows are never removed by retention.
 
@@ -365,6 +365,7 @@ tailstate help admin backup    # one command; every command also accepts -h/--he
 | `admin reset` | One-time password reset token (safe while serving) |
 | `admin rekey -new-key-file PATH` | Master-key rotation (service stopped) |
 | `admin backup -out FILE` | Consistent online database snapshot plus `FILE.sha256` (safe while serving) |
+| `admin compact [-incremental-vacuum]` | Release free pages (service stopped; see [Compaction](#compaction)) |
 | `evidence verify`, `evidence audit`, `evidence public-key` | Evidence verification and ledger audit |
 | `version` | Print the version |
 
@@ -766,20 +767,72 @@ file mount. They are not read as application settings by a standalone binary.
 
 Storage limits are read by both the standalone binary and Compose. The database
 limit is a real SQLite page ceiling: writes that reach it fail atomically, and
-TailState reports the condition through diagnostics and metrics. Set the limit
-above the current database size before lowering it; a restart refuses to open a
-database that already exceeds the configured ceiling. The limit covers the
-logical SQLite database, while the signed evidence ledger remains retained for
-audit and is never silently deleted to make room.
+TailState reports the condition through diagnostics and metrics. The budget is
+compared with *used* bytes, `(page_count - freelist_count) * page_size`:
+retention frees pages that SQLite reuses before it grows the file, so
+`tailstate_storage_used_bytes` and `tailstate_storage_pressure_ratio` fall as
+soon as old history is removed, while `tailstate_storage_bytes` (allocated,
+including free pages), `tailstate_storage_freelist_pages`, and
+`tailstate_storage_free_bytes` show what compaction would return. A restart
+refuses a limit below the used bytes. A limit below the file size but above
+the used bytes is accepted; because SQLite cannot lower its page ceiling below
+the current file size, it is enforced at that size (and `doctor` reports
+`storage_compaction_needed`) until you compact the database. The limit covers
+the logical SQLite database, while the signed evidence ledger remains retained
+for audit and is never silently deleted to make room.
 
-The Settings diagnostics show database use in MiB with its percentage of the
-configured limit. Settings diagnostics, `doctor`, and `/metrics` also expose the
+### Compaction
+
+`admin compact` rewrites the database without free pages. It is an offline
+command: `serve` holds an advisory lock on `tailstate.db.lock` for its whole
+lifetime, and `compact` refuses to run (exit code `1`) while that lock is held.
+It opens the database like `admin reset` (never creates or migrates it),
+writes a compacted copy beside it with `VACUUM INTO`, verifies the copy, and
+only then replaces the original, so an interrupted run leaves the original in
+place. It also refuses if another process still has the database open. Take a
+backup first:
+
+```console
+docker compose exec tailstate /tailstate admin backup -out /data/pre-compact.db
+docker compose stop tailstate
+docker compose run --rm tailstate admin compact
+docker compose up -d tailstate
+```
+
+`-incremental-vacuum` additionally switches the database to SQLite
+`auto_vacuum=INCREMENTAL`; afterwards every retention pass that removes rows
+also returns up to 2,048 free pages to the filesystem, so the file shrinks
+without further manual compaction. The setting is per database and changing
+it requires this rewrite, so it is never applied by a migration. The lock is
+advisory and only covers processes on the same host and kernel; on a
+platform without `flock(2)`, stop the service manually first.
+
+### WAL and read concurrency
+
+The writer connection sets `journal_size_limit` to 64 MiB, so after a burst
+the `-wal` file is truncated back to that cap the next time SQLite restarts
+the log, and every retention pass that changed rows ends with a
+`wal_checkpoint(TRUNCATE)`. `/healthz`, `/readyz`, `/metrics`, session checks,
+History reads, the Status page (collector state, the **Expiring soon** card,
+and per-destination delivery counts), and the Settings page's webhook state
+and mute rules use a separate pool of four read-only (`mode=ro`,
+`query_only`) connections. In WAL mode these readers never wait for the
+single writer, so health checks and scrapes keep answering during a long write
+transaction, and every read observes the latest committed data.
+
+The Settings diagnostics show the used database bytes (excluding free pages)
+in MiB with their percentage of the configured limit, and the allocated size
+when free pages are waiting for reuse or compaction. Settings diagnostics, `doctor`, and `/metrics` also expose the
 observed physical sizes of the main
 `tailstate.db` file, its `-wal` and `-shm` sidecars, and their total. These
 physical gauges are volume-safety observations, not additional enforcement
-limits; a missing transient sidecar is reported as zero. The logical
-`tailstate_storage_bytes` value remains the one compared with
-`TAILSTATE_DATABASE_LIMIT_BYTES`.
+limits; a missing transient sidecar is reported as zero.
+
+The evidence ledger is intentionally never pruned and so grows with the
+number of change batches. Ledger archival (exporting a signed checkpoint plus
+the archived segment, then pruning locally while keeping the chain verifiable
+from that checkpoint) is planned future work; until then, size the database
+budget for the ledger's growth and monitor `tailstate_storage_used_bytes`.
 
 ## Local development
 

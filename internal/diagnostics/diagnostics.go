@@ -73,12 +73,16 @@ type StorageProfile struct {
 // guardrails. It contains sizes and counters only; provider payloads and
 // destination credentials are intentionally absent.
 type StorageRuntime struct {
-	SnapshotLimitBytes      int64
-	EventValueLimitBytes    int64
-	HistoryPageLimitBytes   int64
-	RejectLimitBytes        int64
-	DatabaseLimitBytes      int64
-	DatabaseBytes           int64
+	SnapshotLimitBytes    int64
+	EventValueLimitBytes  int64
+	HistoryPageLimitBytes int64
+	RejectLimitBytes      int64
+	DatabaseLimitBytes    int64
+	DatabaseBytes         int64
+	// DatabaseUsedBytes excludes free pages; StoragePressure is based on it.
+	DatabaseUsedBytes       int64
+	DatabaseFreelistPages   int64
+	DatabaseFreeBytes       int64
 	DatabaseFileBytes       int64
 	DatabaseWALBytes        int64
 	DatabaseSHMBytes        int64
@@ -94,6 +98,10 @@ type StorageRuntime struct {
 	ConfiguredProfile *StorageProfile `json:"configured_profile,omitempty"`
 	PersistedProfile  *StorageProfile `json:"persisted_profile,omitempty"`
 }
+
+// reclaimableFindingBytes is the smallest amount of free space worth an
+// informational compaction hint.
+const reclaimableFindingBytes = 8 << 20
 
 // Report is the complete safe deployment report.
 type Report struct {
@@ -234,12 +242,30 @@ func Build(config boot.Config, runtime Runtime, request *http.Request) Report {
 		}
 		add(Finding{Code: "storage_pressure", Severity: severity, Summary: summary, Remediation: remediation})
 	}
-	if runtime.Storage.LimitNotEnforced {
+	compactionNeeded := runtime.Storage.DatabaseFreeBytes > 0 && runtime.Storage.DatabaseLimitBytes > 0 && runtime.Storage.DatabaseBytes > runtime.Storage.DatabaseLimitBytes
+	if runtime.Storage.LimitNotEnforced && compactionNeeded {
+		// SQLite cannot lower its page ceiling below the current file size,
+		// so a budget lowered below a file that still holds free pages is
+		// enforced at the file size until the free pages are released.
+		add(Finding{
+			Code:        "storage_compaction_needed",
+			Severity:    SeverityWarning,
+			Summary:     "The database file is larger than the configured budget because it holds free pages; the budget is enforced at the current file size until the database is compacted.",
+			Remediation: "Stop TailState, run `tailstate admin compact`, and start it again.",
+		})
+	} else if runtime.Storage.LimitNotEnforced {
 		add(Finding{
 			Code:        "storage_limit_not_enforced",
 			Severity:    SeverityError,
 			Summary:     "SQLite is not enforcing the configured database budget on the active connection.",
 			Remediation: "Restart TailState so the configured page ceiling is reapplied, and report the issue with the TailState version.",
+		})
+	} else if runtime.Storage.DatabaseFreeBytes >= reclaimableFindingBytes && runtime.Storage.DatabaseFreeBytes*4 >= runtime.Storage.DatabaseBytes {
+		add(Finding{
+			Code:        "storage_reclaimable",
+			Severity:    SeverityInfo,
+			Summary:     "At least a quarter of the database file is free pages left by retention.",
+			Remediation: "SQLite reuses free pages before growing the file. To return them to the filesystem, stop TailState and run `tailstate admin compact`.",
 		})
 	}
 

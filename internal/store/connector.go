@@ -3,6 +3,8 @@ package store
 import (
 	"context"
 	"database/sql/driver"
+	"errors"
+	"io"
 	"strconv"
 	"sync/atomic"
 
@@ -20,6 +22,12 @@ type pageLimitedConnector struct {
 	dsn      string
 	driver   *sqlite.Driver
 	maxPages atomic.Int64
+	// enforcedPages is the ceiling SQLite reported after the most recent
+	// connection applied maxPages. SQLite never lowers max_page_count below
+	// the current page_count, so this can exceed maxPages until free pages
+	// are released (see admin compact). StorageMetrics reports it without
+	// queuing behind the single writer connection.
+	enforcedPages atomic.Int64
 }
 
 func newPageLimitedConnector(dsn string) *pageLimitedConnector {
@@ -29,8 +37,22 @@ func newPageLimitedConnector(dsn string) *pageLimitedConnector {
 		if pages < 1 {
 			return nil
 		}
-		_, err := conn.ExecContext(context.Background(), "PRAGMA max_page_count = "+strconv.FormatInt(pages, 10), nil)
-		return err
+		rows, err := conn.QueryContext(context.Background(), "PRAGMA max_page_count = "+strconv.FormatInt(pages, 10), nil)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		values := make([]driver.Value, len(rows.Columns()))
+		if err := rows.Next(values); err != nil {
+			if errors.Is(err, io.EOF) {
+				return nil
+			}
+			return err
+		}
+		if applied, ok := values[0].(int64); ok {
+			connector.enforcedPages.Store(applied)
+		}
+		return nil
 	})
 	return connector
 }

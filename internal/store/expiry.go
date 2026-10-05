@@ -23,9 +23,11 @@ type SnapshotRecord struct {
 
 // CollectorSnapshots returns the current normalized snapshots for one
 // collector in the given generation. Truncated snapshots are skipped because
-// they hold only a size marker instead of the resource fields.
+// they hold only a size marker instead of the resource fields. The read-only
+// pool serves it, so the status page's expiry card and the daily expiry check
+// never queue behind a write transaction.
 func (s *Store) CollectorSnapshots(ctx context.Context, generation int64, collector string) ([]SnapshotRecord, error) {
-	rows, err := s.db.QueryContext(ctx, "SELECT resource_id,name,canonical_json FROM snapshots WHERE generation=? AND collector=? AND content_truncated=0 ORDER BY resource_id", generation, collector)
+	rows, err := s.readDB().QueryContext(ctx, "SELECT resource_id,name,canonical_json FROM snapshots WHERE generation=? AND collector=? AND content_truncated=0 ORDER BY resource_id", generation, collector)
 	if err != nil {
 		return nil, err
 	}
@@ -39,6 +41,30 @@ func (s *Store) CollectorSnapshots(ctx context.Context, generation int64, collec
 		out = append(out, record)
 	}
 	return out, rows.Err()
+}
+
+// ExpiryOptions is the active monitoring generation with the expiry warning
+// windows and tag filter, read without decrypting any credential.
+type ExpiryOptions struct {
+	Generation  int64
+	WarningDays []int
+	TagFilter   []string
+}
+
+// ExpiryOptions reads the expiry warning options through the read-only pool,
+// so the status page's "Expiring soon" card never queues behind a write
+// transaction. It returns sql.ErrNoRows on an unconfigured installation.
+func (s *Store) ExpiryOptions(ctx context.Context) (ExpiryOptions, error) {
+	var out ExpiryOptions
+	if err := s.readDB().QueryRowContext(ctx, "SELECT generation FROM settings WHERE id=1").Scan(&out.Generation); err != nil {
+		return ExpiryOptions{}, err
+	}
+	var options Settings
+	if err := loadMonitoringOptions(ctx, s.readDB(), &options); err != nil {
+		return ExpiryOptions{}, err
+	}
+	out.WarningDays, out.TagFilter = options.ExpiryWarningDays, options.ExpiryTagFilter
+	return out, nil
 }
 
 // ExpiryWarningState returns the persisted expiry warning state, or an empty

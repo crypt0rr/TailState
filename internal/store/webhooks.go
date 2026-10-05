@@ -41,16 +41,17 @@ type WebhookState struct {
 
 // WebhookStatus returns the safe webhook acceleration summary shown on the
 // Settings page. LastAccepted covers the retained trigger ledger (30 days).
+// Reads use the read-only pool.
 func (s *Store) WebhookStatus(ctx context.Context) (WebhookState, error) {
 	var out WebhookState
 	var enabled int
-	err := s.db.QueryRowContext(ctx, "SELECT COALESCE(webhook_secret_enc,'')<>'' FROM settings WHERE id=1").Scan(&enabled)
+	err := s.readDB().QueryRowContext(ctx, "SELECT COALESCE(webhook_secret_enc,'')<>'' FROM settings WHERE id=1").Scan(&enabled)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return WebhookState{}, err
 	}
 	out.Enabled = enabled == 1
 	var received string
-	err = s.db.QueryRowContext(ctx, "SELECT received_at FROM webhook_triggers ORDER BY id DESC LIMIT 1").Scan(&received)
+	err = s.readDB().QueryRowContext(ctx, "SELECT received_at FROM webhook_triggers ORDER BY id DESC LIMIT 1").Scan(&received)
 	if errors.Is(err, sql.ErrNoRows) {
 		return out, nil
 	}

@@ -722,13 +722,14 @@ func (s *Server) retryDeadLettersAuthorized(w http.ResponseWriter, r *http.Reque
 // expiringSoon lists device node keys and auth keys that expire within the
 // widest configured warning window, using the same filters as the warnings.
 // A read failure only hides the card; it never fails the status page.
+// Every read uses the store's read-only pool.
 func (s *Server) expiringSoon(ctx context.Context, now time.Time) ([]expiringResource, int, bool) {
-	settings, err := s.store.Settings(ctx)
+	settings, err := s.store.ExpiryOptions(ctx)
 	if err != nil {
 		return nil, expiry.DefaultHorizonDays, false
 	}
-	horizon := expiry.HorizonDays(settings.ExpiryWarningDays)
-	filtered := len(settings.ExpiryTagFilter) > 0
+	horizon := expiry.HorizonDays(settings.WarningDays)
+	filtered := len(settings.TagFilter) > 0
 	devices, err := s.store.CollectorSnapshots(ctx, settings.Generation, "devices")
 	if err != nil {
 		slog.Error("load device snapshots for expiry card", "error", err)
@@ -739,7 +740,7 @@ func (s *Server) expiringSoon(ctx context.Context, now time.Time) ([]expiringRes
 		slog.Error("load key snapshots for expiry card", "error", err)
 		return nil, horizon, filtered
 	}
-	items := expiry.Upcoming(expiry.Items(expirySnapshots(devices), expirySnapshots(keys), settings.ExpiryTagFilter), now, horizon)
+	items := expiry.Upcoming(expiry.Items(expirySnapshots(devices), expirySnapshots(keys), settings.TagFilter), now, horizon)
 	out := make([]expiringResource, 0, len(items))
 	for _, item := range items {
 		out = append(out, expiringResource{Kind: item.KindLabel(), Name: item.Name, Tags: strings.Join(item.Tags, ", "), Expires: item.Expires, DaysLeft: item.DaysLeft(now)})
@@ -1231,6 +1232,9 @@ func (s *Server) diagnosticReport(ctx context.Context, request *http.Request) di
 			RejectLimitBytes:        limits.RejectBytes,
 			DatabaseLimitBytes:      metrics.DatabaseLimitBytes,
 			DatabaseBytes:           metrics.DatabaseBytes,
+			DatabaseUsedBytes:       metrics.DatabaseUsedBytes,
+			DatabaseFreelistPages:   metrics.DatabaseFreelistPages,
+			DatabaseFreeBytes:       metrics.DatabaseFreeBytes,
 			DatabaseFileBytes:       metrics.DatabaseFileBytes,
 			DatabaseWALBytes:        metrics.DatabaseWALBytes,
 			DatabaseSHMBytes:        metrics.DatabaseSHMBytes,
@@ -1774,9 +1778,12 @@ func (s *Server) writeMetrics(b *bytes.Buffer, status store.Status, storage stor
 			fmt.Fprintf(b, "tailstate_cleanup_rows_total{table=%q} %d\n", row.table, row.count)
 		}
 	}
-	metricValue(b, "tailstate_storage_bytes", "gauge", "Logical bytes used by the SQLite database.", storage.DatabaseBytes)
+	metricValue(b, "tailstate_storage_bytes", "gauge", "Logical bytes allocated by the SQLite database, including free pages.", storage.DatabaseBytes)
+	metricValue(b, "tailstate_storage_used_bytes", "gauge", "Logical bytes in use by the SQLite database, excluding free pages.", storage.DatabaseUsedBytes)
+	metricValue(b, "tailstate_storage_freelist_pages", "gauge", "Free SQLite pages awaiting reuse or compaction.", storage.DatabaseFreelistPages)
+	metricValue(b, "tailstate_storage_free_bytes", "gauge", "Bytes held by free SQLite pages.", storage.DatabaseFreeBytes)
 	metricValue(b, "tailstate_storage_limit_bytes", "gauge", "Configured database budget.", storage.DatabaseLimitBytes)
-	metricValue(b, "tailstate_storage_pressure_ratio", "gauge", "Database bytes divided by the configured budget.", storage.PressureRatio())
+	metricValue(b, "tailstate_storage_pressure_ratio", "gauge", "Used database bytes (excluding free pages) divided by the configured budget.", storage.PressureRatio())
 	metricValue(b, "tailstate_storage_enforced_limit_bytes", "gauge", "Page ceiling SQLite enforces on the active connection.", storage.DatabaseEnforcedLimitBytes)
 	metricValue(b, "tailstate_storage_limit_enforced", "gauge", "Whether the enforced page ceiling is within the configured database budget.", boolMetric(storage.LimitEnforced()))
 	metricValue(b, "tailstate_storage_database_file_bytes", "gauge", "Physical bytes used by the main SQLite database file.", storage.DatabaseFileBytes)

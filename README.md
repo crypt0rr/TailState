@@ -481,11 +481,24 @@ are documented in [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Releases
 
-Pushing a semantic tag such as `v1.0.0` starts the verified release promotion workflow. The exact tagged commit must pass the reusable CI gate, including tests, coverage, Staticcheck, Govulncheck, an Anchore high-severity scan, runtime healthchecks, backup/restore validation, and a multi-architecture build. Release promotion first pushes one immutable candidate manifest, scans and smoke-tests both platform images by digest, and only then creates an annotated stable manifest copy whose platform digests match the candidate. The version, minor, and stable-only `latest` tags point to that verified copy; the temporary candidate package version is removed after the aliases are verified. The workflow publishes signed-build metadata, an SBOM, and `linux/amd64` plus `linux/arm64` images to:
+Pushing a semantic tag such as `v1.0.0` starts the verified release promotion workflow. The exact tagged commit must pass the reusable CI gate, including tests, coverage, Staticcheck, Govulncheck, an Anchore high-severity scan, runtime healthchecks, backup/restore validation, and a multi-architecture build. Release promotion first pushes one immutable candidate manifest, scans and smoke-tests both platform images by digest, and only then creates an annotated stable manifest copy whose platform digests match the candidate. The version, minor, and stable-only `latest` tags point to that verified copy; the temporary candidate package version is removed after the aliases are verified. The workflow publishes a Sigstore-signed build-provenance attestation, an SBOM, and `linux/amd64` plus `linux/arm64` images to:
 
 ```text
 ghcr.io/crypt0rr/tailstate
 ```
+
+Verify that an image was built by this repository's release workflow before
+deploying it:
+
+```console
+gh attestation verify oci://ghcr.io/crypt0rr/tailstate:<version> \
+  --owner crypt0rr \
+  --signer-workflow crypt0rr/TailState/.github/workflows/release.yml
+```
+
+The attestation covers the promoted multi-architecture index digest that the
+version, minor, and `latest` tags resolve to, so the same check works for a
+pinned digest (`oci://ghcr.io/crypt0rr/tailstate@sha256:...`).
 
 The workflow also creates the matching GitHub Release with generated notes. Use the immutable version tag or image digest in deployments; reserve `latest` for development convenience. For a rollback, set `TAILSTATE_IMAGE` to a previously verified digest and keep the matching `secrets/tailstate_master_key` backup available:
 

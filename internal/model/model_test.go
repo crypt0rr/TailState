@@ -496,3 +496,52 @@ func TestDeviceDetailsExcludeDuplicatedCoreDevice(t *testing.T) {
 		t.Fatalf("secondary device details were removed: %s", raw)
 	}
 }
+
+func TestLegacyUnsupportedLogStreamNormalizesToNotConfigured(t *testing.T) {
+	legacy := map[string]any{
+		"configuration": map[string]any{"unsupported": true},
+		"network":       map[string]any{"stream": map[string]any{"destinationType": "splunk"}, "status": map[string]any{}},
+	}
+	current := map[string]any{
+		"configuration": map[string]any{"configured": false},
+		"network":       map[string]any{"stream": map[string]any{"destinationType": "splunk"}, "status": map[string]any{}},
+	}
+	_, legacyHash, err := CanonicalFor("log_streaming", legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, currentHash, err := CanonicalFor("log_streaming", current)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if legacyHash != currentHash {
+		t.Fatal("legacy unsupported log stream snapshot would report drift after upgrade")
+	}
+}
+
+func TestLogStreamCredentialsAreRedacted(t *testing.T) {
+	raw, _, err := CanonicalFor("log_streaming", map[string]any{
+		"configuration": map[string]any{"stream": map[string]any{
+			"gcsCredentials":    `{"type":"external_account","private_key":"very-secret"}`,
+			"s3SecretAccessKey": "s3-secret",
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "very-secret") || strings.Contains(string(raw), "s3-secret") {
+		t.Fatalf("log stream credentials were not redacted: %s", raw)
+	}
+}
+
+func TestUnavailableLogStreamStatusIsPreserved(t *testing.T) {
+	raw, _, err := CanonicalFor("log_streaming", map[string]any{
+		"configuration": map[string]any{"stream": map[string]any{"destinationType": "splunk"}, "status": map[string]any{"state": HealthStatusUnavailable}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"state":"unavailable"`) {
+		t.Fatalf("unavailable status was normalized away: %s", raw)
+	}
+}

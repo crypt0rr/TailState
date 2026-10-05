@@ -91,9 +91,20 @@ func (s *Store) ClaimDueOutbox(ctx context.Context, limit int, leases ...time.Du
 		WHERE status='pending' AND first_attempt<=?`, nowValue, retryCutoff); err != nil {
 		return nil, err
 	}
+	// Each destination receives its notifications oldest first. A row is
+	// claimable only when every older live row for the same destination is
+	// also claimable: an older row that is backing off after a failure, or
+	// still in flight, holds the destination's younger rows back. Without
+	// this, rows that back off independently would be delivered out of
+	// order after an outage (a young row's short retry delay expires before
+	// an old row's long one). Older claimable rows sort first, so a batch cut
+	// by the limit never skips one.
 	rows, err := tx.QueryContext(ctx, outboxSelect+`
 		WHERE o.status='pending' AND o.next_attempt<=? AND d.enabled=1 AND d.deleted_at IS NULL
-		ORDER BY o.id LIMIT ?`, nowValue, limit)
+		  AND NOT EXISTS (SELECT 1 FROM outbox p
+			WHERE p.destination_id=o.destination_id AND p.id<o.id
+			  AND (p.status='processing' OR (p.status='pending' AND p.next_attempt>?)))
+		ORDER BY o.id LIMIT ?`, nowValue, nowValue, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -268,6 +279,26 @@ func (s *Store) RetryClaimedResult(ctx context.Context, item OutboxItem, next ti
 		status = "dead"
 	}
 	result, err := s.db.ExecContext(ctx, "UPDATE outbox SET status=?,next_attempt=?,last_error=?,lease_until=NULL,lease_token='' WHERE id=? AND status='processing' AND lease_token=?", status, next.UTC().Format(time.RFC3339Nano), truncate(message, 500), item.ID, item.LeaseToken)
+	if err != nil {
+		return false, err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return changed == 1, nil
+}
+
+// ReleaseClaimed returns a claimed row to pending without counting an
+// attempt. The delivery worker uses it for a destination's younger rows in a
+// batch after an older row for that destination failed: they were never sent,
+// and the failed row's backoff now holds them back so they stay in order.
+// It reports whether the lease token still owned the row.
+func (s *Store) ReleaseClaimed(ctx context.Context, item OutboxItem) (bool, error) {
+	if item.ID <= 0 || strings.TrimSpace(item.LeaseToken) == "" {
+		return false, nil
+	}
+	result, err := s.db.ExecContext(ctx, "UPDATE outbox SET status='pending',attempts=MAX(attempts-1,0),lease_until=NULL,lease_token='' WHERE id=? AND status='processing' AND lease_token=?", item.ID, item.LeaseToken)
 	if err != nil {
 		return false, err
 	}

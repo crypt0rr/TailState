@@ -14,6 +14,7 @@ rollback requires restoring the backup taken before the upgrade. See
 ## [Unreleased]
 
 ### Fixed
+- Each destination receives notifications in creation order after an outage, and a failing or hanging destination delays the others by at most one send timeout per delivery pass (#159).
 - Large histories export as a chain of signed evidence packs instead of failing: a pack that reaches the read, event, ledger-link, or size budget carries the batches that fit with `truncated` and `next_cursor`, and the History page offers **Download next part** (#155).
 
 ## [0.13.0] - 2026-10-06

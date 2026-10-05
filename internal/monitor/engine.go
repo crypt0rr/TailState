@@ -895,8 +895,19 @@ func (e *Engine) delivery(ctx context.Context) {
 			for _, item := range items {
 				leases[item.ID] = e.startOutboxLease(ctx, item)
 			}
+			// After a destination's first failed send in this batch, its
+			// younger items are returned unsent: the failed item's backoff
+			// keeps them in order, and a hanging destination costs the
+			// others at most one send timeout per tick.
+			failed := make(map[int64]bool)
 			for _, item := range items {
-				e.deliverItemWithLease(ctx, item, leases[item.ID])
+				if failed[item.DestinationID] {
+					e.releaseItem(ctx, item, leases[item.ID])
+					continue
+				}
+				if e.deliverItemWithLease(ctx, item, leases[item.ID]) {
+					failed[item.DestinationID] = true
+				}
 			}
 			for _, lease := range leases {
 				lease.stop()
@@ -912,7 +923,32 @@ func (e *Engine) startOutboxLease(ctx context.Context, item store.OutboxItem) *d
 	return lease
 }
 
-func (e *Engine) deliverItemWithLease(ctx context.Context, item store.OutboxItem, lease *deliveryLease) {
+// releaseItem returns a claimed item that was not sent to pending without
+// counting an attempt.
+func (e *Engine) releaseItem(ctx context.Context, item store.OutboxItem, lease *deliveryLease) {
+	lease.stop()
+	bookkeepingCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	released, err := e.store.ReleaseClaimed(bookkeepingCtx, item)
+	if err != nil {
+		// The lease expires and the row returns to pending on a later claim.
+		slog.Error("release unsent notification", "outbox_id", item.ID, "destination_id", item.DestinationID, "error", err)
+		return
+	}
+	if !released {
+		if lease != nil {
+			e.noteDeliveryLeaseLost(lease.state)
+		}
+		slog.Warn("notification release fenced", "outbox_id", item.ID, "destination_id", item.DestinationID)
+		return
+	}
+	slog.Debug("notification held behind a failed delivery", "outbox_id", item.ID, "destination_id", item.DestinationID)
+}
+
+// deliverItemWithLease sends one claimed item and records the outcome. It
+// reports whether the destination was contacted and the send failed, which
+// holds back the destination's younger items in the same batch.
+func (e *Engine) deliverItemWithLease(ctx context.Context, item store.OutboxItem, lease *deliveryLease) (sendFailed bool) {
 	e.deliveryStats.attempts.Add(1)
 	started := time.Now()
 	if lease == nil {
@@ -947,8 +983,11 @@ func (e *Engine) deliverItemWithLease(ctx context.Context, item store.OutboxItem
 			slog.Warn("notification delivery completion fenced", "outbox_id", item.ID, "destination_id", item.DestinationID, "attempt", item.Attempts, "elapsed_ms", elapsed.Milliseconds())
 		}
 		slog.Debug("notification delivery completed", "outbox_id", item.ID, "destination_id", item.DestinationID, "attempt", item.Attempts, "elapsed_ms", elapsed.Milliseconds(), "lease_lost", leaseLost)
-		return
+		return false
 	}
+	// A payload that could not be prepared never reached the provider and
+	// says nothing about the destination's health.
+	sendFailed = prepareErr == nil
 	e.deliveryStats.failures.Add(1)
 	// Senders are injectable for tests and future transports. Apply the same
 	// destination-aware redaction at this boundary so an upstream provider
@@ -974,6 +1013,7 @@ func (e *Engine) deliverItemWithLease(ctx context.Context, item store.OutboxItem
 	} else {
 		slog.Warn("notification delivery failed", "outbox_id", item.ID, "destination_id", item.DestinationID, "attempt", item.Attempts, "elapsed_ms", elapsed.Milliseconds(), "lease_lost", leaseLost, "error", safeMessage)
 	}
+	return sendFailed
 }
 
 func (e *Engine) renewOutboxLease(ctx context.Context, item store.OutboxItem, state *deliveryLeaseState, done chan<- struct{}) {

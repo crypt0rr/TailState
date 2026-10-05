@@ -453,34 +453,55 @@ func (c *Client) policy(ctx context.Context) ([]model.Resource, error) {
 	return []model.Resource{{ID: "policy", Type: "policy", Name: "Tailnet policy", Collector: "policy", Data: sections}}, nil
 }
 
+// logStreaming collects both log-streaming kinds. Tailscale documents a 404
+// from /logging/{kind}/stream as "log streaming has not been configured" (the
+// same status is also used for an unsupported kind or insufficient access),
+// so a 404 is recorded as an explicit, diffable {"configured": false} state
+// rather than as a plan capability. Disabling a stream therefore produces a
+// change event instead of silently demoting the collector. Only a 403 for
+// every kind is treated as an unsupported collector.
 func (c *Client) logStreaming(ctx context.Context) ([]model.Resource, error) {
 	data := map[string]any{}
-	supported := 0
+	forbidden := 0
 	for _, kind := range []string{"configuration", "network"} {
 		stream, err := c.get(ctx, c.tailnet("logging/"+kind+"/stream"))
 		if err != nil {
-			if IsUnsupported(err) {
-				data[kind] = map[string]any{"unsupported": true}
+			var httpErr *HTTPError
+			switch {
+			case errors.As(err, &httpErr) && httpErr.Status == http.StatusNotFound:
+				data[kind] = map[string]any{"configured": false}
+				continue
+			case errors.As(err, &httpErr) && httpErr.Status == http.StatusForbidden:
+				forbidden++
+				data[kind] = map[string]any{"configured": false}
 				continue
 			}
 			return nil, err
+		}
+		if _, ok := stream.(map[string]any); !ok {
+			return nil, fmt.Errorf("tailscale %s log stream response was not a JSON object", kind)
 		}
 		status, err := c.get(ctx, c.tailnet("logging/"+kind+"/stream/status"))
 		if err != nil {
-			if IsUnsupported(err) {
-				data[kind] = map[string]any{"unsupported": true}
-				continue
+			// The stream configuration was read successfully; a missing
+			// status or an unreachable logging backend must not discard it.
+			var httpErr *HTTPError
+			if !errors.As(err, &httpErr) || (httpErr.Status != http.StatusNotFound && httpErr.Status != http.StatusForbidden && httpErr.Status != http.StatusBadGateway) {
+				return nil, err
 			}
-			return nil, err
+			status = map[string]any{"state": logStreamStatusUnavailable}
 		}
-		supported++
 		data[kind] = map[string]any{"stream": stream, "status": status}
 	}
-	if supported == 0 {
-		return nil, &HTTPError{Status: http.StatusNotFound, URL: "logging", Body: "all log streaming endpoints unsupported"}
+	if forbidden == len(data) {
+		return nil, &HTTPError{Status: http.StatusForbidden, URL: "logging", Body: "log streaming endpoints forbidden"}
 	}
 	return []model.Resource{{ID: "log_streaming", Type: "log_streaming", Name: "Log streaming configuration", Collector: "log_streaming", Data: data}}, nil
 }
+
+// logStreamStatusUnavailable mirrors model.HealthStatusUnavailable; the
+// model package keeps it through status normalization.
+const logStreamStatusUnavailable = model.HealthStatusUnavailable
 
 func (c *Client) single(ctx context.Context, endpoint, collector, typ, name string) ([]model.Resource, error) {
 	value, err := c.get(ctx, endpoint)

@@ -32,10 +32,17 @@ if [[ ${#containers[@]} -ne 1 || -z "${containers[0]}" ]]; then
 fi
 container="${containers[0]}"
 running="$(docker inspect --format '{{.State.Running}}' "$container")"
+data_source="$(bash "$script_dir/data-volume.sh" "$container")"
+archive_path=""
 
 restart() {
     local status=$?
     trap - EXIT
+    if [[ "$status" -ne 0 && -n "$archive_path" ]]; then
+        # Never leave a partial archive that could later be mistaken for a
+        # complete backup.
+        rm -f "$archive_path" "$archive_path.sha256"
+    fi
     if [[ "$running" == "true" ]]; then
         if ! docker compose start "$service" >/dev/null; then
             echo "backup completed, but failed to restart $service" >&2
@@ -52,8 +59,11 @@ fi
 
 archive_name="tailstate-data-$(date -u +%Y%m%dT%H%M%SZ).tar.gz"
 archive_path="$output_dir/$archive_name"
+# Mount only the data volume, read-only, with no network: the helper must not
+# see the master-key secret or reach anything else.
 docker run --rm \
-    --volumes-from "$container" \
+    --network none \
+    --volume "$data_source:/data:ro" \
     --volume "$output_dir:/backup" \
     "$backup_image" \
     sh -ec 'umask 077; tar czf "/backup/$1" -C /data .; chown "$2:$3" "/backup/$1"' -- "$archive_name" "$host_uid" "$host_gid"

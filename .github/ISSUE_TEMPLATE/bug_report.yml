@@ -1,0 +1,50 @@
+name: Bug report
+description: Something in TailState does not work as documented.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. Please never paste OAuth secrets, master keys,
+        destination URLs, session cookies, or database files.
+  - type: input
+    id: version
+    attributes:
+      label: TailState version
+      description: Shown in the web interface header, or run `tailstate version`.
+      placeholder: "0.11.15"
+    validations:
+      required: true
+  - type: dropdown
+    id: deployment
+    attributes:
+      label: Deployment mode
+      options:
+        - Docker Compose (compose.yaml)
+        - Docker Compose with HTTPS override (compose.remote.yaml)
+        - Standalone binary
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened, and what did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+  - type: textarea
+    id: doctor
+    attributes:
+      label: Output of `tailstate doctor -json`
+      description: Run `docker compose exec tailstate /tailstate doctor -json`. It contains no secrets.
+      render: json
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant log lines
+      description: TailState never logs credentials, but please review before pasting.
+      render: text

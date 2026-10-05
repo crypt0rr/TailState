@@ -91,6 +91,8 @@ jobs:
           context: .
           load: true
           tags: tailstate:ci
+          cache-from: type=gha,scope=tailstate-amd64
+          cache-to: type=gha,scope=tailstate-amd64,mode=max
           build-args: |
             VERSION=${{ inputs.version || 'dev' }}
             BUILD_COMMIT=${{ github.sha }}
@@ -119,14 +121,10 @@ jobs:
         env:
           TAILSTATE_BACKUP_IMAGE: tailstate:backup-sidecar
         run: bash scripts/compose-smoke.sh tailstate:ci 18083
-      - name: Validate HTTPS proxy Compose override
-        run: |
-          set -euo pipefail
-          docker compose -f compose.yaml -f compose.remote.yaml config >/tmp/tailstate-remote-compose.yaml
-          grep -q 'caddy:2.11-alpine' /tmp/tailstate-remote-compose.yaml
-          grep -q 'published: "80"' /tmp/tailstate-remote-compose.yaml
-          grep -q 'published: "443"' /tmp/tailstate-remote-compose.yaml
-          ! grep -q 'published: "8080"' /tmp/tailstate-remote-compose.yaml
+      - name: Validate HTTPS proxy Compose override (ports and egress)
+        env:
+          TAILSTATE_BACKUP_IMAGE: tailstate:backup-sidecar
+        run: bash scripts/remote-compose-check.sh
       - name: HTTPS reverse-proxy runtime smoke test
         env:
           TAILSTATE_BACKUP_IMAGE: tailstate:backup-sidecar
@@ -135,9 +133,13 @@ jobs:
         env:
           TAILSTATE_BACKUP_IMAGE: tailstate:backup-sidecar
         run: bash scripts/container-backup-restore-smoke.sh tailstate:ci 18082
-      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
-      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+      # The builder cross-compiles on the runner's native platform, so the
+      # multi-architecture build needs no QEMU emulation.
+      - name: Multi-architecture build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           push: false
           platforms: linux/amd64,linux/arm64
+          cache-from: type=gha,scope=tailstate-multiarch
+          cache-to: type=gha,scope=tailstate-multiarch,mode=max

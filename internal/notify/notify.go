@@ -98,10 +98,11 @@ func (s *SenderImpl) Send(ctx context.Context, serviceURL, message string) error
 	if err != nil {
 		return fmt.Errorf("create notification sender (%s): %s", RedactURL(serviceURL), sanitize(err.Error(), serviceURL))
 	}
-	errs := sender.Send(message, nil)
+	errs := sender.Send(FitMessage(message, MessageLimit(serviceURL)), nil)
 	for _, sendErr := range errs {
 		if sendErr != nil {
-			return &DeliveryError{Status: statusCode(sendErr.Error()), Message: sanitize(sendErr.Error(), serviceURL)}
+			status := statusCode(sendErr.Error())
+			return &DeliveryError{Status: status, Message: sanitize(sendErr.Error(), serviceURL), Permanent: permanentDeliveryFailure(sendErr.Error(), status)}
 		}
 	}
 	// A cancellation that arrives after Shoutrrr has returned successfully
@@ -117,12 +118,36 @@ func (s *SenderImpl) Test(ctx context.Context, serviceURL string) error {
 	return s.Send(ctx, serviceURL, "**TailState test**: notifications are configured correctly.")
 }
 
-// DeliveryError is a retryable transport error. All Shoutrrr delivery errors
-// are retried by the durable outbox until its 24-hour horizon expires.
+// DeliveryError is a transport error. Retryable errors are retried by the
+// durable outbox until its 24-hour horizon expires; Permanent errors (for
+// example a message the provider rejects as too large) can never succeed on
+// retry and are dead-lettered immediately.
 type DeliveryError struct {
 	Status     int
 	Message    string
 	RetryAfter time.Duration
+	Permanent  bool
+}
+
+// messageTooLargeReason is the persisted reason for a payload a provider
+// rejected as too large.
+const messageTooLargeReason = "notification rejected by provider: message too large for this destination"
+
+// permanentDeliveryFailure reports provider responses that no retry of the
+// same payload can fix.
+func permanentDeliveryFailure(message string, status int) bool {
+	if status == 413 {
+		return true
+	}
+	lower := strings.ToLower(message)
+	return strings.Contains(lower, "exceeds the max length") || strings.Contains(lower, "exceeds max size") || strings.Contains(lower, "message too long")
+}
+
+// IsPermanent reports whether err is a delivery failure that retrying the
+// same payload cannot fix.
+func IsPermanent(err error) bool {
+	var delivery *DeliveryError
+	return errors.As(err, &delivery) && delivery != nil && delivery.Permanent
 }
 
 func (e *DeliveryError) Error() string { return e.Message }
@@ -136,6 +161,9 @@ func SafeDeliveryError(err error) string {
 		return "notification delivery failed"
 	}
 	var delivery *DeliveryError
+	if errors.As(err, &delivery) && delivery != nil && delivery.Permanent && (delivery.Status == 413 || permanentDeliveryFailure(delivery.Message, 0)) {
+		return messageTooLargeReason
+	}
 	if errors.As(err, &delivery) && delivery != nil && delivery.Status >= 100 {
 		return fmt.Sprintf("notification delivery failed with HTTP %d", delivery.Status)
 	}
@@ -158,7 +186,7 @@ func SafeDeliveryError(err error) string {
 func SafeDeliveryMessage(message string) string {
 	message = strings.TrimSpace(message)
 	switch message {
-	case "destination disabled", "destination removed", "delivery retry window expired", "no notification destination configured", "monitoring identity changed", "collector reconciliation failed", "reconciliation retry window expired", "notification delivery failed", "notification delivery timed out", "notification delivery canceled":
+	case "destination disabled", "destination removed", "delivery retry window expired", "no notification destination configured", "monitoring identity changed", "collector reconciliation failed", "reconciliation retry window expired", "notification delivery failed", "notification delivery timed out", "notification delivery canceled", messageTooLargeReason:
 		return message
 	default:
 		return SafeDeliveryError(errors.New(message))

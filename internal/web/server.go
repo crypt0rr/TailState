@@ -148,12 +148,16 @@ func New(config boot.Config, st *store.Store, engine *monitor.Engine) (*Server, 
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	staticFS, _ := fs.Sub(assets, "static")
-	mux.Handle("GET /static/", http.StripPrefix("/static/", http.FileServer(http.FS(staticFS))))
+	mux.Handle("GET /static/", http.StripPrefix("/static/", staticFiles(http.FileServer(http.FS(staticFS)))))
+	mux.HandleFunc("GET /favicon.ico", favicon)
 	mux.HandleFunc("GET /healthz", s.health)
 	mux.HandleFunc("GET /readyz", s.ready)
 	mux.HandleFunc("GET /metrics", s.metrics)
 	mux.HandleFunc("POST /webhooks/tailscale", s.tailscaleWebhook)
-	mux.HandleFunc("GET /", s.home)
+	// "/{$}" matches only the root. A bare "GET /" would be a catch-all that
+	// turned every typo (and every browser favicon probe) into a status
+	// lookup and redirect; unknown paths now return 404.
+	mux.HandleFunc("GET /{$}", s.home)
 	mux.HandleFunc("GET /setup", s.setup)
 	mux.HandleFunc("POST /setup/claim", s.claim)
 	mux.HandleFunc("GET /login", s.login)
@@ -177,6 +181,24 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /settings/destinations/delete", s.destinationPost)
 	mux.HandleFunc("POST /settings/destinations/remove", s.destinationPost)
 	return s.security(mux)
+}
+
+// staticFiles serves embedded assets but never a directory listing.
+func staticFiles(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "" || strings.HasSuffix(r.URL.Path, "/") {
+			http.NotFound(w, r)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// favicon answers the browser's automatic favicon probe without touching the
+// store. TailState ships no icon, so the response is an empty, cacheable 204.
+func favicon(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Cache-Control", "public, max-age=86400")
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s *Server) Serve(ctx context.Context) error {

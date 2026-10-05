@@ -59,7 +59,7 @@ func TestPermanentlyFailingDeviceBacksOffDeviceDetailsRetries(t *testing.T) {
 			_, _ = w.Write([]byte(`{"access_token":"access","expires_in":3600}`))
 		case r.URL.Path == "/api/v2/tailnet/-/devices":
 			_, _ = w.Write([]byte(`{"devices":[{"id":"healthy","hostname":"healthy"},{"id":"broken","hostname":"broken"}]}`))
-		case r.URL.Path == "/api/v2/device/healthy/routes":
+		case r.URL.Path == "/api/v2/device/healthy/attributes":
 			fanouts.Add(1)
 			_, _ = w.Write([]byte(`{}`))
 		case strings.HasPrefix(r.URL.Path, "/api/v2/device/healthy/"):

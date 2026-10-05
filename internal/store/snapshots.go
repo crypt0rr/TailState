@@ -137,6 +137,11 @@ func (s *Store) ApplyBatchWithBatch(ctx context.Context, generation int64, resul
 				return ChangeBatchResult{}, err
 			}
 		}
+		// Device details describe a device whose appearance and removal are
+		// already reported by the devices collector. Their snapshots are still
+		// created and deleted (after the same two-poll confirmation), but only
+		// field changes are reported, so one device change is one event.
+		silentLifecycle := result.Collector == "device_details"
 		seen := make(map[string]struct{}, len(result.Resources))
 		for _, resource := range result.Resources {
 			seen[resource.ID] = struct{}{}
@@ -165,7 +170,7 @@ func (s *Store) ApplyBatchWithBatch(ctx context.Context, generation int64, resul
 			noteTruncation(result.Collector, resource.ID, storedSnapshot, limits.SnapshotBytes, true)
 			switch {
 			case errors.Is(err, sql.ErrNoRows):
-				if baseline == 1 && !(absorbSharedUsers && isSharedUser(resource)) {
+				if baseline == 1 && !silentLifecycle && !(absorbSharedUsers && isSharedUser(resource)) {
 					record(model.Change{Kind: "created", Collector: result.Collector, ResourceID: resource.ID, Type: resource.Type, Name: resource.Name}, storedValue{}, existingStoredValue(raw, hash, int64(len(raw)), false))
 				}
 				_, err = tx.ExecContext(ctx, `INSERT INTO snapshots(generation,collector,resource_id,resource_type,name,canonical_json,content_hash,content_bytes,content_truncated,missing_count,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)`, generation, result.Collector, resource.ID, resource.Type, resource.Name, storedSnapshot.raw, hash, storedSnapshot.bytes, boolInt(storedSnapshot.truncated), 0, now.Format(time.RFC3339Nano))
@@ -281,7 +286,7 @@ func (s *Store) ApplyBatchWithBatch(ctx context.Context, generation int64, resul
 			}
 			for _, a := range missingRows {
 				if a.missing+1 >= 2 {
-					if baseline == 1 {
+					if baseline == 1 && !silentLifecycle {
 						record(model.Change{Kind: "removed", Collector: result.Collector, ResourceID: a.id, Type: a.typ, Name: a.name}, existingStoredValue(a.raw, a.hash, a.bytes, a.truncated), storedValue{})
 					}
 					_, err = tx.ExecContext(ctx, "DELETE FROM snapshots WHERE generation=? AND collector=? AND resource_id=?", generation, result.Collector, a.id)

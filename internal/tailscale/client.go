@@ -294,11 +294,13 @@ func (c *Client) deviceDetailsFromDevices(ctx context.Context, devices []map[str
 				}
 				combined := map[string]any{}
 				var detailErr error
+				// Routes are not fetched here: devices?fields=all already returns
+				// advertisedRoutes and enabledRoutes, so a routes sub-request
+				// would only report every route change a second time.
 				for _, detail := range []struct {
 					key  string
 					path string
 				}{
-					{key: "routes", path: "routes"},
 					{key: "postureAttributes", path: "attributes"},
 					{key: "deviceInvites", path: "device-invites"},
 				} {

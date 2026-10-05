@@ -251,7 +251,7 @@ func TestDeviceDetailsPropagatesSecondaryEndpointFailure(t *testing.T) {
 		switch r.URL.Path {
 		case "/api/v2/tailnet/-/devices":
 			_, _ = w.Write([]byte(`{"devices":[{"id":"device-1","hostname":"server"}]}`))
-		case "/api/v2/device/device-1/routes":
+		case "/api/v2/device/device-1/attributes":
 			w.WriteHeader(http.StatusInternalServerError)
 		default:
 			http.NotFound(w, r)

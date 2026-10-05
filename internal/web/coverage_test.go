@@ -583,7 +583,7 @@ func TestDestinationTestAndUnknownMutationErrors(t *testing.T) {
 			return
 		}
 		if r.URL.Path == "/api/v2/tailnet/-/devices" {
-			w.WriteHeader(http.StatusBadGateway)
+			w.WriteHeader(http.StatusInternalServerError)
 			_, _ = w.Write([]byte("UPSTREAM-SECRET-RESPONSE"))
 			return
 		}

@@ -666,9 +666,18 @@ func (c *Client) allPagesWithOptions(ctx context.Context, endpoint, arrayKey str
 			}
 			out = append(out, obj)
 		}
-		candidate := ""
+		candidate, cursor := "", ""
 		if objectOK {
-			candidate = nextURL(object)
+			candidate, cursor = nextPage(object)
+		}
+		if cursor != "" {
+			// A bare cursor continues the current request: keep its existing
+			// query parameters (fields=all, all=true, type=...) and only
+			// replace the cursor.
+			candidate, err = withCursor(next, cursor)
+			if err != nil {
+				return nil, err
+			}
 		}
 		if candidate == "" {
 			return out, nil
@@ -708,19 +717,34 @@ func (c *Client) resolvePaginationURL(current, candidate string) (string, error)
 	return pageURL.String(), nil
 }
 
-func nextURL(object map[string]any) string {
+// nextPage returns either an explicit next-page link or a bare pagination
+// cursor from a collection response.
+func nextPage(object map[string]any) (link, cursor string) {
 	if value, ok := object["next"].(string); ok {
-		return value
+		return value, ""
 	}
 	if p, ok := object["pagination"].(map[string]any); ok {
 		if value, ok := p["next"].(string); ok {
-			return value
+			return value, ""
 		}
 		if cursor, ok := p["nextCursor"].(string); ok && cursor != "" {
-			return "?cursor=" + url.QueryEscape(cursor)
+			return "", cursor
 		}
 	}
-	return ""
+	return "", ""
+}
+
+// withCursor merges a pagination cursor into the current page URL without
+// dropping its other query parameters.
+func withCursor(current, cursor string) (string, error) {
+	currentURL, err := url.Parse(current)
+	if err != nil {
+		return "", fmt.Errorf("invalid current pagination URL: %w", err)
+	}
+	query := currentURL.Query()
+	query.Set("cursor", cursor)
+	currentURL.RawQuery = query.Encode()
+	return currentURL.String(), nil
 }
 
 func (c *Client) get(ctx context.Context, endpoint string) (any, error) {
@@ -737,6 +761,12 @@ func (c *Client) getWithBytes(ctx context.Context, endpoint string) (any, int64,
 	for attempt := 0; attempt < 4; attempt++ {
 		token, err := c.accessToken(retryCtx)
 		if err != nil {
+			// A token-endpoint blip (network error, 429 or 5xx) must not fail
+			// every request that happens to need a fresh token. Retry it within
+			// the same per-request budget.
+			if delay, transient := transientTokenDelay(err, attempt); transient && attempt < 3 && waitWithinBudget(retryCtx, delay) {
+				continue
+			}
 			return nil, 0, err
 		}
 		req, err := http.NewRequestWithContext(retryCtx, http.MethodGet, endpoint, nil)
@@ -777,6 +807,15 @@ func (c *Client) getWithBytes(ctx context.Context, endpoint string) (any, int64,
 			}
 			continue
 		}
+		if transientGatewayStatus(resp.StatusCode) && attempt < 3 {
+			// Tailscale documents 502/503/504 as "try again later". Retry with
+			// backoff (or the provider's Retry-After) while the request budget
+			// allows; otherwise report the upstream status unchanged.
+			delay := retryAfter(resp.Header.Get("Retry-After"), time.Duration(1<<attempt)*time.Second)
+			if waitWithinBudget(retryCtx, delay) {
+				continue
+			}
+		}
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 			return nil, int64(len(body)), &HTTPError{Status: resp.StatusCode, URL: endpoint, Body: safeBody(body)}
 		}
@@ -790,6 +829,56 @@ func (c *Client) getWithBytes(ctx context.Context, endpoint string) (any, int64,
 		return value, int64(len(body)), nil
 	}
 	return nil, 0, errors.New("tailscale request retries exhausted")
+}
+
+// oauthStatusError reports a non-2xx token endpoint response.
+type oauthStatusError struct {
+	Status     int
+	RetryAfter string
+}
+
+func (e *oauthStatusError) Error() string {
+	return fmt.Sprintf("OAuth token request returned %d", e.Status)
+}
+
+// oauthTransportError reports a token request that failed before a response
+// was received.
+type oauthTransportError struct{ Err error }
+
+func (e *oauthTransportError) Error() string { return e.Err.Error() }
+func (e *oauthTransportError) Unwrap() error { return e.Err }
+
+func transientGatewayStatus(status int) bool {
+	return status == http.StatusBadGateway || status == http.StatusServiceUnavailable || status == http.StatusGatewayTimeout
+}
+
+// transientTokenDelay classifies token endpoint failures that are worth
+// retrying and returns the delay before the next attempt.
+func transientTokenDelay(err error, attempt int) (time.Duration, bool) {
+	fallback := time.Duration(1<<attempt) * time.Second
+	var statusErr *oauthStatusError
+	if errors.As(err, &statusErr) {
+		if statusErr.Status == http.StatusTooManyRequests || statusErr.Status >= 500 {
+			return retryAfter(statusErr.RetryAfter, fallback), true
+		}
+		return 0, false
+	}
+	var transportErr *oauthTransportError
+	if errors.As(err, &transportErr) && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+		return fallback, true
+	}
+	return 0, false
+}
+
+// waitWithinBudget sleeps before a retry only when the retry can still start
+// inside the request's deadline. It reports false without sleeping when the
+// delay would exhaust the budget, so the caller returns the upstream error
+// instead of a less useful context deadline error.
+func waitWithinBudget(ctx context.Context, delay time.Duration) bool {
+	if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) <= delay {
+		return false
+	}
+	return waitForRetry(ctx, delay)
 }
 
 func (c *Client) accessToken(ctx context.Context) (string, error) {
@@ -807,7 +896,7 @@ func (c *Client) accessToken(ctx context.Context) (string, error) {
 	req.SetBasicAuth(c.credentials.ClientID, c.credentials.ClientSecret)
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return "", err
+		return "", &oauthTransportError{Err: err}
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxOAuthResponseBytes+1))
@@ -818,7 +907,7 @@ func (c *Client) accessToken(ctx context.Context) (string, error) {
 		return "", fmt.Errorf("OAuth response exceeds %d bytes", maxOAuthResponseBytes)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return "", fmt.Errorf("OAuth token request returned %d", resp.StatusCode)
+		return "", &oauthStatusError{Status: resp.StatusCode, RetryAfter: resp.Header.Get("Retry-After")}
 	}
 	var payload struct {
 		AccessToken string `json:"access_token"`

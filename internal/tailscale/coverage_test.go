@@ -154,8 +154,8 @@ func TestTailscaleHelpersAndHTTPError(t *testing.T) {
 	if got := tailnetEscaped(New("https://example.invalid/api/v2", "", "", Credentials{Tailnet: "team/foo"})); got != "https://example.invalid/api/v2/tailnet/team%2Ffoo/" {
 		t.Fatalf("escaped tailnet URL=%q", got)
 	}
-	if got := nextURL(map[string]any{"pagination": map[string]any{"nextCursor": "abc"}}); got != "?cursor=abc" {
-		t.Fatalf("next cursor=%q", got)
+	if link, cursor := nextPage(map[string]any{"pagination": map[string]any{"nextCursor": "abc"}}); link != "" || cursor != "abc" {
+		t.Fatalf("next cursor link=%q cursor=%q", link, cursor)
 	}
 	if got := safeBody([]byte(strings.Repeat("x", 201))); len(got) > 200 || !strings.HasSuffix(got, "…") {
 		t.Fatalf("safe body=%q", got)

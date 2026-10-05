@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -16,6 +17,11 @@ type recordedChange struct {
 	Change model.Change
 	Before storedValue
 	After  storedValue
+}
+
+type canonicalResource struct {
+	raw  []byte
+	hash string
 }
 
 type truncationLog struct {
@@ -46,6 +52,23 @@ const (
 func (s *Store) ApplyBatchWithBatch(ctx context.Context, generation int64, results []model.Collected, digest func([]model.Change) string, triggerIDs ...int64) (batchResult ChangeBatchResult, err error) {
 	defer func() { err = storageWriteError(err) }()
 	triggerIDs = uniquePositiveIDs(triggerIDs)
+	// Canonicalise every resource before opening the write transaction. The
+	// store uses a single SQLite connection, so CPU-bound normalisation inside
+	// the transaction would delay health checks, metrics, and webhook intake.
+	canonical := make([][]canonicalResource, len(results))
+	for i, result := range results {
+		if result.Error != nil || result.Unsupported {
+			continue
+		}
+		canonical[i] = make([]canonicalResource, len(result.Resources))
+		for j, resource := range result.Resources {
+			raw, hash, canonicalErr := model.CanonicalFor(result.Collector, resource.Data)
+			if canonicalErr != nil {
+				return ChangeBatchResult{}, canonicalErr
+			}
+			canonical[i][j] = canonicalResource{raw: raw, hash: hash}
+		}
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return ChangeBatchResult{}, err
@@ -83,7 +106,7 @@ func (s *Store) ApplyBatchWithBatch(ctx context.Context, generation int64, resul
 		}
 		truncations = append(truncations, truncationLog{collector: collector, resource: resource, valueHash: value.hash, observed: value.bytes, limit: limit, reason: value.reason})
 	}
-	for _, result := range results {
+	for resultIndex, result := range results {
 		if result.Error != nil {
 			continue
 		}
@@ -117,16 +140,17 @@ func (s *Store) ApplyBatchWithBatch(ctx context.Context, generation int64, resul
 			return ChangeBatchResult{}, stateErr
 		}
 		seen := make(map[string]struct{}, len(result.Resources))
-		for _, resource := range result.Resources {
+		for resourceIndex, resource := range result.Resources {
 			seen[resource.ID] = struct{}{}
-			raw, hash, err := model.CanonicalFor(result.Collector, resource.Data)
-			if err != nil {
-				return ChangeBatchResult{}, err
-			}
+			raw, hash := canonical[resultIndex][resourceIndex].raw, canonical[resultIndex][resourceIndex].hash
 			var oldRaw []byte
 			var oldHash, oldType, oldName string
 			var missing, oldBytes, oldTruncated int64
 			err = tx.QueryRowContext(ctx, "SELECT canonical_json,content_hash,resource_type,name,missing_count,content_bytes,content_truncated FROM snapshots WHERE generation=? AND collector=? AND resource_id=?", generation, result.Collector, resource.ID).Scan(&oldRaw, &oldHash, &oldType, &oldName, &missing, &oldBytes, &oldTruncated)
+			// Keep the row exactly as stored: the re-normalisation below
+			// replaces oldRaw/oldHash for diffing, but deciding whether the row
+			// needs a rewrite must compare against what is on disk.
+			storedRaw, storedHash := oldRaw, oldHash
 			oldValue := existingStoredValue(oldRaw, oldHash, oldBytes, oldTruncated == 1)
 			if err == nil && oldHash != hash {
 				var previous any
@@ -159,6 +183,12 @@ func (s *Store) ApplyBatchWithBatch(ctx context.Context, generation int64, resul
 					record(model.Change{Kind: "changed", Collector: result.Collector, ResourceID: resource.ID, Type: resource.Type, Name: resource.Name, Fields: diff.Fields, FieldsTruncated: diff.FieldsTruncated, TotalFields: diff.TotalFields}, oldValue, existingStoredValue(raw, hash, int64(len(raw)), false))
 				}
 				_, err = tx.ExecContext(ctx, "UPDATE snapshots SET resource_type=?,name=?,canonical_json=?,content_hash=?,content_bytes=?,content_truncated=?,missing_count=0,updated_at=? WHERE generation=? AND collector=? AND resource_id=?", resource.Type, resource.Name, storedSnapshot.raw, hash, storedSnapshot.bytes, boolInt(storedSnapshot.truncated), now.Format(time.RFC3339Nano), generation, result.Collector, resource.ID)
+			case storedHash == hash && oldType == resource.Type && oldName == resource.Name && missing == 0 &&
+				(oldTruncated == 1) == storedSnapshot.truncated && oldBytes == storedSnapshot.bytes && bytes.Equal(storedRaw, storedSnapshot.raw):
+				// Unchanged resource: the stored row is already byte-identical to
+				// what would be written, so skip the UPDATE. Rewriting every
+				// snapshot on every poll produced megabytes of WAL traffic per
+				// poll with no drift.
 			default:
 				_, err = tx.ExecContext(ctx, "UPDATE snapshots SET resource_type=?,name=?,canonical_json=?,content_hash=?,content_bytes=?,content_truncated=?,missing_count=0,updated_at=? WHERE generation=? AND collector=? AND resource_id=?", resource.Type, resource.Name, storedSnapshot.raw, hash, storedSnapshot.bytes, boolInt(storedSnapshot.truncated), now.Format(time.RFC3339Nano), generation, result.Collector, resource.ID)
 			}

@@ -360,7 +360,7 @@ func TestEvidenceSigningMetadataValidation(t *testing.T) {
 	}
 	privateEncoded := base64.RawStdEncoding.EncodeToString(private)
 	publicEncoded := base64.RawStdEncoding.EncodeToString(public)
-	privateEnvelope, err := box.Encrypt(privateEncoded)
+	privateEnvelope, err := box.EncryptLegacy(privateEncoded)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -834,7 +834,7 @@ func TestVerifyEvidencePackReportsLedgerLinkErrors(t *testing.T) {
 
 func mustEncryptForTest(t *testing.T, box *secret.Box, value string) string {
 	t.Helper()
-	encrypted, err := box.Encrypt(value)
+	encrypted, err := box.EncryptLegacy(value)
 	if err != nil {
 		t.Fatal(err)
 	}

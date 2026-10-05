@@ -1164,6 +1164,65 @@ func TestIdentityChangeDeadLettersPendingEventNotifications(t *testing.T) {
 	}
 }
 
+// TestIdentityChangeDeadLettersClaimedEventNotifications covers a
+// notification that was in flight (or left 'processing' by a crash) when the
+// operator switched Tailnet/OAuth identity. It must be dead-lettered with its
+// lease cleared, and the stale worker's completion or retry must not revive
+// the old-identity payload.
+func TestIdentityChangeDeadLettersClaimedEventNotifications(t *testing.T) {
+	ctx := context.Background()
+	for _, finish := range []string{"retry", "delivered"} {
+		t.Run(finish, func(t *testing.T) {
+			st := testStore(t)
+			firstGeneration, err := st.SaveSettings(ctx, settings())
+			if err != nil {
+				t.Fatal(err)
+			}
+			baseline := []model.Collected{{Collector: "devices", Resources: []model.Resource{{ID: "1", Type: "device", Name: "server", Data: map[string]any{"hostname": "server"}}}}}
+			changed := []model.Collected{{Collector: "devices", Resources: []model.Resource{{ID: "1", Type: "device", Name: "server", Data: map[string]any{"hostname": "new-server"}}}}}
+			if _, err := st.ApplyBatchWithBatch(ctx, firstGeneration, baseline, func([]model.Change) string { return "baseline" }); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := st.ApplyBatchWithBatch(ctx, firstGeneration, changed, func([]model.Change) string { return "old identity" }); err != nil {
+				t.Fatal(err)
+			}
+			claimed, err := st.ClaimDueOutbox(ctx, 10)
+			if err != nil || len(claimed) != 1 || claimed[0].BatchID == 0 {
+				t.Fatalf("claimed=%+v err=%v", claimed, err)
+			}
+			rotated := settings()
+			rotated.Tailnet = "other.example"
+			if _, err := st.SaveSettings(ctx, rotated); err != nil {
+				t.Fatal(err)
+			}
+			var status, lastError, leaseToken string
+			var leaseUntil sql.NullString
+			if err := st.db.QueryRowContext(ctx, "SELECT status,last_error,lease_token,lease_until FROM outbox WHERE id=?", claimed[0].ID).Scan(&status, &lastError, &leaseToken, &leaseUntil); err != nil {
+				t.Fatal(err)
+			}
+			if status != "dead" || lastError != "monitoring identity changed" || leaseToken != "" || leaseUntil.Valid {
+				t.Fatalf("claimed old-identity row status=%q error=%q token=%q lease=%v", status, lastError, leaseToken, leaseUntil)
+			}
+			var applied bool
+			if finish == "retry" {
+				applied, err = st.RetryClaimedResult(ctx, claimed[0], time.Now().Add(-time.Minute), "temporary failure", false)
+			} else {
+				applied, err = st.DeliveredClaimedResult(ctx, claimed[0])
+			}
+			if err != nil || applied {
+				t.Fatalf("stale lease %s applied=%v err=%v", finish, applied, err)
+			}
+			if err := st.db.QueryRowContext(ctx, "SELECT status FROM outbox WHERE id=?", claimed[0].ID).Scan(&status); err != nil || status != "dead" {
+				t.Fatalf("status after stale %s=%q err=%v", finish, status, err)
+			}
+			again, err := st.ClaimDueOutbox(ctx, 10)
+			if err != nil || len(again) != 0 {
+				t.Fatalf("old-identity payload was claimed again: %+v err=%v", again, err)
+			}
+		})
+	}
+}
+
 func TestEarliestCollectorDueHandlesEmptyImmediateAndInvalidRows(t *testing.T) {
 	ctx := context.Background()
 	st := testStore(t)

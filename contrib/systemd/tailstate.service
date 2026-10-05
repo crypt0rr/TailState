@@ -1,0 +1,70 @@
+# systemd unit for the standalone TailState binary.
+#
+# Install:
+#   install -m 0755 tailstate /usr/local/bin/tailstate
+#   install -d -m 0700 /etc/tailstate
+#   openssl rand -base64 32 > /etc/tailstate/master_key && chmod 0400 /etc/tailstate/master_key
+#   install -m 0644 contrib/systemd/tailstate.service /etc/systemd/system/
+#   systemctl daemon-reload && systemctl enable --now tailstate
+#   journalctl -u tailstate   # one-time setup token
+#
+# Optional settings (for example TAILSTATE_COOKIE_SECURE, TAILSTATE_TRUSTED_PROXIES,
+# or TAILSTATE_METRICS_TOKEN) go in /etc/tailstate/tailstate.env.
+[Unit]
+Description=TailState Tailscale inventory drift monitor
+Documentation=https://github.com/crypt0rr/TailState
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/tailstate serve
+Environment=TAILSTATE_LISTEN_ADDR=127.0.0.1:8080
+Environment=TAILSTATE_DATA_DIR=/var/lib/tailstate
+# The master key is passed as a systemd credential, readable only by this
+# service, instead of exposing /etc/tailstate to the dynamic user.
+LoadCredential=master_key:/etc/tailstate/master_key
+Environment=TAILSTATE_MASTER_KEY_FILE=%d/master_key
+EnvironmentFile=-/etc/tailstate/tailstate.env
+Restart=on-failure
+RestartSec=5s
+# Allow an in-flight notification to finish its durable bookkeeping.
+TimeoutStopSec=30s
+
+DynamicUser=yes
+StateDirectory=tailstate
+StateDirectoryMode=0700
+UMask=0077
+MemoryMax=512M
+TasksMax=128
+
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateUsers=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target

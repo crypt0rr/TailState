@@ -10,7 +10,9 @@ import (
 )
 
 // Rekey re-encrypts every value protected by the database master key in one
-// transaction. The evidence signing key material is copied, not regenerated,
+// transaction. Every value is rewritten as a v2 envelope bound to its storage
+// location, so rekeying (including to the current key) also upgrades legacy
+// v1 values. The evidence signing key material is copied, not regenerated,
 // so previously exported evidence remains verifiable after rotation.
 //
 // Callers should stop the serving process before invoking this operation. The
@@ -20,10 +22,10 @@ func (s *Store) Rekey(ctx context.Context, newBox *secret.Box) error {
 		return errors.New("new master key is required")
 	}
 	var keyCheck string
-	if err := s.db.QueryRowContext(ctx, "SELECT value FROM meta WHERE key='master_key_check'").Scan(&keyCheck); err != nil {
+	if err := s.db.QueryRowContext(ctx, "SELECT value FROM meta WHERE key=?", masterKeyCheckMeta).Scan(&keyCheck); err != nil {
 		return fmt.Errorf("read master key check: %w", err)
 	}
-	plain, err := s.box.Decrypt(keyCheck)
+	plain, err := s.box.Open(metaBinding(masterKeyCheckMeta), keyCheck)
 	if err != nil || plain != "tailstate-master-key-check" {
 		return errors.New("current master key does not match this TailState database")
 	}
@@ -34,15 +36,15 @@ func (s *Store) Rekey(ctx context.Context, newBox *secret.Box) error {
 	}
 	defer tx.Rollback()
 
-	reencrypt := func(value string) (string, error) {
+	reencrypt := func(binding, value string) (string, error) {
 		if value == "" {
 			return "", nil
 		}
-		decoded, decryptErr := s.box.Decrypt(value)
+		decoded, decryptErr := s.box.Open(binding, value)
 		if decryptErr != nil {
 			return "", decryptErr
 		}
-		return newBox.Encrypt(decoded)
+		return newBox.Seal(binding, decoded)
 	}
 
 	var settings struct {
@@ -56,15 +58,15 @@ func (s *Store) Rekey(ctx context.Context, newBox *secret.Box) error {
 		return fmt.Errorf("read encrypted settings: %w", err)
 	}
 	if err == nil {
-		settings.oauth, err = reencrypt(settings.oauth)
+		settings.oauth, err = reencrypt(settingsBinding("oauth_secret_enc"), settings.oauth)
 		if err != nil {
 			return fmt.Errorf("re-encrypt OAuth secret: %w", err)
 		}
-		settings.legacy, err = reencrypt(settings.legacy)
+		settings.legacy, err = reencrypt(settingsBinding("mattermost_url_enc"), settings.legacy)
 		if err != nil {
 			return fmt.Errorf("re-encrypt legacy notification URL: %w", err)
 		}
-		settings.webhook, err = reencrypt(settings.webhook)
+		settings.webhook, err = reencrypt(settingsBinding("webhook_secret_enc"), settings.webhook)
 		if err != nil {
 			return fmt.Errorf("re-encrypt webhook secret: %w", err)
 		}
@@ -73,6 +75,7 @@ func (s *Store) Rekey(ctx context.Context, newBox *secret.Box) error {
 		}
 	}
 
+	// Deleted destinations have an empty URL and are skipped by reencrypt.
 	rows, err := tx.QueryContext(ctx, "SELECT id,service_url_enc FROM notification_destinations ORDER BY id")
 	if err != nil {
 		return fmt.Errorf("read encrypted notification destinations: %w", err)
@@ -98,7 +101,7 @@ func (s *Store) Rekey(ctx context.Context, newBox *secret.Box) error {
 		return fmt.Errorf("close encrypted notification destinations: %w", err)
 	}
 	for _, destination := range destinations {
-		encoded, err := reencrypt(destination.enc)
+		encoded, err := reencrypt(destinationBinding(destination.id), destination.enc)
 		if err != nil {
 			return fmt.Errorf("re-encrypt notification destination %d: %w", destination.id, err)
 		}
@@ -107,7 +110,7 @@ func (s *Store) Rekey(ctx context.Context, newBox *secret.Box) error {
 		}
 	}
 
-	for _, key := range []string{"master_key_check", evidenceSigningPrivateKeyMeta} {
+	for _, key := range []string{masterKeyCheckMeta, evidenceSigningPrivateKeyMeta} {
 		var encoded string
 		err := tx.QueryRowContext(ctx, "SELECT value FROM meta WHERE key=?", key).Scan(&encoded)
 		if errors.Is(err, sql.ErrNoRows) {
@@ -116,7 +119,7 @@ func (s *Store) Rekey(ctx context.Context, newBox *secret.Box) error {
 		if err != nil {
 			return fmt.Errorf("read encrypted metadata %s: %w", key, err)
 		}
-		rotated, err := reencrypt(encoded)
+		rotated, err := reencrypt(metaBinding(key), encoded)
 		if err != nil {
 			return fmt.Errorf("re-encrypt metadata %s: %w", key, err)
 		}

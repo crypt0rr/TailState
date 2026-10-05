@@ -127,7 +127,7 @@ func TestRekeyRollsBackWhenAnEncryptedValueIsCorrupt(t *testing.T) {
 	if err := st.db.QueryRowContext(ctx, "SELECT oauth_secret_enc FROM settings WHERE id=1").Scan(&encoded); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.box.Decrypt(encoded); err != nil {
+	if _, err := st.box.Open(settingsBinding("oauth_secret_enc"), encoded); err != nil {
 		t.Fatalf("transaction did not preserve the original key after rollback: %v", err)
 	}
 }

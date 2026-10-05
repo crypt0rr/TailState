@@ -141,7 +141,7 @@ CREATE TABLE settings(id INTEGER PRIMARY KEY,mattermost_url_enc TEXT);`); err !=
 		encrypted := ""
 		if legacyURL != "" {
 			var err error
-			encrypted, err = box.Encrypt(legacyURL)
+			encrypted, err = box.EncryptLegacy(legacyURL)
 			if err != nil {
 				t.Fatal(err)
 			}

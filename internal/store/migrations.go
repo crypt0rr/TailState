@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -48,11 +49,13 @@ func verifyLegacyMasterKey(db *sql.DB, box *secret.Box) error {
 			if !available[column] {
 				continue
 			}
-			rows, queryErr := db.Query("SELECT " + column + " FROM " + table.name)
+			// rowid equals the INTEGER PRIMARY KEY id of both tables, which is
+			// the row key in their encryption bindings.
+			rows, queryErr := db.Query("SELECT rowid," + column + " FROM " + table.name)
 			if queryErr != nil {
 				return fmt.Errorf("read encrypted %s.%s: %w", table.name, column, queryErr)
 			}
-			if err := verifyEncryptedRows(rows, box); err != nil {
+			if err := verifyEncryptedRows(rows, box, table.name+"."+column); err != nil {
 				return fmt.Errorf("verify encrypted %s.%s: %w", table.name, column, err)
 			}
 		}
@@ -63,11 +66,11 @@ func verifyLegacyMasterKey(db *sql.DB, box *secret.Box) error {
 		return fmt.Errorf("inspect meta schema: %w", err)
 	}
 	if present && available["key"] && available["value"] {
-		rows, queryErr := db.Query("SELECT value FROM meta WHERE key IN ('master_key_check','evidence_signing_private_key_enc')")
+		rows, queryErr := db.Query("SELECT key,value FROM meta WHERE key IN ('master_key_check','evidence_signing_private_key_enc')")
 		if queryErr != nil {
 			return fmt.Errorf("read encrypted meta values: %w", queryErr)
 		}
-		if err := verifyEncryptedRows(rows, box); err != nil {
+		if err := verifyEncryptedRows(rows, box, "meta.value"); err != nil {
 			return fmt.Errorf("verify encrypted meta values: %w", err)
 		}
 	}
@@ -153,17 +156,21 @@ func tableColumns(db *sql.DB, table string) (bool, map[string]bool, error) {
 	return true, columns, nil
 }
 
-func verifyEncryptedRows(rows *sql.Rows, box *secret.Box) error {
+// verifyEncryptedRows authenticates (row key, envelope) rows against the
+// binding "<location>:<row key>". Legacy v1 envelopes carry no binding and are
+// checked against the key alone.
+func verifyEncryptedRows(rows *sql.Rows, box *secret.Box, location string) error {
 	defer rows.Close()
 	for rows.Next() {
+		var rowKey string
 		var encrypted sql.NullString
-		if err := rows.Scan(&encrypted); err != nil {
+		if err := rows.Scan(&rowKey, &encrypted); err != nil {
 			return err
 		}
 		if strings.TrimSpace(encrypted.String) == "" {
 			continue
 		}
-		if _, err := box.Decrypt(encrypted.String); err != nil {
+		if _, err := box.Open(location+":"+rowKey, encrypted.String); err != nil {
 			return errors.New("master key does not match this database")
 		}
 	}
@@ -248,6 +255,12 @@ func migrateSchema(db *sql.DB, box *secret.Box) error {
 		}
 		return migrateSchema(db, box)
 	}
+	if version == 12 {
+		if err := migrateSchemaV12ToV13(db); err != nil {
+			return err
+		}
+		return migrateSchema(db, box)
+	}
 	if version != 1 {
 		return fmt.Errorf("database schema version %d requires a newer migration path", version)
 	}
@@ -306,7 +319,7 @@ func migrateSchema(db *sql.DB, box *secret.Box) error {
 	}
 	var destinationID int64
 	if legacyEnc != "" {
-		legacyURL, err := box.Decrypt(legacyEnc)
+		legacyURL, err := box.Open(settingsBinding("mattermost_url_enc"), legacyEnc)
 		if err != nil {
 			return fmt.Errorf("decrypt legacy Mattermost setting: %w", err)
 		}
@@ -314,18 +327,10 @@ func migrateSchema(db *sql.DB, box *secret.Box) error {
 		if err != nil {
 			return fmt.Errorf("migrate legacy Mattermost setting: %w", err)
 		}
-		convertedEnc, err := box.Encrypt(converted)
-		if err != nil {
-			return fmt.Errorf("encrypt migrated notification destination: %w", err)
-		}
 		now := time.Now().UTC().Format(time.RFC3339Nano)
-		result, err := tx.Exec("INSERT INTO notification_destinations(name,service_url_enc,enabled,created_at,updated_at) VALUES(?,?,1,?,?)", "Mattermost", convertedEnc, now, now)
+		destinationID, err = insertDestinationTx(context.Background(), tx, box, "Mattermost", converted, true, now)
 		if err != nil {
 			return fmt.Errorf("store migrated notification destination: %w", err)
-		}
-		destinationID, err = result.LastInsertId()
-		if err != nil {
-			return err
 		}
 		if _, err := tx.Exec("UPDATE outbox SET destination_id=? WHERE destination_id IS NULL", destinationID); err != nil {
 			return fmt.Errorf("assign migrated outbox rows: %w", err)
@@ -746,6 +751,40 @@ func migrateSchemaV11ToV12(db *sql.DB) error {
 			return fmt.Errorf("invalid bounded history migration phase %q", phase)
 		}
 	}
+}
+
+// migrateSchemaV12ToV13 hardens persisted state without changing any table
+// layout. It scrubs the encrypted service URL of destinations that were
+// soft-deleted before deletion started clearing it, drops two indexes that
+// duplicate another index (events_observed_at is a prefix of
+// events_retention because id is the rowid; evidence_ledger_batch_id
+// duplicates the UNIQUE constraint's index), and adds the indexes that let
+// every retention statement use an index search without a temporary sort.
+func migrateSchemaV12ToV13(db *sql.DB) error {
+	ctx := context.Background()
+	err := withSecureDelete(ctx, db, func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(ctx, "UPDATE notification_destinations SET service_url_enc='' WHERE deleted_at IS NOT NULL AND service_url_enc<>''"); err != nil {
+			return fmt.Errorf("scrub deleted notification destinations: %w", err)
+		}
+		for _, statement := range []string{
+			"DROP INDEX IF EXISTS events_observed_at",
+			"DROP INDEX IF EXISTS evidence_ledger_batch_id",
+			"CREATE INDEX IF NOT EXISTS outbox_dead_retention ON outbox(status, created_at)",
+			"CREATE INDEX IF NOT EXISTS auth_tokens_kind ON auth_tokens(kind)",
+		} {
+			if _, err := tx.ExecContext(ctx, statement); err != nil {
+				return fmt.Errorf("update retention indexes: %w", err)
+			}
+		}
+		if _, err := tx.ExecContext(ctx, "UPDATE schema_version SET version=13"); err != nil {
+			return fmt.Errorf("record persistence hardening migration: %w", err)
+		}
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("persistence hardening migration: %w", err)
+	}
+	return nil
 }
 
 type snapshotMetadataMigrationRow struct {

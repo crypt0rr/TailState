@@ -19,6 +19,7 @@ import (
 
 type Store struct {
 	db           *sql.DB
+	connector    *pageLimitedConnector
 	databasePath string
 	box          *secret.Box
 	evidenceKey  evidenceSigningKey
@@ -211,8 +212,10 @@ func Open(path string, box *secret.Box) (*Store, error) {
 
 // OpenWithLimits opens a store and applies the operator-selected storage
 // profile before bootstrap DDL or migrations can grow the database. The
-// logical SQLite page ceiling is persisted by SQLite and is also reapplied on
-// every restart, so a configured budget cannot silently become advisory.
+// logical SQLite page ceiling is a per-connection setting, so the connector
+// reapplies it to every connection the pool opens (including replacements for
+// connections discarded after an interrupted statement) and on every restart;
+// a configured budget cannot silently become advisory.
 func OpenWithLimits(path string, box *secret.Box, configuredLimits StorageLimits) (*Store, error) {
 	if box == nil {
 		return nil, errors.New("master key is required")
@@ -221,10 +224,8 @@ func OpenWithLimits(path string, box *secret.Box, configuredLimits StorageLimits
 		return nil, err
 	}
 	dsn := "file:" + path + "?_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)&_pragma=synchronous(FULL)"
-	db, err := sql.Open("sqlite", dsn)
-	if err != nil {
-		return nil, err
-	}
+	connector := newPageLimitedConnector(dsn)
+	db := sql.OpenDB(connector)
 	db.SetMaxOpenConns(1)
 	limits := configuredLimits
 	if limits == (StorageLimits{}) {
@@ -235,12 +236,12 @@ func OpenWithLimits(path string, box *secret.Box, configuredLimits StorageLimits
 			limits = persisted
 		}
 	}
-	limits, err = normalizeStorageLimits(limits)
+	limits, err := normalizeStorageLimits(limits)
 	if err != nil {
 		db.Close()
 		return nil, fmt.Errorf("storage limits: %w", err)
 	}
-	if err := configureDatabasePageLimit(db, limits.DatabaseBytes); err != nil {
+	if err := configureDatabasePageLimit(db, connector, limits.DatabaseBytes); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("database storage limit setup failed: %w", err)
 	}
@@ -306,7 +307,7 @@ func OpenWithLimits(path string, box *secret.Box, configuredLimits StorageLimits
 		db.Close()
 		return nil, fmt.Errorf("database migration failed while creating outbox retention index; stop TailState and restore the verified pre-upgrade backup before retrying: %w", err)
 	}
-	st := &Store{db: db, databasePath: path, box: box}
+	st := &Store{db: db, connector: connector, databasePath: path, box: box}
 	st.limits.Store(limits)
 	present, err = verifyExistingMasterKey(db, box)
 	if err != nil {

@@ -88,8 +88,11 @@ type StorageRuntime struct {
 	EventValueTruncations   uint64
 	HistoryPageTruncations  uint64
 	OversizedWritesRejected uint64
-	ConfiguredProfile       *StorageProfile `json:"configured_profile,omitempty"`
-	PersistedProfile        *StorageProfile `json:"persisted_profile,omitempty"`
+	// LimitNotEnforced is set by the serving process when SQLite's active
+	// page ceiling is larger than the configured database budget.
+	LimitNotEnforced  bool            `json:"limit_not_enforced,omitempty"`
+	ConfiguredProfile *StorageProfile `json:"configured_profile,omitempty"`
+	PersistedProfile  *StorageProfile `json:"persisted_profile,omitempty"`
 }
 
 // Report is the complete safe deployment report.
@@ -214,6 +217,14 @@ func Build(config boot.Config, runtime Runtime, request *http.Request) Report {
 			remediation = "Increase the database budget or reclaim retained history before collecting more data."
 		}
 		add(Finding{Code: "storage_pressure", Severity: severity, Summary: summary, Remediation: remediation})
+	}
+	if runtime.Storage.LimitNotEnforced {
+		add(Finding{
+			Code:        "storage_limit_not_enforced",
+			Severity:    SeverityError,
+			Summary:     "SQLite is not enforcing the configured database budget on the active connection.",
+			Remediation: "Restart TailState so the configured page ceiling is reapplied, and report the issue with the TailState version.",
+		})
 	}
 
 	if request != nil {

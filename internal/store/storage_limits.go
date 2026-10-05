@@ -206,10 +206,14 @@ type StorageMetrics struct {
 	OversizedWritesRejected uint64
 	DatabaseBytes           int64
 	DatabaseLimitBytes      int64
-	DatabaseFileBytes       int64
-	DatabaseWALBytes        int64
-	DatabaseSHMBytes        int64
-	DatabasePhysicalBytes   int64
+	// DatabaseEnforcedLimitBytes is the page ceiling SQLite is enforcing on the
+	// connection that served this snapshot (max_page_count * page_size).
+	DatabaseEnforcedLimitBytes int64
+	DatabasePageSizeBytes      int64
+	DatabaseFileBytes          int64
+	DatabaseWALBytes           int64
+	DatabaseSHMBytes           int64
+	DatabasePhysicalBytes      int64
 }
 
 // ErrStorageBudgetExceeded indicates that SQLite rejected a write because the
@@ -238,18 +242,23 @@ func (s *Store) SetStorageLimits(limits StorageLimits) error {
 	if s == nil || s.db == nil {
 		return errors.New("storage limits unavailable")
 	}
-	if err := configureDatabasePageLimit(s.db, normalized.DatabaseBytes); err != nil {
+	if err := configureDatabasePageLimit(s.db, s.connector, normalized.DatabaseBytes); err != nil {
+		_ = configureDatabasePageLimit(s.db, s.connector, previous.DatabaseBytes)
 		return err
 	}
 	if err := persistStorageLimits(context.Background(), s.db, normalized); err != nil {
-		_ = configureDatabasePageLimit(s.db, previous.DatabaseBytes)
+		_ = configureDatabasePageLimit(s.db, s.connector, previous.DatabaseBytes)
 		return err
 	}
 	s.limits.Store(normalized)
 	return nil
 }
 
-func configureDatabasePageLimit(db *sql.DB, limit int64) error {
+// configureDatabasePageLimit applies the byte budget as a SQLite page ceiling
+// on the current pooled connection and records it on the connector, so every
+// later connection receives the same ceiling. A nil connector is accepted for
+// read-only callers that never reconnect for writes.
+func configureDatabasePageLimit(db *sql.DB, connector *pageLimitedConnector, limit int64) error {
 	if db == nil || limit < 1 {
 		return errors.New("database storage limit is invalid")
 	}
@@ -266,6 +275,11 @@ func configureDatabasePageLimit(db *sql.DB, limit int64) error {
 	maxPages := limit / pageSize
 	if maxPages < 1 {
 		maxPages = 1
+	}
+	if connector != nil {
+		// Record the ceiling before applying it so a connection opened
+		// concurrently with this call cannot miss it.
+		connector.maxPages.Store(maxPages)
 	}
 	var appliedPages int64
 	if err := db.QueryRow("PRAGMA max_page_count = " + strconv.FormatInt(maxPages, 10)).Scan(&appliedPages); err != nil {
@@ -309,21 +323,27 @@ func (s *Store) StorageMetrics(ctx context.Context) (StorageMetrics, error) {
 	if err := s.db.QueryRowContext(ctx, "PRAGMA page_size").Scan(&pageSize); err != nil {
 		return StorageMetrics{}, err
 	}
+	var maxPages int64
+	if err := s.db.QueryRowContext(ctx, "PRAGMA max_page_count").Scan(&maxPages); err != nil {
+		return StorageMetrics{}, err
+	}
 	physical, err := s.physicalStorageMetrics(ctx)
 	if err != nil {
 		return StorageMetrics{}, err
 	}
 	return StorageMetrics{
-		SnapshotTruncations:     s.counters.snapshotTruncations.Load(),
-		EventValueTruncations:   s.counters.eventTruncations.Load(),
-		HistoryPageTruncations:  s.counters.historyTruncations.Load(),
-		OversizedWritesRejected: s.counters.oversizedWriteRejects.Load(),
-		DatabaseBytes:           pageCount * pageSize,
-		DatabaseLimitBytes:      limits.DatabaseBytes,
-		DatabaseFileBytes:       physical.main,
-		DatabaseWALBytes:        physical.wal,
-		DatabaseSHMBytes:        physical.shm,
-		DatabasePhysicalBytes:   physical.total,
+		SnapshotTruncations:        s.counters.snapshotTruncations.Load(),
+		EventValueTruncations:      s.counters.eventTruncations.Load(),
+		HistoryPageTruncations:     s.counters.historyTruncations.Load(),
+		OversizedWritesRejected:    s.counters.oversizedWriteRejects.Load(),
+		DatabaseBytes:              pageCount * pageSize,
+		DatabaseLimitBytes:         limits.DatabaseBytes,
+		DatabaseEnforcedLimitBytes: maxPages * pageSize,
+		DatabasePageSizeBytes:      pageSize,
+		DatabaseFileBytes:          physical.main,
+		DatabaseWALBytes:           physical.wal,
+		DatabaseSHMBytes:           physical.shm,
+		DatabasePhysicalBytes:      physical.total,
 	}, nil
 }
 
@@ -374,6 +394,17 @@ func physicalFileBytes(path string) (int64, error) {
 		return 0, fmt.Errorf("%s is not a regular file", path)
 	}
 	return info.Size(), nil
+}
+
+// LimitEnforced reports whether SQLite is enforcing a page ceiling no larger
+// than the configured byte budget. A budget smaller than one page necessarily
+// rounds up to a single page. A false result means writes could grow past the
+// configured limit.
+func (m StorageMetrics) LimitEnforced() bool {
+	if m.DatabaseLimitBytes <= 0 || m.DatabaseEnforcedLimitBytes <= 0 {
+		return false
+	}
+	return m.DatabaseEnforcedLimitBytes <= max(m.DatabaseLimitBytes, m.DatabasePageSizeBytes)
 }
 
 func (m StorageMetrics) PressureRatio() float64 {

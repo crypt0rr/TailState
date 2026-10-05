@@ -480,7 +480,7 @@ func (c *Client) dns(ctx context.Context) ([]model.Resource, error) {
 	data := map[string]any{}
 	supported := 0
 	for _, endpoint := range []string{"nameservers", "preferences", "searchpaths", "split-dns"} {
-		value, err := c.get(ctx, c.tailnet("dns/"+endpoint))
+		value, err := c.getObject(ctx, c.tailnet("dns/"+endpoint), "DNS "+endpoint)
 		if err != nil {
 			if IsUnsupported(err) {
 				data[endpoint] = map[string]any{"unsupported": true}
@@ -498,21 +498,15 @@ func (c *Client) dns(ctx context.Context) ([]model.Resource, error) {
 }
 
 func (c *Client) policy(ctx context.Context) ([]model.Resource, error) {
-	value, err := c.get(ctx, c.tailnet("acl"))
+	object, err := c.getObject(ctx, c.tailnet("acl"), "policy")
 	if err != nil {
 		return nil, err
 	}
 	sections := map[string]any{}
-	if object, ok := value.(map[string]any); ok {
-		for key, section := range object {
-			raw, _, _ := model.CanonicalForSection("policy", key, section)
-			sum := sha256.Sum256(raw)
-			sections[key] = hex.EncodeToString(sum[:])
-		}
-	} else {
-		raw, _, _ := model.Canonical(value)
+	for key, section := range object {
+		raw, _, _ := model.CanonicalForSection("policy", key, section)
 		sum := sha256.Sum256(raw)
-		sections["policy"] = hex.EncodeToString(sum[:])
+		sections[key] = hex.EncodeToString(sum[:])
 	}
 	return []model.Resource{{ID: "policy", Type: "policy", Name: "Tailnet policy", Collector: "policy", Data: sections}}, nil
 }
@@ -528,7 +522,7 @@ func (c *Client) logStreaming(ctx context.Context) ([]model.Resource, error) {
 	data := map[string]any{}
 	forbidden := 0
 	for _, kind := range []string{"configuration", "network"} {
-		stream, err := c.get(ctx, c.tailnet("logging/"+kind+"/stream"))
+		stream, err := c.getObject(ctx, c.tailnet("logging/"+kind+"/stream"), kind+" log stream")
 		if err != nil {
 			var httpErr *HTTPError
 			switch {
@@ -542,10 +536,8 @@ func (c *Client) logStreaming(ctx context.Context) ([]model.Resource, error) {
 			}
 			return nil, err
 		}
-		if _, ok := stream.(map[string]any); !ok {
-			return nil, fmt.Errorf("tailscale %s log stream response was not a JSON object", kind)
-		}
-		status, err := c.get(ctx, c.tailnet("logging/"+kind+"/stream/status"))
+		var status any
+		status, err = c.getObject(ctx, c.tailnet("logging/"+kind+"/stream/status"), kind+" log stream status")
 		if err != nil {
 			// The stream configuration was read successfully; a missing
 			// status or an unreachable logging backend must not discard it.
@@ -568,11 +560,28 @@ func (c *Client) logStreaming(ctx context.Context) ([]model.Resource, error) {
 const logStreamStatusUnavailable = model.HealthStatusUnavailable
 
 func (c *Client) single(ctx context.Context, endpoint, collector, typ, name string) ([]model.Resource, error) {
-	value, err := c.get(ctx, endpoint)
+	value, err := c.getObject(ctx, endpoint, collector)
 	if err != nil {
 		return nil, err
 	}
 	return []model.Resource{{ID: collector, Type: typ, Name: name, Collector: collector, Data: value}}, nil
+}
+
+// getObject fetches a single-object endpoint. Settings, contacts, policy, the
+// DNS sub-endpoints and log-streaming configuration are always JSON objects;
+// an empty body, null, an array or a scalar is an invalid upstream response.
+// Returning an error keeps the last snapshot instead of replacing a baseline
+// with a degenerate value (and reporting the flip back as drift later).
+func (c *Client) getObject(ctx context.Context, endpoint, name string) (map[string]any, error) {
+	value, err := c.get(ctx, endpoint)
+	if err != nil {
+		return nil, err
+	}
+	object, ok := value.(map[string]any)
+	if !ok || object == nil {
+		return nil, fmt.Errorf("tailscale %s response was not a JSON object", name)
+	}
+	return object, nil
 }
 
 func (c *Client) collection(ctx context.Context, endpoint, arrayKey, collector, typ string, ids []string) ([]model.Resource, error) {

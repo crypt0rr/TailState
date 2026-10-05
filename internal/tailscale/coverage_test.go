@@ -79,12 +79,11 @@ func TestPolicyAdditionalCollectorsAndClientTest(t *testing.T) {
 	}))
 	defer primitiveServer.Close()
 	primitive := New(primitiveServer.URL+"/api/v2", primitiveServer.URL+"/oauth/token", "test", Credentials{ClientID: "id", ClientSecret: "secret"})
+	// A non-object policy is an invalid upstream response, not a policy whose
+	// every section changed. It must fail so the last snapshot is preserved.
 	resources, err := primitive.Collect(context.Background(), "policy")
-	if err != nil || len(resources) != 1 {
+	if err == nil || len(resources) != 0 || !strings.Contains(err.Error(), "not a JSON object") {
 		t.Fatalf("primitive policy collection=%#v err=%v", resources, err)
-	}
-	if sections, ok := resources[0].Data.(map[string]any); !ok || len(fmt.Sprint(sections["policy"])) != 64 {
-		t.Fatalf("primitive policy was not hashed: %#v", resources[0].Data)
 	}
 }
 

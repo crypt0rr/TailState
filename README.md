@@ -131,7 +131,7 @@ Compose creates the Docker-managed `tailstate-data` volume and stores `/data/tai
 
 OAuth secrets, the Tailscale webhook secret, every Shoutrrr destination URL, and the evidence-ledger private key are encrypted with AES-256-GCM using `secrets/tailstate_master_key`. Destination credentials and upstream provider response bodies are never echoed into HTML, logs, persisted delivery errors, or the history ledger; delivery history keeps only bounded, provider-independent status reasons. Normalized history snapshots are retained for 30 days, exclude volatile fields, and replace known secret values with one-way fingerprints so presence and rotation remain auditable without exposing the value. OAuth access tokens exist only in memory. Back up the master key separately: TailState intentionally refuses to start if the key is missing or incorrect, and encrypted settings and signed history cannot be recovered without it.
 
-The image is scratch-based, runs as UID/GID `10001`, uses a read-only root filesystem, drops every Linux capability, and publishes the UI only on `127.0.0.1` by default. Keep that publish address when using a reverse proxy; let the proxy terminate TLS and expose the public listener:
+The image is scratch-based, runs as UID/GID `10001`, uses a read-only root filesystem, drops every Linux capability, and publishes the UI only on `127.0.0.1` by default. Compose also caps the process count, rotates container logs (3 × 10 MiB), and allows a 30-second stop grace period so an in-flight notification can finish its durable bookkeeping instead of being resent after a restart. The optional Caddy proxy in `compose.remote.yaml` runs with only `NET_BIND_SERVICE`, `no-new-privileges`, a memory limit, a healthcheck against its loopback admin API, and HTTP/3 (`443/udp`). Keep that publish address when using a reverse proxy; let the proxy terminate TLS and expose the public listener:
 
 ```dotenv
 TAILSTATE_COOKIE_SECURE=true
@@ -274,14 +274,18 @@ Back up `secrets/tailstate_master_key` separately and securely. A backup is
 only useful with the matching master key: TailState intentionally refuses to
 open encrypted state with a different key.
 
-The backup and restore helpers use the single Renovate-managed pinned BusyBox
-sidecar in `scripts/backup-image.sh`; CI and release jobs scan that sidecar
+The backup and restore helpers mount only the TailState data volume (read-only
+for backups) into a network-less container, so the helper never sees the
+master-key secret. A failed backup removes its partial archive. They use the
+single Renovate-managed pinned BusyBox sidecar in `scripts/backup-image.sh`; CI and release jobs scan that sidecar
 separately. Set `TAILSTATE_BACKUP_IMAGE` only for an explicitly reviewed
 override.
 
 Restore into the same Compose project only after confirming the archive and
 key are from the same point in time. The command requires an explicit
-`--yes`, verifies the checksum when present, checks that the archive directory
+`--yes`, requires and verifies the `.sha256` checksum written by the backup
+helper (pass `--no-checksum` to restore an archive that has none), refuses an
+archive that does not contain an SQLite `tailstate.db`, checks that the archive directory
 is writable and has room for a conservative pre-restore copy, rejects unsafe
 paths and symlink/device/FIFO entries before touching the data volume, and
 creates a pre-restore archive beside the source archive before replacing the

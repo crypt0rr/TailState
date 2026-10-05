@@ -16,7 +16,7 @@ services:
       - tailstate-private
 
   caddy:
-    image: caddy:2.11-alpine@sha256:de23def33b17fb5d1290b0f6c2add1d70780e52341896c00a4c8a2a2fe9d355e
+    image: caddy:2.11-alpine@sha256:d44355d3c2149dc580ce2cac735955d1c08d3d00882c30489c241aa51a5c10d9
     restart: unless-stopped
     ports:
       - "80:80"

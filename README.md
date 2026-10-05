@@ -182,10 +182,13 @@ firewall and TLS-terminating proxy already restrict access to the host port.
 Setup, login, and password-reset forms do not reject requests based on
 `Origin`, `Referer`, or Fetch Metadata headers because reverse proxies can
 rewrite those values. Each credential form also carries an action-bound,
-single-use challenge in a `SameSite=Strict` cookie and a signed hidden field.
-Challenges expire after five minutes and are invalidated when TailState
-restarts; reload the page if a challenge expires or a bookmarked form was
-opened before a restart. Setup and reset still require one-time tokens, login
+single-use challenge: a signed hidden field bound to a signed per-browser
+`SameSite=Strict` cookie. Issuing a form keeps no server-side state, so
+unauthenticated page loads cannot evict a pending form, and several tabs in the
+same browser can each submit their own form. Only submitted challenges are
+remembered (until they expire) so they cannot be replayed. Challenges expire
+after five minutes and are invalidated when TailState restarts; reload the page
+if a challenge expires or a bookmarked form was opened before a restart. Setup and reset still require one-time tokens, login
 is rate limited, and authenticated state-changing forms require CSRF tokens.
 Challenge and credential failures are exposed only through low-cardinality
 route/outcome metrics; secrets, tokens, cookies, and request headers are never

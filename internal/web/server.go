@@ -43,7 +43,8 @@ type Server struct {
 	authWork             chan struct{}
 	challengeKey         []byte
 	challengeMu          sync.Mutex
-	challenges           map[string]credentialChallengeRecord
+	consumedChallenges   map[string]time.Time
+	consumedPrunedAt     time.Time
 	metricsMu            sync.Mutex
 	challengeCounts      map[credentialChallengeMetric]uint64
 	credentialRejections map[string]uint64
@@ -109,7 +110,7 @@ func New(config boot.Config, st *store.Store, engine *monitor.Engine) (*Server, 
 		loginAttempts:        map[string][]time.Time{},
 		authWork:             make(chan struct{}, 2),
 		challengeKey:         challengeKey,
-		challenges:           map[string]credentialChallengeRecord{},
+		consumedChallenges:   map[string]time.Time{},
 		challengeCounts:      map[credentialChallengeMetric]uint64{},
 		credentialRejections: map[string]uint64{},
 	}, nil
@@ -186,8 +187,15 @@ func (s *Server) security(next http.Handler) http.Handler {
 	})
 }
 func (s *Server) render(w http.ResponseWriter, name string, data pageData) {
+	s.renderStatus(w, name, data, http.StatusOK)
+}
+
+func (s *Server) renderStatus(w http.ResponseWriter, name string, data pageData, code int) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	data.Version = s.config.Version
+	if code != http.StatusOK {
+		w.WriteHeader(code)
+	}
 	if err := s.templates[name].Execute(w, data); err != nil {
 		slog.Error("render template", "template", name, "error", err)
 	}
@@ -226,7 +234,7 @@ func (s *Server) setup(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/settings", http.StatusSeeOther)
 		return
 	}
-	s.renderCredential(w, "setup", credentialActionSetup, pageData{})
+	s.renderCredential(w, r, "setup", credentialActionSetup, pageData{})
 }
 func (s *Server) claim(w http.ResponseWriter, r *http.Request) {
 	exists, ok := s.adminExists(w, r)
@@ -239,7 +247,7 @@ func (s *Server) claim(w http.ResponseWriter, r *http.Request) {
 	}
 	ip := "setup:" + s.clientIP(r)
 	if s.rateLimited(ip) {
-		s.renderCredential(w, "setup", credentialActionSetup, pageData{Error: "Too many setup attempts. Try again later."})
+		s.renderCredential(w, r, "setup", credentialActionSetup, pageData{Error: "Too many setup attempts. Try again later."})
 		return
 	}
 	if err := r.ParseForm(); err != nil {
@@ -247,7 +255,7 @@ func (s *Server) claim(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !s.validateCredentialChallenge(r, credentialActionSetup) {
-		s.renderCredential(w, "setup", credentialActionSetup, pageData{Error: credentialChallengeError})
+		s.renderCredential(w, r, "setup", credentialActionSetup, pageData{Error: credentialChallengeError})
 		return
 	}
 	select {
@@ -263,7 +271,7 @@ func (s *Server) claim(w http.ResponseWriter, r *http.Request) {
 		// endpoint throttle by repeatedly submitting different confirmations.
 		s.recordFailure(ip)
 		s.recordCredentialRejection(credentialActionSetup)
-		s.renderCredential(w, "setup", credentialActionSetup, pageData{Error: "Passwords do not match."})
+		s.renderCredential(w, r, "setup", credentialActionSetup, pageData{Error: "Passwords do not match."})
 		return
 	}
 	if err := s.store.Claim(r.Context(), r.FormValue("token"), r.FormValue("password")); err != nil {
@@ -272,7 +280,7 @@ func (s *Server) claim(w http.ResponseWriter, r *http.Request) {
 		// Setup is unauthenticated. Keep storage, token, and migration details
 		// out of the response so this endpoint cannot become an oracle.
 		slog.Debug("setup claim rejected", "error", err)
-		s.renderCredential(w, "setup", credentialActionSetup, pageData{Error: "Setup could not be completed. Check the setup token and try again."})
+		s.renderCredential(w, r, "setup", credentialActionSetup, pageData{Error: "Setup could not be completed. Check the setup token and try again."})
 		return
 	}
 	s.clearFailures(ip)
@@ -295,7 +303,7 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/status", http.StatusSeeOther)
 		return
 	}
-	s.renderCredential(w, "login", credentialActionLogin, pageData{})
+	s.renderCredential(w, r, "login", credentialActionLogin, pageData{})
 }
 
 func (s *Server) adminExists(w http.ResponseWriter, r *http.Request) (bool, bool) {
@@ -311,7 +319,7 @@ func (s *Server) adminExists(w http.ResponseWriter, r *http.Request) (bool, bool
 func (s *Server) loginPost(w http.ResponseWriter, r *http.Request) {
 	ip := s.clientIP(r)
 	if s.rateLimited(ip) {
-		s.renderCredential(w, "login", credentialActionLogin, pageData{Error: "Too many login attempts. Try again later."})
+		s.renderCredential(w, r, "login", credentialActionLogin, pageData{Error: "Too many login attempts. Try again later."})
 		return
 	}
 	if err := r.ParseForm(); err != nil {
@@ -319,7 +327,7 @@ func (s *Server) loginPost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !s.validateCredentialChallenge(r, credentialActionLogin) {
-		s.renderCredential(w, "login", credentialActionLogin, pageData{Error: credentialChallengeError})
+		s.renderCredential(w, r, "login", credentialActionLogin, pageData{Error: credentialChallengeError})
 		return
 	}
 	select {
@@ -332,7 +340,7 @@ func (s *Server) loginPost(w http.ResponseWriter, r *http.Request) {
 	if !s.store.Authenticate(r.Context(), r.FormValue("password")) {
 		s.recordFailure(ip)
 		s.recordCredentialRejection(credentialActionLogin)
-		s.renderCredential(w, "login", credentialActionLogin, pageData{Error: "Invalid password."})
+		s.renderCredential(w, r, "login", credentialActionLogin, pageData{Error: "Invalid password."})
 		return
 	}
 	s.clearFailures(ip)
@@ -355,12 +363,12 @@ func (s *Server) logout(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/login", http.StatusSeeOther)
 }
 func (s *Server) reset(w http.ResponseWriter, r *http.Request) {
-	s.renderCredential(w, "reset", credentialActionReset, pageData{})
+	s.renderCredential(w, r, "reset", credentialActionReset, pageData{})
 }
 func (s *Server) resetPost(w http.ResponseWriter, r *http.Request) {
 	ip := "reset:" + s.clientIP(r)
 	if s.rateLimited(ip) {
-		s.renderCredential(w, "reset", credentialActionReset, pageData{Error: "Too many reset attempts. Try again later."})
+		s.renderCredential(w, r, "reset", credentialActionReset, pageData{Error: "Too many reset attempts. Try again later."})
 		return
 	}
 	if err := r.ParseForm(); err != nil {
@@ -368,7 +376,7 @@ func (s *Server) resetPost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !s.validateCredentialChallenge(r, credentialActionReset) {
-		s.renderCredential(w, "reset", credentialActionReset, pageData{Error: credentialChallengeError})
+		s.renderCredential(w, r, "reset", credentialActionReset, pageData{Error: credentialChallengeError})
 		return
 	}
 	select {
@@ -381,7 +389,7 @@ func (s *Server) resetPost(w http.ResponseWriter, r *http.Request) {
 	if r.FormValue("password") != r.FormValue("confirm") {
 		s.recordFailure(ip)
 		s.recordCredentialRejection(credentialActionReset)
-		s.renderCredential(w, "reset", credentialActionReset, pageData{Error: "Passwords do not match."})
+		s.renderCredential(w, r, "reset", credentialActionReset, pageData{Error: "Passwords do not match."})
 		return
 	}
 	if err := s.store.ResetWithToken(r.Context(), r.FormValue("token"), r.FormValue("password")); err != nil {
@@ -391,7 +399,7 @@ func (s *Server) resetPost(w http.ResponseWriter, r *http.Request) {
 		// or temporarily unreadable. The token is deliberately a single
 		// generic oracle to unauthenticated callers.
 		slog.Debug("password reset rejected", "error", err)
-		s.renderCredential(w, "reset", credentialActionReset, pageData{Error: "The reset token is invalid or expired."})
+		s.renderCredential(w, r, "reset", credentialActionReset, pageData{Error: "The reset token is invalid or expired."})
 		return
 	}
 	s.clearFailures(ip)

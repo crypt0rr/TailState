@@ -202,16 +202,11 @@ func TestCredentialChallengeExpiryAndActionBinding(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	binding := "browser-binding"
 	expiresUnix := time.Now().UTC().Add(-time.Second).Unix()
-	payload := strings.Join([]string{string(credentialActionLogin), nonce, strconv.FormatInt(expiresUnix, 10)}, ".")
-	challenge := base64.RawURLEncoding.EncodeToString([]byte(payload)) + "." + base64.RawURLEncoding.EncodeToString(server.signCredentialChallenge([]byte(payload)))
-	cookie := &http.Cookie{Name: credentialActionLogin.cookieName(), Value: nonce}
-	server.challengeMu.Lock()
-	server.challenges[nonce] = credentialChallengeRecord{action: credentialActionLogin, expiresAt: time.Unix(expiresUnix, 0).UTC()}
-	server.challengeMu.Unlock()
-	expiredRequest := httptest.NewRequest(http.MethodPost, "/login", strings.NewReader(url.Values{"_challenge": {challenge}}.Encode()))
-	expiredRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	expiredRequest.AddCookie(cookie)
+	challenge := signedCredentialChallenge(server, credentialActionLogin, nonce, binding, expiresUnix)
+	cookieValue := server.credentialChallengeCookieValue(credentialActionLogin, binding, strconv.FormatInt(time.Now().Add(time.Minute).Unix(), 10))
+	expiredRequest := credentialChallengeRequest("/login", challenge, credentialActionLogin.cookieName(), cookieValue)
 	if server.validateCredentialChallenge(expiredRequest, credentialActionLogin) {
 		t.Fatal("expired challenge was accepted")
 	}
@@ -220,17 +215,15 @@ func TestCredentialChallengeExpiryAndActionBinding(t *testing.T) {
 	}
 
 	issued := httptest.NewRecorder()
-	setupChallenge, err := server.issueCredentialChallenge(issued, credentialActionSetup)
+	setupChallenge, err := server.issueCredentialChallenge(issued, nil, credentialActionSetup)
 	if err != nil {
 		t.Fatal(err)
 	}
 	setupCookie := issued.Result().Cookies()[0]
-	actionRequest := httptest.NewRequest(http.MethodPost, "/login", strings.NewReader(url.Values{"_challenge": {setupChallenge}}.Encode()))
-	actionRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	// The cookie name is intentionally bound to the endpoint as well as the
 	// signed payload. Supplying a setup cookie to the login endpoint must not
 	// turn the setup challenge into a login challenge.
-	actionRequest.AddCookie(&http.Cookie{Name: credentialActionLogin.cookieName(), Value: setupCookie.Value})
+	actionRequest := credentialChallengeRequest("/login", setupChallenge, credentialActionLogin.cookieName(), setupCookie.Value)
 	if server.validateCredentialChallenge(actionRequest, credentialActionLogin) {
 		t.Fatal("cross-action challenge was accepted")
 	}
@@ -241,7 +234,7 @@ func TestCredentialChallengeExpiryAndActionBinding(t *testing.T) {
 
 func TestCredentialChallengeBoundsAndUnsupportedActions(t *testing.T) {
 	server, _, _ := testServer(t)
-	if _, err := server.issueCredentialChallenge(httptest.NewRecorder(), credentialAction("unsupported")); err == nil {
+	if _, err := server.issueCredentialChallenge(httptest.NewRecorder(), nil, credentialAction("unsupported")); err == nil {
 		t.Fatal("unsupported credential action was accepted")
 	}
 	if got := credentialAction("unsupported").pagePath(); got != "/" {
@@ -251,22 +244,161 @@ func TestCredentialChallengeBoundsAndUnsupportedActions(t *testing.T) {
 		t.Fatalf("unsupported action post path=%q", got)
 	}
 
-	now := time.Now().UTC().Add(time.Hour)
+	now := time.Now().UTC()
+	future := now.Add(time.Hour)
 	server.challengeMu.Lock()
-	server.challenges["expired"] = credentialChallengeRecord{action: credentialActionLogin, expiresAt: time.Now().UTC().Add(-time.Second)}
-	for i := 0; i < maxCredentialChallenges; i++ {
-		server.challenges["filled-"+url.QueryEscape(string(rune(i)))] = credentialChallengeRecord{action: credentialActionLogin, expiresAt: now}
+	server.consumedChallenges["expired"] = now.Add(-time.Second)
+	for i := 0; i < maxConsumedCredentialChallenges-1; i++ {
+		server.consumedChallenges["filled-"+strconv.Itoa(i)] = future
 	}
 	server.challengeMu.Unlock()
-	if _, err := server.issueCredentialChallenge(httptest.NewRecorder(), credentialActionLogin); err != nil {
+	// The expired entry is pruned, leaving room for exactly one new nonce.
+	if !server.consumeCredentialChallenge("fresh", future, now) {
+		t.Fatal("consumed challenge cache did not prune expired entries")
+	}
+	if server.consumeCredentialChallenge("fresh", future, now) {
+		t.Fatal("consumed nonce was accepted twice")
+	}
+	// A full cache of unexpired nonces fails closed rather than evicting a
+	// nonce that would then become replayable.
+	if server.consumeCredentialChallenge("overflow", future, now) {
+		t.Fatal("full consumed challenge cache accepted a new nonce")
+	}
+	server.challengeMu.Lock()
+	count := len(server.consumedChallenges)
+	server.challengeMu.Unlock()
+	if count != maxConsumedCredentialChallenges {
+		t.Fatalf("consumed challenge cache size=%d, want %d", count, maxConsumedCredentialChallenges)
+	}
+}
+
+// TestCredentialChallengeSurvivesUnauthenticatedPageFlood proves that page
+// views cannot evict or exhaust challenge state: issuance is stateless, so a
+// legitimate form still validates after a flood of challenge GETs from other
+// addresses.
+func TestCredentialChallengeSurvivesUnauthenticatedPageFlood(t *testing.T) {
+	server, _, token := testServer(t)
+	claimCoverageAdmin(t, server, token)
+	challenge, cookie, available := coverageCredentialChallenge(t, server, credentialActionLogin)
+	if !available {
+		t.Fatal("login page did not issue a challenge")
+	}
+	server.challengeMu.Lock()
+	before := len(server.consumedChallenges)
+	server.challengeMu.Unlock()
+	handler := server.Handler()
+	for i := 0; i < 10_001; i++ {
+		request := httptest.NewRequest(http.MethodGet, "/login", nil)
+		request.RemoteAddr = "203.0.113." + strconv.Itoa(i%250+1) + ":1234"
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		if response.Code != http.StatusOK {
+			t.Fatalf("flood GET %d status=%d", i, response.Code)
+		}
+	}
+	server.challengeMu.Lock()
+	retained := len(server.consumedChallenges)
+	server.challengeMu.Unlock()
+	if retained != before {
+		t.Fatalf("unauthenticated GETs retained %d server-side challenge entries", retained)
+	}
+	form := url.Values{"password": {"a secure password"}, "_challenge": {challenge}}
+	response := coveragePostWithRequest(t, server, "/login", form, []*http.Cookie{cookie}, "", "198.51.100.1:1234", nil)
+	if response.Code != http.StatusSeeOther {
+		t.Fatalf("legitimate login after flood status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
+// TestCredentialChallengeSupportsMultipleTabs opens two login tabs in
+// sequence in the same browser; both forms must remain valid.
+func TestCredentialChallengeSupportsMultipleTabs(t *testing.T) {
+	server, _, token := testServer(t)
+	claimCoverageAdmin(t, server, token)
+	handler := server.Handler()
+
+	first := httptest.NewRecorder()
+	handler.ServeHTTP(first, httptest.NewRequest(http.MethodGet, "/login", nil))
+	firstChallenge := hiddenChallenge(t, first)
+	firstCookie := findCookie(t, first, credentialActionLogin.cookieName())
+
+	secondRequest := httptest.NewRequest(http.MethodGet, "/login", nil)
+	secondRequest.AddCookie(firstCookie)
+	second := httptest.NewRecorder()
+	handler.ServeHTTP(second, secondRequest)
+	secondChallenge := hiddenChallenge(t, second)
+	browserCookie := findCookie(t, second, credentialActionLogin.cookieName())
+	if firstChallenge == secondChallenge {
+		t.Fatal("second tab reused the first tab's nonce")
+	}
+
+	// The browser now holds only the refreshed cookie; the first tab's form
+	// must still validate against it.
+	wrong := coveragePostWithRequest(t, server, "/login", url.Values{"password": {"wrong password"}, "_challenge": {firstChallenge}}, []*http.Cookie{browserCookie}, "", "", nil)
+	if wrong.Code != http.StatusOK || !strings.Contains(wrong.Body.String(), "Invalid password") {
+		t.Fatalf("first tab submission status=%d body=%s", wrong.Code, wrong.Body.String())
+	}
+	right := coveragePostWithRequest(t, server, "/login", url.Values{"password": {"a secure password"}, "_challenge": {secondChallenge}}, []*http.Cookie{browserCookie}, "", "", nil)
+	if right.Code != http.StatusSeeOther {
+		t.Fatalf("second tab submission status=%d body=%s", right.Code, right.Body.String())
+	}
+
+	// A different browser (no or another binding cookie) cannot use the form.
+	otherPage := httptest.NewRecorder()
+	handler.ServeHTTP(otherPage, httptest.NewRequest(http.MethodGet, "/login", nil))
+	otherCookie := findCookie(t, otherPage, credentialActionLogin.cookieName())
+	_, _, freshAvailable := coverageCredentialChallenge(t, server, credentialActionLogin)
+	if !freshAvailable {
+		t.Fatal("login page unavailable")
+	}
+	thirdRequest := httptest.NewRequest(http.MethodGet, "/login", nil)
+	thirdRequest.AddCookie(browserCookie)
+	third := httptest.NewRecorder()
+	handler.ServeHTTP(third, thirdRequest)
+	crossBrowser := coveragePostWithRequest(t, server, "/login", url.Values{"password": {"a secure password"}, "_challenge": {hiddenChallenge(t, third)}}, []*http.Cookie{otherCookie}, "", "", nil)
+	if crossBrowser.Code != http.StatusOK || !strings.Contains(crossBrowser.Body.String(), credentialChallengeError) {
+		t.Fatalf("cross-browser submission status=%d body=%s", crossBrowser.Code, crossBrowser.Body.String())
+	}
+}
+
+func TestCredentialChallengeIsRejectedAfterRestart(t *testing.T) {
+	server, st, token := testServer(t)
+	claimCoverageAdmin(t, server, token)
+	challenge, cookie, available := coverageCredentialChallenge(t, server, credentialActionLogin)
+	if !available {
+		t.Fatal("login page did not issue a challenge")
+	}
+	restarted, err := New(server.config, st, server.engine)
+	if err != nil {
 		t.Fatal(err)
 	}
-	server.challengeMu.Lock()
-	count := len(server.challenges)
-	server.challengeMu.Unlock()
-	if count != maxCredentialChallenges {
-		t.Fatalf("challenge map size=%d, want %d", count, maxCredentialChallenges)
+	response := coveragePostWithRequest(t, restarted, "/login", url.Values{"password": {"a secure password"}, "_challenge": {challenge}}, []*http.Cookie{cookie}, "", "", nil)
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), credentialChallengeError) {
+		t.Fatalf("challenge from previous process status=%d body=%s", response.Code, response.Body.String())
 	}
+}
+
+func hiddenChallenge(t *testing.T, response *httptest.ResponseRecorder) string {
+	t.Helper()
+	const marker = `name="_challenge" value="`
+	body := response.Body.String()
+	start := strings.Index(body, marker)
+	if start < 0 {
+		t.Fatalf("page has no challenge field: status=%d", response.Code)
+	}
+	start += len(marker)
+	end := strings.IndexByte(body[start:], '"')
+	return body[start : start+end]
+}
+
+func findCookie(t *testing.T, response *httptest.ResponseRecorder, name string) *http.Cookie {
+	t.Helper()
+	for _, cookie := range response.Result().Cookies() {
+		if cookie.Name == name {
+			return cookie
+		}
+	}
+	t.Fatalf("response did not set cookie %q", name)
+	return nil
 }
 
 func TestCredentialChallengeRejectsMalformedValues(t *testing.T) {
@@ -276,28 +408,35 @@ func TestCredentialChallengeRejectsMalformedValues(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	valid := signedCredentialChallenge(server, credentialActionLogin, nonce, future)
+	const binding = "binding"
+	cookie := server.credentialChallengeCookieValue(credentialActionLogin, binding, strconv.FormatInt(future, 10))
+	valid := signedCredentialChallenge(server, credentialActionLogin, nonce, binding, future)
 	cases := []struct {
 		name      string
 		challenge string
 		cookie    string
-		record    *credentialChallengeRecord
+		consumed  bool
 	}{
-		{name: "oversized", challenge: strings.Repeat("x", maxCredentialChallengeBytes+1), cookie: nonce},
-		{name: "missing separator", challenge: "not-a-challenge", cookie: nonce},
-		{name: "invalid base64", challenge: "!.c2hvcnQ", cookie: nonce},
-		{name: "short signature", challenge: base64.RawURLEncoding.EncodeToString([]byte(strings.Join([]string{"login", nonce, strconv.FormatInt(future, 10)}, "."))) + ".c2hvcnQ", cookie: nonce},
-		{name: "malformed payload", challenge: signedCredentialPayload(server, "login."+nonce), cookie: nonce},
-		{name: "invalid expiry", challenge: signedCredentialPayload(server, "login."+nonce+".not-a-number"), cookie: nonce},
-		{name: "missing record", challenge: valid, cookie: nonce},
-		{name: "record action mismatch", challenge: valid, cookie: nonce, record: &credentialChallengeRecord{action: credentialActionSetup, expiresAt: time.Unix(future, 0).UTC()}},
-		{name: "record expiry mismatch", challenge: valid, cookie: nonce, record: &credentialChallengeRecord{action: credentialActionLogin, expiresAt: time.Unix(future+1, 0).UTC()}},
+		{name: "oversized", challenge: strings.Repeat("x", maxCredentialChallengeBytes+1), cookie: cookie},
+		{name: "missing separator", challenge: "not-a-challenge", cookie: cookie},
+		{name: "invalid base64", challenge: "!.c2hvcnQ", cookie: cookie},
+		{name: "short signature", challenge: base64.RawURLEncoding.EncodeToString([]byte(strings.Join([]string{"login", nonce, binding, strconv.FormatInt(future, 10)}, "."))) + ".c2hvcnQ", cookie: cookie},
+		{name: "malformed payload", challenge: signedCredentialPayload(server, "login."+nonce+"."+binding), cookie: cookie},
+		{name: "empty nonce", challenge: signedCredentialPayload(server, "login.."+binding+"."+strconv.FormatInt(future, 10)), cookie: cookie},
+		{name: "invalid expiry", challenge: signedCredentialPayload(server, "login."+nonce+"."+binding+".not-a-number"), cookie: cookie},
+		{name: "unsigned cookie", challenge: valid, cookie: binding},
+		{name: "oversized cookie", challenge: valid, cookie: strings.Repeat("x", maxCredentialChallengeBytes+1)},
+		{name: "cookie bad signature encoding", challenge: valid, cookie: binding + ".1.!"},
+		{name: "cookie forged signature", challenge: valid, cookie: binding + "." + strconv.FormatInt(future, 10) + "." + base64.RawURLEncoding.EncodeToString(make([]byte, 32))},
+		{name: "cookie for another binding", challenge: valid, cookie: server.credentialChallengeCookieValue(credentialActionLogin, "other", strconv.FormatInt(future, 10))},
+		{name: "cookie invalid expiry", challenge: valid, cookie: server.credentialChallengeCookieValue(credentialActionLogin, binding, "soon")},
+		{name: "consumed nonce", challenge: valid, cookie: cookie, consumed: true},
 	}
 	for _, test := range cases {
 		t.Run(test.name, func(t *testing.T) {
-			if test.record != nil {
+			if test.consumed {
 				server.challengeMu.Lock()
-				server.challenges[nonce] = *test.record
+				server.consumedChallenges[nonce] = time.Unix(future, 0)
 				server.challengeMu.Unlock()
 			}
 			request := credentialChallengeRequest("/login", test.challenge, credentialActionLogin.cookieName(), test.cookie)
@@ -305,6 +444,19 @@ func TestCredentialChallengeRejectsMalformedValues(t *testing.T) {
 				t.Fatal("malformed challenge was accepted")
 			}
 		})
+	}
+	// An expired or forged cookie is never reused as the browser binding.
+	if _, ok := server.credentialChallengeBinding(credentialActionLogin, server.credentialChallengeCookieValue(credentialActionLogin, binding, "1"), time.Now()); ok {
+		t.Fatal("expired binding cookie was reused")
+	}
+	stale := httptest.NewRequest(http.MethodGet, "/login", nil)
+	stale.AddCookie(&http.Cookie{Name: credentialActionLogin.cookieName(), Value: server.credentialChallengeCookieValue(credentialActionLogin, binding, "1")})
+	issued := httptest.NewRecorder()
+	if _, err := server.issueCredentialChallenge(issued, stale, credentialActionLogin); err != nil {
+		t.Fatal(err)
+	}
+	if strings.HasPrefix(findCookie(t, issued, credentialActionLogin.cookieName()).Value, binding+".") {
+		t.Fatal("expired binding cookie was refreshed instead of replaced")
 	}
 
 	server.challengeKey = nil
@@ -319,8 +471,8 @@ func signedCredentialPayload(server *Server, payload string) string {
 	return base64.RawURLEncoding.EncodeToString([]byte(payload)) + "." + base64.RawURLEncoding.EncodeToString(server.signCredentialChallenge([]byte(payload)))
 }
 
-func signedCredentialChallenge(server *Server, action credentialAction, nonce string, expiresUnix int64) string {
-	return signedCredentialPayload(server, strings.Join([]string{string(action), nonce, strconv.FormatInt(expiresUnix, 10)}, "."))
+func signedCredentialChallenge(server *Server, action credentialAction, nonce, binding string, expiresUnix int64) string {
+	return signedCredentialPayload(server, strings.Join([]string{string(action), nonce, binding, strconv.FormatInt(expiresUnix, 10)}, "."))
 }
 
 func credentialChallengeRequest(path, challenge, cookieName, cookieValue string) *http.Request {

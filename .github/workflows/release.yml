@@ -22,6 +22,17 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+      - name: Require a CHANGELOG entry for the release
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          if ! grep -q "^## \[${version}\]" CHANGELOG.md; then
+            echo "CHANGELOG.md has no '## [${version}]' entry" >&2
+            exit 1
+          fi
+          section="$(awk -v v="## [${version}]" 'index($0, v) == 1 {found=1; next} found && /^## \[/ {exit} found {print}' CHANGELOG.md)"
+          grep -q '^- \*\*Schema:\*\*' <<< "$section" || { echo "CHANGELOG entry for ${version} lacks a Schema line" >&2; exit 1; }
+          grep -q '^- \*\*Rollback:\*\*' <<< "$section" || { echo "CHANGELOG entry for ${version} lacks a Rollback line" >&2; exit 1; }
       - name: Require the tagged commit to be reachable from main
         run: |
           set -euo pipefail

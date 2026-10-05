@@ -615,7 +615,7 @@ The attestation covers the promoted multi-architecture index digest that the
 version, minor, and `latest` tags resolve to, so the same check works for a
 pinned digest (`oci://ghcr.io/crypt0rr/tailstate@sha256:...`).
 
-The workflow also creates the matching GitHub Release with generated notes. Use the immutable version tag or image digest in deployments; reserve `latest` for development convenience. For a rollback, set `TAILSTATE_IMAGE` to a previously verified digest and keep the matching `secrets/tailstate_master_key` backup available:
+The workflow also creates the matching GitHub Release. Every release has a [CHANGELOG](CHANGELOG.md) entry stating its database schema version and whether an image-only rollback is possible; the release workflow refuses a tag without one. Use the immutable version tag or image digest in deployments; reserve `latest` for development convenience. See [UPGRADING.md](UPGRADING.md) for the upgrade and rollback procedure. When the schema did not change, roll back by setting `TAILSTATE_IMAGE` to a previously verified digest; when it did, restore the pre-upgrade backup first, because older releases refuse a migrated database. Keep the matching `secrets/tailstate_master_key` backup available:
 
 ```dotenv
 TAILSTATE_IMAGE=ghcr.io/crypt0rr/tailstate@sha256:<known-good-digest>

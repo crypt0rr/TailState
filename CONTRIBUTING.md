@@ -94,3 +94,12 @@ regression test beside the behavior it protects.
 Describe the user-visible behavior, migration/rollback implications, and the
 validation commands you ran. Keep dependency and GitHub Actions updates
 pin-aware and explain any change to the release or coverage gates.
+
+## Changelog and releases
+
+Add a line under `## [Unreleased]` in [CHANGELOG.md](CHANGELOG.md) for every
+user-visible change, referencing its issue. When preparing a release, rename
+that section to the version and date and add its `- **Schema:**` and
+`- **Rollback:**` lines; the release workflow refuses a tag whose CHANGELOG
+entry is missing either line. A release that migrates the schema is a minor
+release, and [UPGRADING.md](UPGRADING.md#schema-history) gets a new row.

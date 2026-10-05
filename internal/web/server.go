@@ -320,18 +320,44 @@ func favicon(w http.ResponseWriter, _ *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// Serve binds the configured listener and serves until ctx is canceled.
 func (s *Server) Serve(ctx context.Context) error {
+	listener, err := s.Listen()
+	if err != nil {
+		return err
+	}
+	return s.ServeListener(ctx, listener)
+}
+
+// Listen binds the configured address without serving it. The serve command
+// binds before it starts the monitor engine, so an address conflict stops
+// startup before any collector poll or notification delivery.
+func (s *Server) Listen() (net.Listener, error) {
+	listener, err := net.Listen("tcp", s.config.ListenAddr)
+	if err != nil {
+		return nil, fmt.Errorf("listen on %s: %w", s.config.ListenAddr, err)
+	}
+	return listener, nil
+}
+
+// ServeListener serves an already bound listener until ctx is canceled and
+// closes the listener on return.
+func (s *Server) ServeListener(ctx context.Context, listener net.Listener) error {
 	server := &http.Server{Addr: s.config.ListenAddr, Handler: s.Handler(), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: serverWriteTimeout, IdleTimeout: 60 * time.Second}
 	errCh := make(chan error, 1)
 	go func() {
-		slog.Info("TailState web server listening", "address", s.config.ListenAddr)
-		errCh <- server.ListenAndServe()
+		slog.Info("TailState web server listening", "address", listener.Addr().String())
+		errCh <- server.Serve(listener)
 	}()
 	select {
 	case <-ctx.Done():
 		shutdown, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		return server.Shutdown(shutdown)
+		err := server.Shutdown(shutdown)
+		// Serve returns ErrServerClosed once Shutdown has closed the
+		// listener; drain it so the goroutine never outlives the call.
+		<-errCh
+		return err
 	case err := <-errCh:
 		if errors.Is(err, http.ErrServerClosed) {
 			return nil

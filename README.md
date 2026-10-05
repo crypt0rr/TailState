@@ -350,6 +350,45 @@ authenticated HTTPS indication.
 
 Do not expose the setup interface directly to the internet.
 
+### Command line
+
+```console
+tailstate help                 # all commands and exit codes
+tailstate help admin backup    # one command; every command also accepts -h/--help
+```
+
+| Command | Purpose |
+| --- | --- |
+| `serve` (default) | Bind `TAILSTATE_LISTEN_ADDR`, then start collectors and delivery |
+| `healthcheck [-url URL]` | Probe `/healthz`; the URL defaults to `TAILSTATE_LISTEN_ADDR` (a wildcard host such as `0.0.0.0` or `[::]` is probed on loopback) |
+| `doctor [-json]` | Read-only deployment report |
+| `admin reset` | One-time password reset token (safe while serving) |
+| `admin rekey -new-key-file PATH` | Master-key rotation (service stopped) |
+| `admin backup -out FILE` | Consistent online database snapshot plus `FILE.sha256` (safe while serving) |
+| `evidence verify`, `evidence audit`, `evidence public-key` | Evidence verification and ledger audit |
+| `version` | Print the version |
+
+Help output goes to standard output and exits `0`. Exit codes are stable for
+scripts:
+
+| Code | Meaning |
+| --- | --- |
+| `0` | Success (including `help`, `-h`, and `--help`) |
+| `1` | Runtime error: configuration, master key, I/O, database, or network failure |
+| `2` | Usage error: unknown command or subcommand, invalid or missing option, unexpected argument |
+| `3` | The check ran and failed: `doctor` reported a blocking (error) finding, `evidence verify` rejected a pack, or `evidence audit` found a ledger integrity failure |
+
+Logging is configured before configuration is validated or the database is
+opened, so startup errors, schema migration progress, and evidence-ledger
+backfill logs are JSON at the `TAILSTATE_LOG_LEVEL` level. `serve` logs to
+standard output; other commands log to standard error so their standard output
+stays machine-readable. `serve` binds its listener before it writes the setup
+token, queues the version notification, or starts collectors and delivery, so
+an address already in use exits (code `1`) before any poll or notification.
+
+The image `HEALTHCHECK` and the Compose healthcheck run `tailstate healthcheck`
+without arguments, so they follow a custom `TAILSTATE_LISTEN_ADDR` port.
+
 ### Deployment diagnostics
 
 When a deployment reports a proxy or readiness issue, run the doctor command in
@@ -444,6 +483,28 @@ volume name:
 ```console
 ./scripts/backup.sh ./backups
 ```
+
+To take a snapshot without stopping the service, use `admin backup`. It opens
+the live database read-only (it never creates, migrates, or writes it), copies
+a transactionally consistent snapshot with SQLite `VACUUM INTO`, checks the
+copy's integrity and master key, and writes `FILE.sha256` in `sha256sum`
+format. Existing files are never overwritten. In the default Compose
+deployment, write the snapshot into the data volume and copy it out:
+
+```console
+docker compose exec tailstate /tailstate admin backup -out /data/tailstate-backup.db
+docker compose cp tailstate:/data/tailstate-backup.db ./backups/
+docker compose cp tailstate:/data/tailstate-backup.db.sha256 ./backups/
+docker compose exec tailstate /tailstate admin backup -h   # options
+```
+
+The snapshot is a plain SQLite database protected by the same master key. To
+restore it, stop TailState, verify it with `sha256sum -c`, replace
+`tailstate.db` in the data directory with the snapshot (remove any
+`tailstate.db-wal` and `tailstate.db-shm` left beside the old file), keep the
+file owned by the service user with mode `0600`, and start the service. Remove
+the snapshot from the data volume after copying it out; it counts against the
+volume, not against the database budget.
 
 Back up `secrets/tailstate_master_key` separately and securely. A backup is
 only useful with the matching master key: TailState intentionally refuses to

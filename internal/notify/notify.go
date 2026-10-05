@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/nicholas-fedor/shoutrrr"
+	"github.com/nicholas-fedor/shoutrrr/pkg/services/chat/matrix"
 	"github.com/nicholas-fedor/shoutrrr/pkg/types"
 
 	"github.com/crypt0rr/tailstate/internal/textutil"
@@ -150,14 +151,57 @@ func (s *SenderImpl) clientFor(record *responseRecord) *http.Client {
 	return &client
 }
 
+// messageSender is the part of a Shoutrrr sender TailState uses.
+type messageSender interface {
+	Send(message string, params *types.Params) []error
+}
+
+// newSender constructs the Shoutrrr sender for one destination. Construction
+// is not always local: Shoutrrr's Matrix service logs in to the homeserver
+// while it is initialised when the URL carries a user and password, and the
+// router only injects a custom HTTP client after initialisation. Matrix is
+// therefore built directly with client in place first, so its login uses
+// TailState's bounded, redirect-rejecting transport like every other request.
+func newSender(serviceURL string, client *http.Client, timeout time.Duration) (messageSender, error) {
+	if parsed, err := url.Parse(serviceURL); err == nil && parsed.Scheme == matrix.Scheme {
+		service := &matrix.Service{}
+		service.SetHTTPClient(client)
+		if err := service.Initialize(parsed, nil); err != nil {
+			return nil, fmt.Errorf("%s: %w", matrix.Scheme, err)
+		}
+		return matrixSender{service: service, timeout: timeout}, nil
+	}
+	return shoutrrr.CreateSenderWithOptions(types.SenderOptions{HTTPClient: client, Timeout: timeout}, serviceURL)
+}
+
+// matrixSender applies the router's per-send deadline to a directly
+// constructed Matrix service.
+type matrixSender struct {
+	service *matrix.Service
+	timeout time.Duration
+}
+
+func (m matrixSender) Send(message string, params *types.Params) []error {
+	if params == nil {
+		params = &types.Params{}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), m.timeout)
+	defer cancel()
+	return []error{m.service.SendWithContext(ctx, message, params)}
+}
+
 // Validate checks that a URL belongs to a service registered by the pinned
-// Shoutrrr module. It does not make a network request.
+// Shoutrrr module by constructing its sender. For most services this is a
+// local parse, but a Matrix URL with a user and password logs in to the
+// homeserver during construction, so validating one makes network requests
+// through TailState's bounded transport. Access-token Matrix URLs do not log
+// in.
 func Validate(serviceURL string) error {
 	serviceURL = strings.TrimSpace(serviceURL)
 	if serviceURL == "" {
 		return errors.New("notification URL is required")
 	}
-	if _, err := shoutrrr.CreateSenderWithOptions(types.SenderOptions{Timeout: defaultTimeout}, serviceURL); err != nil {
+	if _, err := newSender(serviceURL, New().client, defaultTimeout); err != nil {
 		return fmt.Errorf("invalid notification URL (%s): %s", RedactURL(serviceURL), sanitize(err.Error(), serviceURL))
 	}
 	return nil
@@ -165,17 +209,27 @@ func Validate(serviceURL string) error {
 
 // Send delivers message to exactly one destination. Shoutrrr's sender is
 // created per call so a failure in one destination cannot affect another.
+// The sender is constructed exactly once per call, and that construction is
+// also the URL validation, so a Matrix password URL logs in once per
+// delivery rather than once for validation and again for sending.
 func (s *SenderImpl) Send(ctx context.Context, serviceURL, message string) error {
-	if err := Validate(serviceURL); err != nil {
-		return err
+	serviceURL = strings.TrimSpace(serviceURL)
+	if serviceURL == "" {
+		return errors.New("notification URL is required")
 	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 	record := &responseRecord{}
-	sender, err := shoutrrr.CreateSenderWithOptions(types.SenderOptions{HTTPClient: s.clientFor(record), Timeout: s.timeout}, serviceURL)
+	sender, err := newSender(serviceURL, s.clientFor(record), s.timeout)
 	if err != nil {
-		return fmt.Errorf("create notification sender (%s): %s", RedactURL(serviceURL), sanitize(err.Error(), serviceURL))
+		// A construction that reached the provider (a Matrix login) is a
+		// delivery outcome: classify it like any other HTTP response so a
+		// rejected password dead-letters and a rate limit honours Retry-After.
+		if status, retryAfter := record.failure(); status != 0 {
+			return &DeliveryError{Status: status, Message: sanitize(err.Error(), serviceURL), RetryAfter: retryAfter, Permanent: permanentDeliveryFailure(err.Error(), status)}
+		}
+		return fmt.Errorf("invalid notification URL (%s): %s", RedactURL(serviceURL), sanitize(err.Error(), serviceURL))
 	}
 	errs := sender.Send(FitMessage(message, MessageLimit(serviceURL)), nil)
 	for _, sendErr := range errs {

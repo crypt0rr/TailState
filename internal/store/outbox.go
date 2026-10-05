@@ -151,9 +151,13 @@ func (s *Store) readOutboxItem(scanner outboxScanner) (OutboxItem, error) {
 		item.LeaseUntil = &value
 	}
 	item.Destination = NotificationDestination{ID: item.DestinationID, Name: name, Enabled: enabled == 1}
-	item.Destination.ServiceURL, err = s.box.Decrypt(encrypted)
-	if err != nil {
-		return OutboxItem{}, err
+	// Deleted destinations have their URL scrubbed; claims never select them,
+	// but an empty value must not be treated as a decryption failure.
+	if encrypted != "" {
+		item.Destination.ServiceURL, err = s.box.Decrypt(encrypted)
+		if err != nil {
+			return OutboxItem{}, err
+		}
 	}
 	item.Destination.CreatedAt, err = time.Parse(time.RFC3339Nano, created)
 	if err != nil {

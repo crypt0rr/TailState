@@ -26,8 +26,8 @@ type NotificationDestination struct {
 }
 
 // ListDestinations returns active notification destinations. Pass true to
-// include soft-deleted destinations (their encrypted URLs are still decrypted
-// only inside the process and are never rendered by the web layer).
+// include soft-deleted destinations; their service URL was scrubbed when they
+// were deleted, so they are returned with an empty ServiceURL.
 func (s *Store) ListDestinations(ctx context.Context, includeDeleted ...bool) ([]NotificationDestination, error) {
 	query := "SELECT id,name,service_url_enc,enabled,created_at,updated_at,COALESCE(deleted_at,'') FROM notification_destinations"
 	if len(includeDeleted) == 0 || !includeDeleted[0] {
@@ -47,9 +47,11 @@ func (s *Store) ListDestinations(ctx context.Context, includeDeleted ...bool) ([
 		if err := rows.Scan(&d.ID, &d.Name, &encrypted, &enabled, &created, &updated, &deleted); err != nil {
 			return nil, err
 		}
-		d.ServiceURL, err = s.box.Decrypt(encrypted)
-		if err != nil {
-			return nil, err
+		if encrypted != "" {
+			d.ServiceURL, err = s.box.Decrypt(encrypted)
+			if err != nil {
+				return nil, err
+			}
 		}
 		d.Enabled = enabled == 1
 		d.CreatedAt, err = time.Parse(time.RFC3339Nano, created)
@@ -138,27 +140,55 @@ func (s *Store) SetDestinationEnabled(ctx context.Context, id int64, enabled boo
 	return tx.Commit()
 }
 
-// DeleteDestination soft-deletes a destination and dead-letters its pending
-// notifications. Historical rows remain available for audit and retention.
+// DeleteDestination soft-deletes a destination, scrubs its encrypted service
+// URL, and dead-letters its pending notifications. The name and historical
+// delivery rows remain available for audit and retention, but an operator who
+// deletes a destination because its URL leaked must not leave that credential
+// recoverable from later backups by anyone holding the master key.
 func (s *Store) DeleteDestination(ctx context.Context, id int64) error {
-	tx, err := s.db.BeginTx(ctx, nil)
+	return withSecureDelete(ctx, s.db, func(tx *sql.Tx) error {
+		now := time.Now().UTC().Format(time.RFC3339Nano)
+		result, err := tx.ExecContext(ctx, "UPDATE notification_destinations SET enabled=0,service_url_enc='',deleted_at=?,updated_at=? WHERE id=? AND deleted_at IS NULL", now, now, id)
+		if err != nil {
+			return err
+		}
+		n, err := result.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return errors.New("notification destination not found")
+		}
+		_, err = tx.ExecContext(ctx, "UPDATE outbox SET status='dead',last_error='destination removed',lease_until=NULL,lease_token='' WHERE destination_id=? AND status IN ('pending','processing')", id)
+		return err
+	})
+}
+
+// withSecureDelete runs fn in a transaction on one pinned connection with
+// SQLite's secure_delete enabled, so content removed by the transaction is
+// overwritten in the freed page space instead of lingering in the database
+// file. The pragma is per connection and is restored before the connection
+// returns to the pool to keep ordinary retention deletes cheap.
+func withSecureDelete(ctx context.Context, db *sql.DB, fn func(*sql.Tx) error) (err error) {
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, "PRAGMA secure_delete=ON"); err != nil {
+		return err
+	}
+	defer func() {
+		if _, resetErr := conn.ExecContext(context.WithoutCancel(ctx), "PRAGMA secure_delete=OFF"); resetErr != nil && err == nil {
+			err = resetErr
+		}
+	}()
+	tx, err := conn.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	now := time.Now().UTC().Format(time.RFC3339Nano)
-	result, err := tx.ExecContext(ctx, "UPDATE notification_destinations SET enabled=0,deleted_at=?,updated_at=? WHERE id=? AND deleted_at IS NULL", now, now, id)
-	if err != nil {
-		return err
-	}
-	n, err := result.RowsAffected()
-	if err != nil {
-		return err
-	}
-	if n == 0 {
-		return errors.New("notification destination not found")
-	}
-	if _, err := tx.ExecContext(ctx, "UPDATE outbox SET status='dead',last_error='destination removed',lease_until=NULL,lease_token='' WHERE destination_id=? AND status IN ('pending','processing')", id); err != nil {
+	if err := fn(tx); err != nil {
 		return err
 	}
 	return tx.Commit()

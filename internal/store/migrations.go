@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -244,6 +245,12 @@ func migrateSchema(db *sql.DB, box *secret.Box) error {
 	}
 	if version == 11 {
 		if err := migrateSchemaV11ToV12(db); err != nil {
+			return err
+		}
+		return migrateSchema(db, box)
+	}
+	if version == 12 {
+		if err := migrateSchemaV12ToV13(db); err != nil {
 			return err
 		}
 		return migrateSchema(db, box)
@@ -746,6 +753,26 @@ func migrateSchemaV11ToV12(db *sql.DB) error {
 			return fmt.Errorf("invalid bounded history migration phase %q", phase)
 		}
 	}
+}
+
+// migrateSchemaV12ToV13 hardens persisted state without changing any table
+// layout: it scrubs the encrypted service URL of destinations that were
+// soft-deleted before deletion started clearing it.
+func migrateSchemaV12ToV13(db *sql.DB) error {
+	ctx := context.Background()
+	err := withSecureDelete(ctx, db, func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(ctx, "UPDATE notification_destinations SET service_url_enc='' WHERE deleted_at IS NOT NULL AND service_url_enc<>''"); err != nil {
+			return fmt.Errorf("scrub deleted notification destinations: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, "UPDATE schema_version SET version=13"); err != nil {
+			return fmt.Errorf("record persistence hardening migration: %w", err)
+		}
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("persistence hardening migration: %w", err)
+	}
+	return nil
 }
 
 type snapshotMetadataMigrationRow struct {

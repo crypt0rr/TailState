@@ -193,7 +193,7 @@ type HistoryPage struct {
 	TruncationReason string
 }
 
-const currentSchemaVersion = 12
+const currentSchemaVersion = 13
 
 const (
 	webhookTriggerRetryWindow = 24 * time.Hour

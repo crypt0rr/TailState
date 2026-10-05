@@ -492,3 +492,48 @@ func TestOpenEvidenceReadOnlyRejectsUnsafeTargets(t *testing.T) {
 		})
 	}
 }
+
+// TestEvidenceAuditHeadReadsShareOneSnapshot appends a ledger entry from the
+// serving process between the audit's stored-head and latest-entry reads. The
+// audit must observe one consistent snapshot and verify successfully instead
+// of raising a false head-mismatch alarm.
+func TestEvidenceAuditHeadReadsShareOneSnapshot(t *testing.T) {
+	st, ctx := auditFixture(t)
+	readonly, err := OpenEvidenceReadOnly(st.databasePath, st.box)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { readonly.Close() })
+	var settingsRow Settings
+	if settingsRow, err = st.Settings(ctx); err != nil {
+		t.Fatal(err)
+	}
+	appended := false
+	evidenceAuditBetweenHeadReads = func() {
+		if appended {
+			return
+		}
+		appended = true
+		batch, applyErr := st.ApplyBatchWithBatch(ctx, settingsRow.Generation, []model.Collected{historyResource("server-concurrent", "100.64.0.9")}, func([]model.Change) string { return "concurrent" })
+		if applyErr != nil || batch.ID == 0 {
+			t.Errorf("concurrent append batch=%+v err=%v", batch, applyErr)
+		}
+	}
+	t.Cleanup(func() { evidenceAuditBetweenHeadReads = nil })
+
+	result, err := readonly.AuditEvidenceLedger(ctx, EvidenceAuditOptions{Limit: 1024})
+	if err != nil || !result.Complete || !result.HeadMatches || result.StoredHead != result.ObservedHead {
+		t.Fatalf("audit during concurrent append result=%+v err=%v", result, err)
+	}
+	if !appended {
+		t.Fatal("concurrent append hook did not run")
+	}
+	var latest int64
+	if err := st.db.QueryRowContext(ctx, "SELECT MAX(sequence) FROM evidence_ledger").Scan(&latest); err != nil || latest != result.LatestSequence+1 {
+		t.Fatalf("ledger latest=%d audited latest=%d err=%v", latest, result.LatestSequence, err)
+	}
+	after, err := readonly.AuditEvidenceLedger(ctx, EvidenceAuditOptions{Limit: 1024})
+	if err != nil || !after.Complete || !after.HeadMatches || after.LatestSequence != latest {
+		t.Fatalf("follow-up audit result=%+v err=%v", after, err)
+	}
+}

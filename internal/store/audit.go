@@ -168,11 +168,7 @@ func (s *Store) AuditEvidenceLedger(ctx context.Context, options EvidenceAuditOp
 		return result, errors.New("evidence signing public key is unavailable")
 	}
 	result.SigningKeyID = evidenceKeyID(public)
-	result.StoredHead, err = evidenceAuditStoredHead(ctx, s.db)
-	if err != nil {
-		return result, err
-	}
-	result.LatestSequence, result.ObservedHead, err = evidenceAuditLatest(ctx, s.db)
+	result.StoredHead, result.LatestSequence, result.ObservedHead, err = evidenceAuditHeads(ctx, s.db)
 	if err != nil {
 		return result, err
 	}
@@ -313,7 +309,39 @@ func evidenceAuditFailure(sequence int64, check string, err error) error {
 	return &EvidenceAuditError{Sequence: sequence, Check: check, Err: err}
 }
 
-func evidenceAuditStoredHead(ctx context.Context, db *sql.DB) (string, error) {
+// evidenceAuditBetweenHeadReads is a test seam invoked after the stored head
+// is read and before the latest ledger entry is read.
+var evidenceAuditBetweenHeadReads func()
+
+// evidenceAuditHeads reads the stored ledger head and the latest ledger entry
+// inside one read transaction, so both values come from the same WAL snapshot.
+// Reading them in separate statements let a concurrent append by the serving
+// process land in between and produce a false head-mismatch alarm.
+func evidenceAuditHeads(ctx context.Context, db *sql.DB) (storedHead string, latestSequence int64, observedHead string, err error) {
+	tx, err := db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return "", 0, "", err
+	}
+	defer tx.Rollback()
+	storedHead, err = evidenceAuditStoredHead(ctx, tx)
+	if err != nil {
+		return "", 0, "", err
+	}
+	if evidenceAuditBetweenHeadReads != nil {
+		evidenceAuditBetweenHeadReads()
+	}
+	latestSequence, observedHead, err = evidenceAuditLatest(ctx, tx)
+	if err != nil {
+		return "", 0, "", err
+	}
+	return storedHead, latestSequence, observedHead, tx.Commit()
+}
+
+type auditRowQueryer interface {
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
+func evidenceAuditStoredHead(ctx context.Context, db auditRowQueryer) (string, error) {
 	var head string
 	err := db.QueryRowContext(ctx, "SELECT value FROM meta WHERE key=?", evidenceLedgerHeadMeta).Scan(&head)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -322,7 +350,7 @@ func evidenceAuditStoredHead(ctx context.Context, db *sql.DB) (string, error) {
 	return head, err
 }
 
-func evidenceAuditLatest(ctx context.Context, db *sql.DB) (int64, string, error) {
+func evidenceAuditLatest(ctx context.Context, db auditRowQueryer) (int64, string, error) {
 	var sequence int64
 	var head string
 	err := db.QueryRowContext(ctx, "SELECT sequence,entry_hash FROM evidence_ledger ORDER BY sequence DESC LIMIT 1").Scan(&sequence, &head)

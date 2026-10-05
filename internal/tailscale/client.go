@@ -57,6 +57,13 @@ type Client struct {
 	deviceCache             []map[string]any
 	token                   string
 	expires                 time.Time
+	// detailMu guards the device-detail refresh order. detailAttempt records
+	// the poll sequence in which each device's detail requests last ran to
+	// completion so a deadline-limited poll starts with the stalest devices
+	// and every device is eventually refreshed.
+	detailMu      sync.Mutex
+	detailPoll    int64
+	detailAttempt map[string]int64
 }
 
 type HTTPError struct {
@@ -66,9 +73,10 @@ type HTTPError struct {
 }
 
 // PartialError reports a collector response that contained usable resources
-// but could not complete every related request. Count is the number of failed
-// related requests. Callers may apply the returned resources while preserving
-// existing snapshots for missing items.
+// but could not complete every related request. Count is the number of
+// resources missing from the response, including resources that were never
+// requested because a deadline expired. Callers may apply the returned
+// resources while preserving existing snapshots for missing items.
 type PartialError struct {
 	Err   error
 	Count int
@@ -269,6 +277,7 @@ func (c *Client) deviceDetailsFromDevices(ctx context.Context, devices []map[str
 		aggregateBytes += responseBytes
 		return nil
 	}
+	order := c.deviceDetailOrder(devices)
 	jobs := make(chan detailJob)
 	workers := min(deviceDetailWorkers, len(devices))
 	results := make(chan detailResult, max(1, workers))
@@ -336,9 +345,9 @@ func (c *Client) deviceDetailsFromDevices(ctx context.Context, devices []map[str
 	}
 	go func() {
 		defer close(jobs)
-		for index, device := range devices {
+		for _, index := range order {
 			select {
-			case jobs <- detailJob{index: index, device: device}:
+			case jobs <- detailJob{index: index, device: devices[index]}:
 			case <-detailCtx.Done():
 				return
 			}
@@ -349,17 +358,22 @@ func (c *Client) deviceDetailsFromDevices(ctx context.Context, devices []map[str
 		close(results)
 	}()
 	ordered := make([]detailResult, 0, len(devices))
+	completed := make([]int, 0, len(devices))
 	var partialErr error
-	partialCount := 0
 	for result := range results {
 		if result.err != nil {
-			partialCount++
+			// A request cancelled by the poll deadline was not really attempted;
+			// leave it at the front of the next poll's refresh order.
+			if ctx.Err() == nil {
+				completed = append(completed, result.index)
+			}
 			if partialErr == nil {
 				partialErr = result.err
 			}
 			continue
 		}
 		if result.hasValue {
+			completed = append(completed, result.index)
 			ordered = append(ordered, result)
 		}
 	}
@@ -374,10 +388,60 @@ func (c *Client) deviceDetailsFromDevices(ctx context.Context, devices []map[str
 	for _, result := range ordered {
 		out = append(out, result.resource)
 	}
-	if partialErr != nil {
-		return out, &PartialError{Err: partialErr, Count: partialCount}
+	c.recordDeviceDetailAttempts(devices, completed)
+	// Count every device missing from the result, including devices that were
+	// never dispatched because the deadline expired. A deadline must never look
+	// like a complete response.
+	if missing := len(devices) - len(out); missing > 0 {
+		if partialErr == nil {
+			cause := ctx.Err()
+			if cause == nil {
+				cause = errors.New("device detail results were incomplete")
+			}
+			partialErr = fmt.Errorf("device_details refreshed %d of %d devices before the poll deadline: %w", len(out), len(devices), cause)
+		}
+		return out, &PartialError{Err: partialErr, Count: missing}
 	}
 	return out, nil
+}
+
+// deviceDetailOrder returns device indexes ordered stalest-first: devices
+// whose detail requests have never completed come first, then the ones that
+// completed longest ago. Ties keep the API list order. A poll that hits its
+// deadline therefore resumes with the devices it could not reach instead of
+// starving the same tail of the list on every poll.
+func (c *Client) deviceDetailOrder(devices []map[string]any) []int {
+	order := make([]int, len(devices))
+	attempts := make([]int64, len(devices))
+	c.detailMu.Lock()
+	for index, device := range devices {
+		order[index] = index
+		attempts[index] = c.detailAttempt[idFor(device, []string{"id", "nodeId", "nodeID"})]
+	}
+	c.detailMu.Unlock()
+	sort.SliceStable(order, func(i, j int) bool { return attempts[order[i]] < attempts[order[j]] })
+	return order
+}
+
+// recordDeviceDetailAttempts marks the supplied device indexes as refreshed
+// in a new poll sequence and forgets devices that are no longer listed.
+func (c *Client) recordDeviceDetailAttempts(devices []map[string]any, completed []int) {
+	c.detailMu.Lock()
+	defer c.detailMu.Unlock()
+	c.detailPoll++
+	next := make(map[string]int64, len(devices))
+	for _, device := range devices {
+		id := idFor(device, []string{"id", "nodeId", "nodeID"})
+		if previous, ok := c.detailAttempt[id]; ok && id != "" {
+			next[id] = previous
+		}
+	}
+	for _, index := range completed {
+		if id := idFor(devices[index], []string{"id", "nodeId", "nodeID"}); id != "" {
+			next[id] = c.detailPoll
+		}
+	}
+	c.detailAttempt = next
 }
 
 func (c *Client) cacheDeviceResources(resources []model.Resource) {

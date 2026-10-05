@@ -26,6 +26,17 @@ go tool govulncheck ./...
 git diff --check
 ```
 
+When changing workflows, scripts, or the Dockerfile, run the same linters as
+the CI `lint` job (versions are pinned in `.github/workflows/ci.yml`):
+
+```console
+shellcheck -S warning scripts/*.sh
+docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:1.7.12 -no-color
+docker run --rm -i hadolint/hadolint:v2.15.1 < Dockerfile
+docker run --rm -v "$PWD:/repo" -w /repo ghcr.io/zizmorcore/zizmor:1.30.1 \
+  --offline --min-severity low --config .github/zizmor.yml .github/workflows
+```
+
 When changing dependency declarations or the Renovate configuration, also
 validate the updater metadata and its local dependency lookup:
 

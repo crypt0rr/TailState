@@ -2,7 +2,8 @@ name: Release container
 
 on:
   push:
-    tags: ["v*"]
+    # Semantic version tags only (v1.2.3 and pre-releases such as v1.2.3-rc.1).
+    tags: ["v[0-9]+.[0-9]+.[0-9]+*"]
 
 permissions:
   contents: read
@@ -12,8 +13,27 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  provenance:
+    name: Verify tag is on main
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Require the tagged commit to be reachable from main
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "tag ${GITHUB_REF_NAME} points at ${GITHUB_SHA}, which is not on main" >&2
+            exit 1
+          fi
+
   quality:
     name: Verify release candidate
+    needs: provenance
     uses: ./.github/workflows/ci.yml
     with:
       version: ${{ github.ref_name }}
@@ -24,10 +44,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
-      contents: write
+      contents: read
       packages: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       - name: Verify release toolchain and record provenance
@@ -208,6 +230,16 @@ jobs:
           done <<< "$candidate_tags"
           gh api --method DELETE "/user/packages/container/$package_name/versions/$version_id" 2>/dev/null || \
             gh api --method DELETE "/orgs/$owner/packages/container/$package_name/versions/$version_id"
+
+  github-release:
+    name: Create GitHub release
+    needs: image
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # Only this job can write repository contents (the release itself).
+    permissions:
+      contents: write
+    steps:
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}

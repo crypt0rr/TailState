@@ -10,6 +10,7 @@ services:
     read_only: true
     environment:
       TAILSTATE_LISTEN_ADDR: 0.0.0.0:8080
+      TAILSTATE_CONTAINER: "1"
       TAILSTATE_DATA_DIR: /data
       TAILSTATE_MASTER_KEY_FILE: /run/secrets/tailstate_master_key
       TAILSTATE_COOKIE_SECURE: ${TAILSTATE_COOKIE_SECURE:-false}

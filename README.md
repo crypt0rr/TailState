@@ -111,7 +111,7 @@ curl -fsS http://127.0.0.1:8080/readyz
 curl -fsS http://127.0.0.1:8080/metrics
 ```
 
-`/metrics` exposes readiness, pending/dead delivery counts, notification destination totals and enabled counts (plus a paused gauge when every destination is disabled), pending/processing/dead webhook trigger counts, resource counts, low-cardinality collector health gauges (`supported`, `baseline`, partial-result state, partial error count, failures, poll duration, last success, and next poll timestamps), the scheduler's total database-error counter (`tailstate_collector_due_errors_total`), delivery telemetry (`tailstate_outbox_delivery_attempts_total`, success/failure counters, lease renewal/loss counters, and the `tailstate_outbox_delivery_duration_seconds` histogram), and bounded storage telemetry. Storage metrics include the database size and pressure ratio, the page ceiling SQLite is actually enforcing (`tailstate_storage_enforced_limit_bytes`, plus `tailstate_storage_limit_enforced`, which drops to `0` if the active ceiling ever exceeds the configured budget), configured snapshot/event/history/rejection limits, and counters for snapshot truncation, event-value truncation, history-page truncation, and oversized raw writes represented by a metadata marker. These signals make storage pressure visible without exposing destination URLs, provider bodies, or message contents. The `device_details` collector uses a bounded eight-worker fan-out and a two-minute per-collector deadline; usable partial results are retained and marked in the status page and metrics with the number of failed detail requests. When `TAILSTATE_METRICS_TOKEN` is empty, only a direct loopback connection is accepted; requests from a reverse proxy (including a loopback or trusted proxy), requests with forwarded headers, and non-loopback peers receive `401`. Set that variable for Prometheus or any reverse proxy to require `Authorization: Bearer <token>` from any network location. Do not publish the endpoint without a token through a public reverse proxy.
+`/metrics` exposes readiness, pending/dead delivery counts, notification destination totals and enabled counts, the notification state (`tailstate_notification_state{state="unconfigured|no_destinations|paused|active"}`, exactly one is `1`) and a `tailstate_notifications_paused` gauge that is `1` when a configured installation has no destination or every destination is disabled, pending/processing/dead webhook trigger counts, resource counts, low-cardinality collector health gauges (`supported`, `baseline`, partial-result state, partial error count, failures, poll duration, last success, and next poll timestamps), the scheduler's total database-error counter (`tailstate_collector_due_errors_total`), delivery telemetry (`tailstate_outbox_delivery_attempts_total`, success/failure counters, lease renewal/loss counters, and the `tailstate_outbox_delivery_duration_seconds` histogram), and bounded storage telemetry. Storage metrics include the database size and pressure ratio, the page ceiling SQLite is actually enforcing (`tailstate_storage_enforced_limit_bytes`, plus `tailstate_storage_limit_enforced`, which drops to `0` if the active ceiling ever exceeds the configured budget), configured snapshot/event/history/rejection limits, and counters for snapshot truncation, event-value truncation, history-page truncation, and oversized raw writes represented by a metadata marker. These signals make storage pressure visible without exposing destination URLs, provider bodies, or message contents. The `device_details` collector uses a bounded eight-worker fan-out and a two-minute per-collector deadline; usable partial results are retained and marked in the status page and metrics with the number of failed detail requests. When `TAILSTATE_METRICS_TOKEN` is empty, only a direct loopback connection is accepted; requests from a reverse proxy (including a loopback or trusted proxy), requests with forwarded headers, and non-loopback peers receive `401`. Set that variable for Prometheus or any reverse proxy to require `Authorization: Bearer <token>` from any network location. Do not publish the endpoint without a token through a public reverse proxy. Every metric family carries `# HELP` and `# TYPE` lines (the exposition passes `promtool check metrics`), and the response is rendered in full before it is sent: if a store query fails, the scrape receives a clean `500` rather than a partial `200` body.
 
 Retention cleanup is resumable and writer-friendly. Each table is processed in keyset batches of at most 128 rows, each autocommit transaction has a 250 ms deadline, and one pass stops after two seconds; when work remains, the monitor schedules a continuation within one second instead of waiting for the hourly sweep. Cleanup logs include per-table row counts, transaction count, duration, failures, and the remaining-work flag. The same information is available through `tailstate_cleanup_*` metrics. Active notification and webhook leases are never dead-lettered until their lease has expired, and evidence-ledger rows are never removed by retention.
 
@@ -230,7 +230,16 @@ docker compose exec tailstate /tailstate doctor -json
 ```
 
 The report checks the effective listener, secure-cookie and trusted-proxy
-pairing, setup/baseline state, and whether notifications are paused. The
+pairing, setup/baseline state, and whether notifications are paused
+(`notifications_paused` when every destination is disabled,
+`notifications_no_destinations` when monitoring is configured but no
+destination exists). The Settings banner, these findings, and `/metrics` use
+one shared rule, so they always agree. In the official image
+(`TAILSTATE_CONTAINER=1`, set by the Dockerfile and `compose.yaml`) the
+wildcard container listener is reported as the informational
+`container_listener` finding instead of a warning, because Docker port
+publishing (loopback by default) decides who can reach it; a default Compose
+deployment therefore reports `ok`. The
 authenticated Settings page shows the same checks plus the sanitized origin
 seen for the current request. Raw headers, credentials, and destination URLs
 are never included in reports. `doctor` is strictly read-only: it does not
@@ -337,7 +346,7 @@ in a disposable project before relying on the procedure for an outage.
 - Shoutrrr deliveries retry independently for up to 24 hours across restarts, then remain visible as dead letters until the 30-day operational retention window expires. Delivery is at-least-once: each outbox row is leased while a sender is in flight, and if the process stops after a provider accepts a message but before the durable bookkeeping update commits, that message may be sent again after the lease expires. Per-lease fencing prevents a stale worker from changing a newer retry attempt. Disabling or removing a destination dead-letters its pending or in-flight items; newly added destinations receive only future notifications.
 - Tailscale API retries honor `Retry-After` while capping a provider delay at five minutes and the complete retry window for one request at 30 seconds. Collectors also have a two-minute poll deadline, so a throttled endpoint cannot stall the scheduler indefinitely.
 - Each paginated collection is bounded to 10,000 items and 64 MiB of response data across all pages, in addition to the 16 MiB per-response cap. If an aggregate limit is exceeded, the collector fails without applying partial inventory or deleting the last known snapshots. Device-detail requests share a bounded eight-worker queue so a large device list cannot create one job and result buffer per device.
-- If every destination is disabled, monitoring continues and notifications are reported as paused.
+- If every destination is disabled, or the last destination is removed, monitoring continues and notifications are reported as paused.
 - API collector failures alert after three consecutive failures and once on recovery.
 - A 403/404 from an optional plan-specific endpoint is treated as an
   unsupported response. Collectors that have never produced a baseline are
@@ -428,6 +437,7 @@ the optional webhook secret are entered in the authenticated UI.
 | `TAILSTATE_METRICS_TOKEN` | empty | Loopback-only `/metrics` when empty; bearer token for remote scrapes |
 | `TAILSTATE_TRUSTED_PROXIES` | empty | Comma-separated proxy IPs/CIDRs allowed to supply `X-Forwarded-For` and `X-Forwarded-Proto` |
 | `TAILSTATE_LOG_LEVEL` | `info` | `info` or `debug` structured logging |
+| `TAILSTATE_CONTAINER` | `false` (`1` in the image) | Marks the official container image; its wildcard listener is then an informational diagnostic |
 | `TAILSTATE_SNAPSHOT_LIMIT_BYTES` | `1048576` | Maximum normalized snapshot value retained per resource; `0` uses the default |
 | `TAILSTATE_EVENT_VALUE_LIMIT_BYTES` | `524288` | Maximum before/after value retained per history event; `0` uses the default |
 | `TAILSTATE_HISTORY_PAGE_LIMIT_BYTES` | `2097152` | Maximum stored event data read for one History page; `0` uses the default |
@@ -437,7 +447,9 @@ the optional webhook secret are entered in the authenticated UI.
 The test-only `TAILSTATE_TS_API_URL` and `TAILSTATE_TS_OAUTH_URL` variables allow local mock servers; production deployments should leave them unset.
 
 Standalone binaries bind the authenticated UI to loopback by default. If you
-explicitly bind a plaintext listener beyond loopback, TailState logs a warning;
+explicitly bind a plaintext listener beyond loopback, TailState logs a warning
+(inside the official image, the default wildcard listener is logged at info
+level because the published port controls exposure);
 use `TAILSTATE_COOKIE_SECURE=true` and a configured trusted HTTPS proxy for
 remote access. Compose keeps the application listener on the private container
 network and publishes it on loopback by default.

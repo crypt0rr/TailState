@@ -25,6 +25,9 @@ type Config struct {
 	OAuthTokenURL  string
 	Version        string
 	StorageLimits  StorageLimits
+	// Container is set by the official image (TAILSTATE_CONTAINER=1). Its
+	// wildcard listener is then bounded by Docker/Compose port publishing.
+	Container bool
 }
 
 // StorageLimits contains operator-selected byte ceilings. A zero field keeps
@@ -63,6 +66,11 @@ func Load(version string) (Config, error) {
 		return Config{}, fmt.Errorf("TAILSTATE_COOKIE_SECURE: %w", err)
 	}
 	c.CookieSecure = secure
+	container, err := strconv.ParseBool(env("TAILSTATE_CONTAINER", "false"))
+	if err != nil {
+		return Config{}, fmt.Errorf("TAILSTATE_CONTAINER: %w", err)
+	}
+	c.Container = container
 	trustedProxies, err := parseTrustedProxies(env("TAILSTATE_TRUSTED_PROXIES", ""))
 	if err != nil {
 		return Config{}, err
@@ -163,6 +171,27 @@ func (c Config) DatabasePath() string { return filepath.Join(c.DataDir, "tailsta
 // not a hard rejection: a container or a local development proxy may own the
 // network boundary, but operators should get an explicit diagnostic when they
 // choose that deployment shape.
+// ContainerWildcardListener reports whether the plaintext listener is the
+// container image's all-interfaces default. Inside a container that address
+// is only the container's own network namespace; exposure is decided by the
+// published host port (loopback in the default Compose file), so this shape
+// is informational rather than a warning.
+func (c Config) ContainerWildcardListener() bool {
+	if !c.Container || !c.InsecureHTTPListener() {
+		return false
+	}
+	host, _, err := net.SplitHostPort(c.ListenAddr)
+	if err != nil {
+		return false
+	}
+	host = strings.Trim(host, "[]")
+	if host == "" {
+		return true
+	}
+	address, err := netip.ParseAddr(host)
+	return err == nil && address.IsUnspecified()
+}
+
 func (c Config) InsecureHTTPListener() bool {
 	if c.CookieSecure {
 		return false

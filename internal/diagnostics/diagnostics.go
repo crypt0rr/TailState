@@ -132,7 +132,15 @@ func Build(config boot.Config, runtime Runtime, request *http.Request) Report {
 		}
 	}
 
-	if config.InsecureHTTPListener() {
+	if config.ContainerWildcardListener() {
+		add(Finding{
+			Code:     "container_listener",
+			Severity: SeverityInfo,
+			Summary:  "The container image listens on all container interfaces; Docker port publishing decides who can reach it.",
+			Remediation: "Keep the published port on 127.0.0.1 (the Compose default), or put TailState behind an HTTPS proxy and enable " +
+				"TAILSTATE_COOKIE_SECURE=true before publishing it more widely.",
+		})
+	} else if config.InsecureHTTPListener() {
 		add(Finding{
 			Code:     "plaintext_public_listener",
 			Severity: SeverityWarning,
@@ -198,7 +206,15 @@ func Build(config boot.Config, runtime Runtime, request *http.Request) Report {
 				Remediation: "Review the authenticated Status page and collector health; upstream error details remain out of unauthenticated responses.",
 			})
 		}
-		if runtime.Destinations > 0 && runtime.EnabledDestinations == 0 {
+		switch NotificationStateFor(runtime.Configured, runtime.Destinations, runtime.EnabledDestinations) {
+		case NotificationsNoDestinations:
+			add(Finding{
+				Code:        "notifications_no_destinations",
+				Severity:    SeverityWarning,
+				Summary:     "Monitoring is configured but no notification destination exists, so notifications are paused.",
+				Remediation: "Add and enable a destination in Settings; monitoring and history continue while delivery is paused.",
+			})
+		case NotificationsPaused:
 			add(Finding{
 				Code:        "notifications_paused",
 				Severity:    SeverityWarning,
@@ -248,6 +264,45 @@ func Build(config boot.Config, runtime Runtime, request *http.Request) Report {
 	}
 
 	return report
+}
+
+// NotificationState is the delivery state shared by the Settings page,
+// deployment diagnostics, and metrics so the three surfaces always agree.
+type NotificationState string
+
+const (
+	// NotificationsUnconfigured: monitoring has not been configured yet.
+	NotificationsUnconfigured NotificationState = "unconfigured"
+	// NotificationsNoDestinations: configured, but no destination exists.
+	NotificationsNoDestinations NotificationState = "no_destinations"
+	// NotificationsPaused: destinations exist but every one is disabled.
+	NotificationsPaused NotificationState = "paused"
+	// NotificationsActive: at least one destination is enabled.
+	NotificationsActive NotificationState = "active"
+)
+
+// NotificationStates lists every state in a stable order.
+var NotificationStates = []NotificationState{NotificationsUnconfigured, NotificationsNoDestinations, NotificationsPaused, NotificationsActive}
+
+// NotificationStateFor classifies notification delivery. Enabled
+// destinations make delivery active even before monitoring is configured.
+func NotificationStateFor(configured bool, destinations, enabled int) NotificationState {
+	switch {
+	case enabled > 0:
+		return NotificationsActive
+	case !configured:
+		return NotificationsUnconfigured
+	case destinations == 0:
+		return NotificationsNoDestinations
+	default:
+		return NotificationsPaused
+	}
+}
+
+// Paused reports whether a configured installation is not delivering
+// notifications, either because no destination exists or all are disabled.
+func (s NotificationState) Paused() bool {
+	return s == NotificationsNoDestinations || s == NotificationsPaused
 }
 
 // HasErrors reports whether the report contains a blocking finding.

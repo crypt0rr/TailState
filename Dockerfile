@@ -41,7 +41,10 @@ EXPOSE 8080
 # Containers receive their network boundary from Compose/Docker port
 # publishing; keep the application reachable on the container bridge while
 # standalone binaries default to loopback in boot.Config.
-ENV TAILSTATE_LISTEN_ADDR=0.0.0.0:8080
+# TAILSTATE_CONTAINER tells diagnostics that this wildcard listener is the
+# image default, bounded by the published port rather than the host network.
+ENV TAILSTATE_LISTEN_ADDR=0.0.0.0:8080 \
+    TAILSTATE_CONTAINER=1
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 CMD ["/tailstate", "healthcheck"]
 ENTRYPOINT ["/tailstate"]
 CMD ["serve"]

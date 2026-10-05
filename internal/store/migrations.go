@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/crypt0rr/tailstate/internal/model"
 	"github.com/crypt0rr/tailstate/internal/notify"
 	"github.com/crypt0rr/tailstate/internal/secret"
 )
@@ -257,6 +258,12 @@ func migrateSchema(db *sql.DB, box *secret.Box) error {
 	}
 	if version == 12 {
 		if err := migrateSchemaV12ToV13(db); err != nil {
+			return err
+		}
+		return migrateSchema(db, box)
+	}
+	if version == 13 {
+		if err := migrateSchemaV13ToV14(db); err != nil {
 			return err
 		}
 		return migrateSchema(db, box)
@@ -785,6 +792,107 @@ func migrateSchemaV12ToV13(db *sql.DB) error {
 		return fmt.Errorf("persistence hardening migration: %w", err)
 	}
 	return nil
+}
+
+// migrateSchemaV13ToV14 adds notification routing and classification
+// state. Every new column defaults to the pre-upgrade behaviour: destinations
+// route all changes. Existing events are classified in bounded, resumable
+// chunks; severity is derived data and is not part of the signed evidence
+// ledger payload, so backfilling it cannot change a ledger digest.
+func migrateSchemaV13ToV14(db *sql.DB) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin notification routing migration: %w", err)
+	}
+	defer tx.Rollback()
+	for _, column := range []struct {
+		table, name, definition string
+	}{
+		{table: "notification_destinations", name: "route_min_severity", definition: "TEXT NOT NULL DEFAULT ''"},
+		{table: "notification_destinations", name: "route_include_collectors", definition: "TEXT NOT NULL DEFAULT ''"},
+		{table: "notification_destinations", name: "route_exclude_collectors", definition: "TEXT NOT NULL DEFAULT ''"},
+		{table: "notification_destinations", name: "route_change_kinds", definition: "TEXT NOT NULL DEFAULT ''"},
+		{table: "events", name: "severity", definition: "TEXT NOT NULL DEFAULT ''"},
+	} {
+		if err := addColumnIfMissing(tx, column.table, column.name, column.definition); err != nil {
+			return err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit notification routing columns: %w", err)
+	}
+	var cursor int64
+	for {
+		next, done, err := migrateEventSeverityChunk(db, cursor)
+		if err != nil {
+			return err
+		}
+		if done {
+			break
+		}
+		cursor = next
+	}
+	finalTx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin notification routing migration completion: %w", err)
+	}
+	defer finalTx.Rollback()
+	if _, err := finalTx.Exec("UPDATE schema_version SET version=14"); err != nil {
+		return fmt.Errorf("record notification routing migration: %w", err)
+	}
+	if err := finalTx.Commit(); err != nil {
+		return fmt.Errorf("commit notification routing migration: %w", err)
+	}
+	return nil
+}
+
+// migrateEventSeverityChunk classifies up to migrationChunkSize unclassified
+// events after cursor in one transaction. Rerunning it after an interruption
+// only revisits events that are still unclassified.
+func migrateEventSeverityChunk(db *sql.DB, cursor int64) (int64, bool, error) {
+	tx, err := db.Begin()
+	if err != nil {
+		return cursor, false, fmt.Errorf("begin event severity backfill: %w", err)
+	}
+	defer tx.Rollback()
+	rows, err := tx.Query("SELECT id,collector,event_type,changes_json FROM events WHERE id>? AND severity='' ORDER BY id LIMIT ?", cursor, migrationChunkSize)
+	if err != nil {
+		return cursor, false, fmt.Errorf("read events for severity backfill: %w", err)
+	}
+	type pending struct {
+		id       int64
+		severity model.Severity
+	}
+	var items []pending
+	for rows.Next() {
+		var id int64
+		var collector, kind string
+		var changes []byte
+		if err := rows.Scan(&id, &collector, &kind, &changes); err != nil {
+			rows.Close()
+			return cursor, false, fmt.Errorf("read events for severity backfill: %w", err)
+		}
+		items = append(items, pending{id: id, severity: classifyStoredEvent(collector, kind, changes)})
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return cursor, false, fmt.Errorf("read events for severity backfill: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return cursor, false, err
+	}
+	if len(items) == 0 {
+		return cursor, true, nil
+	}
+	for _, item := range items {
+		if _, err := tx.Exec("UPDATE events SET severity=? WHERE id=?", string(item.severity), item.id); err != nil {
+			return cursor, false, fmt.Errorf("record event severity: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return cursor, false, fmt.Errorf("commit event severity backfill: %w", err)
+	}
+	return items[len(items)-1].id, false, nil
 }
 
 type snapshotMetadataMigrationRow struct {

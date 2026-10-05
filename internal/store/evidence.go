@@ -66,6 +66,7 @@ type EvidenceFilter struct {
 	Cursor     int64  `json:"cursor,omitempty"`
 	Limit      int    `json:"limit"`
 	BatchID    int64  `json:"batch,omitempty"`
+	Severity   string `json:"severity,omitempty"`
 }
 
 // EvidenceBatch contains one atomic polling result and its related events and

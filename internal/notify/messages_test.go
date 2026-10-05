@@ -106,7 +106,7 @@ func TestCodeSpansRenderValuesWithoutMarkdownEscapes(t *testing.T) {
 		"  - `last_seen`: `\"2026-10-05T12:00:00Z\"` → `\"2026-10-05T13:00:00Z\"`\n",
 		"  - `tags`: `[\"tag:prod-db\"]` → `[\"tag:prod-db\",\"tag:#ops\"]`",
 		// Bold and prose contexts keep their Markdown escapes.
-		"✏️ **db\\-1** `changed` (device\\_details)\n",
+		"🟠 ✏️ **db\\-1** `changed` (device\\_details, medium)\n",
 	} {
 		if !strings.Contains(digest, want) {
 			t.Fatalf("digest missing %q:\n%s", want, digest)

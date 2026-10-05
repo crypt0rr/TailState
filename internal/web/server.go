@@ -22,9 +22,11 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/crypt0rr/tailstate/internal/boot"
 	"github.com/crypt0rr/tailstate/internal/diagnostics"
+	"github.com/crypt0rr/tailstate/internal/model"
 	"github.com/crypt0rr/tailstate/internal/monitor"
 	"github.com/crypt0rr/tailstate/internal/notify"
 	"github.com/crypt0rr/tailstate/internal/store"
@@ -90,6 +92,8 @@ type pageData struct {
 	HistoryFilter                   store.HistoryFilter
 	HistoryCollectors               []string
 	HistoryEventTypes               []string
+	HistorySeverities               []string
+	Collectors                      []string
 	HistoryNextURL                  string
 	HistoryExportURL                string
 	EvidenceSigningKeyID            string
@@ -104,6 +108,75 @@ type destinationPage struct {
 	Name       string
 	DisplayURL string
 	Enabled    bool
+	// Routing fields are pre-rendered for the edit form.
+	MinSeverity       string
+	IncludeCollectors string
+	ExcludeCollectors string
+	ChangeKinds       map[string]bool
+	RoutingSummary    string
+}
+
+// routingSummary describes a destination's rules in one line.
+func routingSummary(rules store.RoutingRules) string {
+	if rules.AllChanges() {
+		return "All changes"
+	}
+	parts := []string{}
+	if rules.MinSeverity != "" {
+		parts = append(parts, "severity "+string(rules.MinSeverity)+" or higher")
+	}
+	if len(rules.IncludeCollectors) > 0 {
+		parts = append(parts, "only "+strings.Join(rules.IncludeCollectors, ", "))
+	}
+	if len(rules.ExcludeCollectors) > 0 {
+		parts = append(parts, "excluding "+strings.Join(rules.ExcludeCollectors, ", "))
+	}
+	if len(rules.ChangeKinds) > 0 {
+		parts = append(parts, strings.Join(rules.ChangeKinds, ", ")+" changes")
+	}
+	return strings.Join(parts, "; ")
+}
+
+func knownCollectors() []string {
+	collectors := append([]string{}, tailscale.CoreCollectors...)
+	return append(collectors, tailscale.InventoryCollectors...)
+}
+
+// splitCollectorList parses a comma- or space-separated collector list and
+// rejects names this release does not monitor, so a typo cannot silently
+// route nothing.
+func splitCollectorList(value string) ([]string, error) {
+	known := map[string]bool{}
+	for _, collector := range knownCollectors() {
+		known[collector] = true
+	}
+	var out []string
+	for _, part := range strings.FieldsFunc(value, func(r rune) bool { return r == ',' || unicode.IsSpace(r) }) {
+		part = strings.ToLower(part)
+		if !known[part] {
+			return nil, fmt.Errorf("unknown collector %q", part)
+		}
+		out = append(out, part)
+	}
+	return out, nil
+}
+
+// routingFromForm parses the destination routing fields.
+func routingFromForm(r *http.Request) (store.RoutingRules, error) {
+	include, err := splitCollectorList(r.FormValue("include_collectors"))
+	if err != nil {
+		return store.RoutingRules{}, err
+	}
+	exclude, err := splitCollectorList(r.FormValue("exclude_collectors"))
+	if err != nil {
+		return store.RoutingRules{}, err
+	}
+	return store.NormalizeRoutingRules(store.RoutingRules{
+		MinSeverity:       model.Severity(strings.TrimSpace(r.FormValue("min_severity"))),
+		IncludeCollectors: include,
+		ExcludeCollectors: exclude,
+		ChangeKinds:       r.Form["change_kinds"],
+	})
 }
 
 type readinessCollector struct {
@@ -494,14 +567,13 @@ func (s *Server) history(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "load history", http.StatusInternalServerError)
 		return
 	}
-	collectors := append([]string{}, tailscale.CoreCollectors...)
-	collectors = append(collectors, tailscale.InventoryCollectors...)
 	data := pageData{
 		CSRF:              csrf,
 		History:           history,
 		HistoryFilter:     filter,
-		HistoryCollectors: collectors,
+		HistoryCollectors: knownCollectors(),
 		HistoryEventTypes: []string{"created", "changed", "removed"},
+		HistorySeverities: []string{string(model.SeverityHigh), string(model.SeverityMedium), string(model.SeverityLow)},
 	}
 	data.EvidenceSigningKeyID, _ = s.store.EvidenceSigningKeyID(r.Context())
 	if history.HasNext {
@@ -544,6 +616,9 @@ func historyFilter(r *http.Request) store.HistoryFilter {
 	if batch, err := strconv.ParseInt(strings.TrimSpace(r.URL.Query().Get("batch")), 10, 64); err == nil && batch > 0 {
 		filter.BatchID = batch
 	}
+	if severity, ok := model.ParseSeverity(r.URL.Query().Get("severity")); ok {
+		filter.Severity = string(severity)
+	}
 	return filter
 }
 
@@ -562,6 +637,9 @@ func historyFilterValues(filter store.HistoryFilter) url.Values {
 	}
 	if filter.ResourceID != "" {
 		values.Set("resource", filter.ResourceID)
+	}
+	if filter.Severity != "" {
+		values.Set("severity", filter.Severity)
 	}
 	return values
 }
@@ -731,12 +809,23 @@ func settingsInputError(input *store.Settings, device, inventory int64, deviceEr
 }
 
 func (s *Server) settingsData(ctx context.Context, csrf string, configured bool, settings store.Settings, request *http.Request) pageData {
-	data := pageData{CSRF: csrf, Configured: configured, Settings: settings, DeviceSeconds: int64(settings.DeviceInterval.Seconds()), InventorySeconds: int64(settings.InventoryInterval.Seconds()), Diagnostics: s.diagnosticReport(ctx, request)}
+	data := pageData{CSRF: csrf, Configured: configured, Settings: settings, DeviceSeconds: int64(settings.DeviceInterval.Seconds()), InventorySeconds: int64(settings.InventoryInterval.Seconds()), Diagnostics: s.diagnosticReport(ctx, request), Collectors: knownCollectors(), HistoryEventTypes: []string{"created", "changed", "removed"}}
 	destinations, err := s.store.ListDestinations(ctx)
 	if err == nil {
 		data.Destinations = make([]destinationPage, 0, len(destinations))
 		for _, destination := range destinations {
-			data.Destinations = append(data.Destinations, destinationPage{ID: destination.ID, Name: destination.Name, DisplayURL: notify.RedactURL(destination.ServiceURL), Enabled: destination.Enabled})
+			kinds := map[string]bool{}
+			for _, kind := range destination.Routing.ChangeKinds {
+				kinds[kind] = true
+			}
+			data.Destinations = append(data.Destinations, destinationPage{
+				ID: destination.ID, Name: destination.Name, DisplayURL: notify.RedactURL(destination.ServiceURL), Enabled: destination.Enabled,
+				MinSeverity:       string(destination.Routing.MinSeverity),
+				IncludeCollectors: strings.Join(destination.Routing.IncludeCollectors, ", "),
+				ExcludeCollectors: strings.Join(destination.Routing.ExcludeCollectors, ", "),
+				ChangeKinds:       kinds,
+				RoutingSummary:    routingSummary(destination.Routing),
+			})
 		}
 		enabled := 0
 		for _, destination := range data.Destinations {
@@ -835,7 +924,24 @@ func (s *Server) destinationPost(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		enabled := r.FormValue("enabled") == "on" || r.FormValue("enabled") == "true"
-		if _, err := s.store.SaveDestination(ctx, store.NotificationDestination{ID: id, Name: r.FormValue("name"), ServiceURL: serviceURL, Enabled: enabled}); err != nil {
+		// Forms that carry routing fields mark themselves with routing=1, so a
+		// save without them never resets a destination's rules.
+		withRouting := r.FormValue("routing") == "1"
+		var rules store.RoutingRules
+		if withRouting {
+			var err error
+			if rules, err = routingFromForm(r); err != nil {
+				data := s.currentSettingsData(ctx, csrf, r)
+				data.Error = "Notification routing was not saved: " + err.Error() + "."
+				s.render(w, "settings", data)
+				return
+			}
+		}
+		savedID, err := s.store.SaveDestination(ctx, store.NotificationDestination{ID: id, Name: r.FormValue("name"), ServiceURL: serviceURL, Enabled: enabled})
+		if err == nil && withRouting {
+			err = s.store.SetDestinationRouting(ctx, savedID, rules)
+		}
+		if err != nil {
 			slog.Error("save notification destination", "error", err)
 			data := s.currentSettingsData(ctx, csrf, r)
 			data.Error = destinationMutationMessage("save", err)

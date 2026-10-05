@@ -76,7 +76,7 @@ func TestSchemaV13MigrationReplacesRedundantIndexes(t *testing.T) {
 	}
 	assertIndexes("migrated database")
 	var version int
-	if err := st.db.QueryRow("SELECT version FROM schema_version").Scan(&version); err != nil || version != 13 {
+	if err := st.db.QueryRow("SELECT version FROM schema_version").Scan(&version); err != nil || version != currentSchemaVersion {
 		t.Fatalf("schema version=%d err=%v", version, err)
 	}
 }

@@ -33,17 +33,24 @@ func TextDigest(text string) DigestFunc {
 
 var changeIcons = map[string]string{"created": "➕", "changed": "✏️", "removed": "➖"}
 
+// severityIcons prefix every digest line with its built-in severity.
+var severityIcons = map[model.Severity]string{model.SeverityHigh: "🔴", model.SeverityMedium: "🟠", model.SeverityLow: "⚪"}
+
 // Digest renders a change batch. The digest names the instance and tailnet,
 // states when the batch was observed, links to the batch in History when a
 // public URL is configured, and lists every change with its field diffs up to
 // the default digest budget.
 func (c Context) Digest(in DigestInput) Message {
 	counts := map[string]int{}
-	for _, change := range in.Changes {
+	severities := make([]model.Severity, len(in.Changes))
+	for index, change := range in.Changes {
 		counts[change.Kind]++
+		severities[index] = model.Classify(change)
+		counts[string(severities[index])]++
 	}
 	message := c.message("", "Tailscale inventory changed",
 		line(strong(fmt.Sprintf("%d change(s):", len(in.Changes))), lit(fmt.Sprintf(" %d created, %d changed, %d removed", counts["created"], counts["changed"], counts["removed"]))),
+		line(strong("Severity:"), lit(fmt.Sprintf(" %s %d high, %s %d medium, %s %d low", severityIcons[model.SeverityHigh], counts["high"], severityIcons[model.SeverityMedium], counts["medium"], severityIcons[model.SeverityLow], counts["low"]))),
 		observedLine(in.ObservedAt),
 	)
 	if batchURL := c.HistoryBatchURL(in.BatchID); batchURL != "" {
@@ -65,7 +72,8 @@ func (c Context) Digest(in DigestInput) Message {
 		return true
 	}
 	for index, change := range in.Changes {
-		if !add(line(lit(changeIcons[change.Kind]+" "), bold(change.Name), lit(" "), code(change.Kind), lit(" ("), txt(change.Collector), lit(")"))) {
+		severity := severities[index]
+		if !add(line(lit(severityIcons[severity]+" "+changeIcons[change.Kind]+" "), bold(change.Name), lit(" "), code(change.Kind), lit(" ("), txt(change.Collector), lit(", "+string(severity)+")"))) {
 			message.Lines = append(message.Lines, blank(), line(emph(fmt.Sprintf("%d more change(s) omitted; total: %d. See TailState History for the full batch.", len(in.Changes)-index, len(in.Changes)))))
 			break
 		}

@@ -387,7 +387,7 @@ in a disposable project before relying on the procedure for an outage.
 - Failed or partial polls never delete snapshots.
 - Single-object endpoints (tailnet settings, contacts, policy, each DNS sub-endpoint, and log-streaming configuration and status) must return a JSON object. A `null`, empty, array, or scalar body is treated as an invalid upstream response: the collector fails, no events are recorded, and the last snapshot is kept.
 - Multiple changes in one poll become one digest, fanned out into one durable outbox item per enabled destination. Each digest is fitted to the receiving service's message limit (for example 4,096 bytes for Telegram, Lark, WeCom, and ntfy, 1,024 for Pushover, and 10,000 for Zulip) by dropping whole lines from the end and adding an explicit "lines omitted, see History" note. A provider that still rejects a message as too large (or with HTTP 413) dead-letters it immediately instead of retrying for 24 hours.
-- Every change batch is also recorded in the authenticated History page with field-level diffs and redacted normalized before/after snapshots. Filters support collector, change type, resource name or ID, and a single batch (`/history?batch=<id>`, the target of notification links); history is retained for 30 days. Normalized snapshots are capped at 1 MiB and each event before/after value at 512 KiB. Larger values retain their SHA-256, original byte count, configured limit, and a bounded truncation marker instead of the provider body; the authenticated UI calls this out explicitly. A normal history page reads at most 2 MiB of stored event data and displays a truncation notice with a cursor when that budget is reached. The hard 4 MiB raw-write ceiling prevents an unusually large normalized value from entering SQLite unbounded; the small marker remains queryable for audit.
+- Every change batch is also recorded in the authenticated History page with field-level diffs and redacted normalized before/after snapshots. Filters support collector, change type, severity, resource name or ID, and a single batch (`/history?batch=<id>`, the target of notification links); history is retained for 30 days. Normalized snapshots are capped at 1 MiB and each event before/after value at 512 KiB. Larger values retain their SHA-256, original byte count, configured limit, and a bounded truncation marker instead of the provider body; the authenticated UI calls this out explicitly. A normal history page reads at most 2 MiB of stored event data and displays a truncation notice with a cursor when that budget is reached. The hard 4 MiB raw-write ceiling prevents an unusually large normalized value from entering SQLite unbounded; the small marker remains queryable for audit.
 - The History page can download a filtered, redacted JSON evidence pack for incident reports and offline review. Packs include normalized snapshots, field diffs, destination delivery outcomes, a SHA-256 content hash, and an Ed25519 signature over a hash-linked event ledger; exports are limited to 100 batches, 2,000 events, and 5 MiB. A changed export fails verification.
 - Verify an export offline with `tailstate evidence verify --file tailstate-drift-evidence.json`. Verification checks the content hash, embedded public key fingerprint, signature, and included ledger links; packs and public-key files are bounded before decoding (5 MiB and 4 KiB respectively). For independent trust, print the instance public key with `tailstate evidence public-key`, save it as a base64 file, and pass it with `--public-key public.key`. `evidence public-key` opens the database read-only and fails if the database, the current schema, or the stored signing key is missing; it never creates a database or a new key.
 - Audit the persisted evidence ledger explicitly with `tailstate evidence audit`. The command opens the existing database read-only, verifies sequence continuity, predecessor hashes, signatures, key IDs, stored head, and canonical payload digests, then resumes through bounded pages until the chain is complete. Pass `--public-key public.key` to anchor verification to an independently trusted Ed25519 key; entries whose event snapshots have aged out are reported as cryptographically verified but payload-unverifiable. The audit never creates a database, runs migrations, generates keys, or changes metadata, and can run while TailState is serving from SQLite WAL mode.
@@ -423,6 +423,34 @@ in a disposable project before relying on the procedure for an outage.
   explicitly returned `[]` is the healthy empty result. This prevents a
   malformed or permission-filtered response from looking like mass removal.
 - Starting a different TailState release queues one durable notification containing the previous and current versions.
+
+### Severity and routing
+
+Every change is classified with a built-in severity. The digest prefixes each
+line with 🔴 high, 🟠 medium, or ⚪ low and repeats the severity next to the
+collector, and History can be filtered by severity.
+
+| Severity | Changes |
+| --- | --- |
+| High | Any `policy`, `log_streaming`, `settings` (tailnet settings), or `webhooks` change; a `keys` resource created; a `users` change to `role`; a `devices` change to `tags`, `authorized` false→true, or `keyExpiryDisabled` false→true |
+| Low | A `devices` change whose changed fields are all `clientVersion`, `updateAvailable`, `os`, or `distro` |
+| Medium | Everything else, for example devices created or removed, route changes (`enabledRoutes`, `advertisedRoutes`), user invites, users created or removed, keys removed, DNS, contacts, and posture changes |
+
+A changed resource takes the highest severity of its changed fields; a change
+whose field list was truncated is at least medium, because the omitted fields
+cannot be shown to be routine.
+
+Each destination has routing rules, edited under **Edit destination** in
+Settings: a minimum severity (all, medium and high, or high only), collectors
+to include (empty means all), collectors to exclude, and change kinds
+(created, changed, removed; none selected means all). Fan-out renders one
+digest per distinct rule set, so each destination receives only its matching
+changes, and a destination whose rules match nothing in a batch receives no
+digest. For example, a paging channel with "high only" receives nothing for a
+batch of client upgrades, while a default destination still receives it.
+Destinations created before routing existed, and new destinations, receive all
+changes. Collector health and release notifications are not inventory changes
+and always reach every enabled destination.
 
 Version tracking is introduced in v0.3.0. Its first startup records the release silently because earlier releases did not persist their version; subsequent upgrades include both exact versions in the notification.
 
@@ -489,6 +517,13 @@ History. It also drops two redundant indexes (`events_observed_at` and
 unique batch constraint) and adds `outbox_dead_retention` and
 `auth_tokens_kind`, so every retention statement reaches its rows through an
 index search and a pass with nothing to delete stays cheap on large databases.
+
+Schema v14 adds per-destination routing rules and a built-in severity on every
+history event. Existing destinations default to receiving all changes, so the
+upgrade does not change delivery. Existing events are classified in bounded,
+resumable 64-row transactions during the migration; severity is derived data
+and is not part of the signed ledger payload, so previously signed evidence and
+exported packs still verify.
 
 ## Runtime configuration
 

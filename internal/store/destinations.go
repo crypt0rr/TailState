@@ -23,13 +23,17 @@ type NotificationDestination struct {
 	CreatedAt  time.Time
 	UpdatedAt  time.Time
 	DeletedAt  *time.Time
+	// Routing selects the changes this destination receives. It is read by
+	// ListDestinations and written by SetDestinationRouting; SaveDestination
+	// leaves it unchanged.
+	Routing RoutingRules
 }
 
 // ListDestinations returns active notification destinations. Pass true to
 // include soft-deleted destinations; their service URL was scrubbed when they
 // were deleted, so they are returned with an empty ServiceURL.
 func (s *Store) ListDestinations(ctx context.Context, includeDeleted ...bool) ([]NotificationDestination, error) {
-	query := "SELECT id,name,service_url_enc,enabled,created_at,updated_at,COALESCE(deleted_at,'') FROM notification_destinations"
+	query := "SELECT id,name,service_url_enc,enabled,created_at,updated_at,COALESCE(deleted_at,''),route_min_severity,route_include_collectors,route_exclude_collectors,route_change_kinds FROM notification_destinations"
 	if len(includeDeleted) == 0 || !includeDeleted[0] {
 		query += " WHERE deleted_at IS NULL"
 	}
@@ -43,10 +47,12 @@ func (s *Store) ListDestinations(ctx context.Context, includeDeleted ...bool) ([
 	for rows.Next() {
 		var d NotificationDestination
 		var encrypted, created, updated, deleted string
+		var minSeverity, include, exclude, kinds string
 		var enabled int
-		if err := rows.Scan(&d.ID, &d.Name, &encrypted, &enabled, &created, &updated, &deleted); err != nil {
+		if err := rows.Scan(&d.ID, &d.Name, &encrypted, &enabled, &created, &updated, &deleted, &minSeverity, &include, &exclude, &kinds); err != nil {
 			return nil, err
 		}
+		d.Routing = routingFromColumns(minSeverity, include, exclude, kinds)
 		if encrypted != "" {
 			d.ServiceURL, err = s.box.Open(destinationBinding(d.ID), encrypted)
 			if err != nil {

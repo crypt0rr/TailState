@@ -150,6 +150,7 @@ type HistoryEvent struct {
 	AfterBytes      int64
 	BeforeTruncated bool
 	AfterTruncated  bool
+	Severity        string
 }
 
 type HistoryDelivery struct {
@@ -183,6 +184,8 @@ type HistoryFilter struct {
 	Limit      int
 	// BatchID selects exactly one batch, for notification deep links.
 	BatchID int64
+	// Severity selects events with exactly this built-in severity.
+	Severity string
 }
 
 type HistoryPage struct {
@@ -195,7 +198,7 @@ type HistoryPage struct {
 	TruncationReason string
 }
 
-const currentSchemaVersion = 13
+const currentSchemaVersion = 14
 
 const (
 	webhookTriggerRetryWindow = 24 * time.Hour

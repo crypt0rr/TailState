@@ -233,3 +233,12 @@ select { width: 100%; border: 1px solid var(--border); border-radius: 6px; backg
   .diff-heading, .diff-row { grid-template-columns: 1fr; gap: 4px; }
   .diff-heading { display: none; }
 }
+
+.severity{display:inline-block;margin-left:.4rem;padding:.05rem .45rem;border-radius:999px;font-size:.75rem;font-weight:600;text-transform:uppercase;letter-spacing:.03em}
+.severity-high{background:#fde2e1;color:#9b1c1c}
+.severity-medium{background:#fdf0d5;color:#8a4b08}
+.severity-low{background:#eceff3;color:#4a5361}
+.routing{border:1px solid #d9dee5;border-radius:8px;margin:.75rem 0;padding:.5rem .9rem .8rem}
+.routing legend{font-weight:600;padding:0 .3rem}
+.check-row{display:flex;flex-wrap:wrap;gap:.9rem;align-items:center;margin-top:.5rem}
+.destination-routing{margin:.25rem 0 .5rem}

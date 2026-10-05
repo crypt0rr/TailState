@@ -109,7 +109,7 @@ curl -fsS http://127.0.0.1:8080/readyz
 curl -fsS http://127.0.0.1:8080/metrics
 ```
 
-`/metrics` exposes readiness, pending/dead delivery counts, notification destination totals and enabled counts (plus a paused gauge when every destination is disabled), pending/processing/dead webhook trigger counts, resource counts, low-cardinality collector health gauges (`supported`, `baseline`, partial-result state, partial error count, failures, poll duration, last success, and next poll timestamps), the scheduler's total database-error counter (`tailstate_collector_due_errors_total`), delivery telemetry (`tailstate_outbox_delivery_attempts_total`, success/failure counters, lease renewal/loss counters, and the `tailstate_outbox_delivery_duration_seconds` histogram), and bounded storage telemetry. Storage metrics include the database size and pressure ratio, configured snapshot/event/history/rejection limits, and counters for snapshot truncation, event-value truncation, history-page truncation, and oversized raw writes represented by a metadata marker. These signals make storage pressure visible without exposing destination URLs, provider bodies, or message contents. The `device_details` collector uses a bounded eight-worker fan-out and a two-minute per-collector deadline; usable partial results are retained and marked in the status page and metrics with the number of failed detail requests. When `TAILSTATE_METRICS_TOKEN` is empty, only a direct loopback connection is accepted; requests from a reverse proxy (including a loopback or trusted proxy), requests with forwarded headers, and non-loopback peers receive `401`. Set that variable for Prometheus or any reverse proxy to require `Authorization: Bearer <token>` from any network location. Do not publish the endpoint without a token through a public reverse proxy.
+`/metrics` exposes readiness, pending/dead delivery counts, notification destination totals and enabled counts (plus a paused gauge when every destination is disabled), pending/processing/dead webhook trigger counts, resource counts, low-cardinality collector health gauges (`supported`, `baseline`, partial-result state, partial error count, failures, poll duration, last success, and next poll timestamps), the scheduler's total database-error counter (`tailstate_collector_due_errors_total`), delivery telemetry (`tailstate_outbox_delivery_attempts_total`, success/failure counters, lease renewal/loss counters, and the `tailstate_outbox_delivery_duration_seconds` histogram), and bounded storage telemetry. Storage metrics include the database size and pressure ratio, the page ceiling SQLite is actually enforcing (`tailstate_storage_enforced_limit_bytes`, plus `tailstate_storage_limit_enforced`, which drops to `0` if the active ceiling ever exceeds the configured budget), configured snapshot/event/history/rejection limits, and counters for snapshot truncation, event-value truncation, history-page truncation, and oversized raw writes represented by a metadata marker. These signals make storage pressure visible without exposing destination URLs, provider bodies, or message contents. The `device_details` collector uses a bounded eight-worker fan-out and a two-minute per-collector deadline; usable partial results are retained and marked in the status page and metrics with the number of failed detail requests. When `TAILSTATE_METRICS_TOKEN` is empty, only a direct loopback connection is accepted; requests from a reverse proxy (including a loopback or trusted proxy), requests with forwarded headers, and non-loopback peers receive `401`. Set that variable for Prometheus or any reverse proxy to require `Authorization: Bearer <token>` from any network location. Do not publish the endpoint without a token through a public reverse proxy.
 
 Retention cleanup is resumable and writer-friendly. Each table is processed in keyset batches of at most 128 rows, each autocommit transaction has a 250 ms deadline, and one pass stops after two seconds; when work remains, the monitor schedules a continuation within one second instead of waiting for the hourly sweep. Cleanup logs include per-table row counts, transaction count, duration, failures, and the remaining-work flag. The same information is available through `tailstate_cleanup_*` metrics. Active notification and webhook leases are never dead-lettered until their lease has expired, and evidence-ledger rows are never removed by retention.
 
@@ -131,7 +131,7 @@ Compose creates the Docker-managed `tailstate-data` volume and stores `/data/tai
 
 OAuth secrets, the Tailscale webhook secret, every Shoutrrr destination URL, and the evidence-ledger private key are encrypted with AES-256-GCM using `secrets/tailstate_master_key`. Destination credentials and upstream provider response bodies are never echoed into HTML, logs, persisted delivery errors, or the history ledger; delivery history keeps only bounded, provider-independent status reasons. Normalized history snapshots are retained for 30 days, exclude volatile fields, and replace known secret values with one-way fingerprints so presence and rotation remain auditable without exposing the value. OAuth access tokens exist only in memory. Back up the master key separately: TailState intentionally refuses to start if the key is missing or incorrect, and encrypted settings and signed history cannot be recovered without it.
 
-The image is scratch-based, runs as UID/GID `10001`, uses a read-only root filesystem, drops every Linux capability, and publishes the UI only on `127.0.0.1` by default. Keep that publish address when using a reverse proxy; let the proxy terminate TLS and expose the public listener:
+The image is scratch-based, runs as UID/GID `10001`, uses a read-only root filesystem, drops every Linux capability, and publishes the UI only on `127.0.0.1` by default. Compose also caps the process count, rotates container logs (3 × 10 MiB), and allows a 30-second stop grace period so an in-flight notification can finish its durable bookkeeping instead of being resent after a restart. The optional Caddy proxy in `compose.remote.yaml` runs with only `NET_BIND_SERVICE`, `no-new-privileges`, a memory limit, a healthcheck against its loopback admin API, and HTTP/3 (`443/udp`). Keep that publish address when using a reverse proxy; let the proxy terminate TLS and expose the public listener:
 
 ```dotenv
 TAILSTATE_COOKIE_SECURE=true
@@ -162,7 +162,9 @@ and application wiring reproducible.
 
 With the copied `Caddyfile`, start the private listener and HTTPS proxy
 together. The proxy has a public network for ACME certificate renewal and a
-separate fixed-address private network for TailState. The fixed proxy address and
+separate fixed-address internal network for reaching TailState. TailState also
+joins an outbound-only `tailstate-egress` network so it can reach the Tailscale
+API and notification providers; no service publishes ports on that network. The fixed proxy address and
 `TAILSTATE_TRUSTED_PROXIES` setting are paired intentionally; if you choose a
 different subnet or proxy address, change both values together:
 
@@ -274,14 +276,18 @@ Back up `secrets/tailstate_master_key` separately and securely. A backup is
 only useful with the matching master key: TailState intentionally refuses to
 open encrypted state with a different key.
 
-The backup and restore helpers use the single Renovate-managed pinned BusyBox
-sidecar in `scripts/backup-image.sh`; CI and release jobs scan that sidecar
+The backup and restore helpers mount only the TailState data volume (read-only
+for backups) into a network-less container, so the helper never sees the
+master-key secret. A failed backup removes its partial archive. They use the
+single Renovate-managed pinned BusyBox sidecar in `scripts/backup-image.sh`; CI and release jobs scan that sidecar
 separately. Set `TAILSTATE_BACKUP_IMAGE` only for an explicitly reviewed
 override.
 
 Restore into the same Compose project only after confirming the archive and
 key are from the same point in time. The command requires an explicit
-`--yes`, verifies the checksum when present, checks that the archive directory
+`--yes`, requires and verifies the `.sha256` checksum written by the backup
+helper (pass `--no-checksum` to restore an archive that has none), refuses an
+archive that does not contain an SQLite `tailstate.db`, checks that the archive directory
 is writable and has room for a conservative pre-restore copy, rejects unsafe
 paths and symlink/device/FIFO entries before touching the data volume, and
 creates a pre-restore archive beside the source archive before replacing the
@@ -311,7 +317,7 @@ in a disposable project before relying on the procedure for an outage.
 - Stable additions and modifications alert on the next successful poll.
 - Removals require absence from two complete successful polls.
 - Failed or partial polls never delete snapshots.
-- Multiple changes in one poll become one digest, fanned out into one durable outbox item per enabled destination.
+- Multiple changes in one poll become one digest, fanned out into one durable outbox item per enabled destination. Each digest is fitted to the receiving service's message limit (for example 4,096 bytes for Telegram, Lark, WeCom, and ntfy, 1,024 for Pushover, and 10,000 for Zulip) by dropping whole lines from the end and adding an explicit "lines omitted, see History" note. A provider that still rejects a message as too large (or with HTTP 413) dead-letters it immediately instead of retrying for 24 hours.
 - Every change batch is also recorded in the authenticated History page with field-level diffs and redacted normalized before/after snapshots. Filters support collector, change type, and resource name or ID; history is retained for 30 days. Normalized snapshots are capped at 1 MiB and each event before/after value at 512 KiB. Larger values retain their SHA-256, original byte count, configured limit, and a bounded truncation marker instead of the provider body; the authenticated UI calls this out explicitly. A normal history page reads at most 2 MiB of stored event data and displays a truncation notice with a cursor when that budget is reached. The hard 4 MiB raw-write ceiling prevents an unusually large normalized value from entering SQLite unbounded; the small marker remains queryable for audit.
 - The History page can download a filtered, redacted JSON evidence pack for incident reports and offline review. Packs include normalized snapshots, field diffs, destination delivery outcomes, a SHA-256 content hash, and an Ed25519 signature over a hash-linked event ledger; exports are limited to 100 batches, 2,000 events, and 5 MiB. A changed export fails verification.
 - Verify an export offline with `tailstate evidence verify --file tailstate-drift-evidence.json`. Verification checks the content hash, embedded public key fingerprint, signature, and included ledger links; packs and public-key files are bounded before decoding (5 MiB and 4 KiB respectively). For independent trust, print the instance public key with `tailstate evidence public-key`, save it as a base64 file, and pass it with `--public-key public.key`.
@@ -330,6 +336,14 @@ in a disposable project before relying on the procedure for an outage.
   instead of silently rebasing. A later non-403/404 failure is recorded as a
   transient supported collector failure rather than retaining the unsupported
   label.
+- Log streaming is the exception to the 404 rule: Tailscale returns `404` from
+  `/logging/{kind}/stream` when no stream is configured, so TailState records
+  that kind as `{"configured": false}` and diffs it like any other state.
+  Deleting a configuration or network log stream, or configuring the first one,
+  is reported as a change. Only a `403` for both kinds marks the collector
+  unsupported. When a stream's status endpoint returns `404`, `403`, or `502`,
+  the stream configuration is kept and its status is recorded as
+  `unavailable`.
 - Collection endpoints must return the documented array field. TailState treats
   an omitted, `null`, or wrong-typed `userInvites` or `webhooks` field as an
   invalid upstream response and preserves the last known snapshots; an
@@ -524,7 +538,7 @@ The workflow also creates the matching GitHub Release with generated notes. Use 
 TAILSTATE_IMAGE=ghcr.io/crypt0rr/tailstate@sha256:<known-good-digest>
 ```
 
-The builder and runtime base images are pinned by digest and updated by Renovate, so a release is reproducible until an explicit dependency update changes those pins. Release images carry OCI labels for the compiler version, base-image digest, target platform, source commit, and release version; BuildKit's max-level provenance and the SBOM provide the corresponding attestation metadata.
+The builder and runtime base images are pinned by digest and updated by Renovate, so a release is reproducible until an explicit dependency update changes those pins. Release images carry OCI labels for the compiler version, target platform, source commit, and release version. The image is built `FROM scratch`, so it has no base-image labels; the exact digest-pinned builder image is recorded in BuildKit's max-level provenance attestation alongside the SBOM. The builder stage runs on the build host's native platform and cross-compiles the static binary for each target architecture.
 
 ## License
 

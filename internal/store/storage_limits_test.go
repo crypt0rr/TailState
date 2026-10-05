@@ -733,10 +733,10 @@ func TestStorageLimitPersistenceAndErrorEdges(t *testing.T) {
 		t.Fatalf("persisted limits = %#v found=%t err=%v, want %#v", got, found, err, valid)
 	}
 
-	if err := configureDatabasePageLimit(nil, valid.DatabaseBytes); err == nil {
+	if err := configureDatabasePageLimit(nil, nil, valid.DatabaseBytes); err == nil {
 		t.Fatal("nil database limit configuration unexpectedly succeeded")
 	}
-	if err := configureDatabasePageLimit(db, 0); err == nil {
+	if err := configureDatabasePageLimit(db, nil, 0); err == nil {
 		t.Fatal("zero database limit configuration unexpectedly succeeded")
 	}
 	if err := storageWriteError(nil); err != nil {
@@ -766,13 +766,13 @@ func TestStorageLimitPersistenceAndErrorEdges(t *testing.T) {
 	if err := persistStorageLimits(ctx, closed, valid); err == nil {
 		t.Fatal("persisting limits to closed database unexpectedly succeeded")
 	}
-	if err := configureDatabasePageLimit(closed, valid.DatabaseBytes); err == nil {
+	if err := configureDatabasePageLimit(closed, nil, valid.DatabaseBytes); err == nil {
 		t.Fatal("configuring closed database limit unexpectedly succeeded")
 	}
 	if _, _, err := loadPersistedStorageLimits(closed); err == nil {
 		t.Fatal("loading limits from closed database unexpectedly succeeded")
 	}
-	if err := configureDatabasePageLimit(db, 1); err == nil {
+	if err := configureDatabasePageLimit(db, nil, 1); err == nil {
 		t.Fatal("database limit below the existing page count unexpectedly succeeded")
 	}
 

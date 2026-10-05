@@ -102,18 +102,19 @@ wait_health "TailState became unavailable after rejecting a read-only archive di
 # restore must leave the service stopped for operator inspection.
 extraction_failure_dir="$(mktemp -d)"
 mkdir -p "$extraction_failure_dir/child-source/conflict"
+printf 'SQLite format 3\000' >"$extraction_failure_dir/tailstate.db"
 printf 'file\n' >"$extraction_failure_dir/conflict"
 printf 'child\n' >"$extraction_failure_dir/child-source/conflict/child"
 extraction_failure_tar="$backup_dir/extraction-failure.tar"
 extraction_failure_archive="$backup_dir/extraction-failure.tar.gz"
-tar -cf "$extraction_failure_tar" -C "$extraction_failure_dir" conflict
+tar -cf "$extraction_failure_tar" -C "$extraction_failure_dir" tailstate.db conflict
 tar -rf "$extraction_failure_tar" -C "$extraction_failure_dir/child-source" conflict/child
 gzip -c "$extraction_failure_tar" >"$extraction_failure_archive"
 rm -rf "$extraction_failure_dir" "$extraction_failure_tar"
 sentinel="restore-live-sentinel-${run_id}"
 docker run --rm --volumes-from "$container_name" "$backup_image" \
     sh -ec 'printf "%s\\n" "$1" > /data/restore-live-sentinel' -- "$sentinel"
-if "$repo_dir/scripts/restore.sh" "$extraction_failure_archive" --yes; then
+if "$repo_dir/scripts/restore.sh" "$extraction_failure_archive" --yes --no-checksum; then
     echo "restore helper accepted an archive that fails during extraction" >&2
     exit 1
 fi
@@ -134,7 +135,7 @@ ln -s /data "$unsafe_dir/escape"
 unsafe_archive="$backup_dir/unsafe-special-file.tar.gz"
 tar czf "$unsafe_archive" -C "$unsafe_dir" escape
 rm -rf "$unsafe_dir"
-if "$repo_dir/scripts/restore.sh" "$unsafe_archive" --yes; then
+if "$repo_dir/scripts/restore.sh" "$unsafe_archive" --yes --no-checksum; then
     echo "restore helper accepted an unsafe symlink archive" >&2
     exit 1
 fi
@@ -142,9 +143,45 @@ wait_health "TailState became unavailable after rejecting an unsafe archive"
 
 corrupt_archive="$backup_dir/corrupt-archive.tar.gz"
 printf 'this is not a gzip archive\n' >"$corrupt_archive"
-if "$repo_dir/scripts/restore.sh" "$corrupt_archive" --yes; then
+if "$repo_dir/scripts/restore.sh" "$corrupt_archive" --yes --no-checksum; then
     echo "restore helper accepted a corrupt archive" >&2
     exit 1
 fi
 wait_health "TailState became unavailable after rejecting a corrupt archive"
+# An archive without its checksum file is refused unless the operator opts
+# out explicitly, and the running service is left untouched.
+unchecked_archive="$backup_dir/unchecked.tar.gz"
+cp "$archive" "$unchecked_archive"
+if "$repo_dir/scripts/restore.sh" "$unchecked_archive" --yes; then
+    echo "restore helper accepted an archive without a checksum file" >&2
+    exit 1
+fi
+wait_health "TailState became unavailable after rejecting an archive without a checksum"
+
+# An unrelated archive (no tailstate.db) is refused before the service stops.
+foreign_dir="$(mktemp -d)"
+printf 'not tailstate\n' >"$foreign_dir/notes.txt"
+foreign_archive="$backup_dir/foreign.tar.gz"
+tar czf "$foreign_archive" -C "$foreign_dir" notes.txt
+rm -rf "$foreign_dir"
+if "$repo_dir/scripts/restore.sh" "$foreign_archive" --yes --no-checksum; then
+    echo "restore helper accepted an archive without tailstate.db" >&2
+    exit 1
+fi
+if [[ "$(docker inspect --format '{{.State.Running}}' "$container_name")" != "true" ]]; then
+    echo "rejecting a foreign archive stopped the service" >&2
+    exit 1
+fi
+
+# Helpers mount only the data volume: the master-key secret is not visible.
+data_source="$(bash "$repo_dir/scripts/data-volume.sh" "$container_name")"
+if docker run --rm --network none --volume "$data_source:/data:ro" "$backup_image" test -e /run/secrets/tailstate_master_key; then
+    echo "backup helper mount exposes the master-key secret" >&2
+    exit 1
+fi
+if ! docker run --rm --network none --volume "$data_source:/data:ro" "$backup_image" test -f /data/tailstate.db; then
+    echo "backup helper mount does not expose the TailState database" >&2
+    exit 1
+fi
+
 echo "TailState backup/restore smoke test passed"

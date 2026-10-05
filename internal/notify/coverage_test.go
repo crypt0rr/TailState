@@ -49,9 +49,6 @@ func TestNotifyTestAndErrorHelpers(t *testing.T) {
 	if err := Validate(""); err == nil {
 		t.Fatal("empty notification URL was accepted")
 	}
-	if statusCode("provider failed without an HTTP status") != 0 || statusCode("provider returned 503") != 503 {
-		t.Fatal("status code parser returned incorrect values")
-	}
 	for raw, want := range map[string]string{"%%%": "<redacted>", "mattermost:///path": "mattermost://<redacted>", "mattermost://host:8443/path": "mattermost://host:8443"} {
 		if got := RedactURL(raw); got != want {
 			t.Fatalf("RedactURL(%q)=%q, want %q", raw, got, want)
@@ -82,7 +79,7 @@ func TestNotifyTestAndErrorHelpers(t *testing.T) {
 		want string
 	}{
 		{name: "nil", want: "notification delivery failed"},
-		{name: "status in generic error", err: errors.New("provider returned 429 while busy"), want: "notification delivery failed with HTTP 429"},
+		{name: "digits in generic error are not a status", err: errors.New("provider returned 429 while busy"), want: "notification delivery failed"},
 		{name: "deadline", err: errors.New("context deadline exceeded"), want: "notification delivery timed out"},
 		{name: "timeout", err: errors.New("socket timeout"), want: "notification delivery timed out"},
 		{name: "canceled", err: errors.New("request canceled by caller"), want: "notification delivery canceled"},

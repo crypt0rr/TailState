@@ -13,7 +13,9 @@ import (
 	"net/url"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/nicholas-fedor/shoutrrr"
@@ -54,7 +56,13 @@ func New() *SenderImpl {
 	}
 }
 
-type rejectRedirectTransport struct{ base http.RoundTripper }
+// rejectRedirectTransport refuses redirects and, when record is set, notes
+// the status and Retry-After of every response so a failed send can be
+// classified from the real HTTP outcome instead of from provider text.
+type rejectRedirectTransport struct {
+	base   http.RoundTripper
+	record *responseRecord
+}
 
 func (t rejectRedirectTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	base := t.base
@@ -65,11 +73,81 @@ func (t rejectRedirectTransport) RoundTrip(req *http.Request) (*http.Response, e
 	if err != nil {
 		return nil, err
 	}
+	t.record.observe(response)
 	if response.StatusCode >= 300 && response.StatusCode < 400 {
 		_ = response.Body.Close()
 		return nil, fmt.Errorf("redirect response %s", response.Status)
 	}
 	return response, nil
+}
+
+// maxRetryAfter caps a provider's Retry-After hint so a hostile or buggy
+// response cannot park a notification for most of its 24-hour retry window.
+const maxRetryAfter = time.Hour
+
+// responseRecord holds the last HTTP response observed during one Send call.
+// Each call owns its own record, so concurrent sends never share outcomes.
+type responseRecord struct {
+	mu         sync.Mutex
+	status     int
+	retryAfter time.Duration
+}
+
+func (r *responseRecord) observe(response *http.Response) {
+	if r == nil {
+		return
+	}
+	retryAfter := parseRetryAfter(response.Header.Get("Retry-After"), time.Now())
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.status = response.StatusCode
+	r.retryAfter = retryAfter
+}
+
+// failure returns the final response's status and Retry-After when that
+// response was not successful. A successful final response (for example a
+// Matrix login followed by a network failure) is not a delivery status.
+func (r *responseRecord) failure() (int, time.Duration) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.status < 300 {
+		return 0, 0
+	}
+	return r.status, r.retryAfter
+}
+
+// parseRetryAfter accepts both Retry-After forms (delay-seconds and
+// HTTP-date) and returns a positive delay capped at maxRetryAfter, or zero.
+func parseRetryAfter(value string, now time.Time) time.Duration {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0
+	}
+	var delay time.Duration
+	if seconds, err := strconv.ParseInt(value, 10, 64); err == nil {
+		if seconds <= 0 {
+			return 0
+		}
+		if seconds >= int64(maxRetryAfter/time.Second) {
+			return maxRetryAfter
+		}
+		delay = time.Duration(seconds) * time.Second
+	} else if when, err := http.ParseTime(value); err == nil {
+		delay = when.Sub(now)
+	}
+	return min(max(delay, 0), maxRetryAfter)
+}
+
+// clientFor returns a per-send copy of the bounded client whose transport
+// records responses into record.
+func (s *SenderImpl) clientFor(record *responseRecord) *http.Client {
+	client := *s.client
+	base := client.Transport
+	if reject, ok := base.(rejectRedirectTransport); ok {
+		base = reject.base
+	}
+	client.Transport = rejectRedirectTransport{base: base, record: record}
+	return &client
 }
 
 // Validate checks that a URL belongs to a service registered by the pinned
@@ -94,15 +172,19 @@ func (s *SenderImpl) Send(ctx context.Context, serviceURL, message string) error
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	sender, err := shoutrrr.CreateSenderWithOptions(types.SenderOptions{HTTPClient: s.client, Timeout: s.timeout}, serviceURL)
+	record := &responseRecord{}
+	sender, err := shoutrrr.CreateSenderWithOptions(types.SenderOptions{HTTPClient: s.clientFor(record), Timeout: s.timeout}, serviceURL)
 	if err != nil {
 		return fmt.Errorf("create notification sender (%s): %s", RedactURL(serviceURL), sanitize(err.Error(), serviceURL))
 	}
 	errs := sender.Send(FitMessage(message, MessageLimit(serviceURL)), nil)
 	for _, sendErr := range errs {
 		if sendErr != nil {
-			status := statusCode(sendErr.Error())
-			return &DeliveryError{Status: status, Message: sanitize(sendErr.Error(), serviceURL), Permanent: permanentDeliveryFailure(sendErr.Error(), status)}
+			// The status comes only from the response TailState's transport
+			// observed. Provider error text is never parsed for a status: it
+			// contains port numbers, SMTP codes, and other unrelated digits.
+			status, retryAfter := record.failure()
+			return &DeliveryError{Status: status, Message: sanitize(sendErr.Error(), serviceURL), RetryAfter: retryAfter, Permanent: permanentDeliveryFailure(sendErr.Error(), status)}
 		}
 	}
 	// A cancellation that arrives after Shoutrrr has returned successfully
@@ -133,12 +215,28 @@ type DeliveryError struct {
 // rejected as too large.
 const messageTooLargeReason = "notification rejected by provider: message too large for this destination"
 
+// permanentStatusReasons are the persisted reasons for HTTP statuses that no
+// retry can fix: a malformed request, revoked or missing credentials, or a
+// deleted webhook. 413 uses messageTooLargeReason.
+var permanentStatusReasons = map[int]string{
+	http.StatusBadRequest:   "notification rejected by provider (HTTP 400)",
+	http.StatusUnauthorized: "notification rejected by provider (HTTP 401)",
+	http.StatusForbidden:    "notification rejected by provider (HTTP 403)",
+	http.StatusNotFound:     "notification rejected by provider (HTTP 404)",
+}
+
 // permanentDeliveryFailure reports provider responses that no retry of the
 // same payload can fix.
 func permanentDeliveryFailure(message string, status int) bool {
-	if status == 413 {
+	if _, ok := permanentStatusReasons[status]; ok || status == http.StatusRequestEntityTooLarge {
 		return true
 	}
+	return messageTooLarge(message)
+}
+
+// messageTooLarge recognises Shoutrrr's local size rejections, which happen
+// before any HTTP request is made.
+func messageTooLarge(message string) bool {
 	lower := strings.ToLower(message)
 	return strings.Contains(lower, "exceeds the max length") || strings.Contains(lower, "exceeds max size") || strings.Contains(lower, "message too long")
 }
@@ -161,14 +259,18 @@ func SafeDeliveryError(err error) string {
 		return "notification delivery failed"
 	}
 	var delivery *DeliveryError
-	if errors.As(err, &delivery) && delivery != nil && delivery.Permanent && (delivery.Status == 413 || permanentDeliveryFailure(delivery.Message, 0)) {
-		return messageTooLargeReason
-	}
-	if errors.As(err, &delivery) && delivery != nil && delivery.Status >= 100 {
-		return fmt.Sprintf("notification delivery failed with HTTP %d", delivery.Status)
-	}
-	if status := statusCode(err.Error()); status >= 100 {
-		return fmt.Sprintf("notification delivery failed with HTTP %d", status)
+	if errors.As(err, &delivery) && delivery != nil {
+		if delivery.Permanent {
+			if reason, ok := permanentStatusReasons[delivery.Status]; ok {
+				return reason
+			}
+			if delivery.Status == http.StatusRequestEntityTooLarge || messageTooLarge(delivery.Message) {
+				return messageTooLargeReason
+			}
+		}
+		if delivery.Status >= 100 && delivery.Status <= 599 {
+			return httpFailureReason(delivery.Status)
+		}
 	}
 	message := strings.ToLower(err.Error())
 	switch {
@@ -186,11 +288,23 @@ func SafeDeliveryError(err error) string {
 func SafeDeliveryMessage(message string) string {
 	message = strings.TrimSpace(message)
 	switch message {
-	case "destination disabled", "destination removed", "delivery retry window expired", "no notification destination configured", "monitoring identity changed", "collector reconciliation failed", "reconciliation retry window expired", "notification delivery failed", "notification delivery timed out", "notification delivery canceled", messageTooLargeReason:
+	case "destination disabled", "destination removed", "delivery retry window expired", "no notification destination configured", "monitoring identity changed", "collector reconciliation failed", "reconciliation retry window expired", "notification delivery failed", "notification delivery timed out", "notification delivery canceled", messageTooLargeReason,
+		permanentStatusReasons[http.StatusBadRequest], permanentStatusReasons[http.StatusUnauthorized], permanentStatusReasons[http.StatusForbidden], permanentStatusReasons[http.StatusNotFound]:
 		return message
-	default:
-		return SafeDeliveryError(errors.New(message))
 	}
+	// Only the exact reason SafeDeliveryError writes for an HTTP status is
+	// trusted; a status is never extracted from arbitrary text.
+	if match := httpFailurePattern.FindStringSubmatch(message); match != nil {
+		status, _ := strconv.Atoi(match[1])
+		return httpFailureReason(status)
+	}
+	return SafeDeliveryError(errors.New(message))
+}
+
+var httpFailurePattern = regexp.MustCompile(`^notification delivery failed with HTTP ([1-5][0-9]{2})$`)
+
+func httpFailureReason(status int) string {
+	return fmt.Sprintf("notification delivery failed with HTTP %d", status)
 }
 
 // SafeTestError keeps local validation errors useful in the Settings page
@@ -230,18 +344,6 @@ func SafeTestError(err error, serviceURLs ...string) string {
 func isValidationError(err error) bool {
 	message := strings.TrimSpace(err.Error())
 	return message == "notification URL is required" || strings.HasPrefix(message, "invalid notification URL") || strings.HasPrefix(message, "create notification sender")
-}
-
-var statusPattern = regexp.MustCompile(`\b([3-5][0-9]{2})\b`)
-
-func statusCode(message string) int {
-	match := statusPattern.FindStringSubmatch(message)
-	if len(match) != 2 {
-		return 0
-	}
-	var status int
-	_, _ = fmt.Sscanf(match[1], "%d", &status)
-	return status
 }
 
 // RedactURL returns scheme and host information while hiding credentials,

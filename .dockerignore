@@ -1,14 +1,8 @@
-.git
-.github
-.env
-secrets
-tailstate-data
-target
-*.db
-*.tar
-*.tar.gz
-*.tgz
-*.zip
-backups/
-Caddyfile
-README.md
+# Build-context allowlist: the image only needs the Go module files and
+# sources. Everything else (local databases, backups, secrets, coverage,
+# Compose state, agent worktrees) stays out of the context and the cache.
+*
+!go.mod
+!go.sum
+!cmd/
+!internal/

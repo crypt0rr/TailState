@@ -1,0 +1,7 @@
+# zizmor configuration used by the CI lint job.
+rules:
+  # The reusable CI workflow is called with the established ./ path syntax,
+  # which actionlint and older runners understand; the newer $/ self-repository
+  # form offers no security benefit for a same-repository call.
+  self-repository:
+    disable: true

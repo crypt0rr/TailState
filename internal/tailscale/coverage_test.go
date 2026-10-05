@@ -182,8 +182,14 @@ func TestLogStreamingAllUnsupportedAndHTTPRetries(t *testing.T) {
 		http.NotFound(w, r)
 	}))
 	client := New(unsupported.URL+"/api/v2", unsupported.URL+"/oauth/token", "test", Credentials{ClientID: "id", ClientSecret: "secret"})
-	if _, err := client.Collect(context.Background(), "log_streaming"); err == nil || !IsUnsupported(err) {
-		t.Fatalf("all-unsupported log streaming error=%v", err)
+	resources, err := client.Collect(context.Background(), "log_streaming")
+	if err != nil || len(resources) != 1 {
+		t.Fatalf("unconfigured log streaming resources=%#v err=%v", resources, err)
+	}
+	for _, kind := range []string{"configuration", "network"} {
+		if state := resources[0].Data.(map[string]any)[kind].(map[string]any); state["configured"] != false {
+			t.Fatalf("404 %s stream should be recorded as not configured, got %#v", kind, state)
+		}
 	}
 	unsupported.Close()
 

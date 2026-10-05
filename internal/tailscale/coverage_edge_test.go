@@ -246,7 +246,7 @@ func TestCollectorHTTPErrorBranches(t *testing.T) {
 			}
 		case "log-unsupported":
 			if strings.Contains(r.URL.Path, "/logging/") {
-				w.WriteHeader(http.StatusNotFound)
+				w.WriteHeader(http.StatusForbidden)
 				return
 			}
 		}
@@ -283,32 +283,59 @@ func TestCollectorHTTPErrorBranches(t *testing.T) {
 		t.Fatal("log streaming server error was ignored")
 	}
 	mode = "log-unsupported"
-	if _, err := newClient().Collect(context.Background(), "log_streaming"); err == nil {
-		t.Fatal("unsupported log streaming was not reported")
+	if _, err := newClient().Collect(context.Background(), "log_streaming"); err == nil || !IsUnsupported(err) {
+		t.Fatalf("forbidden log streaming was not reported as unsupported: %v", err)
 	}
 }
 
-func TestLogStreamingStatusUnsupportedBranch(t *testing.T) {
+func TestLogStreamingKeepsConfigurationWhenStatusIsUnavailable(t *testing.T) {
+	for _, status := range []int{http.StatusNotFound, http.StatusForbidden, http.StatusBadGateway} {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/oauth/token" {
+				_, _ = w.Write([]byte(`{"access_token":"access","expires_in":3600}`))
+				return
+			}
+			switch r.URL.Path {
+			case "/api/v2/tailnet/-/logging/configuration/stream":
+				_, _ = w.Write([]byte(`{"destinationType":"splunk","url":"https://splunk.example"}`))
+			case "/api/v2/tailnet/-/logging/configuration/stream/status":
+				w.WriteHeader(status)
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		client := New(server.URL+"/api/v2", server.URL+"/oauth/token", "test", Credentials{Tailnet: "-", ClientID: "id", ClientSecret: "secret"})
+		resources, err := client.Collect(context.Background(), "log_streaming")
+		server.Close()
+		if err != nil || len(resources) != 1 {
+			t.Fatalf("status %d: resources=%#v err=%v", status, resources, err)
+		}
+		data := resources[0].Data.(map[string]any)
+		configuration := data["configuration"].(map[string]any)
+		if configuration["stream"] == nil {
+			t.Fatalf("status %d discarded the stream configuration: %#v", status, data)
+		}
+		if got := configuration["status"].(map[string]any)["state"]; got != "unavailable" {
+			t.Fatalf("status %d recorded status=%v, want unavailable", status, got)
+		}
+		if network := data["network"].(map[string]any); network["configured"] != false {
+			t.Fatalf("unconfigured network stream = %#v", network)
+		}
+	}
+}
+
+func TestLogStreamingRejectsNonObjectStream(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/oauth/token" {
 			_, _ = w.Write([]byte(`{"access_token":"access","expires_in":3600}`))
 			return
 		}
-		switch r.URL.Path {
-		case "/api/v2/tailnet/-/logging/configuration/stream":
-			_, _ = w.Write([]byte(`{"enabled":true}`))
-		case "/api/v2/tailnet/-/logging/configuration/stream/status":
-			w.WriteHeader(http.StatusNotFound)
-		case "/api/v2/tailnet/-/logging/network/stream":
-			w.WriteHeader(http.StatusNotFound)
-		default:
-			http.NotFound(w, r)
-		}
+		_, _ = w.Write([]byte(`null`))
 	}))
 	defer server.Close()
 	client := New(server.URL+"/api/v2", server.URL+"/oauth/token", "test", Credentials{Tailnet: "-", ClientID: "id", ClientSecret: "secret"})
-	if _, err := client.Collect(context.Background(), "log_streaming"); err == nil || !IsUnsupported(err) {
-		t.Fatalf("status-unsupported log streaming error=%v", err)
+	if _, err := client.Collect(context.Background(), "log_streaming"); err == nil || !strings.Contains(err.Error(), "not a JSON object") {
+		t.Fatalf("null stream response error=%v", err)
 	}
 }
 

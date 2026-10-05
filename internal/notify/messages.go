@@ -34,7 +34,7 @@ func Digest(changes []model.Change) string {
 		b.WriteString(line)
 		omittedFields := 0
 		for fieldIndex, field := range c.Fields {
-			detail := fmt.Sprintf("  - `%s`: `%s` → `%s`\n", escape(field.Field), short(field.Old), short(field.New))
+			detail := fmt.Sprintf("  - `%s`: `%s` → `%s`\n", escapeCode(field.Field), short(field.Old), short(field.New))
 			if b.Len()+len(detail) > digestBudget-reserve {
 				omittedFields = len(c.Fields) - fieldIndex
 				break
@@ -54,25 +54,23 @@ func Digest(changes []model.Change) string {
 
 func SourceHealth(collector string, recovered bool) string {
 	if recovered {
-		return fmt.Sprintf("### ✅ Tailscale API collector recovered\n`%s` is responding successfully again.", escape(collector))
+		return fmt.Sprintf("### ✅ Tailscale API collector recovered\n`%s` is responding successfully again.", escapeCode(collector))
 	}
-	return fmt.Sprintf("### ⚠️ Tailscale API collector unhealthy\n`%s` failed three consecutive polls. TailState will keep retrying.", escape(collector))
+	return fmt.Sprintf("### ⚠️ Tailscale API collector unhealthy\n`%s` failed three consecutive polls. TailState will keep retrying.", escapeCode(collector))
 }
 
 func Update(previous, current string) string {
-	return fmt.Sprintf("### 🚀 TailState updated\n**Previous version:** `%s`\n**Current version:** `%s`", escape(previous), escape(current))
+	return fmt.Sprintf("### 🚀 TailState updated\n**Previous version:** `%s`\n**Current version:** `%s`", escapeCode(previous), escapeCode(current))
 }
 
+// escape makes value inert in bold and prose Markdown contexts. It must not
+// be used inside a code span: CommonMark does not process backslash escapes
+// there, so every escape would be shown literally. Use escapeCode instead.
 func escape(value string) string {
-	value = strings.Map(func(r rune) rune {
-		if unicode.IsControl(r) {
-			return ' '
-		}
-		return r
-	}, value)
+	value = stripControl(value)
 	// Escape Markdown syntax that can change links, emphasis, headings, HTML,
-	// or block structure. Backticks are rendered as apostrophes because these
-	// values are placed in code/bold spans by the message builders.
+	// or block structure. Backticks are rendered as apostrophes so a value
+	// cannot open a code span that swallows the rest of the line.
 	value = strings.NewReplacer(
 		"\\", "\\\\",
 		"`", "'",
@@ -96,11 +94,33 @@ func escape(value string) string {
 	return truncate(value, 256)
 }
 
+// escapeCode makes value safe inside a single-backtick code span. Code span
+// content is literal in CommonMark (links, emphasis, headings, and HTML are
+// not interpreted), so only the characters that can end the span or the
+// line are neutralised: backticks become apostrophes and control characters
+// become spaces. Everything else is kept verbatim so timestamps, tags, and
+// collector names stay readable and copyable.
+func escapeCode(value string) string {
+	return truncate(strings.ReplaceAll(stripControl(value), "`", "'"), 256)
+}
+
+// stripControl replaces control characters and Unicode line/paragraph
+// separators with spaces so a value can never start a new Markdown block.
+func stripControl(value string) string {
+	return strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) || r == ' ' || r == ' ' {
+			return ' '
+		}
+		return r
+	}, value)
+}
+
+// short renders a field value as compact JSON for a code span.
 func short(value any) string {
 	raw, _ := json.Marshal(value)
 	text := string(raw)
 	if len(text) > 180 {
 		text = truncate(text, 179)
 	}
-	return escape(text)
+	return escapeCode(text)
 }

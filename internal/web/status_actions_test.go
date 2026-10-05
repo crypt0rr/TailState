@@ -377,9 +377,9 @@ func TestStatusActionsReportStoreFailures(t *testing.T) {
 		request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 		response := httptest.NewRecorder()
 		if path == "/status/reconcile" {
-			server.reconcileAuthorized(response, request)
+			server.reconcileAuthorized(response, request, "")
 		} else {
-			server.retryDeadLettersAuthorized(response, request)
+			server.retryDeadLettersAuthorized(response, request, "")
 		}
 		if response.Code != http.StatusSeeOther {
 			t.Fatalf("%s with a closed store status=%d", path, response.Code)

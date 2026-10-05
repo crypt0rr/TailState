@@ -399,6 +399,7 @@ type CleanupStats struct {
 	WebhookTriggersDeleted    int64
 	DeliveredOutboxDeleted    int64
 	DeadOutboxDeleted         int64
+	AdminAuditDeleted         int64
 	Transactions              int
 	Duration                  time.Duration
 	Remaining                 bool
@@ -413,7 +414,7 @@ type CleanupStats struct {
 
 // TotalRowsChanged returns the total number of rows changed by the pass.
 func (c CleanupStats) TotalRowsChanged() int64 {
-	return c.SessionsDeleted + c.AuthTokensDeleted + c.MetaDeleted + c.OutboxDeadLettered + c.WebhookDeadLettered + c.EventsDeleted + c.EventBatchesDeleted + c.EventBatchTriggersDeleted + c.WebhookTriggersDeleted + c.DeliveredOutboxDeleted + c.DeadOutboxDeleted
+	return c.SessionsDeleted + c.AuthTokensDeleted + c.MetaDeleted + c.OutboxDeadLettered + c.WebhookDeadLettered + c.EventsDeleted + c.EventBatchesDeleted + c.EventBatchTriggersDeleted + c.WebhookTriggersDeleted + c.DeliveredOutboxDeleted + c.DeadOutboxDeleted + c.AdminAuditDeleted
 }
 
 // Cleanup expires short-lived authentication/session state, bounds pending
@@ -506,6 +507,7 @@ func cleanupPhases(stats *CleanupStats, now time.Time, retention time.Duration) 
 	retryCutoff := now.Add(-outboxRetryWindow).Format(time.RFC3339Nano)
 	webhookRetryCutoff := now.Add(-webhookTriggerRetryWindow).Format(time.RFC3339Nano)
 	cutoff := now.Add(-retention).Format(time.RFC3339Nano)
+	adminAuditCutoff := now.Add(-AdminAuditRetention).Format(time.RFC3339Nano)
 	return []cleanupPhase{
 		{name: "sessions", query: `DELETE FROM sessions WHERE rowid IN (SELECT rowid FROM sessions WHERE expires_at<=? ORDER BY expires_at,rowid LIMIT ?)`, args: []any{nowValue}, add: func(n int64) { stats.SessionsDeleted += n }},
 		{name: "auth_tokens", query: `DELETE FROM auth_tokens WHERE rowid IN (SELECT rowid FROM auth_tokens WHERE expires_at<=? ORDER BY expires_at,rowid LIMIT ?)`, args: []any{nowValue}, add: func(n int64) { stats.AuthTokensDeleted += n }},
@@ -537,6 +539,9 @@ func cleanupPhases(stats *CleanupStats, now time.Time, retention time.Duration) 
 		{name: "webhook_triggers", query: `DELETE FROM webhook_triggers WHERE rowid IN (SELECT rowid FROM webhook_triggers WHERE received_at<? AND +status IN ('processed','dead') ORDER BY received_at,id LIMIT ?)`, args: []any{cutoff}, add: func(n int64) { stats.WebhookTriggersDeleted += n }},
 		{name: "delivered_outbox", query: `DELETE FROM outbox WHERE rowid IN (SELECT rowid FROM outbox WHERE status='delivered' AND delivered_at<? ORDER BY delivered_at,created_at,id LIMIT ?)`, args: []any{cutoff}, add: func(n int64) { stats.DeliveredOutboxDeleted += n }},
 		{name: "dead_outbox", query: `DELETE FROM outbox WHERE rowid IN (SELECT rowid FROM outbox WHERE status='dead' AND created_at<? ORDER BY created_at,rowid LIMIT ?)`, args: []any{cutoff}, add: func(n int64) { stats.DeadOutboxDeleted += n }},
+		// The administrative audit trail has its own, longer retention
+		// period, independent of the history retention window.
+		{name: "admin_audit", query: `DELETE FROM admin_audit WHERE rowid IN (SELECT rowid FROM admin_audit WHERE created_at<? ORDER BY created_at,id LIMIT ?)`, args: []any{adminAuditCutoff}, add: func(n int64) { stats.AdminAuditDeleted += n }},
 	}
 }
 

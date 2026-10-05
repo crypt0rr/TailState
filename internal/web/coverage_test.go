@@ -165,6 +165,7 @@ func webServerWithDatabase(t *testing.T) (*Server, *store.Store, *sql.DB, []*htt
 	if err != nil {
 		t.Fatal(err)
 	}
+	server.noticeSender = &recordingSender{}
 	db, err := sql.Open("sqlite", "file:"+path+"?_pragma=busy_timeout(5000)")
 	if err != nil {
 		t.Fatal(err)
@@ -684,7 +685,7 @@ func TestWebAuthenticationAndHelperErrorBranches(t *testing.T) {
 		t.Fatal(err)
 	}
 	response := httptest.NewRecorder()
-	if server.startSession(response, httptest.NewRequest(http.MethodPost, "/login", nil)) {
+	if _, ok := server.startSession(response, httptest.NewRequest(http.MethodPost, "/login", nil)); ok {
 		t.Fatal("startSession succeeded with a closed store")
 	}
 	if response.Code != http.StatusInternalServerError {

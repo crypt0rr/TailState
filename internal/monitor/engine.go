@@ -90,6 +90,7 @@ type CleanupMetrics struct {
 	WebhookTriggersDeleted    uint64
 	DeliveredOutboxDeleted    uint64
 	DeadOutboxDeleted         uint64
+	AdminAuditDeleted         uint64
 }
 
 type cleanupTelemetry struct {
@@ -99,6 +100,7 @@ type cleanupTelemetry struct {
 	eventsDeleted, eventBatchesDeleted                                      atomic.Uint64
 	eventBatchTriggersDeleted, webhookTriggersDeleted                       atomic.Uint64
 	deliveredOutboxDeleted, deadOutboxDeleted                               atomic.Uint64
+	adminAuditDeleted                                                       atomic.Uint64
 }
 
 type deliveryLeaseState struct {
@@ -278,6 +280,7 @@ func (e *Engine) CleanupMetrics() CleanupMetrics {
 		WebhookTriggersDeleted:    e.cleanupStats.webhookTriggersDeleted.Load(),
 		DeliveredOutboxDeleted:    e.cleanupStats.deliveredOutboxDeleted.Load(),
 		DeadOutboxDeleted:         e.cleanupStats.deadOutboxDeleted.Load(),
+		AdminAuditDeleted:         e.cleanupStats.adminAuditDeleted.Load(),
 	}
 }
 
@@ -1099,6 +1102,7 @@ func (e *Engine) recordCleanup(stats store.CleanupStats, err error) {
 	e.cleanupStats.webhookTriggersDeleted.Add(uint64(max(stats.WebhookTriggersDeleted, 0)))
 	e.cleanupStats.deliveredOutboxDeleted.Add(uint64(max(stats.DeliveredOutboxDeleted, 0)))
 	e.cleanupStats.deadOutboxDeleted.Add(uint64(max(stats.DeadOutboxDeleted, 0)))
+	e.cleanupStats.adminAuditDeleted.Add(uint64(max(stats.AdminAuditDeleted, 0)))
 }
 
 // cleanupBackoff schedules retention passes. Genuine leftover work continues
@@ -1143,7 +1147,7 @@ func (e *Engine) cleanup(ctx context.Context) {
 			// consecutive failures (see cleanupBackoff).
 			return stats.Remaining, err
 		}
-		slog.Info("retention cleanup completed", "duration_ms", stats.Duration.Milliseconds(), "transactions", stats.Transactions, "sessions_deleted", stats.SessionsDeleted, "auth_tokens_deleted", stats.AuthTokensDeleted, "meta_deleted", stats.MetaDeleted, "outbox_dead_lettered", stats.OutboxDeadLettered, "webhook_dead_lettered", stats.WebhookDeadLettered, "events_deleted", stats.EventsDeleted, "event_batches_deleted", stats.EventBatchesDeleted, "event_batch_triggers_deleted", stats.EventBatchTriggersDeleted, "webhook_triggers_deleted", stats.WebhookTriggersDeleted, "delivered_outbox_deleted", stats.DeliveredOutboxDeleted, "dead_outbox_deleted", stats.DeadOutboxDeleted, "remaining", stats.Remaining, "pages_released", stats.PagesReleased, "wal_checkpointed", stats.WALCheckpointed)
+		slog.Info("retention cleanup completed", "duration_ms", stats.Duration.Milliseconds(), "transactions", stats.Transactions, "sessions_deleted", stats.SessionsDeleted, "auth_tokens_deleted", stats.AuthTokensDeleted, "meta_deleted", stats.MetaDeleted, "outbox_dead_lettered", stats.OutboxDeadLettered, "webhook_dead_lettered", stats.WebhookDeadLettered, "events_deleted", stats.EventsDeleted, "event_batches_deleted", stats.EventBatchesDeleted, "event_batch_triggers_deleted", stats.EventBatchTriggersDeleted, "webhook_triggers_deleted", stats.WebhookTriggersDeleted, "delivered_outbox_deleted", stats.DeliveredOutboxDeleted, "dead_outbox_deleted", stats.DeadOutboxDeleted, "admin_audit_deleted", stats.AdminAuditDeleted, "remaining", stats.Remaining, "pages_released", stats.PagesReleased, "wal_checkpointed", stats.WALCheckpointed)
 		return stats.Remaining, nil
 	}
 

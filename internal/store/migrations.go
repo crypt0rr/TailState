@@ -870,9 +870,10 @@ func migrateSchemaV13ToV14(db *sql.DB) error {
 }
 
 // migrateSchemaV14ToV15 adds administrative security state: a last-seen
-// time on sessions for the idle timeout. Existing sessions are backfilled
-// with their creation time, so a session idle for longer than the timeout
-// before the upgrade must sign in again; nothing else changes behaviour.
+// time on sessions for the idle timeout and the administrative audit table.
+// Existing sessions are backfilled with their creation time, so a session
+// idle for longer than the timeout before the upgrade must sign in again;
+// nothing else changes behaviour.
 func migrateSchemaV14ToV15(db *sql.DB) error {
 	tx, err := db.Begin()
 	if err != nil {
@@ -884,6 +885,23 @@ func migrateSchemaV14ToV15(db *sql.DB) error {
 	}
 	if _, err := tx.Exec("UPDATE sessions SET last_seen_at=created_at WHERE last_seen_at=''"); err != nil {
 		return fmt.Errorf("backfill session activity: %w", err)
+	}
+	for _, statement := range []string{
+		`CREATE TABLE IF NOT EXISTS admin_audit (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			created_at TEXT NOT NULL,
+			event TEXT NOT NULL,
+			outcome TEXT NOT NULL DEFAULT 'success',
+			client_ip TEXT NOT NULL DEFAULT '',
+			session_ref TEXT NOT NULL DEFAULT '',
+			target TEXT NOT NULL DEFAULT '',
+			fields TEXT NOT NULL DEFAULT ''
+		)`,
+		"CREATE INDEX IF NOT EXISTS admin_audit_created_at ON admin_audit(created_at, id)",
+	} {
+		if _, err := tx.Exec(statement); err != nil {
+			return fmt.Errorf("create administrative audit table: %w", err)
+		}
 	}
 	if _, err := tx.Exec("UPDATE schema_version SET version=15"); err != nil {
 		return fmt.Errorf("record administrative security migration: %w", err)

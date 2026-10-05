@@ -17,6 +17,7 @@ func downgradeToV14(t *testing.T, db *sql.DB) {
 	t.Helper()
 	for _, statement := range []string{
 		"ALTER TABLE sessions DROP COLUMN last_seen_at",
+		"DROP TABLE admin_audit",
 		"UPDATE schema_version SET version=14",
 	} {
 		if _, err := db.Exec(statement); err != nil {
@@ -78,6 +79,13 @@ func TestSchemaV15MigrationKeepsSessionsAndAddsSecurityState(t *testing.T) {
 	if !st.Authenticate(ctx, "a secure password") {
 		t.Fatal("administrator password lost in the upgrade")
 	}
+	if _, err := st.RecordAdminAudit(ctx, AdminAuditEntry{Event: AuditLoginSuccess}, nil); err != nil {
+		t.Fatalf("administrative audit table missing after the upgrade: %v", err)
+	}
+	var indexes int
+	if err := st.db.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='admin_audit_created_at'").Scan(&indexes); err != nil || indexes != 1 {
+		t.Fatalf("audit retention index missing: %d %v", indexes, err)
+	}
 }
 
 func TestSchemaV14ToV15ReportsErrors(t *testing.T) {
@@ -94,6 +102,15 @@ CREATE TRIGGER fail_session_backfill BEFORE UPDATE OF last_seen_at ON sessions B
 			t.Fatal(err)
 		}
 		if err := migrateSchemaV14ToV15(db); err == nil || !strings.Contains(err.Error(), "backfill session activity") {
+			t.Fatalf("migration error=%v", err)
+		}
+	})
+	t.Run("audit table", func(t *testing.T) {
+		db := currentSchemaMigrationDB(t, 14)
+		if _, err := db.Exec("DROP TABLE admin_audit; CREATE VIEW admin_audit AS SELECT 1 AS created_at, 1 AS id"); err != nil {
+			t.Fatal(err)
+		}
+		if err := migrateSchemaV14ToV15(db); err == nil || !strings.Contains(err.Error(), "create administrative audit table") {
 			t.Fatalf("migration error=%v", err)
 		}
 	})

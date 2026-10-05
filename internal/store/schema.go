@@ -30,6 +30,19 @@ CREATE TABLE IF NOT EXISTS sessions (
   last_seen_at TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS sessions_expires_at ON sessions(expires_at);
+-- Administrative audit trail: event names, field names, and identifiers
+-- only, never values. Retained for 365 days by bounded cleanup.
+CREATE TABLE IF NOT EXISTS admin_audit (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  created_at TEXT NOT NULL,
+  event TEXT NOT NULL,
+  outcome TEXT NOT NULL DEFAULT 'success',
+  client_ip TEXT NOT NULL DEFAULT '',
+  session_ref TEXT NOT NULL DEFAULT '',
+  target TEXT NOT NULL DEFAULT '',
+  fields TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS admin_audit_created_at ON admin_audit(created_at, id);
 CREATE TABLE IF NOT EXISTS settings (
   id INTEGER PRIMARY KEY CHECK(id = 1),
   tailnet TEXT NOT NULL,

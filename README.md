@@ -242,7 +242,7 @@ Only the documented routes exist: `/` redirects to the right page, unknown paths
 
 `/metrics` exposes readiness, pending/dead delivery counts, notification destination totals and enabled counts, the notification state (`tailstate_notification_state{state="unconfigured|no_destinations|paused|active"}`, exactly one is `1`) and a `tailstate_notifications_paused` gauge that is `1` when a configured installation has no destination or every destination is disabled, pending/processing/dead webhook trigger counts, resource counts, low-cardinality collector health gauges (`supported`, `baseline`, partial-result state, partial error count, failures, poll duration, last success, and next poll timestamps), the scheduler's total database-error counter (`tailstate_collector_due_errors_total`), delivery telemetry (`tailstate_outbox_delivery_attempts_total`, success/failure counters, lease renewal/loss counters, and the `tailstate_outbox_delivery_duration_seconds` histogram), and bounded storage telemetry. Storage metrics include the allocated and used database size, free pages, and the used-bytes pressure ratio, the page ceiling SQLite is actually enforcing (`tailstate_storage_enforced_limit_bytes`, plus `tailstate_storage_limit_enforced`, which drops to `0` if the active ceiling ever exceeds the configured budget), configured snapshot/event/history/rejection limits, and counters for snapshot truncation, event-value truncation, history-page truncation, and oversized raw writes represented by a metadata marker. These signals make storage pressure visible without exposing destination URLs, provider bodies, or message contents. The `device_details` collector uses a bounded eight-worker fan-out and a two-minute per-collector deadline; usable partial results are retained and marked in the status page and metrics with the number of devices whose details are missing. When `TAILSTATE_METRICS_TOKEN` is empty, only a direct loopback connection is accepted; requests from a reverse proxy (including a loopback or trusted proxy), requests with forwarded headers, and non-loopback peers receive `401`. Set that variable for Prometheus or any reverse proxy to require `Authorization: Bearer <token>` from any network location. Do not publish the endpoint without a token through a public reverse proxy. Every metric family carries `# HELP` and `# TYPE` lines (the exposition passes `promtool check metrics`), and the response is rendered in full before it is sent: if a store query fails, the scrape receives a clean `500` rather than a partial `200` body.
 
-Retention cleanup is resumable and writer-friendly. Each table is processed in keyset batches of at most 128 rows, each autocommit transaction has a 250 ms deadline, and one pass stops after two seconds; when work remains, the monitor schedules a continuation within one second instead of waiting for the hourly sweep. A failed pass is retried after one second, and consecutive failures double that delay up to the hourly sweep interval, so a persistent error (for example a full disk) does not retry every second; the next successful pass resets the backoff. Cleanup logs include per-table row counts, transaction count, duration, failures, and the remaining-work flag. The same information is available through `tailstate_cleanup_*` metrics. Active notification and webhook leases are never dead-lettered until their lease has expired, and evidence-ledger rows are never removed by retention.
+Retention cleanup is resumable and writer-friendly. Each table is processed in keyset batches of at most 128 rows, each autocommit transaction has a 250 ms deadline, and one pass stops after two seconds; when work remains, the monitor schedules a continuation within one second instead of waiting for the hourly sweep. A failed pass is retried after one second, and consecutive failures double that delay up to the hourly sweep interval, so a persistent error (for example a full disk) does not retry every second; the next successful pass resets the backoff. Cleanup logs include per-table row counts, transaction count, duration, failures, and the remaining-work flag. The same information is available through `tailstate_cleanup_*` metrics. Active notification and webhook leases are never dead-lettered until their lease has expired, and evidence-ledger rows are never removed by retention. Administrative audit records use their own 365-day retention period.
 
 `/readyz` reports each collector's baseline state. It returns `503` while setup
 is incomplete or before the first baseline; after the 15-minute first-baseline
@@ -427,6 +427,56 @@ secure cookies were enabled) keep working until they expire; the next
 sign-in replaces them, and the two namings are never combined. The
 short-lived credential-form challenge cookies keep their page-scoped paths
 and therefore their existing names.
+
+### Administrative audit trail
+
+TailState records its own security-relevant configuration changes in a
+durable `admin_audit` table, so a change made with a stolen session or by an
+insider is not silent. One record is written for each sign-in, failed
+sign-in, sign-out, setup claim, token password reset, password change, and
+"sign out all other sessions"; for each monitoring settings save that changes
+something (tailnet, OAuth client ID, OAuth secret rotation, OAuth scopes,
+either polling interval, expiry warning windows or tag filter, webhook secret
+set or cleared); for each notification destination added, edited (name, URL,
+enabled state, routing, message format), enabled, disabled, or removed (after
+the confirmation step); for each mute rule added or removed; and for the
+status page's operator actions, **Reconcile now** (when the request is
+accepted, not when the cooldown refuses it) and **Retry dead letters** (when
+it requeued at least one notification). A record holds
+the event, time, outcome, the client address (taken from
+`X-Forwarded-For` only when the peer is a trusted proxy), a short reference
+to the acting session, the affected object as `kind:id`, and the **names** of
+the changed fields. Values are never recorded: the store accepts only the
+fixed event vocabulary and identifier-shaped field names, so a URL, secret,
+password, or display name cannot be written by mistake. Every record is also
+logged as a structured `administrative action` line (`event`, `outcome`,
+`client_ip`, `session`, `target`, `fields`) for SIEM collection, and the 25
+newest records are listed under **Recent administrative activity** in
+Settings. Records are kept for 365 days and removed afterwards by the same
+bounded, resumable retention cleanup as other tables
+(`tailstate_cleanup_rows_total{table="admin_audit"}`).
+
+Command-line administration (`tailstate admin reset`, `admin rekey`,
+`admin backup`, `admin compact`) is not recorded in the audit table: those
+commands run with direct access to the database and master key, outside any
+web session, and `admin rekey`/`admin compact` require the service to be
+stopped. A password reset token issued by `admin reset` is audited when it is
+used on the reset page; the commands report their own result on standard
+output or standard error for the operator who ran them.
+
+High-risk changes also send a "TailState configuration changed" system
+notification (action, changed field names, object, client address, time) to
+every destination that was enabled **before** the change: monitoring
+settings changes (including an OAuth identity change, which notifies every
+enabled destination and is not dead-lettered by the identity switch),
+password resets and changes, mute rules added, and destination URL, routing,
+disable, and removal changes. The notice is queued in the same transaction as
+the audit record. A destination that the change itself disables, removes, or
+points at a new URL is notified directly at its current URL before the
+change is applied (bounded to 10 seconds and best effort, so an unreachable
+destination can still be removed; the outcome is logged), which means
+disabling or deleting the last enabled destination still tells that
+destination first.
 
 ### Deployment diagnostics
 
@@ -772,8 +822,10 @@ Schema v15 adds administrative security state. Sessions gain a last-activity
 time for the 60-minute idle timeout; existing sessions are backfilled with
 their sign-in time, so a session that has been idle for longer than the
 timeout must sign in again after the upgrade, and every other session keeps
-working. The migration runs in one transaction and changes no existing
-setting, destination, history, or evidence row.
+working. It also creates the `admin_audit` table and its
+retention index; the audit trail starts empty at the upgrade. The migration
+runs in one transaction and changes no existing setting, destination,
+history, or evidence row.
 
 ## Runtime configuration
 

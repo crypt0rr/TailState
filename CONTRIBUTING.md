@@ -69,7 +69,8 @@ expresses the operator guarantee, not only a branch-coverage test.
 
 The persistence package is split by responsibility: `auth.go` owns setup,
 password and setup/reset token state; `sessions.go` owns sessions, the idle
-timeout, and password changes; `settings.go` owns encrypted application
+timeout, and password changes; `admin_audit.go` owns the administrative
+audit trail and its notices; `settings.go` owns encrypted application
 settings; `snapshots.go` owns collector application and baseline transitions;
 `outbox.go` owns notification delivery bookkeeping; `status.go` owns health,
 scheduling, and retention queries; and `history.go`, `destinations.go`,

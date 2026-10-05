@@ -60,6 +60,10 @@ type Server struct {
 	reconcileMu          sync.Mutex
 	lastReconcile        time.Time
 	reconcileCooldown    time.Duration
+	// noticeSender delivers administrative notices that must reach a
+	// destination before a change disables, removes, or redirects it.
+	noticeSender  notify.Sender
+	noticeTimeout time.Duration
 }
 
 const (
@@ -129,6 +133,7 @@ type pageData struct {
 	WebhookUnavailable              bool
 	DestinationDeliveries           []store.DestinationDelivery
 	Sessions                        []store.SessionInfo
+	AdminActivity                   []store.AdminAuditEntry
 	SessionIdleMinutes              int
 	MinPasswordLength               int
 }
@@ -263,6 +268,8 @@ func New(config boot.Config, st *store.Store, engine *monitor.Engine) (*Server, 
 		credentialRejections: map[string]uint64{},
 		webhookOutcomes:      map[string]uint64{},
 		reconcileCooldown:    defaultReconcileCooldown,
+		noticeSender:         notify.New(),
+		noticeTimeout:        defaultNoticeTimeout,
 	}, nil
 }
 
@@ -503,9 +510,11 @@ func (s *Server) claim(w http.ResponseWriter, r *http.Request) {
 	}
 	s.clearFailures(ip)
 	s.clearCredentialChallengeCookie(w, credentialActionSetup)
-	if !s.startSession(w, r) {
+	token, ok := s.startSession(w, r)
+	if !ok {
 		return
 	}
+	s.recordAdmin(r, store.SessionRef(token), adminChange{event: store.AuditSetupClaim}, nil, 0)
 	http.Redirect(w, r, "/settings", http.StatusSeeOther)
 }
 func (s *Server) login(w http.ResponseWriter, r *http.Request) {
@@ -563,14 +572,17 @@ func (s *Server) loginPost(w http.ResponseWriter, r *http.Request) {
 	if !s.store.Authenticate(r.Context(), r.FormValue("password")) {
 		s.recordFailure(credentialActionLogin, ip)
 		s.recordCredentialRejection(credentialActionLogin)
+		s.recordAdmin(r, "", adminChange{event: store.AuditLoginFailure, outcome: store.AuditFailure}, nil, 0)
 		s.renderCredential(w, r, "login", credentialActionLogin, pageData{Error: "Invalid password.", Next: next})
 		return
 	}
 	s.clearFailures(ip)
 	s.clearCredentialChallengeCookie(w, credentialActionLogin)
-	if !s.startSession(w, r) {
+	token, ok := s.startSession(w, r)
+	if !ok {
 		return
 	}
+	s.recordAdmin(r, store.SessionRef(token), adminChange{event: store.AuditLoginSuccess}, nil, 0)
 	if next == "" {
 		next = "/"
 	}
@@ -578,13 +590,13 @@ func (s *Server) loginPost(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) logout(w http.ResponseWriter, r *http.Request) {
-	if !s.authenticated(r, true) {
+	auth, ok := s.session(r, true, true)
+	if !ok {
 		s.rejectUnauthenticated(w, r, true)
 		return
 	}
-	if session, _, ok := s.sessionCookies(r); ok {
-		s.store.DeleteSession(r.Context(), session.Value)
-	}
+	s.store.DeleteSession(r.Context(), auth.token)
+	s.recordAdmin(r, auth.ref, adminChange{event: store.AuditLogout}, nil, 0)
 	s.clearCookies(w)
 	http.Redirect(w, r, "/login", http.StatusSeeOther)
 }
@@ -622,6 +634,7 @@ func (s *Server) resetPost(w http.ResponseWriter, r *http.Request) {
 		s.renderCredential(w, r, "reset", credentialActionReset, pageData{Error: secret.PasswordPolicyMessage(err)})
 		return
 	}
+	before := s.enabledDestinations(r.Context())
 	if err := s.store.ResetWithToken(r.Context(), r.FormValue("token"), r.FormValue("password")); err != nil {
 		s.recordFailure(credentialActionReset, ip)
 		s.recordCredentialRejection(credentialActionReset)
@@ -634,6 +647,7 @@ func (s *Server) resetPost(w http.ResponseWriter, r *http.Request) {
 	}
 	s.clearFailures(ip)
 	s.clearCredentialChallengeCookie(w, credentialActionReset)
+	s.recordAdmin(r, "", adminChange{event: store.AuditPasswordReset, highRisk: true}, before, 0)
 	s.clearCookies(w)
 	http.Redirect(w, r, "/login", http.StatusSeeOther)
 }
@@ -675,13 +689,16 @@ func (s *Server) status(w http.ResponseWriter, r *http.Request) {
 // CSRF-protected POST, rate-limited to one request per reconcileCooldown,
 // and answers with Post/Redirect/Get so a reload cannot repeat it.
 func (s *Server) reconcile(w http.ResponseWriter, r *http.Request) {
-	if _, ok := s.requireAuth(w, r, true); !ok {
+	auth, ok := s.requireSession(w, r, true, true)
+	if !ok {
 		return
 	}
-	s.reconcileAuthorized(w, r)
+	s.reconcileAuthorized(w, r, auth.ref)
 }
 
-func (s *Server) reconcileAuthorized(w http.ResponseWriter, r *http.Request) {
+// reconcileAuthorized handles an authenticated reconcile request; an
+// accepted request is recorded in the administrative audit trail.
+func (s *Server) reconcileAuthorized(w http.ResponseWriter, r *http.Request, sessionRef string) {
 	status, err := s.store.Status(r.Context())
 	if err != nil {
 		slog.Error("load status for reconcile", "error", err)
@@ -698,6 +715,7 @@ func (s *Server) reconcileAuthorized(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.engine.Trigger(monitor.ReconcileRequest{})
+	s.recordAdmin(r, sessionRef, adminChange{event: store.AuditReconcileRequested}, nil, 0)
 	s.redirectWithFlash(w, r, "/status", flashKindSuccess, "Reconciliation requested. Every collector will be polled within a few seconds.")
 }
 
@@ -718,13 +736,16 @@ func (s *Server) reserveReconcile(now time.Time) (time.Duration, bool) {
 // retryDeadLetters requeues one destination's retryable dead letters with a
 // fresh delivery window.
 func (s *Server) retryDeadLetters(w http.ResponseWriter, r *http.Request) {
-	if _, ok := s.requireAuth(w, r, true); !ok {
+	auth, ok := s.requireSession(w, r, true, true)
+	if !ok {
 		return
 	}
-	s.retryDeadLettersAuthorized(w, r)
+	s.retryDeadLettersAuthorized(w, r, auth.ref)
 }
 
-func (s *Server) retryDeadLettersAuthorized(w http.ResponseWriter, r *http.Request) {
+// retryDeadLettersAuthorized handles an authenticated retry; a retry that
+// requeued anything is recorded in the administrative audit trail.
+func (s *Server) retryDeadLettersAuthorized(w http.ResponseWriter, r *http.Request, sessionRef string) {
 	id, _ := strconv.ParseInt(r.FormValue("id"), 10, 64)
 	requeued, err := s.store.RetryDeadOutbox(r.Context(), id)
 	switch {
@@ -735,6 +756,9 @@ func (s *Server) retryDeadLettersAuthorized(w http.ResponseWriter, r *http.Reque
 		slog.Error("retry dead notifications", "error", err)
 		s.redirectWithFlash(w, r, "/status", flashKindError, destinationMutationMessage("retry", err))
 		return
+	}
+	if requeued > 0 {
+		s.recordAdmin(r, sessionRef, adminChange{event: store.AuditDeadLettersRetried, target: destinationTarget(id)}, nil, 0)
 	}
 	s.engine.Wake()
 	noun := "notifications"
@@ -1036,10 +1060,11 @@ func (s *Server) settings(w http.ResponseWriter, r *http.Request) {
 	s.render(w, "settings", data)
 }
 func (s *Server) settingsPost(w http.ResponseWriter, r *http.Request) {
-	csrf, ok := s.requireAuth(w, r, true)
+	auth, ok := s.requireSession(w, r, true, true)
 	if !ok {
 		return
 	}
+	csrf := auth.csrf
 	if err := r.ParseForm(); err != nil {
 		http.Error(w, "invalid form", 400)
 		return
@@ -1142,11 +1167,20 @@ func (s *Server) settingsPost(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// The notice for a settings change (including an OAuth identity change,
+	// which dead-letters queued change digests) goes to every destination
+	// that is enabled now. System notices are not tied to a change batch, so
+	// the identity change does not dead-letter them.
+	before := s.enabledDestinations(r.Context())
+	fields := settingsChangeFields(configured, current, input)
 	if _, err := s.store.SaveSettings(r.Context(), input); err != nil {
 		slog.Error("save settings", "error", err)
 		data.Error = "Settings could not be saved. Check the values and try again."
 		s.render(w, "settings", data)
 		return
+	}
+	if len(fields) > 0 {
+		s.recordAdmin(r, auth.ref, adminChange{event: store.AuditSettingsChanged, fields: fields, highRisk: true}, before, 0)
 	}
 	s.engine.Wake()
 	http.Redirect(w, r, "/status", http.StatusSeeOther)
@@ -1300,6 +1334,11 @@ func (s *Server) settingsData(ctx context.Context, csrf string, configured bool,
 	} else {
 		slog.Error("load mute rules", "error", err)
 	}
+	if activity, err := s.store.RecentAdminAudit(ctx, recentAdminActivity); err == nil {
+		data.AdminActivity = activity
+	} else {
+		slog.Error("load administrative activity", "error", err)
+	}
 	return data
 }
 
@@ -1345,7 +1384,8 @@ func (s *Server) diagnosticReport(ctx context.Context, request *http.Request) di
 // so reloading the resulting page never repeats a test notification, a
 // toggle, or a removal.
 func (s *Server) destinationPost(w http.ResponseWriter, r *http.Request) {
-	if _, ok := s.requireAuth(w, r, true); !ok {
+	auth, ok := s.requireSession(w, r, true, true)
+	if !ok {
 		return
 	}
 	if err := r.ParseForm(); err != nil {
@@ -1389,6 +1429,8 @@ func (s *Server) destinationPost(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
+		before := s.enabledDestinations(ctx)
+		change, notified := s.prepareDestinationSave(ctx, r, id, serviceURL, enabled, withRouting, rules, format)
 		savedID, err := s.store.SaveDestination(ctx, store.NotificationDestination{ID: id, Name: r.FormValue("name"), ServiceURL: serviceURL, Enabled: enabled})
 		if err == nil && withRouting {
 			err = s.store.SetDestinationRouting(ctx, savedID, rules)
@@ -1400,6 +1442,10 @@ func (s *Server) destinationPost(w http.ResponseWriter, r *http.Request) {
 			slog.Error("save notification destination", "error", err)
 			s.redirectWithFlash(w, r, "/settings", flashKindError, destinationMutationMessage("save", err))
 			return
+		}
+		if change.event != "" {
+			change.target = destinationTarget(savedID)
+			s.recordAdmin(r, auth.ref, change, before, notified)
 		}
 		s.engine.Wake()
 		s.redirectWithFlash(w, r, "/settings", flashKindSuccess, "Notification destination saved.")
@@ -1437,10 +1483,28 @@ func (s *Server) destinationPost(w http.ResponseWriter, r *http.Request) {
 		} else if r.URL.Path == "/settings/destinations/disable" {
 			enabled = false
 		}
+		before := s.enabledDestinations(ctx)
+		old, found := findDestination(before, id)
+		var change adminChange
+		var notified int64
+		if enabled {
+			change = adminChange{event: store.AuditDestinationEnabled, target: destinationTarget(id), fields: []string{"enabled"}}
+		} else if found {
+			// Disabling an enabled destination: tell it first, because a
+			// disabled destination receives nothing afterwards.
+			change = adminChange{event: store.AuditDestinationDisabled, target: destinationTarget(id), fields: []string{"enabled"}, highRisk: true}
+			s.noticeBeforeChange(ctx, old, s.adminMessage(ctx, r, change))
+			notified = id
+		}
 		if err := s.store.SetDestinationEnabled(ctx, id, enabled); err != nil {
 			slog.Error("update notification destination", "error", err)
 			s.redirectWithFlash(w, r, "/settings", flashKindError, destinationMutationMessage("update", err))
 			return
+		}
+		// Re-enabling an enabled destination, or disabling a disabled one,
+		// changes nothing and is not recorded.
+		if change.event != "" && (!enabled || !found) {
+			s.recordAdmin(r, auth.ref, change, before, notified)
 		}
 		s.engine.Wake()
 		message := "Notification destination enabled."
@@ -1456,11 +1520,21 @@ func (s *Server) destinationPost(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		name, pending := s.destinationPending(ctx, id)
+		before := s.enabledDestinations(ctx)
+		change := adminChange{event: store.AuditDestinationDeleted, target: destinationTarget(id), highRisk: true}
+		var notified int64
+		if old, found := findDestination(before, id); found {
+			// The URL is erased by the removal, so this is the last chance
+			// to reach the destination.
+			s.noticeBeforeChange(ctx, old, s.adminMessage(ctx, r, change))
+			notified = id
+		}
 		if err := s.store.DeleteDestination(ctx, id); err != nil {
 			slog.Error("remove notification destination", "error", err)
 			s.redirectWithFlash(w, r, "/settings", flashKindError, destinationMutationMessage("remove", err))
 			return
 		}
+		s.recordAdmin(r, auth.ref, change, before, notified)
 		s.engine.Wake()
 		noun := "notifications were"
 		if pending == 1 {
@@ -1476,7 +1550,8 @@ func (s *Server) destinationPost(w http.ResponseWriter, r *http.Request) {
 // a collector this release monitors. Like the destination forms, every
 // outcome is reported with Post/Redirect/Get and a one-time flash message.
 func (s *Server) mutePost(w http.ResponseWriter, r *http.Request) {
-	if _, ok := s.requireAuth(w, r, true); !ok {
+	auth, ok := s.requireSession(w, r, true, true)
+	if !ok {
 		return
 	}
 	ctx := r.Context()
@@ -1490,10 +1565,14 @@ func (s *Server) mutePost(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
-		if _, err := s.store.AddMuteRule(ctx, kind, value); err != nil {
+		before := s.enabledDestinations(ctx)
+		ruleID, err := s.store.AddMuteRule(ctx, kind, value)
+		if err != nil {
 			s.redirectWithFlash(w, r, "/settings", flashKindError, "Mute rule was not saved: "+muteRuleMessage(err)+".")
 			return
 		}
+		// A mute rule can silence alerts, so it is a high-risk change.
+		s.recordAdmin(r, auth.ref, adminChange{event: store.AuditMuteAdded, target: "mute:" + strconv.FormatInt(ruleID, 10), fields: []string{"kind", "value"}, highRisk: true}, before, 0)
 		s.redirectWithFlash(w, r, "/settings", flashKindSuccess, "Mute rule added.")
 	case "delete":
 		id, _ := strconv.ParseInt(r.FormValue("id"), 10, 64)
@@ -1501,6 +1580,7 @@ func (s *Server) mutePost(w http.ResponseWriter, r *http.Request) {
 			s.redirectWithFlash(w, r, "/settings", flashKindError, "Mute rule not found.")
 			return
 		}
+		s.recordAdmin(r, auth.ref, adminChange{event: store.AuditMuteRemoved, target: "mute:" + strconv.FormatInt(id, 10)}, nil, 0)
 		s.redirectWithFlash(w, r, "/settings", flashKindSuccess, "Mute rule removed.")
 	default:
 		http.Error(w, "unknown mute rule action", http.StatusBadRequest)
@@ -1864,6 +1944,7 @@ func (s *Server) writeMetrics(b *bytes.Buffer, status store.Status, storage stor
 			{"webhook_triggers", cleanup.WebhookTriggersDeleted},
 			{"delivered_outbox", cleanup.DeliveredOutboxDeleted},
 			{"dead_outbox", cleanup.DeadOutboxDeleted},
+			{"admin_audit", cleanup.AdminAuditDeleted},
 		} {
 			fmt.Fprintf(b, "tailstate_cleanup_rows_total{table=%q} %d\n", row.table, row.count)
 		}
@@ -1976,11 +2057,11 @@ func (s *Server) metricsAuthorized(r *http.Request) bool {
 	return strings.TrimSpace(r.Header.Get("X-Forwarded-For")) == "" && strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")) == ""
 }
 
-func (s *Server) startSession(w http.ResponseWriter, r *http.Request) bool {
+func (s *Server) startSession(w http.ResponseWriter, r *http.Request) (string, bool) {
 	token, csrf, err := s.store.CreateSession(r.Context())
 	if err != nil {
 		http.Error(w, "create session", http.StatusInternalServerError)
-		return false
+		return "", false
 	}
 	// With secure cookies a sign-in expires the unprefixed cookies of an
 	// earlier sign-in, so the browser holds one generation only.
@@ -1992,7 +2073,7 @@ func (s *Server) startSession(w http.ResponseWriter, r *http.Request) bool {
 	maxAge := int(store.SessionLifetime / time.Second)
 	http.SetCookie(w, &http.Cookie{Name: s.cookieName(sessionCookieBase), Value: token, Path: "/", MaxAge: maxAge, HttpOnly: true, Secure: s.config.CookieSecure, SameSite: http.SameSiteStrictMode})
 	http.SetCookie(w, &http.Cookie{Name: s.cookieName(csrfCookieBase), Value: csrf, Path: "/", MaxAge: maxAge, HttpOnly: false, Secure: s.config.CookieSecure, SameSite: http.SameSiteStrictMode})
-	return true
+	return token, true
 }
 
 // clearCookies expires the session cookies under both namings.

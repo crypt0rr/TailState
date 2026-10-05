@@ -325,4 +325,42 @@
     <button class="button-danger" type="submit">Sign out all other sessions</button>
   </form>
 </section>
+
+<section class="card activity-card" id="activity" aria-labelledby="activity-heading">
+  <div class="section-heading">
+    <div>
+      <h2 id="activity-heading">Recent administrative activity</h2>
+      <p>Sign-ins, password and session changes, configuration changes, and operator actions, newest first. Only the names of changed fields are recorded, never their values. Records are kept for 365 days and are also written to the log as <code>administrative action</code> lines.</p>
+    </div>
+  </div>
+  {{if .AdminActivity}}
+  <table class="data-table activity-table">
+    <caption class="visually-hidden">Administrative activity, newest first</caption>
+    <thead>
+      <tr>
+        <th scope="col">Time</th>
+        <th scope="col">Action</th>
+        <th scope="col">Outcome</th>
+        <th scope="col">Changed</th>
+        <th scope="col">Client</th>
+        <th scope="col">Session</th>
+      </tr>
+    </thead>
+    <tbody>
+      {{- range .AdminActivity}}
+      <tr{{if eq .Outcome "failure"}} class="failure"{{end}}>
+        <td data-label="Time">{{template "when" (when .At $.Now)}}</td>
+        <th scope="row" data-label="Action">{{.Label}}{{if .Target}} <code>{{.Target}}</code>{{end}}</th>
+        <td data-label="Outcome">{{.Outcome}}</td>
+        <td data-label="Changed">{{range $index, $field := .Fields}}{{if $index}}, {{end}}<code>{{$field}}</code>{{else}}—{{end}}</td>
+        <td data-label="Client">{{if .ClientIP}}<code>{{.ClientIP}}</code>{{else}}—{{end}}</td>
+        <td data-label="Session">{{if .SessionRef}}<code>{{.SessionRef}}</code>{{else}}—{{end}}</td>
+      </tr>
+      {{- end}}
+    </tbody>
+  </table>
+  {{else}}
+  <p class="muted">No administrative activity recorded yet.</p>
+  {{end}}
+</section>
 {{end}}

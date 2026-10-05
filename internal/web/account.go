@@ -163,6 +163,7 @@ func (s *Server) passwordPost(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "authentication busy", http.StatusServiceUnavailable)
 		return
 	}
+	before := s.enabledDestinations(ctx)
 	if err := s.store.ChangePassword(ctx, auth.token, r.FormValue("current_password"), password); err != nil {
 		if errors.Is(err, store.ErrCurrentPasswordMismatch) {
 			s.recordFailure(passwordChangeThrottle, key)
@@ -174,6 +175,7 @@ func (s *Server) passwordPost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.clearFailures(key)
+	s.recordAdmin(r, auth.ref, adminChange{event: store.AuditPasswordChanged, highRisk: true}, before, 0)
 	s.redirectWithFlash(w, r, accountSection, flashKindSuccess, "Password changed. Every other session was signed out.")
 }
 
@@ -189,6 +191,7 @@ func (s *Server) sessionsPost(w http.ResponseWriter, r *http.Request) {
 		s.redirectWithFlash(w, r, accountSection, flashKindError, "Other sessions could not be signed out. Try again.")
 		return
 	}
+	s.recordAdmin(r, auth.ref, adminChange{event: store.AuditSessionsRevoked}, nil, 0)
 	message := "Signed out every other session."
 	if removed == 0 {
 		message = "No other session was active."

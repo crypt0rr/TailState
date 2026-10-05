@@ -43,6 +43,8 @@ func testServer(t *testing.T) (*Server, *store.Store, string) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Administrative notices never leave the test process.
+	server.noticeSender = &recordingSender{}
 	return server, st, token
 }
 

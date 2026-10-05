@@ -243,6 +243,45 @@ func (c Context) Update(previous, current string, observedAt time.Time) Message 
 	)
 }
 
+// SettingsURL returns the Settings page link, or "" when no public URL is
+// configured.
+func (c Context) SettingsURL() string {
+	if c.PublicURL == "" {
+		return ""
+	}
+	return c.PublicURL + "/settings"
+}
+
+// AdminChange reports a security-relevant change to TailState's own
+// configuration. It names the action, the changed field names (never their
+// values), the affected object, and the client address the request came
+// from, so a change made with a stolen session is visible to the
+// destinations that were active before it.
+func (c Context) AdminChange(action string, fields []string, target, client string, observedAt time.Time) Message {
+	lines := []Line{line(strong("Action:"), lit(" "), txt(action))}
+	if len(fields) > 0 {
+		spans := []Span{strong("Changed:"), lit(" ")}
+		for index, field := range fields {
+			if index > 0 {
+				spans = append(spans, lit(", "))
+			}
+			spans = append(spans, code(field))
+		}
+		lines = append(lines, line(spans...))
+	}
+	if target != "" {
+		lines = append(lines, line(strong("Object:"), lit(" "), code(target)))
+	}
+	if client != "" {
+		lines = append(lines, line(strong("Client:"), lit(" "), code(client)))
+	}
+	lines = append(lines, observedLine(observedAt), line(emph("If you did not make this change, sign in, review Recent administrative activity in Settings, and change the administrator password.")))
+	if settingsURL := c.SettingsURL(); settingsURL != "" {
+		lines = append(lines, line(link("Open TailState settings", settingsURL)))
+	}
+	return c.message("🔐", "TailState configuration changed", lines...)
+}
+
 // Test is the message sent by the Settings "Send test" action. It names the
 // instance, tailnet, and version so an operator can confirm which TailState
 // sent it.

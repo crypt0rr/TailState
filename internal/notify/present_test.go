@@ -57,12 +57,10 @@ func presenterDigest() Message {
 // values in every format.
 func TestPresentedValuesAreGolden(t *testing.T) {
 	golden := map[string]string{
-		FormatMarkdown: "### Tailscale inventory changed · example.com\n" +
-			"**4 change(s):** 0 created, 4 changed, 0 removed\n" +
-			"**Severity:** 🔴 3 high, 🟠 1 medium, ⚪ 0 low\n" +
-			"Observed at 2026-10-05T12:00:00Z\n" +
+		FormatMarkdown: "### 🔴 4 Tailscale changes (3 high) · example.com\n" +
+			"4 changed · 🔴 3 high, 🟠 1 medium\n" +
 			"\n" +
-			"🔴 ✏️ **web\\-02** `changed` (devices, high)\n" +
+			"🔴 ✏️ **web-02** (device) changed\n" +
 			"  - `tags`: +`tag:db`, −`tag:old`\n" +
 			"  - `enabledRoutes`: +`10.1.0.0/24`\n" +
 			"  - `name`: `web-02` → `web-02b`\n" +
@@ -71,24 +69,24 @@ func TestPresentedValuesAreGolden(t *testing.T) {
 			"  - `description`: `old text` → (not set)\n" +
 			"  - `comment`: (not set) → (empty)\n" +
 			"  - `posture`: `{\"fingerprint\":\"3f9a1c0e…\",\"ok\":true}` → `{\"ok\":false}`\n" +
-			"🔴 ✏️ **Tailnet policy** `changed` (policy, high)\n" +
+			"🔴 ✏️ **Tailnet policy** changed\n" +
 			"  - section `acls` changed (`3f9a1c0e` → `c41b7e2a`)\n" +
 			"  - section `ssh` added (`9e8d7c6b`)\n" +
 			"  - section `tests` removed\n" +
-			"🔴 ✏️ **SIEM webhook** `changed` (webhooks, high)\n" +
+			"🔴 ✏️ **SIEM webhook** (webhook) changed\n" +
 			"  - `endpointUrl`: secret changed (fingerprint `3f9a1c0e` → `c41b7e2a`)\n" +
 			"  - `secret`: secret set\n" +
 			"  - `token`: secret removed\n" +
-			"🟠 ✏️ **DNS configuration** `changed` (dns, medium)\n" +
+			"🟠 ✏️ **DNS configuration** changed\n" +
 			"  - `searchPaths`: now `example.com`, `corp.example.com`\n" +
 			"  - `nameservers`: now `8.8.8.8`, `1.1.1.1` (+`8.8.8.8`)\n" +
-			"  - `splitDNS.corp`: +`10.0.0.53`",
-		FormatSlack: "*Tailscale inventory changed · example.com*\n" +
-			"*4 change(s):* 0 created, 4 changed, 0 removed\n" +
-			"*Severity:* 🔴 3 high, 🟠 1 medium, ⚪ 0 low\n" +
-			"Observed at 2026-10-05T12:00:00Z\n" +
+			"  - `splitDNS.corp`: +`10.0.0.53`\n" +
 			"\n" +
-			"🔴 ✏️ *web-02* `changed` (devices, high)\n" +
+			"5 Oct 2026 12:00 UTC",
+		FormatSlack: "*🔴 4 Tailscale changes (3 high) · example.com*\n" +
+			"4 changed · 🔴 3 high, 🟠 1 medium\n" +
+			"\n" +
+			"🔴 ✏️ *web-02* (device) changed\n" +
 			"    • `tags`: +`tag:db`, −`tag:old`\n" +
 			"    • `enabledRoutes`: +`10.1.0.0/24`\n" +
 			"    • `name`: `web-02` → `web-02b`\n" +
@@ -97,24 +95,24 @@ func TestPresentedValuesAreGolden(t *testing.T) {
 			"    • `description`: `old text` → (not set)\n" +
 			"    • `comment`: (not set) → (empty)\n" +
 			"    • `posture`: `{\"fingerprint\":\"3f9a1c0e…\",\"ok\":true}` → `{\"ok\":false}`\n" +
-			"🔴 ✏️ *Tailnet policy* `changed` (policy, high)\n" +
+			"🔴 ✏️ *Tailnet policy* changed\n" +
 			"    • section `acls` changed (`3f9a1c0e` → `c41b7e2a`)\n" +
 			"    • section `ssh` added (`9e8d7c6b`)\n" +
 			"    • section `tests` removed\n" +
-			"🔴 ✏️ *SIEM webhook* `changed` (webhooks, high)\n" +
+			"🔴 ✏️ *SIEM webhook* (webhook) changed\n" +
 			"    • `endpointUrl`: secret changed (fingerprint `3f9a1c0e` → `c41b7e2a`)\n" +
 			"    • `secret`: secret set\n" +
 			"    • `token`: secret removed\n" +
-			"🟠 ✏️ *DNS configuration* `changed` (dns, medium)\n" +
+			"🟠 ✏️ *DNS configuration* changed\n" +
 			"    • `searchPaths`: now `example.com`, `corp.example.com`\n" +
 			"    • `nameservers`: now `8.8.8.8`, `1.1.1.1` (+`8.8.8.8`)\n" +
-			"    • `splitDNS.corp`: +`10.0.0.53`",
-		FormatPlain: "Tailscale inventory changed · example.com\n" +
-			"4 change(s): 0 created, 4 changed, 0 removed\n" +
-			"Severity: 🔴 3 high, 🟠 1 medium, ⚪ 0 low\n" +
-			"Observed at 2026-10-05T12:00:00Z\n" +
+			"    • `splitDNS.corp`: +`10.0.0.53`\n" +
 			"\n" +
-			"🔴 ✏️ web-02 changed (devices, high)\n" +
+			"5 Oct 2026 12:00 UTC",
+		FormatPlain: "🔴 4 Tailscale changes (3 high) · example.com\n" +
+			"4 changed · 🔴 3 high, 🟠 1 medium\n" +
+			"\n" +
+			"🔴 ✏️ web-02 (device) changed\n" +
 			"  • tags: +tag:db, −tag:old\n" +
 			"  • enabledRoutes: +10.1.0.0/24\n" +
 			"  • name: web-02 → web-02b\n" +
@@ -123,18 +121,72 @@ func TestPresentedValuesAreGolden(t *testing.T) {
 			"  • description: old text → (not set)\n" +
 			"  • comment: (not set) → (empty)\n" +
 			"  • posture: {\"fingerprint\":\"3f9a1c0e…\",\"ok\":true} → {\"ok\":false}\n" +
-			"🔴 ✏️ Tailnet policy changed (policy, high)\n" +
+			"🔴 ✏️ Tailnet policy changed\n" +
 			"  • section acls changed (3f9a1c0e → c41b7e2a)\n" +
 			"  • section ssh added (9e8d7c6b)\n" +
 			"  • section tests removed\n" +
-			"🔴 ✏️ SIEM webhook changed (webhooks, high)\n" +
+			"🔴 ✏️ SIEM webhook (webhook) changed\n" +
 			"  • endpointUrl: secret changed (fingerprint 3f9a1c0e → c41b7e2a)\n" +
 			"  • secret: secret set\n" +
 			"  • token: secret removed\n" +
-			"🟠 ✏️ DNS configuration changed (dns, medium)\n" +
+			"🟠 ✏️ DNS configuration changed\n" +
 			"  • searchPaths: now example.com, corp.example.com\n" +
 			"  • nameservers: now 8.8.8.8, 1.1.1.1 (+8.8.8.8)\n" +
-			"  • splitDNS.corp: +10.0.0.53",
+			"  • splitDNS.corp: +10.0.0.53\n" +
+			"\n" +
+			"5 Oct 2026 12:00 UTC",
+		FormatTeams: "**🔴 4 Tailscale changes (3 high) · example.com**\n" +
+			"4 changed · 🔴 3 high, 🟠 1 medium\n" +
+			"\n" +
+			"🔴 ✏️ **web-02** (device) changed\n" +
+			"- tags: +tag:db, −tag:old\n" +
+			"- enabledRoutes: +10.1.0.0/24\n" +
+			"- name: web-02 → web-02b\n" +
+			"- keyExpiryDisabled: false → true\n" +
+			"- retries: 3 → 4.5\n" +
+			"- description: old text → (not set)\n" +
+			"- comment: (not set) → (empty)\n" +
+			"- posture: {\"fingerprint\":\"3f9a1c0e…\",\"ok\":true} → {\"ok\":false}\n" +
+			"🔴 ✏️ **Tailnet policy** changed\n" +
+			"- section acls changed (3f9a1c0e → c41b7e2a)\n" +
+			"- section ssh added (9e8d7c6b)\n" +
+			"- section tests removed\n" +
+			"🔴 ✏️ **SIEM webhook** (webhook) changed\n" +
+			"- endpointUrl: secret changed (fingerprint 3f9a1c0e → c41b7e2a)\n" +
+			"- secret: secret set\n" +
+			"- token: secret removed\n" +
+			"🟠 ✏️ **DNS configuration** changed\n" +
+			"- searchPaths: now example.com, corp.example.com\n" +
+			"- nameservers: now 8.8.8.8, 1.1.1.1 (+8.8.8.8)\n" +
+			"- splitDNS.corp: +10.0.0.53\n" +
+			"\n" +
+			"5 Oct 2026 12:00 UTC",
+		FormatHTML: "<b>🔴 4 Tailscale changes (3 high) · example.com</b>\n" +
+			"4 changed · 🔴 3 high, 🟠 1 medium\n" +
+			"\n" +
+			"🔴 ✏️ <b>web-02</b> (device) changed\n" +
+			"  • <code>tags</code>: +<code>tag:db</code>, −<code>tag:old</code>\n" +
+			"  • <code>enabledRoutes</code>: +<code>10.1.0.0/24</code>\n" +
+			"  • <code>name</code>: <code>web-02</code> → <code>web-02b</code>\n" +
+			"  • <code>keyExpiryDisabled</code>: <code>false</code> → <code>true</code>\n" +
+			"  • <code>retries</code>: <code>3</code> → <code>4.5</code>\n" +
+			"  • <code>description</code>: <code>old text</code> → (not set)\n" +
+			"  • <code>comment</code>: (not set) → (empty)\n" +
+			"  • <code>posture</code>: <code>{&#34;fingerprint&#34;:&#34;3f9a1c0e…&#34;,&#34;ok&#34;:true}</code> → <code>{&#34;ok&#34;:false}</code>\n" +
+			"🔴 ✏️ <b>Tailnet policy</b> changed\n" +
+			"  • section <code>acls</code> changed (<code>3f9a1c0e</code> → <code>c41b7e2a</code>)\n" +
+			"  • section <code>ssh</code> added (<code>9e8d7c6b</code>)\n" +
+			"  • section <code>tests</code> removed\n" +
+			"🔴 ✏️ <b>SIEM webhook</b> (webhook) changed\n" +
+			"  • <code>endpointUrl</code>: secret changed (fingerprint <code>3f9a1c0e</code> → <code>c41b7e2a</code>)\n" +
+			"  • <code>secret</code>: secret set\n" +
+			"  • <code>token</code>: secret removed\n" +
+			"🟠 ✏️ <b>DNS configuration</b> changed\n" +
+			"  • <code>searchPaths</code>: now <code>example.com</code>, <code>corp.example.com</code>\n" +
+			"  • <code>nameservers</code>: now <code>8.8.8.8</code>, <code>1.1.1.1</code> (+<code>8.8.8.8</code>)\n" +
+			"  • <code>splitDNS.corp</code>: +<code>10.0.0.53</code>\n" +
+			"\n" +
+			"5 Oct 2026 12:00 UTC",
 	}
 	message := presenterDigest()
 	for format, want := range golden {
@@ -230,7 +282,7 @@ func TestPresenterEdgeCases(t *testing.T) {
 	for i := 0; i < 6; i++ {
 		changes = append(changes, model.Change{Kind: "changed", Collector: "devices", ResourceID: string(rune('a' + i)), Name: string(rune('a' + i)), Fields: []model.FieldChange{set("tags", []any{"tag:prod"}, []any{"tag:db", "tag:prod"})}})
 	}
-	if got := Plain(Context{}.Digest(DigestInput{ObservedAt: testObservedAt, Changes: changes})); !strings.Contains(got, "🔴 📦 tags: +tag:db on 6 resources (devices)") {
+	if got := Plain(Context{}.Digest(DigestInput{ObservedAt: testObservedAt, Changes: changes})); !strings.Contains(got, "🔴 📦 6 devices: tags +tag:db\n") {
 		t.Fatalf("fleet line:\n%s", got)
 	}
 }

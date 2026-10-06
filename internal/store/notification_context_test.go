@@ -62,7 +62,7 @@ func TestDigestLinksItsHistoryBatchOnlyWhenPublicURLIsSet(t *testing.T) {
 		t.Fatalf("first batch=%+v err=%v", first, err)
 	}
 	payloads := pendingPayloads(t, st, first.ID)
-	if len(payloads) != 1 || !strings.Contains(payloads[0], fmt.Sprintf("(https://tailstate.example/history?batch=%d)", first.ID)) || !strings.Contains(payloads[0], "· example.com") || !strings.Contains(payloads[0], "Observed at "+first.ObservedAt.UTC().Format("2006-01-02T15:04:05Z")) {
+	if len(payloads) != 1 || !strings.Contains(payloads[0], fmt.Sprintf("(https://tailstate.example/history?batch=%d)", first.ID)) || !strings.Contains(payloads[0], "· example.com") || !strings.Contains(payloads[0], "\n"+first.ObservedAt.UTC().Format("2 Jan 2006 15:04 UTC")) {
 		t.Fatalf("digest payload does not link its batch: %q", payloads)
 	}
 	unlinked := notify.Context{Tailnet: "example.com"}
@@ -114,7 +114,7 @@ func TestEnqueueMessageAndUpdateNotificationCarryContext(t *testing.T) {
 		t.Fatalf("payloads=%q", payloads)
 	}
 	for _, payload := range payloads {
-		if !strings.Contains(payload, "· corp.example") || !strings.Contains(payload, "Observed at 2026-10-05T12:00:00Z") {
+		if !strings.Contains(payload, "· corp.example") || !strings.Contains(payload, "Observed at 5 Oct 2026 12:00 UTC") {
 			t.Fatalf("system message lacks context: %q", payload)
 		}
 	}

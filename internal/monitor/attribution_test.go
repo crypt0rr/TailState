@@ -108,7 +108,8 @@ func auditLogBody(at time.Time) string {
 // configuration audit source end to end with spec-shaped fixtures: a device
 // tag change and a policy edit are attributed in History, in every digest
 // renderer, and in the signed evidence pack; a client upgrade without an
-// audit entry is "actor unknown" in the same batch; and no audit-log
+// audit entry is "actor unknown" in History (and names no actor in the
+// digest) in the same batch; and no audit-log
 // old/new value, action detail, or error text reaches the database.
 func TestChangeAttributionNamesActorInHistoryDigestAndEvidence(t *testing.T) {
 	ctx := context.Background()
@@ -185,10 +186,13 @@ func TestChangeAttributionNamesActorInHistoryDigestAndEvidence(t *testing.T) {
 		if len(messages) != 1 {
 			t.Fatalf("%s received %d digests", serviceURL, len(messages))
 		}
-		for _, text := range []string{"Changed by:", "alice@example.com", "Alice Example", "via admin console", "kCIclient", "via API", "actor unknown"} {
+		for _, text := range []string{"changed by alice@example.com", "Alice Example", "via admin console", "changed by kCIclient", "via API", "Attributed: 2 of 3 changes"} {
 			if !strings.Contains(messages[0], text) {
 				t.Fatalf("%s digest is missing %q:\n%s", serviceURL, text, messages[0])
 			}
+		}
+		if strings.Contains(messages[0], "actor unknown") {
+			t.Fatalf("%s digest names an unknown actor:\n%s", serviceURL, messages[0])
 		}
 	}
 	sender.mu.Unlock()
@@ -333,7 +337,8 @@ func TestUnsupportedAuditLogDegradesSilently(t *testing.T) {
 
 // TestAuditLookupFailureNeverDelaysOrFailsDriftDetection hangs the audit
 // endpoint: the batch is still recorded and notified within the lookup
-// budget, every change is "actor unknown", the failure is counted in the
+// budget, every change is "actor unknown" in History, the digest says
+// "Attribution unavailable", the failure is counted in the
 // metrics, and the status page reports the source as unavailable.
 func TestAuditLookupFailureNeverDelaysOrFailsDriftDetection(t *testing.T) {
 	previous := attributionLookupBudget
@@ -366,7 +371,7 @@ func TestAuditLookupFailureNeverDelaysOrFailsDriftDetection(t *testing.T) {
 		}
 	}
 	items, err := st.ClaimDueOutbox(ctx, 10, time.Minute)
-	if err != nil || len(items) != 1 || !strings.Contains(items[0].Payload, "actor unknown") {
+	if err != nil || len(items) != 1 || !strings.Contains(items[0].Payload, "Attribution unavailable") || strings.Contains(items[0].Payload, "actor unknown") {
 		t.Fatalf("digest after failed lookup=%v err=%v", items, err)
 	}
 	if metrics := engine.AttributionMetrics(); metrics.LookupsFailed != 1 || metrics.ChangesUnknown != 2 {

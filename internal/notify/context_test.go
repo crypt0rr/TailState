@@ -22,10 +22,16 @@ func TestEveryNotificationIncludesTailnetAndObservedTime(t *testing.T) {
 	for name, message := range cases {
 		rendered := Markdown(message)
 		title, _, _ := strings.Cut(rendered, "\n")
-		if !strings.Contains(title, `prod\-eu \(example.com\)`) {
+		if !strings.Contains(title, "prod-eu (example.com)") {
 			t.Fatalf("%s title does not name the instance and tailnet: %q", name, title)
 		}
-		if !strings.Contains(rendered, "\nObserved at 2026-10-05T12:00:00Z") {
+		// Digests state the time on their closing context line, every other
+		// message on an "Observed at" line.
+		observed := "\nObserved at 5 Oct 2026 12:00 UTC"
+		if name == "digest" {
+			observed = "\n5 Oct 2026 12:00 UTC"
+		}
+		if !strings.Contains(rendered, observed) {
 			t.Fatalf("%s message has no observation time:\n%s", name, rendered)
 		}
 	}
@@ -42,7 +48,7 @@ func TestDigestLinksBatchOnlyWithPublicURL(t *testing.T) {
 		t.Fatalf("digest without a public URL contains a link:\n%s", without)
 	}
 	with := Markdown(Context{Tailnet: "example.com", PublicURL: "https://tailstate.example/base"}.Digest(DigestInput{BatchID: 42, ObservedAt: testObservedAt, Changes: changes}))
-	if !strings.Contains(with, "[View batch \\#42 in TailState History](https://tailstate.example/base/history?batch=42)") {
+	if !strings.Contains(with, "[Batch 42 in History](https://tailstate.example/base/history?batch=42)") {
 		t.Fatalf("digest does not link the batch:\n%s", with)
 	}
 	health := Markdown(Context{PublicURL: "https://tailstate.example"}.CollectorsUnhealthy([]CollectorHealth{{Collector: "devices"}}, testObservedAt))
@@ -56,7 +62,7 @@ func TestDigestLinksBatchOnlyWithPublicURL(t *testing.T) {
 
 func TestTestMessageNamesInstanceTailnetVersionAndTime(t *testing.T) {
 	got := Markdown(Context{Label: "lab", Tailnet: "corp.example", Version: "v1.4.0"}.Test(testObservedAt))
-	for _, want := range []string{"TailState test", "**Instance:** lab", "**Tailnet:** corp.example", "**Version:** `v1.4.0`", "Observed at 2026-10-05T12:00:00Z"} {
+	for _, want := range []string{"TailState test", "**Instance:** lab", "**Tailnet:** corp.example", "**Version:** `v1.4.0`", "Observed at 5 Oct 2026 12:00 UTC"} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("test message missing %q:\n%s", want, got)
 		}

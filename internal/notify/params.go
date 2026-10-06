@@ -8,12 +8,21 @@ import (
 
 	"github.com/nicholas-fedor/shoutrrr/pkg/format"
 	"github.com/nicholas-fedor/shoutrrr/pkg/types"
+
+	"github.com/crypt0rr/tailstate/internal/model"
 )
 
 // Shoutrrr parameters TailState may set when it sends a message.
 const (
 	paramTitle      = "title"
 	paramSplitLines = "splitlines"
+	paramPriority   = "priority"
+	paramTags       = "tags"
+	paramColor      = "color"
+	paramParseMode  = "parsemode"
+
+	// parseModeHTML is the Telegram parse mode of the HTML rendering.
+	parseModeHTML = "HTML"
 )
 
 // serviceParams is the per-service allowlist of Shoutrrr config keys
@@ -30,17 +39,49 @@ const (
 // title key) receive no parameters, and their messages keep the title as the
 // first line of the body. Mattermost, Matrix, and Zulip have a title key but
 // are deliberately not listed: Mattermost and Matrix only prepend it to the
-// body as unformatted text, and Zulip uses it as the stream topic.
+// body as unformatted text, and Zulip uses it as the stream topic. Opsgenie
+// is listed for its priority only (see severityParams).
 var serviceParams = map[string]map[string][]string{
-	"discord":    {paramTitle: {"title"}, paramSplitLines: {"splitlines"}},
-	"gotify":     {paramTitle: {"title"}},
-	"ntfy":       {paramTitle: {"title"}},
+	"discord":    {paramTitle: {"title"}, paramSplitLines: {"splitlines"}, paramColor: {"color"}},
+	"gotify":     {paramTitle: {"title"}, paramPriority: {"priority"}},
+	"ntfy":       {paramTitle: {"title"}, paramPriority: {"priority"}, paramTags: {"tags"}},
+	"opsgenie":   {paramPriority: {"priority"}},
 	"pushbullet": {paramTitle: {"title"}},
-	"pushover":   {paramTitle: {"title"}},
-	"slack":      {paramTitle: {"title"}},
+	"pushover":   {paramTitle: {"title"}, paramPriority: {"priority"}},
+	"slack":      {paramTitle: {"title"}, paramColor: {"color"}},
 	"smtp":       {paramTitle: {"subject", "title"}},
-	"teams":      {paramTitle: {"title"}},
-	"telegram":   {paramTitle: {"title"}},
+	"teams":      {paramTitle: {"title"}, paramColor: {"color"}},
+	"telegram":   {paramTitle: {"title"}, paramParseMode: {"parsemode"}},
+}
+
+// severityParams maps a message's severity (the highest severity of a
+// digest, or the fixed level of a system notification) to provider
+// priority, tags, and colour. Every parameter is on the service's
+// allowlist, so a value set in the destination URL wins. No mapping uses a
+// priority that needs acknowledgement, such as Pushover's emergency 2.
+// Slack is sent natively: its colour is applied to the payload's
+// attachment (see slackPayloadFor).
+var severityParams = map[string]map[string]map[model.Severity]string{
+	"ntfy": {
+		paramPriority: {model.SeverityHigh: "4", model.SeverityMedium: "3", model.SeverityLow: "2"},
+		paramTags:     {model.SeverityHigh: "rotating_light", model.SeverityMedium: "warning", model.SeverityLow: "information_source"},
+	},
+	"pushover": {paramPriority: {model.SeverityHigh: "1", model.SeverityMedium: "0", model.SeverityLow: "-1"}},
+	"gotify":   {paramPriority: {model.SeverityHigh: "8", model.SeverityMedium: "5", model.SeverityLow: "2"}},
+	"opsgenie": {paramPriority: {model.SeverityHigh: "P2", model.SeverityMedium: "P3", model.SeverityLow: "P5"}},
+	"discord":  {paramColor: {model.SeverityHigh: "0xd60510", model.SeverityMedium: "0xff8c00", model.SeverityLow: "0x95a5a6"}},
+	"slack":    {paramColor: {model.SeverityHigh: "#d60510", model.SeverityMedium: "#ff8c00", model.SeverityLow: "#95a5a6"}},
+	"teams":    {paramColor: {model.SeverityHigh: "attention", model.SeverityMedium: "warning", model.SeverityLow: "default"}},
+}
+
+// severityParam returns the value TailState passes for a severity-mapped
+// parameter, or "" when the service has no mapping, the severity is unknown
+// (a legacy row), or the destination URL sets the parameter itself.
+func (d destination) severityParam(param, severity string) string {
+	if d.paramKey(param) == "" {
+		return ""
+	}
+	return severityParams[d.scheme][param][model.Severity(severity)]
 }
 
 // serviceDefaults are fixed parameter values TailState passes unless the
@@ -120,11 +161,12 @@ func (d destination) sendsTitleSeparately() bool {
 	}
 	switch d.scheme {
 	case "telegram":
-		// Shoutrrr shows a Telegram title only in its HTML parse mode, which
-		// it selects (escaping the body) when no parse mode is set. With an
-		// explicit Markdown parse mode the title would be dropped.
-		mode := strings.ToLower(d.query["parsemode"])
-		return mode == "" || mode == "none"
+		// Shoutrrr shows a Telegram title only in its HTML parse mode: the one
+		// TailState passes with its HTML rendering, the one an operator set,
+		// or the one Shoutrrr selects (escaping a plain body) when no parse
+		// mode is set. With a Markdown parse mode the title would be dropped.
+		mode := strings.ToLower(d.query[paramParseMode])
+		return mode == "" || mode == "none" || mode == "html"
 	case "discord":
 		// In JSON mode Discord sends the body as a raw payload and ignores
 		// every parameter.
@@ -164,13 +206,26 @@ func CountSplitLinesWarnings(serviceURLs []string) int {
 }
 
 // params returns the Shoutrrr parameters for one send, or nil when the
-// destination accepts none. title is the plain-text title, or "" when the
-// title is part of the body.
-func (d destination) params(title string) *types.Params {
+// destination accepts none: the plain-text title when the message carries
+// it separately, the severity's priority, tags, and colour, and the
+// service's fixed defaults, each only when the URL does not set it.
+func (d destination) params(message Prepared) *types.Params {
 	params := types.Params{}
-	if title != "" {
+	if message.Title != "" {
 		if key := d.paramKey(paramTitle); key != "" {
-			params[key] = encodeTitle(d.scheme, title)
+			params[key] = encodeTitle(d.scheme, message.Title)
+		}
+	}
+	if message.Format == FormatHTML {
+		// The HTML rendering is only shown as such in Telegram's HTML parse
+		// mode; Shoutrrr's own HTML mode would escape it.
+		if key := d.paramKey(paramParseMode); key != "" {
+			params[key] = parseModeHTML
+		}
+	}
+	for param := range severityParams[d.scheme] {
+		if value := d.severityParam(param, message.Severity); value != "" {
+			params[d.paramKey(param)] = value
 		}
 	}
 	for param, value := range serviceDefaults[d.scheme] {

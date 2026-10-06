@@ -25,36 +25,46 @@ func goldenDigest() Message {
 // one digest (E-019 golden tests).
 func TestRenderedFormatsAreGolden(t *testing.T) {
 	golden := map[string]string{
-		FormatMarkdown: "### Tailscale inventory changed · lab \\(example.com\\)\n" +
-			"**2 change(s):** 1 created, 1 changed, 0 removed\n" +
-			"**Severity:** 🔴 1 high, 🟠 1 medium, ⚪ 0 low\n" +
-			"Observed at 2026-10-05T12:00:00Z\n" +
-			"[View batch \\#42 in TailState History](https://tailstate.example/history?batch=42)\n" +
-			"_1 muted change(s) not shown; they are recorded in TailState History._\n" +
+		FormatMarkdown: "### 🔴 2 Tailscale changes (1 high) · lab (example.com)\n" +
+			"1 created, 1 changed · 🔴 1 high, 🟠 1 medium\n" +
 			"\n" +
-			"🔴 ✏️ **alice** `changed` (users, high)\n" +
+			"🔴 ✏️ **alice** (user) changed\n" +
 			"  - `role`: `member` → `admin`\n" +
-			"🟠 ➕ **web\\_\\*1\\*\\<\\!channel\\>** `created` (devices, medium)",
-		FormatSlack: "*Tailscale inventory changed · lab (example.com)*\n" +
-			"*2 change(s):* 1 created, 1 changed, 0 removed\n" +
-			"*Severity:* 🔴 1 high, 🟠 1 medium, ⚪ 0 low\n" +
-			"Observed at 2026-10-05T12:00:00Z\n" +
-			"<https://tailstate.example/history?batch=42|View batch #42 in TailState History>\n" +
-			"_1 muted change(s) not shown; they are recorded in TailState History._\n" +
+			"🟠 ➕ **web\\_\\*1\\*\\<!channel>** (device) created\n" +
 			"\n" +
-			"🔴 ✏️ *alice* `changed` (users, high)\n" +
+			"1 muted change not shown · 5 Oct 2026 12:00 UTC · [Batch 42 in History](https://tailstate.example/history?batch=42)",
+		FormatSlack: "*🔴 2 Tailscale changes (1 high) · lab (example.com)*\n" +
+			"1 created, 1 changed · 🔴 1 high, 🟠 1 medium\n" +
+			"\n" +
+			"🔴 ✏️ *alice* (user) changed\n" +
 			"    • `role`: `member` → `admin`\n" +
-			"🟠 ➕ *web_∗1∗&lt;!channel&gt;* `created` (devices, medium)",
-		FormatPlain: "Tailscale inventory changed · lab (example.com)\n" +
-			"2 change(s): 1 created, 1 changed, 0 removed\n" +
-			"Severity: 🔴 1 high, 🟠 1 medium, ⚪ 0 low\n" +
-			"Observed at 2026-10-05T12:00:00Z\n" +
-			"View batch #42 in TailState History: https://tailstate.example/history?batch=42\n" +
-			"1 muted change(s) not shown; they are recorded in TailState History.\n" +
+			"🟠 ➕ *web_∗1∗&lt;!channel&gt;* (device) created\n" +
 			"\n" +
-			"🔴 ✏️ alice changed (users, high)\n" +
+			"1 muted change not shown · 5 Oct 2026 12:00 UTC · <https://tailstate.example/history?batch=42|Batch 42 in History>",
+		FormatPlain: "🔴 2 Tailscale changes (1 high) · lab (example.com)\n" +
+			"1 created, 1 changed · 🔴 1 high, 🟠 1 medium\n" +
+			"\n" +
+			"🔴 ✏️ alice (user) changed\n" +
 			"  • role: member → admin\n" +
-			"🟠 ➕ web_*1*<!channel> created (devices, medium)",
+			"🟠 ➕ web_*1*<!channel> (device) created\n" +
+			"\n" +
+			"1 muted change not shown · 5 Oct 2026 12:00 UTC · Batch 42 in History: https://tailstate.example/history?batch=42",
+		FormatTeams: "**🔴 2 Tailscale changes (1 high) · lab (example.com)**\n" +
+			"1 created, 1 changed · 🔴 1 high, 🟠 1 medium\n" +
+			"\n" +
+			"🔴 ✏️ **alice** (user) changed\n" +
+			"- role: member → admin\n" +
+			"🟠 ➕ **web＿∗1∗<!channel>** (device) created\n" +
+			"\n" +
+			"1 muted change not shown · 5 Oct 2026 12:00 UTC · [Batch 42 in History](https://tailstate.example/history?batch=42)",
+		FormatHTML: "<b>🔴 2 Tailscale changes (1 high) · lab (example.com)</b>\n" +
+			"1 created, 1 changed · 🔴 1 high, 🟠 1 medium\n" +
+			"\n" +
+			"🔴 ✏️ <b>alice</b> (user) changed\n" +
+			"  • <code>role</code>: <code>member</code> → <code>admin</code>\n" +
+			"🟠 ➕ <b>web_*1*&lt;!channel&gt;</b> (device) created\n" +
+			"\n" +
+			"1 muted change not shown · 5 Oct 2026 12:00 UTC · <a href=\"https://tailstate.example/history?batch=42\">Batch 42 in History</a>",
 	}
 	message := goldenDigest()
 	for format, want := range golden {
@@ -77,7 +87,7 @@ func TestRenderedFormatsAreGolden(t *testing.T) {
 // criterion, and keeps tenant values from creating mentions or links.
 func TestSlackDigestUsesMrkdwnWithoutHeadings(t *testing.T) {
 	got := Render(goldenDigest(), FormatFor("slack://hooks/T000/B000/XXXX", ""))
-	if strings.Contains(got, "###") || strings.Contains(got, "**") || !strings.HasPrefix(got, "*Tailscale inventory changed") || !strings.Contains(got, "*alice*") {
+	if strings.Contains(got, "###") || strings.Contains(got, "**") || !strings.HasPrefix(got, "*🔴 2 Tailscale changes (1 high)") || !strings.Contains(got, "*alice*") {
 		t.Fatalf("slack digest is not mrkdwn:\n%s", got)
 	}
 	if strings.Contains(got, "<!channel>") || strings.Contains(got, "\\") {
@@ -113,18 +123,21 @@ func TestPlainOutputHasNoMarkdownControlSyntax(t *testing.T) {
 
 func TestFormatSelectionByServiceAndOverride(t *testing.T) {
 	cases := map[string]string{
-		"slack://hooks/a/b/c":                   FormatSlack,
-		"googlechat://chat.googleapis.com/v1/x": FormatSlack,
-		"mattermost://host/token":               FormatMarkdown,
-		"discord://token@id":                    FormatMarkdown,
-		"generic+https://example.com/hook":      FormatMarkdown,
-		"telegram://token@telegram?chats=1":     FormatPlain,
-		"smtp://user:pass@host:25/?to=a@b":      FormatPlain,
-		"pushover://shoutrrr:token@user":        FormatPlain,
-		"matrix://:token@matrix.example/":       FormatPlain,
-		"ntfy://ntfy.sh/topic":                  FormatPlain,
-		"unknownservice://x":                    FormatMarkdown,
-		"not a url":                             FormatMarkdown,
+		"slack://hooks/a/b/c":                                  FormatSlack,
+		"googlechat://chat.googleapis.com/v1/x":                FormatSlack,
+		"mattermost://host/token":                              FormatMarkdown,
+		"discord://token@id":                                   FormatMarkdown,
+		"generic+https://example.com/hook":                     FormatMarkdown,
+		"telegram://token@telegram?chats=1":                    FormatHTML,
+		"telegram://token@telegram?chats=1&parsemode=HTML":     FormatHTML,
+		"telegram://token@telegram?chats=1&parsemode=Markdown": FormatPlain,
+		"telegram://token@telegram?chats=1&parsemode=None":     FormatPlain,
+		"smtp://user:pass@host:25/?to=a@b":                     FormatPlain,
+		"pushover://shoutrrr:token@user":                       FormatPlain,
+		"matrix://:token@matrix.example/":                      FormatPlain,
+		"ntfy://ntfy.sh/topic":                                 FormatPlain,
+		"unknownservice://x":                                   FormatMarkdown,
+		"not a url":                                            FormatMarkdown,
 	}
 	for serviceURL, want := range cases {
 		if got := FormatFor(serviceURL, ""); got != want {
@@ -134,18 +147,18 @@ func TestFormatSelectionByServiceAndOverride(t *testing.T) {
 	if got := FormatFor("slack://hooks/a/b/c", "plain"); got != FormatPlain {
 		t.Fatalf("override ignored: %q", got)
 	}
-	if got := FormatFor("telegram://t@telegram", "bogus"); got != FormatPlain {
+	if got := FormatFor("telegram://t@telegram", "bogus"); got != FormatHTML {
 		t.Fatalf("invalid override was applied: %q", got)
 	}
-	for _, valid := range []string{"", "Markdown", " slack ", "plain"} {
+	for _, valid := range []string{"", "Markdown", " slack ", "plain", "Teams", "HTML"} {
 		if _, err := ValidateFormat(valid); err != nil {
 			t.Fatalf("ValidateFormat(%q): %v", valid, err)
 		}
 	}
-	if _, err := ValidateFormat("html"); err == nil {
+	if _, err := ValidateFormat("markdownv2"); err == nil {
 		t.Fatal("unknown format accepted")
 	}
-	if len(Formats) != 3 {
+	if len(Formats) != 5 {
 		t.Fatalf("formats=%v", Formats)
 	}
 }

@@ -13,6 +13,8 @@ import (
 	"strings"
 
 	"github.com/nicholas-fedor/shoutrrr/pkg/services/chat/slack"
+
+	"github.com/crypt0rr/tailstate/internal/model"
 )
 
 // Slack Block Kit limits.
@@ -108,8 +110,14 @@ func slackPayloadFor(message Prepared, config *slack.Config) slackPayload {
 		}
 		blocks = append(blocks, slackBlock{Type: "section", Text: slackText{Type: textType, Text: chunk}})
 	}
-	if config.Color != "" {
-		payload.Attachments = []slackAttachment{{Color: config.Color, Blocks: blocks}}
+	// An operator colour from the URL wins over the severity's colour; a
+	// legacy row without a severity has neither.
+	color := config.Color
+	if color == "" {
+		color = severityParams["slack"][paramColor][model.Severity(message.Severity)]
+	}
+	if color != "" {
+		payload.Attachments = []slackAttachment{{Color: color, Blocks: blocks}}
 	} else {
 		payload.Blocks = blocks
 	}

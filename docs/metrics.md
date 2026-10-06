@@ -79,7 +79,7 @@ validated in CI with `promtool check rules`:
 | `TailStateCollectorFailing` | A supported collector has failed three or more consecutive polls |
 | `TailStateCollectorPollOverdue`, `TailStateSchedulerDatabaseErrors` | The scheduler is behind or cannot read due collectors |
 | `TailStateWebhookTriggersDead` | Webhook triggers exhausted their retry window |
-| `TailStateAttributionLookupsFailing` | Audit log lookups keep failing, so changes show "actor unknown" |
+| `TailStateAttributionLookupsFailing` | Audit log lookups keep failing, so changes show "actor unknown" in History and digests say "Attribution unavailable" |
 | `TailStateStoragePressureHigh`, `TailStateStoragePressureCritical` | Used database bytes exceed 80% or 95% of the budget |
 | `TailStateStorageLimitNotEnforced` | `tailstate_storage_limit_enforced == 0`: the database needs compaction |
 | `TailStateRetentionCleanupFailing` | Retention cleanup keeps failing |

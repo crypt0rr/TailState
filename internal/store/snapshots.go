@@ -565,7 +565,7 @@ func (s *Store) recordChangeBatch(a *batchApply, results []model.Collected, dige
 			return ChangeBatchResult{}, err
 		}
 	}
-	input := notify.DigestInput{BatchID: batchID, ObservedAt: a.now, Changes: notifiable, MutedCount: mutedCount, ResourceCounts: resourceCounts, Attributed: attributionShown(lookup.Status)}
+	input := notify.DigestInput{BatchID: batchID, ObservedAt: a.now, Changes: notifiable, MutedCount: mutedCount, ResourceCounts: resourceCounts, Attributed: attributionShown(lookup.Status), AttributionUnavailable: lookup.Status == AttributionUnavailable}
 	if err := enqueueDigestTx(ctx, tx, digest, input, severities, a.observedAt); err != nil {
 		return ChangeBatchResult{}, err
 	}

@@ -81,7 +81,7 @@ func TestHighSeverityDestinationSkipsRoutineClientUpdates(t *testing.T) {
 	if _, paged := deliveries[pagerID]; paged || len(deliveries) != 1 {
 		t.Fatalf("client-version-only batch reached the high-severity destination: %v", deliveries)
 	}
-	if !strings.Contains(deliveries[defaultID], "⚪ ✏️ **host\\-a**") || !strings.Contains(deliveries[defaultID], "(devices, low)") {
+	if !strings.Contains(deliveries[defaultID], "⚪ ✏️ **host-a**") || !strings.Contains(deliveries[defaultID], "(device) changed") {
 		t.Fatalf("default digest does not show the low severity:\n%s", deliveries[defaultID])
 	}
 	retag, err := st.ApplyBatchWithBatch(ctx, generation, []model.Collected{deviceFleet(func(index int) map[string]any {
@@ -176,7 +176,7 @@ func TestDestinationFormatOverride(t *testing.T) {
 	if err != nil || destinations[0].Format != notify.FormatSlack {
 		t.Fatalf("format=%+v err=%v", destinations, err)
 	}
-	if err := st.SetDestinationFormat(ctx, id, "html"); err == nil {
+	if err := st.SetDestinationFormat(ctx, id, "markdownv2"); err == nil {
 		t.Fatal("unknown format saved")
 	}
 	if err := st.SetDestinationFormat(ctx, 999, notify.FormatPlain); err == nil || !strings.Contains(err.Error(), "not found") {

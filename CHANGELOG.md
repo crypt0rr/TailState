@@ -13,6 +13,18 @@ rollback requires restoring the backup taken before the upgrade. See
 
 ## [Unreleased]
 
+### Added
+- Notifications carry their severity to services that support it: the highest severity of a digest (or a fixed level for health alerts, expiry warnings, configuration changes, and the Settings test) sets the ntfy priority and tags (4/3/2, `rotating_light`/`warning`/`information_source`), the Pushover priority (1/0/-1, never the acknowledgement-only 2), the Gotify priority (8/5/2), the Opsgenie priority (P2/P3/P5), and a red, orange, or grey colour for Discord embeds, Slack attachments, and Teams card titles. A value set in the destination URL wins, services without these keys receive none, and messages queued before the upgrade keep the provider's default (#234).
+- Telegram notifications use Telegram's HTML formatting: names in bold, values in `<code>`, remarks in italics, and the History and Status links as labelled anchors to the public URL, sent with `parsemode=HTML` and the title. Every value is HTML-escaped, the 4,096-byte budget is counted on the rendered HTML, and a `parsemode` set in the URL is respected (Markdown modes receive plain text). Plain text stays available as a format override, and "Telegram HTML" is a new override (#235).
+
+### Changed
+- Digests use a compact layout: the title states the number of changes, leads with the highest severity's icon, and counts that severity ("🔴 19 Tailscale changes (5 high) · prod (example.com)"), so push and e-mail previews show volume and urgency; change lines read "🔴 ✏️ **web-02** (device) changed" instead of repeating kind and severity; fleet transitions on the same resources share one line ("12 devices: clientVersion 1.80.2 → 1.82.0, updateAvailable true → false"); counts use collector nouns and proper plurals; device names lose the tailnet's MagicDNS suffix (History, the API, and evidence packs keep it); times are shown as "6 Oct 2026 09:14 UTC"; and one closing context line names the muted count, time, and History link and is kept when a digest is shortened. The assessment's sample digest is about 36% smaller than in v0.15.0 with every change, actor, and field still present (#236).
+- Digests name an actor only when the configuration audit log knows it, on the change's own line ("🔴 ✏️ **Tailnet policy** changed by alice@example.com via admin console", or on a "Changed by" line when the line is long), and fleet and schema summaries name the actors of the changes they stand for. There are no more "Changed by: actor unknown" lines; instead the header states "Attributed: 4 of 19 changes", or "Attribution unavailable" when the lookup failed. History, the API, and evidence packs keep their explicit "actor unknown" (#233).
+
+### Fixed
+- Microsoft Teams notifications no longer show raw `###` headings, backticks, and backslashes: Teams destinations get their own rendering for the Adaptive Card TextBlock subset (the title as the card title, `**bold**` names, plain values, `- ` list items, `[label](url)` links), with values escaped by look-alike characters instead of backslashes so they cannot form links or emphasis. The rendering is also available as the "Microsoft Teams" format override in Settings (#231).
+- Markdown notifications no longer add backslashes to ordinary names and labels: values escape only the characters that change inline meaning (`*`, `_`, `[`, `]`, `` ` ``, `<`, `\`, `~`, `|`), so `prod-monitor (example.com)`, `ci-runner auth key`, and e-mail addresses read and copy as they are. Images, links, emphasis, HTML, and autolinks inside values stay inert, and a generated-value test checks that no rendered line in any format starts with tenant-controlled text (#232).
+
 ## [0.16.0] - 2026-10-06
 
 - **Schema:** 17 (unchanged)

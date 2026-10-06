@@ -179,7 +179,8 @@ func TestAttributionWindowCoversPollIntervalWithClockSkew(t *testing.T) {
 
 // TestAttributionLookupFailuresNeverFailTheBatch records the batch when the
 // lookup reports an unknown status, overruns its budget, or is unsupported:
-// failures render "actor unknown" and unsupported renders nothing.
+// failures record "actor unknown" in History and "Attribution unavailable" in
+// the digest, and unsupported renders nothing.
 func TestAttributionLookupFailuresNeverFailTheBatch(t *testing.T) {
 	ctx := context.Background()
 	st := testStore(t)
@@ -227,7 +228,10 @@ func TestAttributionLookupFailuresNeverFailTheBatch(t *testing.T) {
 				t.Fatalf("changed by=%q, want %q", got, tc.want)
 			}
 			payloads := pendingPayloads(t, st, batch.ID)
-			if len(payloads) != 1 || strings.Contains(payloads[0], "Changed by") != (tc.want != "") {
+			// The digest states the lookup outcome in its header and names
+			// only known actors; History keeps "actor unknown".
+			header := map[string]string{AttributionUnavailable: "\nAttribution unavailable\n", AttributionComplete: "\nAttributed: 1 of 1 change\n"}[tc.status]
+			if len(payloads) != 1 || strings.Contains(payloads[0], model.ActorUnknown) || strings.Contains(payloads[0], "Attribut") != (header != "") || !strings.Contains(payloads[0], header) || strings.Contains(payloads[0], "changed by alice via admin console") != (tc.status == AttributionComplete) {
 				t.Fatalf("digest attribution for %s: %v", tc.name, payloads)
 			}
 		})

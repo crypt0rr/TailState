@@ -194,13 +194,20 @@ when a poll can produce a change.
 - **Where it is shown.** History shows **Changed by** for every change of an
   attributed batch, for example "alice@example.com (Alice) via admin console"
   or "k123 [OAuth client] via API", followed by the audit action and time.
-  Digests add a **Changed by** line under each listed change in every message
-  format, `/api/v1/history` adds `changed_by`, the `attribution` record, and
+  Digests name each known actor on the change's own line in every message
+  format ("🔴 ✏️ **Tailnet policy** changed by alice@example.com via admin
+  console", or on a separate **Changed by** line when the change line is
+  long), and fleet and schema summaries name the actors of the changes they
+  stand for; the digest header states "Attributed: 3 of 7 changes", or
+  "Attribution unavailable" when the lookup failed. `/api/v1/history` adds
+  `changed_by`, the `attribution` record, and
   the batch `attribution_status`, and evidence packs (format version 5) sign
   the record (see [History and evidence](evidence.md#evidence-packs)).
 - **Unknown actors.** A change without a matching entry, or every change of a
-  batch whose lookup failed or timed out, shows "actor unknown"; the batch
-  itself is recorded and notified as usual.
+  batch whose lookup failed or timed out, shows "actor unknown" in History,
+  the API, and evidence packs; digests leave the actor out instead of adding
+  an "actor unknown" line. The batch itself is recorded and notified as
+  usual.
 - **Unsupported.** A `403` (missing scope or plan) or `404` (logging not
   available) degrades silently: changes carry no attribution and no
   "Changed by" line, the status page's **Change attribution** card shows

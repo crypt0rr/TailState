@@ -6,6 +6,8 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	"github.com/crypt0rr/tailstate/internal/model"
 )
 
 // Message is a format-neutral notification. Spans carry a style instead of
@@ -22,14 +24,33 @@ type Message struct {
 	Scope string `json:"scope,omitempty"`
 	Lines []Line `json:"lines,omitempty"`
 	Text  string `json:"text,omitempty"`
+	// Severity is "high", "medium", or "low": the highest severity of a
+	// digest, or the fixed level of a system notification. It selects the
+	// destination's priority, tags, or colour (see severityParams).
+	Severity string `json:"severity,omitempty"`
 }
 
-// Line kinds. A plain line is a paragraph line, an item is a bulleted detail
-// below the previous line, and a note is an indented, emphasised remark.
+// Fixed severities of system notifications: collector failures and
+// configuration changes are urgent, expiry warnings are not yet, and
+// recoveries, release notices, and the Settings test are routine.
 const (
-	LinePlain = ""
-	LineItem  = "item"
-	LineNote  = "note"
+	severityUnhealthy   = model.SeverityHigh
+	severityAdminChange = model.SeverityHigh
+	severityExpiry      = model.SeverityMedium
+	severityRecovered   = model.SeverityLow
+	severityUpdate      = model.SeverityLow
+	severityTest        = model.SeverityLow
+)
+
+// Line kinds. A plain line is a paragraph line, an item is a bulleted detail
+// below the previous line, and a note is an indented, emphasised remark. A
+// context line is rendered like a plain line, but trailing context lines are
+// kept when a message is shortened for a destination (see PrepareMessage).
+const (
+	LinePlain   = ""
+	LineItem    = "item"
+	LineNote    = "note"
+	LineContext = "context"
 )
 
 // Line is one rendered line. Every line is complete on its own in every
@@ -80,7 +101,21 @@ func item(spans ...Span) Line   { return Line{Kind: LineItem, Spans: spans} }
 func note(text string) Line     { return Line{Kind: LineNote, Spans: []Span{emph(text)}} }
 func blank() Line               { return Line{} }
 func observedLine(at time.Time) Line {
-	return line(lit("Observed at "), lit(at.UTC().Format(time.RFC3339)))
+	return line(lit("Observed at "), lit(compactTime(at)))
+}
+
+// compactTimeLayout is the notification time format, for example
+// "6 Oct 2026 09:14 UTC". History and the API keep full RFC 3339 times.
+const compactTimeLayout = "2 Jan 2006 15:04 UTC"
+
+func compactTime(at time.Time) string { return at.UTC().Format(compactTimeLayout) }
+
+// plural returns "1 change" or "3 changes".
+func plural(count int, singular, pluralForm string) string {
+	if count == 1 {
+		return "1 " + singular
+	}
+	return fmt.Sprintf("%d %s", count, pluralForm)
 }
 
 // Context is the instance identity added to every notification: the
@@ -179,8 +214,8 @@ func ValidateInstanceLabel(raw string) (string, error) {
 	return label, nil
 }
 
-func (c Context) message(icon, title string, lines ...Line) Message {
-	return Message{Icon: icon, Title: title, Scope: c.Scope(), Lines: lines}
+func (c Context) message(severity model.Severity, icon, title string, lines ...Line) Message {
+	return Message{Icon: icon, Title: title, Scope: c.Scope(), Lines: lines, Severity: string(severity)}
 }
 
 // CollectorHealth is one collector transition reported in a grouped health
@@ -211,7 +246,7 @@ func (c Context) CollectorsUnhealthy(collectors []CollectorHealth, observedAt ti
 	if statusURL := c.StatusURL(); statusURL != "" {
 		lines = append(lines, line(link("Open TailState status", statusURL)))
 	}
-	return c.message("⚠️", title, lines...)
+	return c.message(severityUnhealthy, "⚠️", title, lines...)
 }
 
 // CollectorsRecovered groups every collector that recovered in one poll into
@@ -231,12 +266,12 @@ func (c Context) CollectorsRecovered(collectors []string, observedAt time.Time) 
 	if statusURL := c.StatusURL(); statusURL != "" {
 		lines = append(lines, line(link("Open TailState status", statusURL)))
 	}
-	return c.message("✅", title, lines...)
+	return c.message(severityRecovered, "✅", title, lines...)
 }
 
 // Update reports that a different TailState release started.
 func (c Context) Update(previous, current string, observedAt time.Time) Message {
-	return c.message("🚀", "TailState updated",
+	return c.message(severityUpdate, "🚀", "TailState updated",
 		line(strong("Previous version:"), lit(" "), code(previous)),
 		line(strong("Current version:"), lit(" "), code(current)),
 		observedLine(observedAt),
@@ -279,7 +314,7 @@ func (c Context) AdminChange(action string, fields []string, target, client stri
 	if settingsURL := c.SettingsURL(); settingsURL != "" {
 		lines = append(lines, line(link("Open TailState settings", settingsURL)))
 	}
-	return c.message("🔐", "TailState configuration changed", lines...)
+	return c.message(severityAdminChange, "🔐", "TailState configuration changed", lines...)
 }
 
 // Test is the message sent by the Settings "Send test" action. It names the
@@ -296,5 +331,5 @@ func (c Context) Test(observedAt time.Time) Message {
 		version = "unknown"
 	}
 	lines = append(lines, line(strong("Version:"), lit(" "), code(version)), observedLine(observedAt))
-	return c.message("🧪", "TailState test", lines...)
+	return c.message(severityTest, "🧪", "TailState test", lines...)
 }

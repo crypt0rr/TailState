@@ -17,10 +17,15 @@ const (
 	FormatSlack = "slack"
 	// FormatPlain is plain text without any markup.
 	FormatPlain = "plain"
+	// FormatTeams is the Markdown subset of Microsoft Teams Adaptive Card
+	// text blocks: no headings or code spans, **bold**, - lists, and links.
+	FormatTeams = "teams"
+	// FormatHTML is Telegram's HTML subset (<b>, <i>, <code>, <a href>).
+	FormatHTML = "html"
 )
 
 // Formats lists the explicit per-destination format overrides.
-var Formats = []string{FormatMarkdown, FormatSlack, FormatPlain}
+var Formats = []string{FormatMarkdown, FormatSlack, FormatPlain, FormatTeams, FormatHTML}
 
 // Stored outbox payload kinds. Rows written before schema v14 hold
 // pre-rendered Markdown and keep being delivered exactly as stored.
@@ -38,9 +43,9 @@ var schemeFormats = map[string]string{
 	"discord":    FormatMarkdown,
 	"rocketchat": FormatMarkdown,
 	"zulip":      FormatMarkdown,
-	"teams":      FormatMarkdown,
+	"teams":      FormatTeams,
 	"generic":    FormatMarkdown,
-	"telegram":   FormatPlain,
+	"telegram":   FormatHTML,
 	"smtp":       FormatPlain,
 	"pushover":   FormatPlain,
 	"matrix":     FormatPlain,
@@ -66,7 +71,7 @@ var schemeFormats = map[string]string{
 func ValidateFormat(format string) (string, error) {
 	format = strings.ToLower(strings.TrimSpace(format))
 	switch format {
-	case FormatAuto, FormatMarkdown, FormatSlack, FormatPlain:
+	case FormatAuto, FormatMarkdown, FormatSlack, FormatPlain, FormatTeams, FormatHTML:
 		return format, nil
 	}
 	return "", fmt.Errorf("unknown message format %q", format)
@@ -86,23 +91,40 @@ func FormatFor(serviceURL, override string) string {
 	if base, _, ok := strings.Cut(scheme, "+"); ok {
 		scheme = base
 	}
+	if scheme == "telegram" {
+		// Telegram renders HTML when TailState passes parsemode=HTML. A URL
+		// that chooses another parse mode keeps it and receives plain text.
+		if mode := parseDestination(serviceURL).query[paramParseMode]; mode != "" && !strings.EqualFold(mode, "html") {
+			return FormatPlain
+		}
+	}
 	if format, ok := schemeFormats[scheme]; ok {
 		return format
 	}
 	return FormatMarkdown
 }
 
+// flavourFor returns the renderer of a format; unknown formats render as
+// Markdown, the historical default.
+func flavourFor(format string) flavour {
+	switch format {
+	case FormatSlack:
+		return slackFlavour
+	case FormatPlain:
+		return plainFlavour
+	case FormatTeams:
+		return teamsFlavour
+	case FormatHTML:
+		return htmlFlavour
+	default:
+		return markdownFlavour
+	}
+}
+
 // Render renders a message in one format. A pre-rendered Text message is
 // returned unchanged in every format.
 func Render(m Message, format string) string {
-	switch format {
-	case FormatSlack:
-		return Slack(m)
-	case FormatPlain:
-		return Plain(m)
-	default:
-		return Markdown(m)
-	}
+	return flavourFor(format).render(m)
 }
 
 // EncodePayload converts a message into its stored outbox form. Pre-rendered
@@ -136,6 +158,10 @@ type Prepared struct {
 	Body string
 	// Format is the rendering format of Text and Body.
 	Format string
+	// Severity is the message's severity ("high", "medium", or "low"),
+	// mapped to the destination's priority, tags, or colour (see
+	// severityParams). It is "" for a legacy row, which gets none.
+	Severity string
 }
 
 // Message returns what is sent as the message body: Body when the title is
@@ -175,12 +201,38 @@ func PrepareFor(payloadFormat, payload, serviceURL, override string) (Prepared, 
 
 // PrepareMessage renders a message for one destination: in the destination's
 // format, fitted to its budget, and with the title split from the body when
-// the destination receives the title as a separate field.
+// the destination receives the title as a separate field. A digest's
+// trailing context line (time, muted count, History link) is kept when the
+// message is shortened: change lines are dropped before it.
 func PrepareMessage(message Message, serviceURL, override string) Prepared {
 	format := FormatFor(serviceURL, override)
 	limit := MessageLimit(serviceURL)
-	rendered := Render(message, format)
-	prepared := Prepared{Text: FitMessageFor(rendered, limit, format), Format: format}
+	render := flavourFor(format)
+	if destination := parseDestination(serviceURL); format != FormatHTML && destination.scheme == "telegram" && strings.EqualFold(destination.query[paramParseMode], "html") {
+		// The URL selects Telegram's HTML mode, but the destination's
+		// format override is not HTML: escape the rendering so its text
+		// is shown as written and a value cannot add markup.
+		render = render.htmlEscaped()
+	}
+	head, context := splitContext(message)
+	rendered := render.render(head)
+	footer := ""
+	if len(context) > 0 {
+		footer = render.lines(context)
+	}
+	fit := func(text string, limit int) string {
+		if footer == "" {
+			return FitMessageFor(text, limit, format)
+		}
+		if whole := text + "\n" + footer; len(whole) <= limit || limit <= 0 {
+			return whole
+		}
+		if room := limit - len(footer) - 1; room > len(footer) {
+			return FitMessageFor(text, room, format) + "\n" + footer
+		}
+		return FitMessageFor(text+"\n"+footer, limit, format)
+	}
+	prepared := Prepared{Text: fit(rendered, limit), Format: format, Severity: message.Severity}
 	if message.IsText() || !parseDestination(serviceURL).sendsTitleSeparately() {
 		return prepared
 	}
@@ -196,103 +248,6 @@ func PrepareMessage(message Message, serviceURL, override string) Prepared {
 	// against the same limit as the body, so the title's size is reserved
 	// for every service.
 	prepared.Title = title
-	prepared.Body = FitMessageFor(body, limit-len(title)-1, format)
+	prepared.Body = fit(body, limit-len(title)-1)
 	return prepared
-}
-
-// Slack renders a message as Slack mrkdwn: single-asterisk bold, no
-// headings, <url|label> links, and &, <, > escaped so a value cannot create
-// a mention or link.
-func Slack(m Message) string {
-	if m.IsText() {
-		return m.Text
-	}
-	var b strings.Builder
-	title := escapeSlack(titleText(m), false)
-	if scope := strings.TrimSpace(m.Scope); scope != "" {
-		title += " · " + escapeSlack(scope, true)
-	}
-	b.WriteString("*" + title + "*")
-	for _, l := range m.Lines {
-		b.WriteByte('\n')
-		switch l.Kind {
-		case LineItem:
-			b.WriteString("    • ")
-		case LineNote:
-			b.WriteString("    ")
-		}
-		for _, span := range l.Spans {
-			switch span.Style {
-			case SpanLiteral:
-				b.WriteString(escapeSlack(span.Text, false))
-			case SpanBold:
-				b.WriteString("*" + escapeSlack(span.Text, true) + "*")
-			case SpanStrong:
-				b.WriteString("*" + escapeSlack(span.Text, false) + "*")
-			case SpanCode:
-				b.WriteString("`" + truncate(strings.ReplaceAll(escapeSlack(span.Text, false), "`", "'"), 256) + "`")
-			case SpanEmph:
-				b.WriteString("_" + escapeSlack(span.Text, false) + "_")
-			case SpanLink:
-				if safeLinkURL(span.URL) {
-					b.WriteString("<" + span.URL + "|" + escapeSlack(span.Text, true) + ">")
-				} else {
-					b.WriteString(escapeSlack(span.Text, true))
-				}
-			default:
-				b.WriteString(escapeSlack(span.Text, true))
-			}
-		}
-	}
-	return strings.TrimRight(b.String(), "\n")
-}
-
-// escapeSlack applies Slack's required entity escaping. Untrusted values
-// additionally lose the characters that open or close bold, strike, and code
-// formatting, so they cannot restyle the rest of the line.
-func escapeSlack(value string, untrusted bool) string {
-	value = strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;").Replace(stripControl(value))
-	if untrusted {
-		value = strings.NewReplacer("*", "∗", "~", "∼", "`", "'").Replace(value)
-		value = truncate(value, 256)
-	}
-	return value
-}
-
-// Plain renders a message as plain text without any markup, for services
-// that show text verbatim (email, SMS, push, Matrix, Telegram by default).
-func Plain(m Message) string {
-	if m.IsText() {
-		return m.Text
-	}
-	var b strings.Builder
-	b.WriteString(stripControl(titleText(m)))
-	if scope := strings.TrimSpace(m.Scope); scope != "" {
-		b.WriteString(" · " + truncate(stripControl(scope), 256))
-	}
-	for _, l := range m.Lines {
-		b.WriteByte('\n')
-		switch l.Kind {
-		case LineItem:
-			b.WriteString("  • ")
-		case LineNote:
-			b.WriteString("  ")
-		}
-		for _, span := range l.Spans {
-			text := stripControl(span.Text)
-			switch span.Style {
-			case SpanLiteral, SpanStrong, SpanEmph:
-				b.WriteString(text)
-			case SpanLink:
-				if safeLinkURL(span.URL) {
-					b.WriteString(text + ": " + span.URL)
-				} else {
-					b.WriteString(truncate(text, 256))
-				}
-			default:
-				b.WriteString(truncate(text, 256))
-			}
-		}
-	}
-	return strings.TrimRight(b.String(), "\n")
 }

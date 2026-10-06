@@ -27,13 +27,13 @@ func TestFleetRolloutCollapsesToOneSummaryLine(t *testing.T) {
 		{Field: "name", Old: "a", New: "b", OldPresent: true, NewPresent: true},
 	}})
 	got := Markdown(Context{PublicURL: "https://tailstate.example"}.Digest(DigestInput{BatchID: 9, ObservedAt: testObservedAt, Changes: changes}))
-	if strings.Count(got, "updateAvailable") != 1 || !strings.Contains(got, "⚪ 📦 `updateAvailable`: `false` → `true` on 144 resources (devices) [details](https://tailstate.example/history?batch=9)") {
+	if strings.Count(got, "updateAvailable") != 1 || !strings.Contains(got, "\n⚪ 📦 144 devices: `updateAvailable` `false` → `true`\n") {
 		t.Fatalf("rollout was not summarised in one line:\n%s", got)
 	}
-	if strings.Contains(got, "host\\-001") {
+	if strings.Contains(got, "host-001") {
 		t.Fatalf("summarised devices are still listed individually:\n%s", got)
 	}
-	if !strings.Contains(got, "**odd\\-one**") || !strings.Contains(got, "`name`: `a` → `b`") || !strings.Contains(got, "**144 change(s):**") {
+	if !strings.Contains(got, "**odd-one**") || !strings.Contains(got, "`name`: `a` → `b`") || !strings.Contains(got, "144 changed · 🟠 1 medium, ⚪ 143 low") {
 		t.Fatalf("remaining field or header counts were lost:\n%s", got)
 	}
 	// Below the threshold every device is listed.
@@ -57,14 +57,14 @@ func TestUpstreamFieldAdditionProducesOneSchemaChangeLine(t *testing.T) {
 		return out
 	}
 	got := Markdown(Context{}.Digest(DigestInput{ObservedAt: testObservedAt, Changes: keys(12), ResourceCounts: map[string]int{"keys": 12}}))
-	if strings.Count(got, "Upstream schema change") != 1 || !strings.Contains(got, "`audience` newly present on all 12 keys resources") || strings.Contains(got, "key\\-3") {
+	if strings.Count(got, "Upstream schema change") != 1 || !strings.Contains(got, "🟠 🧩 Upstream schema change: `audience` newly present on all 12 keys\n") || strings.Contains(got, "key-3") {
 		t.Fatalf("schema addition was not one line:\n%s", got)
 	}
 	removed := []model.Change{
 		{Kind: "changed", Collector: "keys", Name: "a", Fields: []model.FieldChange{{Field: "legacy", Old: 1, OldPresent: true}}},
 		{Kind: "changed", Collector: "keys", Name: "b", Fields: []model.FieldChange{{Field: "legacy", Old: 2, OldPresent: true}}},
 	}
-	if got := Markdown(Context{}.Digest(DigestInput{ObservedAt: testObservedAt, Changes: removed, ResourceCounts: map[string]int{"keys": 2}})); !strings.Contains(got, "`legacy` no longer present on any of the 2 keys resources") {
+	if got := Markdown(Context{}.Digest(DigestInput{ObservedAt: testObservedAt, Changes: removed, ResourceCounts: map[string]int{"keys": 2}})); !strings.Contains(got, "`legacy` no longer present on any of the 2 keys\n") {
 		t.Fatalf("schema removal was not summarised:\n%s", got)
 	}
 	// A field added on only some resources is ordinary drift.
@@ -76,7 +76,7 @@ func TestUpstreamFieldAdditionProducesOneSchemaChangeLine(t *testing.T) {
 
 func TestDigestReportsMutedCount(t *testing.T) {
 	got := Markdown(Context{}.Digest(DigestInput{ObservedAt: testObservedAt, Changes: rollout(1), MutedCount: 4}))
-	if !strings.Contains(got, "_4 muted change(s) not shown; they are recorded in TailState History._") {
+	if !strings.Contains(got, "4 muted changes not shown · 5 Oct 2026 12:00 UTC") {
 		t.Fatalf("muted count missing:\n%s", got)
 	}
 }

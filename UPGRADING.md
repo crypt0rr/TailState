@@ -69,6 +69,8 @@ migration without performing it.
 | 12 | 0.11.5 | Snapshot/event byte and truncation metadata, bounded history |
 | 13 | 0.12.0 | Deleted-destination scrub, retention index changes |
 | 14 | 0.13.0 | Destination routing, mute rules, rendering format, format-neutral outbox payloads, event severity |
+| 15 | 0.14.0 | Session activity, administrative audit trail, API tokens |
+| 16 | 0.14.0 | Change attribution from the configuration audit log |
 
 The README section "Migration from older releases" describes each migration
 in detail.

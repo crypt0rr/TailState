@@ -37,26 +37,20 @@ their own title field (see [Titles](#titles)):
 ```text
 🔴 19 Tailscale changes (5 high) · prod (example.com)
 2 created, 17 changed · 🔴 5 high, 🟠 2 medium, ⚪ 12 low
+Attributed: 4 of 19 changes
 
-🔴 ✏️ web-02 (device) changed
-  • Changed by: ci-bot [api key]
+🔴 ✏️ web-02 (device) changed by ci-bot [api key]
   • tags: +tag:db
-🔴 ➕ kAbc123CNTRL (key) created
-  • Changed by: alice@example.com
-🔴 ✏️ Tailnet policy changed
-  • Changed by: alice@example.com
+🔴 ➕ kAbc123CNTRL (key) created by alice@example.com
+🔴 ✏️ Tailnet policy changed by alice@example.com
   • section acls changed (3f9a1c0e → c41b7e2a)
   • section ssh added (9e8d7c6b)
-🔴 ✏️ bob@example.com (user) changed
-  • Changed by: alice@example.com
+🔴 ✏️ bob@example.com (user) changed by alice@example.com
   • role: member → admin
 🔴 ✏️ SIEM webhook (webhook) changed
-  • Changed by: actor unknown
   • endpointUrl: secret changed (fingerprint aa11bb22 → 99887766)
 🟠 ➕ laptop-new (device) created
-  • Changed by: actor unknown
 🟠 ✏️ DNS configuration changed
-  • Changed by: actor unknown
   • searchPaths: now example.com, corp.example.com
 ⚪ 📦 12 devices: clientVersion 1.80.2 → 1.82.1
 
@@ -70,6 +64,16 @@ The layout is compact:
   previews show volume and urgency. Services with a title field receive it
   there.
 - **Header:** the counts by kind and by severity; zero counts are left out.
+  When the configuration audit log was consulted, a second line states how
+  many changes it attributed ("Attributed: 4 of 19 changes"), or "Attribution
+  unavailable" when the lookup failed (see
+  [Change attribution](monitoring.md#change-attribution)).
+- **Actors:** a known actor is named on the change's own line ("changed by
+  alice@example.com"), or on a "Changed by" line below it when the line would
+  be long; fleet and schema summaries name the actors of the changes they
+  stand for ("· by ci-bot [api key] (3 of 12)"). Changes without a known
+  actor name none; History, the API, and evidence packs still record "actor
+  unknown" for them.
 - **Change lines:** the severity and kind icons, the name, the resource type
   ("device", "user", "key"; left out for the single policy, DNS, settings,
   contacts, and log streaming resources), and the kind as a word, so the line
@@ -91,7 +95,7 @@ The same digest per service:
 | Email (`smtp`) | Subject | Plain text as above, without the title line |
 | Telegram | Bold first line (HTML mode) | Plain text as above |
 | ntfy, Gotify, Pushbullet | Notification title | Plain text as above |
-| Pushover | Notification title | Plain text, shortened to 1,024 bytes ("Shortened for this destination: 3 more lines omitted…" before the context line), so the high-severity changes stay |
+| Pushover | Notification title | Plain text as above, which fits in 1,024 bytes; a longer digest is shortened ("Shortened for this destination: 7 more lines omitted…" before the context line), so the high-severity changes stay |
 | Discord | Embed title | Markdown in one embed (`**bob@example.com** (user) changed`, `` `role`: `member` → `admin` ``) |
 | Microsoft Teams | Card heading | Markdown, one text block per line |
 | Slack | Header block and preview text | Slack mrkdwn in one section (`*bob@example.com*`, links as `<url\|label>`) |

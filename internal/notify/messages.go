@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/crypt0rr/tailstate/internal/model"
 )
@@ -28,9 +29,14 @@ type DigestInput struct {
 	// this poll, used to recognise upstream schema changes.
 	ResourceCounts map[string]int
 	// Attributed is set when the configuration audit log was consulted for
-	// the batch: every listed change then names its actor (Change.Attribution)
-	// or "actor unknown".
+	// the batch: the header states how many changes it attributed, and every
+	// change with a known actor (Change.Attribution) names it. Changes
+	// without a known actor show none; History, the API, and evidence packs
+	// keep their explicit "actor unknown".
 	Attributed bool
+	// AttributionUnavailable is set when the audit log lookup failed or ran
+	// out of time, so no change could be attributed.
+	AttributionUnavailable bool
 }
 
 // DigestFunc builds the notification for one digest.
@@ -69,6 +75,9 @@ func (c Context) Digest(in DigestInput) Message {
 		title += fmt.Sprintf(" (%d %s)", counts[string(top)], top)
 	}
 	message := c.message(severityIcons[top], title, line(lit(digestCounts(counts))))
+	if header, ok := attributionHeader(in); ok {
+		message.Lines = append(message.Lines, header)
+	}
 	message.Lines = append(message.Lines, blank())
 	context := c.digestContext(in)
 	entries := c.digestEntries(in)
@@ -95,8 +104,8 @@ func (c Context) Digest(in DigestInput) Message {
 			continue
 		}
 		change := *entry.change
-		if in.Attributed {
-			add(changedByLine(change))
+		if entry.actorLine != nil {
+			add(*entry.actorLine)
 		}
 		omittedFields := 0
 		for fieldIndex, field := range change.Fields {
@@ -159,6 +168,9 @@ type digestEntry struct {
 	severity model.Severity
 	line     Line
 	change   *model.Change
+	// actorLine names the change's actor below the change line when the
+	// actor does not fit on it.
+	actorLine *Line
 }
 
 // severityRank orders severities from most to least important.
@@ -174,16 +186,36 @@ func (c Context) digestEntries(in DigestInput) []digestEntry {
 	schema, fleet, listed := summarize(in)
 	entries := make([]digestEntry, 0, len(schema)+len(fleet)+len(listed))
 	for _, change := range schema {
-		entries = append(entries, digestEntry{severity: change.severity(), line: c.schemaLine(change)})
+		l := c.schemaLine(change)
+		if in.Attributed {
+			l.Spans = append(l.Spans, summaryActors(in.Changes, change.changes)...)
+		}
+		entries = append(entries, digestEntry{severity: change.severity(), line: l})
 	}
 	for _, transition := range fleet {
-		entries = append(entries, digestEntry{severity: transition.severity(), line: c.fleetLine(transition)})
+		l := c.fleetLine(transition)
+		if in.Attributed {
+			l.Spans = append(l.Spans, summaryActors(in.Changes, transition.changes)...)
+		}
+		entries = append(entries, digestEntry{severity: transition.severity(), line: l})
 	}
 	summaries := len(entries)
 	for index := range listed {
 		change := &listed[index]
 		severity := model.Classify(*change)
-		entries = append(entries, digestEntry{severity: severity, change: change, line: changeLine(*change, severity)})
+		entry := digestEntry{severity: severity, change: change, line: changeLine(*change, severity)}
+		if actor := knownActor(*change); in.Attributed && actor != "" {
+			// "… changed by alice@example.com via admin console" on the
+			// change's own line, or below it when the line would be long.
+			byActor := append(entry.line.Spans, lit(" by "), txt(actor))
+			if utf8.RuneCountInString(plainLine(line(byActor...))) <= maxInlineActorRunes {
+				entry.line = line(byActor...)
+			} else {
+				actorLine := item(strong("Changed by:"), lit(" "), txt(actor))
+				entry.actorLine = &actorLine
+			}
+		}
+		entries = append(entries, entry)
 	}
 	sort.SliceStable(entries[summaries:], func(i, j int) bool {
 		a, b := entries[summaries+i].change, entries[summaries+j].change
@@ -243,13 +275,80 @@ func omittedEntries(entries []digestEntry, total int) string {
 	return fmt.Sprintf("%s; total: %d. See TailState History for the full batch.", omitted, total)
 }
 
-// changedByLine names who made a change: the audit log actor, or "actor
-// unknown" when the configuration audit log had no matching entry.
-func changedByLine(change model.Change) Line {
+// maxInlineActorRunes bounds a change line that also names its actor; a
+// longer line names the actor on its own "Changed by" line instead.
+const maxInlineActorRunes = 120
+
+// maxSummaryActors bounds the actors named on one fleet or schema summary.
+const maxSummaryActors = 3
+
+// knownActor is the display text of a change's audit log actor, or "" when
+// the configuration audit log had no matching entry. Notifications name only
+// known actors; History, the API, and evidence packs keep "actor unknown".
+func knownActor(change model.Change) string {
 	if change.Attribution == nil || change.Attribution.IsZero() {
-		return item(strong("Changed by:"), lit(" "+model.ActorUnknown))
+		return ""
 	}
-	return item(strong("Changed by:"), lit(" "), txt(change.Attribution.Display()))
+	return change.Attribution.Display()
+}
+
+// attributionHeader is the digest header line for an attributed batch:
+// "Attributed: 3 of 7 changes", or "Attribution unavailable" when the audit
+// log lookup failed. A batch whose lookup did not run (or is unsupported)
+// has none.
+func attributionHeader(in DigestInput) (Line, bool) {
+	if !in.Attributed {
+		return Line{}, false
+	}
+	if in.AttributionUnavailable {
+		return line(lit("Attribution unavailable")), true
+	}
+	attributed := 0
+	for _, change := range in.Changes {
+		if knownActor(change) != "" {
+			attributed++
+		}
+	}
+	return line(lit(fmt.Sprintf("Attributed: %d of %s", attributed, plural(len(in.Changes), "change", "changes")))), true
+}
+
+// summaryActors names the known actors of the changes a fleet or schema
+// summary stands for, for example " · by ci-bot [api key] (3 of 12)": at most
+// maxSummaryActors distinct actors, and how many of the changes they made
+// when not all of them were attributed.
+func summaryActors(changes []model.Change, indices []int) []Span {
+	var actors []string
+	seen := map[string]bool{}
+	attributed := 0
+	for _, index := range indices {
+		actor := knownActor(changes[index])
+		if actor == "" {
+			continue
+		}
+		attributed++
+		if !seen[actor] {
+			seen[actor] = true
+			actors = append(actors, actor)
+		}
+	}
+	if attributed == 0 {
+		return nil
+	}
+	spans := []Span{lit(" · by ")}
+	for index, actor := range actors {
+		if index == maxSummaryActors {
+			spans = append(spans, lit(fmt.Sprintf(" and %d more", len(actors)-index)))
+			break
+		}
+		if index > 0 {
+			spans = append(spans, lit(", "))
+		}
+		spans = append(spans, txt(actor))
+	}
+	if attributed < len(indices) {
+		spans = append(spans, lit(fmt.Sprintf(" (%d of %d)", attributed, len(indices))))
+	}
+	return spans
 }
 
 // ExpiryLine is one resource listed in an expiry warning.

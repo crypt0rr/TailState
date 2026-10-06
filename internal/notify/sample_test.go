@@ -45,92 +45,79 @@ func sampleDigest() Message {
 	return sampleContext.Digest(DigestInput{BatchID: 1842, ObservedAt: testObservedAt, Changes: changes, MutedCount: 3, Attributed: true})
 }
 
-// Rendered sizes of the sample digest in v0.15.0, the notification
-// assessment's baseline, before readable values and the compact layout.
-var sampleBaselineBytes = map[string]int{FormatMarkdown: 1786, FormatSlack: 1794, FormatPlain: 1674}
+// Rendered sizes of the sample digest before the compact layout: in v0.15.0,
+// the notification assessment's baseline, and with readable values (#230)
+// but the earlier layout.
+var sampleBaselineBytes = []map[string]int{
+	{FormatMarkdown: 1786, FormatSlack: 1794, FormatPlain: 1674},
+	{FormatMarkdown: 1425, FormatSlack: 1433, FormatPlain: 1317},
+}
 
 // TestAssessmentSampleIsGolden pins the assessment's sample digest in every
 // format: the counts and top severity in the title, high-severity changes
-// first, compact change lines, one merged fleet line, readable values without
-// hashes, no duplicate lines, and one closing context line. The compact
-// layout keeps every change, actor, and field while the rendering is at
-// least 25% smaller than before (E-036).
+// first, compact change lines with their known actors, one merged fleet
+// line, readable values without hashes, no duplicate lines, and one closing
+// context line. The compact layout (E-036) and naming only known actors
+// (E-033) keep every change, actor, and field while the rendering is at
+// least 25% smaller than before.
 func TestAssessmentSampleIsGolden(t *testing.T) {
 	golden := map[string]string{
 		FormatMarkdown: "### 🔴 19 Tailscale changes (5 high) · prod \\(example.com\\)\n" +
 			"2 created, 17 changed · 🔴 5 high, 🟠 2 medium, ⚪ 12 low\n" +
+			"Attributed: 4 of 19 changes\n" +
 			"\n" +
-			"🔴 ✏️ **web\\-02** (device) changed\n" +
-			"  - **Changed by:** ci\\-bot \\[api key\\]\n" +
+			"🔴 ✏️ **web\\-02** (device) changed by ci\\-bot \\[api key\\]\n" +
 			"  - `tags`: +`tag:db`\n" +
-			"🔴 ➕ **kAbc123CNTRL** (key) created\n" +
-			"  - **Changed by:** alice@example.com\n" +
-			"🔴 ✏️ **Tailnet policy** changed\n" +
-			"  - **Changed by:** alice@example.com\n" +
+			"🔴 ➕ **kAbc123CNTRL** (key) created by alice@example.com\n" +
+			"🔴 ✏️ **Tailnet policy** changed by alice@example.com\n" +
 			"  - section `acls` changed (`3f9a1c0e` → `c41b7e2a`)\n" +
 			"  - section `ssh` added (`9e8d7c6b`)\n" +
-			"🔴 ✏️ **bob@example.com** (user) changed\n" +
-			"  - **Changed by:** alice@example.com\n" +
+			"🔴 ✏️ **bob@example.com** (user) changed by alice@example.com\n" +
 			"  - `role`: `member` → `admin`\n" +
 			"🔴 ✏️ **SIEM webhook** (webhook) changed\n" +
-			"  - **Changed by:** actor unknown\n" +
 			"  - `endpointUrl`: secret changed (fingerprint `aa11bb22` → `99887766`)\n" +
 			"🟠 ➕ **laptop\\-new** (device) created\n" +
-			"  - **Changed by:** actor unknown\n" +
 			"🟠 ✏️ **DNS configuration** changed\n" +
-			"  - **Changed by:** actor unknown\n" +
 			"  - `searchPaths`: now `example.com`, `corp.example.com`\n" +
 			"⚪ 📦 12 devices: `clientVersion` `1.80.2` → `1.82.1`\n" +
 			"\n" +
 			"3 muted changes not shown · 5 Oct 2026 12:00 UTC · [Batch 1842 in History](https://tailstate.example/history?batch=1842)",
 		FormatSlack: "*🔴 19 Tailscale changes (5 high) · prod (example.com)*\n" +
 			"2 created, 17 changed · 🔴 5 high, 🟠 2 medium, ⚪ 12 low\n" +
+			"Attributed: 4 of 19 changes\n" +
 			"\n" +
-			"🔴 ✏️ *web-02* (device) changed\n" +
-			"    • *Changed by:* ci-bot [api key]\n" +
+			"🔴 ✏️ *web-02* (device) changed by ci-bot [api key]\n" +
 			"    • `tags`: +`tag:db`\n" +
-			"🔴 ➕ *kAbc123CNTRL* (key) created\n" +
-			"    • *Changed by:* alice@example.com\n" +
-			"🔴 ✏️ *Tailnet policy* changed\n" +
-			"    • *Changed by:* alice@example.com\n" +
+			"🔴 ➕ *kAbc123CNTRL* (key) created by alice@example.com\n" +
+			"🔴 ✏️ *Tailnet policy* changed by alice@example.com\n" +
 			"    • section `acls` changed (`3f9a1c0e` → `c41b7e2a`)\n" +
 			"    • section `ssh` added (`9e8d7c6b`)\n" +
-			"🔴 ✏️ *bob@example.com* (user) changed\n" +
-			"    • *Changed by:* alice@example.com\n" +
+			"🔴 ✏️ *bob@example.com* (user) changed by alice@example.com\n" +
 			"    • `role`: `member` → `admin`\n" +
 			"🔴 ✏️ *SIEM webhook* (webhook) changed\n" +
-			"    • *Changed by:* actor unknown\n" +
 			"    • `endpointUrl`: secret changed (fingerprint `aa11bb22` → `99887766`)\n" +
 			"🟠 ➕ *laptop-new* (device) created\n" +
-			"    • *Changed by:* actor unknown\n" +
 			"🟠 ✏️ *DNS configuration* changed\n" +
-			"    • *Changed by:* actor unknown\n" +
 			"    • `searchPaths`: now `example.com`, `corp.example.com`\n" +
 			"⚪ 📦 12 devices: `clientVersion` `1.80.2` → `1.82.1`\n" +
 			"\n" +
 			"3 muted changes not shown · 5 Oct 2026 12:00 UTC · <https://tailstate.example/history?batch=1842|Batch 1842 in History>",
 		FormatPlain: "🔴 19 Tailscale changes (5 high) · prod (example.com)\n" +
 			"2 created, 17 changed · 🔴 5 high, 🟠 2 medium, ⚪ 12 low\n" +
+			"Attributed: 4 of 19 changes\n" +
 			"\n" +
-			"🔴 ✏️ web-02 (device) changed\n" +
-			"  • Changed by: ci-bot [api key]\n" +
+			"🔴 ✏️ web-02 (device) changed by ci-bot [api key]\n" +
 			"  • tags: +tag:db\n" +
-			"🔴 ➕ kAbc123CNTRL (key) created\n" +
-			"  • Changed by: alice@example.com\n" +
-			"🔴 ✏️ Tailnet policy changed\n" +
-			"  • Changed by: alice@example.com\n" +
+			"🔴 ➕ kAbc123CNTRL (key) created by alice@example.com\n" +
+			"🔴 ✏️ Tailnet policy changed by alice@example.com\n" +
 			"  • section acls changed (3f9a1c0e → c41b7e2a)\n" +
 			"  • section ssh added (9e8d7c6b)\n" +
-			"🔴 ✏️ bob@example.com (user) changed\n" +
-			"  • Changed by: alice@example.com\n" +
+			"🔴 ✏️ bob@example.com (user) changed by alice@example.com\n" +
 			"  • role: member → admin\n" +
 			"🔴 ✏️ SIEM webhook (webhook) changed\n" +
-			"  • Changed by: actor unknown\n" +
 			"  • endpointUrl: secret changed (fingerprint aa11bb22 → 99887766)\n" +
 			"🟠 ➕ laptop-new (device) created\n" +
-			"  • Changed by: actor unknown\n" +
 			"🟠 ✏️ DNS configuration changed\n" +
-			"  • Changed by: actor unknown\n" +
 			"  • searchPaths: now example.com, corp.example.com\n" +
 			"⚪ 📦 12 devices: clientVersion 1.80.2 → 1.82.1\n" +
 			"\n" +
@@ -154,8 +141,10 @@ func TestAssessmentSampleIsGolden(t *testing.T) {
 			t.Fatalf("%s: hash in rendering", format)
 		}
 		assertSeverityOrder(t, format, got)
-		if baseline := sampleBaselineBytes[format]; len(got)*4 > baseline*3 {
-			t.Fatalf("%s: %d bytes is not at least 25%% smaller than %d", format, len(got), baseline)
+		for _, baselines := range sampleBaselineBytes {
+			if baseline := baselines[format]; len(got)*4 > baseline*3 {
+				t.Fatalf("%s: %d bytes is not at least 25%% smaller than %d", format, len(got), baseline)
+			}
 		}
 		// No information is lost: every change, actor, field, the muted
 		// count, the time, and the History link are still present.

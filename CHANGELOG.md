@@ -13,6 +13,11 @@ rollback requires restoring the backup taken before the upgrade. See
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-10-06
+
+- **Schema:** 17 (migrates from 16)
+- **Rollback:** restore the pre-upgrade backup; older releases refuse a schema 17 database.
+
 ### Changed
 - Leases, token and session expiries, retry times, and retention compare correctly within the same second: timestamps are stored in a fixed-width UTC form (`2006-01-02T15:04:05.000000000Z`) instead of RFC 3339 with trailing zeros dropped, which sorted `…:00Z` after `…:00.1Z`. Schema 17 rewrites stored operational timestamps in bounded, resumable transactions; signed observation times keep their bytes and are compared against whole-second bounds. The web server, collector batch application, schema migrations, monitor engine, and Tailscale client are split into smaller files and named phases without other behaviour changes (#197).
 
@@ -120,7 +125,8 @@ Releases before 0.11.16 are described in their
 [GitHub release notes](https://github.com/crypt0rr/TailState/releases); their
 schema versions are listed in [UPGRADING.md](UPGRADING.md#schema-history).
 
-[Unreleased]: https://github.com/crypt0rr/TailState/compare/v0.14.0...HEAD
+[Unreleased]: https://github.com/crypt0rr/TailState/compare/v0.15.0...HEAD
+[0.15.0]: https://github.com/crypt0rr/TailState/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/crypt0rr/TailState/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/crypt0rr/TailState/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/crypt0rr/TailState/compare/v0.11.16...v0.12.0

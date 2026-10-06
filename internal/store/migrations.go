@@ -181,108 +181,79 @@ func verifyEncryptedRows(rows *sql.Rows, box *secret.Box, location string) error
 	return nil
 }
 
+// migration upgrades a database from one schema version to the next. Each
+// step records its target version itself, in the same transaction as its
+// final change, so an interrupted upgrade resumes at the first step that did
+// not commit.
+type migration struct {
+	from, to int
+	apply    func(db *sql.DB, box *secret.Box) error
+}
+
+// migrations is the versioned on-disk upgrade path, in order.
+var migrations = []migration{
+	{from: 1, to: 2, apply: migrateSchemaV1ToV2},
+	{from: 2, to: 3, apply: withoutKey(migrateSchemaV2ToV3)},
+	{from: 3, to: 4, apply: withoutKey(migrateSchemaV3ToV4)},
+	{from: 4, to: 5, apply: withoutKey(migrateSchemaV4ToV5)},
+	{from: 5, to: 6, apply: withoutKey(migrateSchemaV5ToV6)},
+	{from: 6, to: 7, apply: withoutKey(migrateSchemaV6ToV7)},
+	{from: 7, to: 8, apply: withoutKey(migrateSchemaV7ToV8)},
+	{from: 8, to: 9, apply: withoutKey(migrateSchemaV8ToV9)},
+	{from: 9, to: 10, apply: withoutKey(migrateSchemaV9ToV10)},
+	{from: 10, to: 11, apply: withoutKey(migrateSchemaV10ToV11)},
+	{from: 11, to: 12, apply: withoutKey(migrateSchemaV11ToV12)},
+	{from: 12, to: 13, apply: withoutKey(migrateSchemaV12ToV13)},
+	{from: 13, to: 14, apply: withoutKey(migrateSchemaV13ToV14)},
+	{from: 14, to: 15, apply: withoutKey(migrateSchemaV14ToV15)},
+	{from: 15, to: 16, apply: withoutKey(migrateSchemaV15ToV16)},
+}
+
+// withoutKey adapts a migration step that needs no master key.
+func withoutKey(apply func(*sql.DB) error) func(*sql.DB, *secret.Box) error {
+	return func(db *sql.DB, _ *secret.Box) error { return apply(db) }
+}
+
 // migrateSchema owns the versioned on-disk upgrade path. Keeping migrations
 // separate from runtime settings, reconciliation, and history queries makes
 // schema changes easier to review without changing their transactional
-// behavior.
+// behavior. It applies the step for the stored version until the database
+// reaches currentSchemaVersion, re-reading the version after every step.
 func migrateSchema(db *sql.DB, box *secret.Box) error {
-	var version int
-	if err := db.QueryRow("SELECT version FROM schema_version ORDER BY version DESC LIMIT 1").Scan(&version); err != nil {
-		return fmt.Errorf("read database schema version: %w", err)
-	}
-	if version > currentSchemaVersion {
-		return fmt.Errorf("database schema version %d is newer than this TailState release supports (max %d)", version, currentSchemaVersion)
-	}
-	if version == currentSchemaVersion {
-		return nil
-	}
-	if version == 2 {
-		if err := migrateSchemaV2ToV3(db); err != nil {
+	for {
+		var version int
+		if err := db.QueryRow("SELECT version FROM schema_version ORDER BY version DESC LIMIT 1").Scan(&version); err != nil {
+			return fmt.Errorf("read database schema version: %w", err)
+		}
+		if version > currentSchemaVersion {
+			return fmt.Errorf("database schema version %d is newer than this TailState release supports (max %d)", version, currentSchemaVersion)
+		}
+		if version == currentSchemaVersion {
+			return nil
+		}
+		step, ok := migrationFrom(version)
+		if !ok {
+			return fmt.Errorf("database schema version %d requires a newer migration path", version)
+		}
+		if err := step.apply(db, box); err != nil {
 			return err
 		}
-		return migrateSchema(db, box)
 	}
-	if version == 3 {
-		if err := migrateSchemaV3ToV4(db); err != nil {
-			return err
+}
+
+// migrationFrom returns the step that upgrades version.
+func migrationFrom(version int) (migration, bool) {
+	for _, step := range migrations {
+		if step.from == version {
+			return step, true
 		}
-		return migrateSchema(db, box)
 	}
-	if version == 4 {
-		if err := migrateSchemaV4ToV5(db); err != nil {
-			return err
-		}
-		return migrateSchema(db, box)
-	}
-	if version == 5 {
-		if err := migrateSchemaV5ToV6(db); err != nil {
-			return err
-		}
-		return migrateSchema(db, box)
-	}
-	if version == 6 {
-		if err := migrateSchemaV6ToV7(db); err != nil {
-			return err
-		}
-		return migrateSchema(db, box)
-	}
-	if version == 7 {
-		if err := migrateSchemaV7ToV8(db); err != nil {
-			return err
-		}
-		return migrateSchema(db, box)
-	}
-	if version == 8 {
-		if err := migrateSchemaV8ToV9(db); err != nil {
-			return err
-		}
-		return migrateSchema(db, box)
-	}
-	if version == 9 {
-		if err := migrateSchemaV9ToV10(db); err != nil {
-			return err
-		}
-		return migrateSchema(db, box)
-	}
-	if version == 10 {
-		if err := migrateSchemaV10ToV11(db); err != nil {
-			return err
-		}
-		return migrateSchema(db, box)
-	}
-	if version == 11 {
-		if err := migrateSchemaV11ToV12(db); err != nil {
-			return err
-		}
-		return migrateSchema(db, box)
-	}
-	if version == 12 {
-		if err := migrateSchemaV12ToV13(db); err != nil {
-			return err
-		}
-		return migrateSchema(db, box)
-	}
-	if version == 13 {
-		if err := migrateSchemaV13ToV14(db); err != nil {
-			return err
-		}
-		return migrateSchema(db, box)
-	}
-	if version == 14 {
-		if err := migrateSchemaV14ToV15(db); err != nil {
-			return err
-		}
-		return migrateSchema(db, box)
-	}
-	if version == 15 {
-		if err := migrateSchemaV15ToV16(db); err != nil {
-			return err
-		}
-		return migrateSchema(db, box)
-	}
-	if version != 1 {
-		return fmt.Errorf("database schema version %d requires a newer migration path", version)
-	}
+	return migration{}, false
+}
+
+// migrateSchemaV1ToV2 moves the legacy Mattermost setting into the
+// destination-specific notification table and assigns the outbox to it.
+func migrateSchemaV1ToV2(db *sql.DB, box *secret.Box) error {
 	tx, err := db.Begin()
 	if err != nil {
 		return fmt.Errorf("begin schema migration: %w", err)
@@ -368,7 +339,7 @@ func migrateSchema(db *sql.DB, box *secret.Box) error {
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit schema migration: %w", err)
 	}
-	return migrateSchema(db, box)
+	return nil
 }
 
 func migrateSchemaV2ToV3(db *sql.DB) error {

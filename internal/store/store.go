@@ -347,40 +347,9 @@ func OpenWithLimits(path string, box *secret.Box, configuredLimits StorageLimits
 		db.Close()
 		return nil, fmt.Errorf("database migration failed; stop TailState and restore the verified pre-upgrade backup before retrying: %w", err)
 	}
-	// The due index depends on columns introduced by the v4-to-v5 migration.
-	// Keep it out of the bootstrap DDL so historical v4 databases can reach
-	// that migration before the index is created.
-	if _, err := db.Exec("CREATE INDEX IF NOT EXISTS webhook_triggers_due ON webhook_triggers(status, next_attempt_at, id)"); err != nil {
+	if err := createPostMigrationIndexes(db); err != nil {
 		db.Close()
-		return nil, fmt.Errorf("database migration failed while creating webhook trigger index; stop TailState and restore the verified pre-upgrade backup before retrying: %w", err)
-	}
-	if _, err := db.Exec("CREATE INDEX IF NOT EXISTS events_batch_id ON events(batch_id, id)"); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("database migration failed while creating event history index; stop TailState and restore the verified pre-upgrade backup before retrying: %w", err)
-	}
-	if _, err := db.Exec("CREATE INDEX IF NOT EXISTS outbox_batch_id ON outbox(batch_id, id)"); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("database migration failed while creating outbox history index; stop TailState and restore the verified pre-upgrade backup before retrying: %w", err)
-	}
-	if _, err := db.Exec("CREATE INDEX IF NOT EXISTS events_retention ON events(observed_at, id)"); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("database migration failed while creating event retention index; stop TailState and restore the verified pre-upgrade backup before retrying: %w", err)
-	}
-	if _, err := db.Exec("CREATE INDEX IF NOT EXISTS outbox_retry_retention ON outbox(status, first_attempt, lease_until, id)"); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("database migration failed while creating outbox retry index; stop TailState and restore the verified pre-upgrade backup before retrying: %w", err)
-	}
-	if _, err := db.Exec("CREATE INDEX IF NOT EXISTS outbox_delivered_retention ON outbox(status, delivered_at, created_at, id)"); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("database migration failed while creating outbox retention index; stop TailState and restore the verified pre-upgrade backup before retrying: %w", err)
-	}
-	if _, err := db.Exec("CREATE INDEX IF NOT EXISTS outbox_dead_retention ON outbox(status, created_at)"); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("database migration failed while creating outbox dead-letter retention index; stop TailState and restore the verified pre-upgrade backup before retrying: %w", err)
-	}
-	if _, err := db.Exec("CREATE INDEX IF NOT EXISTS auth_tokens_kind ON auth_tokens(kind)"); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("database migration failed while creating authentication token kind index; stop TailState and restore the verified pre-upgrade backup before retrying: %w", err)
+		return nil, err
 	}
 	st := &Store{db: db, connector: connector, databasePath: path, box: box}
 	st.limits.Store(limits)
@@ -424,6 +393,32 @@ func OpenWithLimits(path string, box *secret.Box, configuredLimits StorageLimits
 	}
 	st.reader = reader
 	return st, nil
+}
+
+// postMigrationIndexes are created after every migration has run, because
+// they depend on columns that older schema versions lack. The due index, for
+// example, needs columns introduced by the v4-to-v5 migration, so it stays out
+// of the bootstrap DDL and historical v4 databases can reach that migration
+// before the index is created.
+var postMigrationIndexes = []struct{ ddl, description string }{
+	{ddl: "CREATE INDEX IF NOT EXISTS webhook_triggers_due ON webhook_triggers(status, next_attempt_at, id)", description: "webhook trigger index"},
+	{ddl: "CREATE INDEX IF NOT EXISTS events_batch_id ON events(batch_id, id)", description: "event history index"},
+	{ddl: "CREATE INDEX IF NOT EXISTS outbox_batch_id ON outbox(batch_id, id)", description: "outbox history index"},
+	{ddl: "CREATE INDEX IF NOT EXISTS events_retention ON events(observed_at, id)", description: "event retention index"},
+	{ddl: "CREATE INDEX IF NOT EXISTS outbox_retry_retention ON outbox(status, first_attempt, lease_until, id)", description: "outbox retry index"},
+	{ddl: "CREATE INDEX IF NOT EXISTS outbox_delivered_retention ON outbox(status, delivered_at, created_at, id)", description: "outbox retention index"},
+	{ddl: "CREATE INDEX IF NOT EXISTS outbox_dead_retention ON outbox(status, created_at)", description: "outbox dead-letter retention index"},
+	{ddl: "CREATE INDEX IF NOT EXISTS auth_tokens_kind ON auth_tokens(kind)", description: "authentication token kind index"},
+}
+
+// createPostMigrationIndexes creates postMigrationIndexes in order.
+func createPostMigrationIndexes(db *sql.DB) error {
+	for _, index := range postMigrationIndexes {
+		if _, err := db.Exec(index.ddl); err != nil {
+			return fmt.Errorf("database migration failed while creating %s; stop TailState and restore the verified pre-upgrade backup before retrying: %w", index.description, err)
+		}
+	}
+	return nil
 }
 
 // journalSizeLimitBytes is the WAL size SQLite truncates to after a

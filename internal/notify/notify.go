@@ -1,8 +1,10 @@
 // Package notify provides the notification transport used by TailState.
 //
-// Shoutrrr owns provider parsing and payload delivery. This package keeps the
-// application-specific safety guarantees around it: bounded HTTP requests,
-// redirects disabled, and no service credentials in returned errors.
+// Shoutrrr owns provider parsing and, except for Slack, payload delivery.
+// Slack messages are built natively (see sendSlack) from Shoutrrr's parsed
+// Slack URL. This package keeps the application-specific safety guarantees
+// around every delivery: bounded HTTP requests, redirects disabled, and no
+// service credentials in returned errors.
 package notify
 
 import (
@@ -19,7 +21,9 @@ import (
 	"time"
 
 	"github.com/nicholas-fedor/shoutrrr"
+	"github.com/nicholas-fedor/shoutrrr/pkg/services/chat/discord"
 	"github.com/nicholas-fedor/shoutrrr/pkg/services/chat/matrix"
+	"github.com/nicholas-fedor/shoutrrr/pkg/services/chat/slack"
 	"github.com/nicholas-fedor/shoutrrr/pkg/types"
 
 	"github.com/crypt0rr/tailstate/internal/textutil"
@@ -35,6 +39,21 @@ const (
 type Sender interface {
 	Send(ctx context.Context, serviceURL, message string) error
 	Test(ctx context.Context, serviceURL string) error
+}
+
+// PreparedSender is implemented by senders that deliver a prepared message's
+// title as a separate field (see Prepared). SenderImpl implements it.
+type PreparedSender interface {
+	SendPrepared(ctx context.Context, serviceURL string, message Prepared) error
+}
+
+// Deliver sends a prepared message through sender: with its separate title
+// when sender supports it, otherwise as the complete text.
+func Deliver(ctx context.Context, sender Sender, serviceURL string, message Prepared) error {
+	if prepared, ok := sender.(PreparedSender); ok {
+		return prepared.SendPrepared(ctx, serviceURL, message)
+	}
+	return sender.Send(ctx, serviceURL, message.Text)
 }
 
 // SenderImpl sends one message to one Shoutrrr destination.
@@ -162,6 +181,8 @@ type messageSender interface {
 // router only injects a custom HTTP client after initialisation. Matrix is
 // therefore built directly with client in place first, so its login uses
 // TailState's bounded, redirect-rejecting transport like every other request.
+// Discord is also built directly, so its body can be sent as embeds of whole
+// lines (see newDiscordSender).
 func newSender(serviceURL string, client *http.Client, timeout time.Duration) (messageSender, error) {
 	if parsed, err := url.Parse(serviceURL); err == nil && parsed.Scheme == matrix.Scheme {
 		service := &matrix.Service{}
@@ -170,6 +191,8 @@ func newSender(serviceURL string, client *http.Client, timeout time.Duration) (m
 			return nil, fmt.Errorf("%s: %w", matrix.Scheme, err)
 		}
 		return matrixSender{service: service, timeout: timeout}, nil
+	} else if err == nil && parsed.Scheme == discord.Scheme {
+		return newDiscordSender(parsed, client, timeout)
 	}
 	return shoutrrr.CreateSenderWithOptions(types.SenderOptions{HTTPClient: client, Timeout: timeout}, serviceURL)
 }
@@ -207,12 +230,22 @@ func Validate(serviceURL string) error {
 	return nil
 }
 
-// Send delivers message to exactly one destination. Shoutrrr's sender is
-// created per call so a failure in one destination cannot affect another.
-// The sender is constructed exactly once per call, and that construction is
-// also the URL validation, so a Matrix password URL logs in once per
-// delivery rather than once for validation and again for sending.
+// Send delivers a complete, pre-rendered message to exactly one destination.
+// It sends no separate title; see SendPrepared.
 func (s *SenderImpl) Send(ctx context.Context, serviceURL, message string) error {
+	return s.SendPrepared(ctx, serviceURL, Prepared{Text: message})
+}
+
+// SendPrepared delivers message to exactly one destination. Shoutrrr's
+// sender is created per call so a failure in one destination cannot affect
+// another. The sender is constructed exactly once per call, and that
+// construction is also the URL validation, so a Matrix password URL logs in
+// once per delivery rather than once for validation and again for sending.
+//
+// Only allowlisted Shoutrrr parameters are passed (see serviceParams): the
+// title when the destination receives it separately, never overriding a
+// value set in the destination URL.
+func (s *SenderImpl) SendPrepared(ctx context.Context, serviceURL string, message Prepared) error {
 	serviceURL = strings.TrimSpace(serviceURL)
 	if serviceURL == "" {
 		return errors.New("notification URL is required")
@@ -221,7 +254,8 @@ func (s *SenderImpl) Send(ctx context.Context, serviceURL, message string) error
 		return err
 	}
 	record := &responseRecord{}
-	sender, err := newSender(serviceURL, s.clientFor(record), s.timeout)
+	client := s.clientFor(record)
+	sender, err := newSender(serviceURL, client, s.timeout)
 	if err != nil {
 		// A construction that reached the provider (a Matrix login) is a
 		// delivery outcome: classify it like any other HTTP response so a
@@ -231,7 +265,20 @@ func (s *SenderImpl) Send(ctx context.Context, serviceURL, message string) error
 		}
 		return fmt.Errorf("invalid notification URL (%s): %s", RedactURL(serviceURL), sanitize(err.Error(), serviceURL))
 	}
-	errs := sender.Send(FitMessage(message, MessageLimit(serviceURL)), nil)
+	body := FitMessage(message.Message(), MessageLimit(serviceURL))
+	var errs []error
+	if parsed, parseErr := url.Parse(serviceURL); parseErr == nil && parsed.Scheme == slack.Scheme {
+		// Slack is sent natively (see sendSlack); Shoutrrr only validated
+		// the URL above.
+		if message.Title != "" {
+			message.Body = body
+		} else {
+			message.Text = body
+		}
+		errs = []error{s.sendSlack(ctx, parsed, message, client)}
+	} else {
+		errs = sender.Send(body, parseDestination(serviceURL).params(message.Title))
+	}
 	for _, sendErr := range errs {
 		if sendErr != nil {
 			// The status comes only from the response TailState's transport
@@ -253,7 +300,7 @@ func (s *SenderImpl) Send(ctx context.Context, serviceURL, message string) error
 // Settings page sends Context.Test instead, which also names the instance,
 // tailnet, and version.
 func (s *SenderImpl) Test(ctx context.Context, serviceURL string) error {
-	return s.Send(ctx, serviceURL, Markdown(Context{}.Test(time.Now())))
+	return s.SendPrepared(ctx, serviceURL, PrepareMessage(Context{}.Test(time.Now()), serviceURL, ""))
 }
 
 // DeliveryError is a transport error. Retryable errors are retried by the

@@ -51,6 +51,8 @@ type Server struct {
 	// destination before a change disables, removes, or redirects it.
 	noticeSender  notify.Sender
 	noticeTimeout time.Duration
+	// destinationTester sends the Settings "Send test" message.
+	destinationTester notify.PreparedSender
 	// apiWindows holds each API token's current rate-limit window.
 	apiMu      sync.Mutex
 	apiWindows map[int64]apiWindow
@@ -165,6 +167,7 @@ func New(config boot.Config, st *store.Store, engine *monitor.Engine) (*Server, 
 		reconcileCooldown:    defaultReconcileCooldown,
 		noticeSender:         notify.New(),
 		noticeTimeout:        defaultNoticeTimeout,
+		destinationTester:    notify.New(),
 		apiWindows:           map[int64]apiWindow{},
 		tokenReveals:         newRevealStore(),
 	}, nil

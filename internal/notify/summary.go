@@ -151,8 +151,18 @@ func summarize(in DigestInput) ([]schemaChange, []fleetTransition, []model.Chang
 	return schema, fleet, remaining
 }
 
+// severity is the built-in severity of the summarised field change.
+func (s schemaChange) severity() model.Severity {
+	return model.Classify(model.Change{Kind: "changed", Collector: s.collector, Fields: []model.FieldChange{s.sample}})
+}
+
+// severity is the built-in severity of the summarised field transition.
+func (f fleetTransition) severity() model.Severity {
+	return model.Classify(model.Change{Kind: "changed", Collector: f.collector, Fields: []model.FieldChange{f.field}})
+}
+
 func (c Context) schemaLine(change schemaChange, batchID int64) Line {
-	severity := model.Classify(model.Change{Kind: "changed", Collector: change.collector, Fields: []model.FieldChange{change.sample}})
+	severity := change.severity()
 	presence := " newly present on all "
 	if !change.added {
 		presence = " no longer present on any of the "
@@ -162,8 +172,9 @@ func (c Context) schemaLine(change schemaChange, batchID int64) Line {
 }
 
 func (c Context) fleetLine(transition fleetTransition, batchID int64) Line {
-	severity := model.Classify(model.Change{Kind: "changed", Collector: transition.collector, Fields: []model.FieldChange{transition.field}})
-	l := line(lit(severityIcons[severity]+" 📦 "), code(transition.field.Field), lit(": "), code(shortValue(transition.field.Old)), lit(" → "), code(shortValue(transition.field.New)), lit(fmt.Sprintf(" on %d resources (", transition.count)), txt(transition.collector), lit(")"))
+	severity := transition.severity()
+	spans := append([]Span{lit(severityIcons[severity] + " 📦 ")}, presentField(transition.collector, transition.field)...)
+	l := line(append(spans, lit(fmt.Sprintf(" on %d resources (", transition.count)), txt(transition.collector), lit(")"))...)
 	return c.withDetails(l, batchID)
 }
 

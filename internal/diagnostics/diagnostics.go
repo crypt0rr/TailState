@@ -6,6 +6,7 @@
 package diagnostics
 
 import (
+	"fmt"
 	"net"
 	"net/http"
 	"net/netip"
@@ -47,12 +48,15 @@ type RequestInfo struct {
 
 // Runtime describes the non-secret state needed for operator diagnostics.
 type Runtime struct {
-	Configured             bool
-	BaselineReady          bool
-	BaselineDegraded       bool
-	BaselineReason         string
-	Destinations           int
-	EnabledDestinations    int
+	Configured          bool
+	BaselineReady       bool
+	BaselineDegraded    bool
+	BaselineReason      string
+	Destinations        int
+	EnabledDestinations int
+	// DiscordSplitLines counts enabled Discord destinations whose URL
+	// forces splitlines=yes (see notify.SplitLinesWarning).
+	DiscordSplitLines      int
 	DatabaseMissing        bool
 	SchemaVersion          int
 	SchemaMigrationPending bool
@@ -228,6 +232,14 @@ func Build(config boot.Config, runtime Runtime, request *http.Request) Report {
 				Severity:    SeverityWarning,
 				Summary:     "All notification destinations are disabled, so notifications are paused.",
 				Remediation: "Enable at least one destination in Settings; monitoring and history continue while delivery is paused.",
+			})
+		}
+		if runtime.DiscordSplitLines > 0 {
+			add(Finding{
+				Code:        "discord_splitlines_forced",
+				Severity:    SeverityWarning,
+				Summary:     fmt.Sprintf("%d enabled Discord destination(s) set splitlines=yes; the pinned Shoutrrr release loses or repeats lines of notifications longer than 10 lines in that mode.", runtime.DiscordSplitLines),
+				Remediation: "Edit the destination in Settings and remove splitlines from its URL (TailState then sends splitlines=no) or set splitlines=no.",
 			})
 		}
 	}

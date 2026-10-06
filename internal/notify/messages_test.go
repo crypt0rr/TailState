@@ -20,7 +20,7 @@ func TestDigestRendersEscapedChangesAndCounts(t *testing.T) {
 		"**3 change(s):** 1 created, 1 changed, 1 removed",
 		"new server",
 		"de'vices",
-		"`role`: `\"viewer\"` → `\"admin\"`",
+		"`role`: `viewer` → `admin`",
 	} {
 		if !strings.Contains(message, want) {
 			t.Fatalf("digest missing %q: %s", want, message)
@@ -104,8 +104,8 @@ func TestCodeSpansRenderValuesWithoutMarkdownEscapes(t *testing.T) {
 		},
 	}})
 	for _, want := range []string{
-		"  - `last_seen`: `\"2026-10-05T12:00:00Z\"` → `\"2026-10-05T13:00:00Z\"`\n",
-		"  - `tags`: `[\"tag:prod-db\"]` → `[\"tag:prod-db\",\"tag:#ops\"]`",
+		"  - `last_seen`: `2026-10-05T12:00:00Z` → `2026-10-05T13:00:00Z`\n",
+		"  - `tags`: +`tag:#ops`",
 		// Bold and prose contexts keep their Markdown escapes.
 		"🟠 ✏️ **db\\-1** `changed` (device\\_details, medium)\n",
 	} {
@@ -141,7 +141,7 @@ func TestCodeSpansCannotBeClosedOrBrokenByValues(t *testing.T) {
 			t.Fatalf("value broke out of its code span with %q: %q", unwanted, got)
 		}
 	}
-	if !strings.Contains(got, "`\"x' [click](https://evil.example) \\u003cimg src=x\\u003e\"`") {
+	if !strings.Contains(got, "`x' [click](https://evil.example) <img src=x>` → `line break return`") {
 		t.Fatalf("code span did not keep inert link text verbatim: %s", got)
 	}
 	if long := escapeCode(strings.Repeat("a", 400)); len(long) > 256 {

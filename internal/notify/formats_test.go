@@ -32,9 +32,9 @@ func TestRenderedFormatsAreGolden(t *testing.T) {
 			"[View batch \\#42 in TailState History](https://tailstate.example/history?batch=42)\n" +
 			"_1 muted change(s) not shown; they are recorded in TailState History._\n" +
 			"\n" +
-			"🟠 ➕ **web\\_\\*1\\*\\<\\!channel\\>** `created` (devices, medium)\n" +
 			"🔴 ✏️ **alice** `changed` (users, high)\n" +
-			"  - `role`: `\"member\"` → `\"admin\"`",
+			"  - `role`: `member` → `admin`\n" +
+			"🟠 ➕ **web\\_\\*1\\*\\<\\!channel\\>** `created` (devices, medium)",
 		FormatSlack: "*Tailscale inventory changed · lab (example.com)*\n" +
 			"*2 change(s):* 1 created, 1 changed, 0 removed\n" +
 			"*Severity:* 🔴 1 high, 🟠 1 medium, ⚪ 0 low\n" +
@@ -42,9 +42,9 @@ func TestRenderedFormatsAreGolden(t *testing.T) {
 			"<https://tailstate.example/history?batch=42|View batch #42 in TailState History>\n" +
 			"_1 muted change(s) not shown; they are recorded in TailState History._\n" +
 			"\n" +
-			"🟠 ➕ *web_∗1∗&lt;!channel&gt;* `created` (devices, medium)\n" +
 			"🔴 ✏️ *alice* `changed` (users, high)\n" +
-			"    • `role`: `\"member\"` → `\"admin\"`",
+			"    • `role`: `member` → `admin`\n" +
+			"🟠 ➕ *web_∗1∗&lt;!channel&gt;* `created` (devices, medium)",
 		FormatPlain: "Tailscale inventory changed · lab (example.com)\n" +
 			"2 change(s): 1 created, 1 changed, 0 removed\n" +
 			"Severity: 🔴 1 high, 🟠 1 medium, ⚪ 0 low\n" +
@@ -52,9 +52,9 @@ func TestRenderedFormatsAreGolden(t *testing.T) {
 			"View batch #42 in TailState History: https://tailstate.example/history?batch=42\n" +
 			"1 muted change(s) not shown; they are recorded in TailState History.\n" +
 			"\n" +
-			"🟠 ➕ web_*1*<!channel> created (devices, medium)\n" +
 			"🔴 ✏️ alice changed (users, high)\n" +
-			"  • role: \"member\" → \"admin\"",
+			"  • role: member → admin\n" +
+			"🟠 ➕ web_*1*<!channel> created (devices, medium)",
 	}
 	message := goldenDigest()
 	for format, want := range golden {

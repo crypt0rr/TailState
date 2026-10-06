@@ -76,11 +76,10 @@ func (s *Server) adminMessage(ctx context.Context, r *http.Request, change admin
 // unreachable destination must still be removable. The durable notice queued
 // by recordAdmin skips this destination.
 func (s *Server) noticeBeforeChange(ctx context.Context, destination store.NotificationDestination, message notify.Message) {
-	format := notify.FormatFor(destination.ServiceURL, destination.Format)
-	text := notify.FitMessageFor(notify.Render(message, format), notify.MessageLimit(destination.ServiceURL), format)
+	prepared := notify.PrepareMessage(message, destination.ServiceURL, destination.Format)
 	sendCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), s.noticeTimeout)
 	defer cancel()
-	if err := s.noticeSender.Send(sendCtx, destination.ServiceURL, text); err != nil {
+	if err := notify.Deliver(sendCtx, s.noticeSender, destination.ServiceURL, prepared); err != nil {
 		slog.Warn("administrative notice could not be delivered before the change", "destination_id", destination.ID, "reason", notify.SafeDeliveryError(err))
 		return
 	}

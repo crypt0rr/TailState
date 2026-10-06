@@ -2,8 +2,12 @@ package notify
 
 import (
 	"fmt"
+	"regexp"
+	"strconv"
 	"strings"
 	"unicode/utf8"
+
+	"github.com/crypt0rr/tailstate/internal/model"
 )
 
 // serviceMessageLimits are the per-message size budgets, in bytes, that the
@@ -17,7 +21,7 @@ var serviceMessageLimits = map[string]int{
 	"wecom":      4096,
 	"ntfy":       4096,
 	"rocketchat": 5000,
-	"discord":    6000, // Shoutrrr splits into 2000-byte chunks, 6000 bytes in total
+	"discord":    6000, // sent as embeds of at most 2000 characters, 6000 in total
 	"zulip":      10000,
 	"pushover":   1024,
 	"mattermost": 16383,
@@ -41,8 +45,8 @@ func MessageLimit(serviceURL string) int {
 }
 
 const (
-	shortenedNoteFormat      = "\n_Shortened for this destination: %d more line(s) omitted. See TailState History for the full batch._"
-	shortenedPlainNoteFormat = "\nShortened for this destination: %d more line(s) omitted. See TailState History for the full batch."
+	shortenedNoteFormat      = "\n_Shortened for this destination: %s. See TailState History for the full batch._"
+	shortenedPlainNoteFormat = "\nShortened for this destination: %s. See TailState History for the full batch."
 )
 
 // FitMessage shortens a Markdown message to at most limit bytes. It removes
@@ -65,7 +69,11 @@ func FitMessageFor(message string, limit int, format string) string {
 	}
 	lines := strings.SplitAfter(message, "\n")
 	for kept := len(lines) - 1; kept >= 1; kept-- {
-		note := fmt.Sprintf(noteFormat, countLines(lines[kept:]))
+		omitted := fmt.Sprintf("%d more line(s) omitted", countLines(lines[kept:]))
+		if high := countHighSeverity(lines[kept:]); high > 0 {
+			omitted += fmt.Sprintf(", including %d high-severity change(s)", high)
+		}
+		note := fmt.Sprintf(noteFormat, omitted)
 		body := strings.TrimRight(strings.Join(lines[:kept], ""), "\n")
 		if len(body)+len(note) <= limit {
 			return body + note
@@ -82,6 +90,27 @@ func countLines(lines []string) int {
 		}
 	}
 	return count
+}
+
+// digestOmissionPattern matches the digest's own closing note (see
+// omittedEntries), which starts a line, so a tenant value inside a change
+// line cannot imitate it.
+var digestOmissionPattern = regexp.MustCompile(`^_?\d+ more change\(s\).*, including (\d+) high-severity,`)
+
+// countHighSeverity counts the high-severity changes among dropped digest
+// lines: change and summary lines start with the high-severity icon, and a
+// dropped digest omission note carries its own count.
+func countHighSeverity(lines []string) int {
+	high := 0
+	for _, line := range lines {
+		if strings.HasPrefix(line, severityIcons[model.SeverityHigh]) {
+			high++
+		} else if match := digestOmissionPattern.FindStringSubmatch(line); match != nil {
+			count, _ := strconv.Atoi(match[1])
+			high += count
+		}
+	}
+	return high
 }
 
 func truncateBytes(value string, limit int) string {

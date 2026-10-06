@@ -143,6 +143,27 @@ func (s *ReadOnlyStore) StorageMetrics(ctx context.Context) (StorageMetrics, err
 	return s.store.StorageMetrics(ctx)
 }
 
+// EnabledDestinationURLs returns the decrypted URLs of the enabled
+// notification destinations so diagnostics can check their parameters. The
+// URLs carry credentials: callers must derive bounded findings from them and
+// never print them.
+func (s *ReadOnlyStore) EnabledDestinationURLs(ctx context.Context) ([]string, error) {
+	if s == nil || s.store == nil {
+		return nil, errors.New("read-only store is unavailable")
+	}
+	destinations, err := s.store.ListDestinations(ctx)
+	if err != nil {
+		return nil, err
+	}
+	urls := make([]string, 0, len(destinations))
+	for _, destination := range destinations {
+		if destination.Enabled {
+			urls = append(urls, destination.ServiceURL)
+		}
+	}
+	return urls, nil
+}
+
 // Close releases the read-only database connection.
 func (s *ReadOnlyStore) Close() error {
 	if s == nil || s.store == nil || s.store.db == nil {

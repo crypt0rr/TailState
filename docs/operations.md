@@ -160,7 +160,9 @@ pairing, setup/baseline state, and whether notifications are paused
 (`notifications_paused` when every destination is disabled,
 `notifications_no_destinations` when monitoring is configured but no
 destination exists). The Settings banner, these findings, and `/metrics` use
-one shared rule, so they always agree. In the official image
+one shared rule, so they always agree. `discord_splitlines_forced` flags an
+enabled Discord destination whose URL sets `splitlines=yes` (see
+[Discord](notifications.md#discord)). In the official image
 (`TAILSTATE_CONTAINER=1`, set by the Dockerfile and `compose.yaml`) the
 wildcard container listener is reported as the informational
 `container_listener` finding instead of a warning, because Docker port

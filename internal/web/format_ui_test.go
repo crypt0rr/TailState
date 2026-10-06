@@ -47,11 +47,11 @@ func TestDestinationFormatOverrideIsEditableAndUsedForTests(t *testing.T) {
 		t.Fatalf("saved format=%+v err=%v", destinations, err)
 	}
 	page := authenticatedGet(t, server, "/settings", cookies).Body.String()
-	if !strings.Contains(page, "Format: plain") || !strings.Contains(page, `<option value="plain" selected>`) || !strings.Contains(page, `<option value="teams">Microsoft Teams</option>`) {
+	if !strings.Contains(page, "Format: plain") || !strings.Contains(page, `<option value="plain" selected>`) || !strings.Contains(page, `<option value="teams">Microsoft Teams</option>`) || !strings.Contains(page, `<option value="html">Telegram HTML</option>`) {
 		t.Fatalf("settings page does not show the format override: %s", page)
 	}
 	invalid := cloneForm(form)
-	invalid.Set("message_format", "html")
+	invalid.Set("message_format", "markdownv2")
 	if rejected := followFlash(t, server, cookies, coveragePost(t, server, "/settings/destinations", invalid, cookies)); !strings.Contains(rejected, "Notification routing was not saved") {
 		t.Fatalf("unknown format accepted: %s", rejected)
 	}

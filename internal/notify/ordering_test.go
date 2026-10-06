@@ -134,7 +134,7 @@ func TestBusyTelegramDigestKeepsPolicyChange(t *testing.T) {
 	}
 	changes = append(changes, model.Change{Kind: "changed", Collector: "policy", Name: "Tailnet policy", Fields: []model.FieldChange{{Field: "acls", Old: "a", New: "b", OldPresent: true, NewPresent: true}}})
 	prepared := PrepareMessage(Context{Tailnet: "example.com"}.Digest(DigestInput{ObservedAt: testObservedAt, Changes: changes}), telegramURL, "")
-	if len(prepared.Message()) > 4096 || !strings.Contains(prepared.Message(), "🔴 ✏️ Tailnet policy changed\n") || !strings.Contains(prepared.Message(), "Shortened for this destination") {
+	if len(prepared.Message()) > 4096 || !strings.Contains(prepared.Message(), "🔴 ✏️ <b>Tailnet policy</b> changed\n") || !strings.Contains(prepared.Message(), "Shortened for this destination") {
 		t.Fatalf("telegram digest lost the policy change:\n%s", prepared.Message())
 	}
 }

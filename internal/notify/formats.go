@@ -20,10 +20,12 @@ const (
 	// FormatTeams is the Markdown subset of Microsoft Teams Adaptive Card
 	// text blocks: no headings or code spans, **bold**, - lists, and links.
 	FormatTeams = "teams"
+	// FormatHTML is Telegram's HTML subset (<b>, <i>, <code>, <a href>).
+	FormatHTML = "html"
 )
 
 // Formats lists the explicit per-destination format overrides.
-var Formats = []string{FormatMarkdown, FormatSlack, FormatPlain, FormatTeams}
+var Formats = []string{FormatMarkdown, FormatSlack, FormatPlain, FormatTeams, FormatHTML}
 
 // Stored outbox payload kinds. Rows written before schema v14 hold
 // pre-rendered Markdown and keep being delivered exactly as stored.
@@ -43,7 +45,7 @@ var schemeFormats = map[string]string{
 	"zulip":      FormatMarkdown,
 	"teams":      FormatTeams,
 	"generic":    FormatMarkdown,
-	"telegram":   FormatPlain,
+	"telegram":   FormatHTML,
 	"smtp":       FormatPlain,
 	"pushover":   FormatPlain,
 	"matrix":     FormatPlain,
@@ -69,7 +71,7 @@ var schemeFormats = map[string]string{
 func ValidateFormat(format string) (string, error) {
 	format = strings.ToLower(strings.TrimSpace(format))
 	switch format {
-	case FormatAuto, FormatMarkdown, FormatSlack, FormatPlain, FormatTeams:
+	case FormatAuto, FormatMarkdown, FormatSlack, FormatPlain, FormatTeams, FormatHTML:
 		return format, nil
 	}
 	return "", fmt.Errorf("unknown message format %q", format)
@@ -89,6 +91,13 @@ func FormatFor(serviceURL, override string) string {
 	if base, _, ok := strings.Cut(scheme, "+"); ok {
 		scheme = base
 	}
+	if scheme == "telegram" {
+		// Telegram renders HTML when TailState passes parsemode=HTML. A URL
+		// that chooses another parse mode keeps it and receives plain text.
+		if mode := parseDestination(serviceURL).query[paramParseMode]; mode != "" && !strings.EqualFold(mode, "html") {
+			return FormatPlain
+		}
+	}
 	if format, ok := schemeFormats[scheme]; ok {
 		return format
 	}
@@ -105,6 +114,8 @@ func flavourFor(format string) flavour {
 		return plainFlavour
 	case FormatTeams:
 		return teamsFlavour
+	case FormatHTML:
+		return htmlFlavour
 	default:
 		return markdownFlavour
 	}
@@ -197,6 +208,12 @@ func PrepareMessage(message Message, serviceURL, override string) Prepared {
 	format := FormatFor(serviceURL, override)
 	limit := MessageLimit(serviceURL)
 	render := flavourFor(format)
+	if destination := parseDestination(serviceURL); format != FormatHTML && destination.scheme == "telegram" && strings.EqualFold(destination.query[paramParseMode], "html") {
+		// The URL selects Telegram's HTML mode, but the destination's
+		// format override is not HTML: escape the rendering so its text
+		// is shown as written and a value cannot add markup.
+		render = render.htmlEscaped()
+	}
 	head, context := splitContext(message)
 	rendered := render.render(head)
 	footer := ""

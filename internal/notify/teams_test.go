@@ -23,6 +23,9 @@ func TestTeamsFlavourHasNoUnsupportedMarkup(t *testing.T) {
 	}
 	for _, message := range messages {
 		got := Render(message, FormatTeams)
+		if Teams(message) != got {
+			t.Fatal("Teams and Render disagree")
+		}
 		for _, syntax := range []string{"###", "`", "\\", "  - ", "•"} {
 			if strings.Contains(got, syntax) {
 				t.Fatalf("teams rendering contains %q:\n%s", syntax, got)

@@ -83,7 +83,9 @@ func TestServiceParamAllowlistMatchesShoutrrrKeys(t *testing.T) {
 			}
 			// Every value TailState passes must be accepted by the field.
 			values := []string{"TailState title"}
-			if fixed, ok := serviceDefaults[scheme][param]; ok {
+			if param == paramParseMode {
+				values = []string{parseModeHTML}
+			} else if fixed, ok := serviceDefaults[scheme][param]; ok {
 				values = []string{fixed}
 			} else if mapped, ok := severityParams[scheme][param]; ok {
 				values = values[:0]
@@ -392,7 +394,7 @@ func TestTitleParameterRules(t *testing.T) {
 		telegramURL:                                                   true,
 		telegramURL + "&parsemode=None":                               true,
 		telegramURL + "&parsemode=Markdown":                           false,
-		telegramURL + "&ParseMode=HTML":                               false,
+		telegramURL + "&ParseMode=HTML":                               true,
 		discordURL + "?json=yes":                                      false,
 		discordURL + "?json=no":                                       true,
 		"smtp://mail.example:25/?from=a@example.com&to=b@example.com": true,

@@ -47,9 +47,11 @@ func sampleDigest() Message {
 
 // Rendered sizes of the sample digest before the compact layout: in v0.15.0,
 // the notification assessment's baseline, and with readable values (#230)
-// but the earlier layout.
+// but the earlier layout. Teams then received Markdown and Telegram plain
+// text; Telegram's HTML adds tags to the same visible text, so it is only
+// compared with v0.15.0.
 var sampleBaselineBytes = []map[string]int{
-	{FormatMarkdown: 1786, FormatSlack: 1794, FormatPlain: 1674, FormatTeams: 1786},
+	{FormatMarkdown: 1786, FormatSlack: 1794, FormatPlain: 1674, FormatTeams: 1786, FormatHTML: 1674},
 	{FormatMarkdown: 1425, FormatSlack: 1433, FormatPlain: 1317, FormatTeams: 1425},
 }
 
@@ -142,6 +144,26 @@ func TestAssessmentSampleIsGolden(t *testing.T) {
 			"⚪ 📦 12 devices: clientVersion 1.80.2 → 1.82.1\n" +
 			"\n" +
 			"3 muted changes not shown · 5 Oct 2026 12:00 UTC · [Batch 1842 in History](https://tailstate.example/history?batch=1842)",
+		FormatHTML: "<b>🔴 19 Tailscale changes (5 high) · prod (example.com)</b>\n" +
+			"2 created, 17 changed · 🔴 5 high, 🟠 2 medium, ⚪ 12 low\n" +
+			"Attributed: 4 of 19 changes\n" +
+			"\n" +
+			"🔴 ✏️ <b>web-02</b> (device) changed by ci-bot [api key]\n" +
+			"  • <code>tags</code>: +<code>tag:db</code>\n" +
+			"🔴 ➕ <b>kAbc123CNTRL</b> (key) created by alice@example.com\n" +
+			"🔴 ✏️ <b>Tailnet policy</b> changed by alice@example.com\n" +
+			"  • section <code>acls</code> changed (<code>3f9a1c0e</code> → <code>c41b7e2a</code>)\n" +
+			"  • section <code>ssh</code> added (<code>9e8d7c6b</code>)\n" +
+			"🔴 ✏️ <b>bob@example.com</b> (user) changed by alice@example.com\n" +
+			"  • <code>role</code>: <code>member</code> → <code>admin</code>\n" +
+			"🔴 ✏️ <b>SIEM webhook</b> (webhook) changed\n" +
+			"  • <code>endpointUrl</code>: secret changed (fingerprint <code>aa11bb22</code> → <code>99887766</code>)\n" +
+			"🟠 ➕ <b>laptop-new</b> (device) created\n" +
+			"🟠 ✏️ <b>DNS configuration</b> changed\n" +
+			"  • <code>searchPaths</code>: now <code>example.com</code>, <code>corp.example.com</code>\n" +
+			"⚪ 📦 12 devices: <code>clientVersion</code> <code>1.80.2</code> → <code>1.82.1</code>\n" +
+			"\n" +
+			"3 muted changes not shown · 5 Oct 2026 12:00 UTC · <a href=\"https://tailstate.example/history?batch=1842\">Batch 1842 in History</a>",
 	}
 	message := sampleDigest()
 	hash := regexp.MustCompile(`[0-9a-f]{32,}`)
@@ -162,7 +184,7 @@ func TestAssessmentSampleIsGolden(t *testing.T) {
 		}
 		assertSeverityOrder(t, format, got)
 		for _, baselines := range sampleBaselineBytes {
-			if baseline := baselines[format]; len(got)*4 > baseline*3 {
+			if baseline, ok := baselines[format]; ok && len(got)*4 > baseline*3 {
 				t.Fatalf("%s: %d bytes is not at least 25%% smaller than %d", format, len(got), baseline)
 			}
 		}

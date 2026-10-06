@@ -161,6 +161,32 @@ func TestPresentedValuesAreGolden(t *testing.T) {
 			"- splitDNS.corp: +10.0.0.53\n" +
 			"\n" +
 			"5 Oct 2026 12:00 UTC",
+		FormatHTML: "<b>🔴 4 Tailscale changes (3 high) · example.com</b>\n" +
+			"4 changed · 🔴 3 high, 🟠 1 medium\n" +
+			"\n" +
+			"🔴 ✏️ <b>web-02</b> (device) changed\n" +
+			"  • <code>tags</code>: +<code>tag:db</code>, −<code>tag:old</code>\n" +
+			"  • <code>enabledRoutes</code>: +<code>10.1.0.0/24</code>\n" +
+			"  • <code>name</code>: <code>web-02</code> → <code>web-02b</code>\n" +
+			"  • <code>keyExpiryDisabled</code>: <code>false</code> → <code>true</code>\n" +
+			"  • <code>retries</code>: <code>3</code> → <code>4.5</code>\n" +
+			"  • <code>description</code>: <code>old text</code> → (not set)\n" +
+			"  • <code>comment</code>: (not set) → (empty)\n" +
+			"  • <code>posture</code>: <code>{&#34;fingerprint&#34;:&#34;3f9a1c0e…&#34;,&#34;ok&#34;:true}</code> → <code>{&#34;ok&#34;:false}</code>\n" +
+			"🔴 ✏️ <b>Tailnet policy</b> changed\n" +
+			"  • section <code>acls</code> changed (<code>3f9a1c0e</code> → <code>c41b7e2a</code>)\n" +
+			"  • section <code>ssh</code> added (<code>9e8d7c6b</code>)\n" +
+			"  • section <code>tests</code> removed\n" +
+			"🔴 ✏️ <b>SIEM webhook</b> (webhook) changed\n" +
+			"  • <code>endpointUrl</code>: secret changed (fingerprint <code>3f9a1c0e</code> → <code>c41b7e2a</code>)\n" +
+			"  • <code>secret</code>: secret set\n" +
+			"  • <code>token</code>: secret removed\n" +
+			"🟠 ✏️ <b>DNS configuration</b> changed\n" +
+			"  • <code>searchPaths</code>: now <code>example.com</code>, <code>corp.example.com</code>\n" +
+			"  • <code>nameservers</code>: now <code>8.8.8.8</code>, <code>1.1.1.1</code> (+<code>8.8.8.8</code>)\n" +
+			"  • <code>splitDNS.corp</code>: +<code>10.0.0.53</code>\n" +
+			"\n" +
+			"5 Oct 2026 12:00 UTC",
 	}
 	message := presenterDigest()
 	for format, want := range golden {

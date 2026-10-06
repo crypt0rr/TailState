@@ -25,7 +25,7 @@ Destinations are added, edited, tested, and removed on the Settings page; see
 ## Message content and rendering
 
 - Every notification names the tailnet (prefixed by `TAILSTATE_INSTANCE_LABEL` when set) in its title and states when it was observed, in a compact UTC form such as `6 Oct 2026 09:14 UTC` (History and the API keep full RFC 3339 times): digests on their closing context line, other notifications on an `Observed at` line. With `TAILSTATE_PUBLIC_URL` set, digests link to their History batch (`/history?batch=<id>`) and health alerts and expiry warnings to `/status`. The Settings test message names the instance, tailnet, TailState version, and time.
-- Multiple changes in one poll become one digest, fanned out into one durable outbox item per enabled destination (subject to its [routing rules](#severity-and-routing)). The outbox stores a format-neutral message that is rendered when it is sent, in the format the receiving service displays: Slack mrkdwn for `slack` and `googlechat` (single-asterisk bold, no `###` headings, `<url|label>` links, and `&`, `<`, `>` escaped so a resource name cannot mention a channel), the Teams subset of Markdown for `teams` (see [Microsoft Teams](#microsoft-teams)), plain text for `telegram`, `smtp`, `pushover`, `matrix`, `ntfy`, `gotify`, `signal`, `bark`, `join`, `lark`, `wecom`, `pushbullet`, `ifttt`, `opsgenie`, `pagerduty`, `mqtt`, `twilio`, `xmpp`, `signalgrid`, and `hass`, and Markdown for every other service (for example `mattermost`, `discord`, `rocketchat`, `zulip`, and `generic`). Each destination can override the automatic choice under **Edit destination** in Settings (Markdown, Slack mrkdwn, plain text, or Microsoft Teams); the Settings test message uses the same format. Each digest is fitted to the receiving service's message limit (for example 4,096 bytes for Telegram, Lark, WeCom, and ntfy, 1,024 for Pushover, and 10,000 for Zulip) by dropping whole lines from the end and adding an explicit "lines omitted, see History" note. A provider that still rejects a message as too large (or with HTTP 413) dead-letters it immediately instead of retrying for 24 hours.
+- Multiple changes in one poll become one digest, fanned out into one durable outbox item per enabled destination (subject to its [routing rules](#severity-and-routing)). The outbox stores a format-neutral message that is rendered when it is sent, in the format the receiving service displays: Slack mrkdwn for `slack` and `googlechat` (single-asterisk bold, no `###` headings, `<url|label>` links, and `&`, `<`, `>` escaped so a resource name cannot mention a channel), the Teams subset of Markdown for `teams` (see [Microsoft Teams](#microsoft-teams)), Telegram HTML for `telegram` (see [Telegram](#telegram)), plain text for `smtp`, `pushover`, `matrix`, `ntfy`, `gotify`, `signal`, `bark`, `join`, `lark`, `wecom`, `pushbullet`, `ifttt`, `opsgenie`, `pagerduty`, `mqtt`, `twilio`, `xmpp`, `signalgrid`, and `hass`, and Markdown for every other service (for example `mattermost`, `discord`, `rocketchat`, `zulip`, and `generic`). Each destination can override the automatic choice under **Edit destination** in Settings (Markdown, Slack mrkdwn, plain text, Microsoft Teams, or Telegram HTML); the Settings test message uses the same format. Each digest is fitted to the receiving service's message limit (for example 4,096 bytes for Telegram, Lark, WeCom, and ntfy, 1,024 for Pushover, and 10,000 for Zulip) by dropping whole lines from the end and adding an explicit "lines omitted, see History" note. A provider that still rejects a message as too large (or with HTTP 413) dead-letters it immediately instead of retrying for 24 hours.
 
 ## Example digest
 
@@ -93,14 +93,46 @@ The same digest per service:
 | Service | Title | Body |
 | --- | --- | --- |
 | Email (`smtp`) | Subject | Plain text as above, without the title line |
-| Telegram | Bold first line (HTML mode) | Plain text as above |
+| Telegram | Bold first line (HTML mode) | Telegram HTML: names in bold, values in `<code>`, the History link as a labelled anchor (see [Telegram](#telegram)) |
 | ntfy, Gotify, Pushbullet | Notification title | Plain text as above |
 | Pushover | Notification title | Plain text as above, which fits in 1,024 bytes; a longer digest is shortened ("Shortened for this destination: 7 more lines omitted…" before the context line), so the high-severity changes stay |
-| Discord | Embed title | Markdown in one embed (`**bob@example.com** (user) changed`, `` `role`: `member` → `admin` ``) |
+| Discord | Embed title | Markdown in one embed (`**bob@example.com** (user) changed by alice@example.com`, `` `role`: `member` → `admin` ``) |
 | Microsoft Teams | Card title | The Teams subset of Markdown, one text block per line (`**bob@example.com** (user) changed by alice@example.com`, `- role: member → admin`) |
 | Slack | Header block and preview text | Slack mrkdwn in one section (`*bob@example.com*`, links as `<url\|label>`) |
 | Mattermost, Rocket.Chat, Zulip, generic webhooks | `### 🔴 19 Tailscale changes (5 high) · prod (example.com)` heading line | Markdown |
 | Matrix, Signal, other plain-text services | First line | Plain text as above |
+
+The start of the same digest in Markdown (Discord, Mattermost, Rocket.Chat,
+Zulip, generic webhooks; the `###` heading line only where the title is not a
+separate field):
+
+```markdown
+### 🔴 19 Tailscale changes (5 high) · prod (example.com)
+2 created, 17 changed · 🔴 5 high, 🟠 2 medium, ⚪ 12 low
+Attributed: 4 of 19 changes
+
+🔴 ✏️ **web-02** (device) changed by ci-bot \[api key\]
+  - `tags`: +`tag:db`
+🔴 ✏️ **bob@example.com** (user) changed by alice@example.com
+  - `role`: `member` → `admin`
+…
+3 muted changes not shown · 5 Oct 2026 12:00 UTC · [Batch 1842 in History](https://tailstate.example/history?batch=1842)
+```
+
+And in Slack mrkdwn (the title is the header block and preview text):
+
+```text
+2 created, 17 changed · 🔴 5 high, 🟠 2 medium, ⚪ 12 low
+Attributed: 4 of 19 changes
+
+🔴 ✏️ *web-02* (device) changed by ci-bot [api key]
+    • `tags`: +`tag:db`
+…
+3 muted changes not shown · 5 Oct 2026 12:00 UTC · <https://tailstate.example/history?batch=1842|Batch 1842 in History>
+```
+
+The Microsoft Teams and Telegram renderings are shown in
+[Microsoft Teams](#microsoft-teams) and [Telegram](#telegram).
 
 ## How values are shown
 
@@ -147,6 +179,10 @@ every message type and format.
   meaning: `*` becomes `∗`, an `_` that could start or end emphasis becomes
   `＿` (one inside a word, as in `tag:prod_db`, is kept), and a `]` followed
   by `(` becomes `］`, so a value cannot form a link.
+- **Telegram HTML:** every value (and every other text) is HTML-escaped
+  (`&`, `<`, `>`, `"`, `'`), so a value cannot add a tag, an attribute, or an
+  entity; the only tags are TailState's own `<b>`, `<i>`, `<code>`, and
+  `<a href>` to the configured public URL.
 - **Plain text:** values are shown as they are.
 
 ## Titles
@@ -162,7 +198,7 @@ with the first content line instead of repeating the title:
 | `discord` | Embed title |
 | `slack` | Header block, and the message text used for push previews |
 | `teams` | Card title (a bolder, medium text block) |
-| `telegram` | Bold first line |
+| `telegram` | Bold first line (HTML mode) |
 | `gotify`, `ntfy`, `pushover`, `pushbullet` | Notification title |
 
 Every other service receives the title as the first line of the message. This
@@ -175,8 +211,8 @@ pinned Shoutrrr release; a test fails when a Shoutrrr update drops or renames
 one of them. A parameter set in the destination URL always wins: with
 `?title=` (for email `?subject=` or `?title=`) in the URL, TailState keeps the
 operator's title and leaves its own as the first line of the body. Telegram
-receives a separate title only when the URL sets no `parsemode` (Shoutrrr shows
-a title only in its HTML mode, escaping the body), and a Discord URL with
+receives a separate title unless the URL sets a Markdown `parsemode` (Shoutrrr
+shows a title only in its HTML mode; see [Telegram](#telegram)), and a Discord URL with
 `json=yes` receives the body unchanged.
 
 ## Discord
@@ -243,6 +279,36 @@ Attributed: 4 of 19 changes
 
 The Teams rendering can also be chosen as a destination's format override,
 and a Teams destination can be overridden to Markdown or plain text.
+
+## Telegram
+
+Telegram destinations receive Telegram's HTML subset: names and labels in
+`<b>`, remarks in `<i>`, values in `<code>`, and the History and Status links
+as `<a href>` anchors (only to the configured public URL). TailState sends
+the message with `parsemode=HTML` and the title, which Shoutrrr puts in bold
+on the first line:
+
+```text
+<b>🔴 19 Tailscale changes (5 high) · prod (example.com)</b>
+2 created, 17 changed · 🔴 5 high, 🟠 2 medium, ⚪ 12 low
+Attributed: 4 of 19 changes
+
+🔴 ✏️ <b>web-02</b> (device) changed by ci-bot [api key]
+  • <code>tags</code>: +<code>tag:db</code>
+…
+3 muted changes not shown · 5 Oct 2026 12:00 UTC · <a href="https://tailstate.example/history?batch=1842">Batch 1842 in History</a>
+```
+
+The 4,096-byte budget is counted on the rendered HTML, tags and entities
+included, after reserving the title; a longer digest is shortened at line
+boundaries, so every tag stays closed. A URL that sets `parsemode` keeps it:
+with `parsemode=HTML` the destination still receives the HTML rendering,
+and with `Markdown`, `MarkdownV2`, or `None` it receives plain text (with
+`None`, Shoutrrr escapes it in its own HTML mode). Plain text also stays
+available as the destination's format override; Telegram HTML can likewise
+be chosen as an override. When a URL forces `parsemode=HTML` and the
+destination's override is another format, that rendering is HTML-escaped, so
+it is shown as written.
 
 ## Severity and routing
 

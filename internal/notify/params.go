@@ -19,6 +19,10 @@ const (
 	paramPriority   = "priority"
 	paramTags       = "tags"
 	paramColor      = "color"
+	paramParseMode  = "parsemode"
+
+	// parseModeHTML is the Telegram parse mode of the HTML rendering.
+	parseModeHTML = "HTML"
 )
 
 // serviceParams is the per-service allowlist of Shoutrrr config keys
@@ -47,7 +51,7 @@ var serviceParams = map[string]map[string][]string{
 	"slack":      {paramTitle: {"title"}, paramColor: {"color"}},
 	"smtp":       {paramTitle: {"subject", "title"}},
 	"teams":      {paramTitle: {"title"}, paramColor: {"color"}},
-	"telegram":   {paramTitle: {"title"}},
+	"telegram":   {paramTitle: {"title"}, paramParseMode: {"parsemode"}},
 }
 
 // severityParams maps a message's severity (the highest severity of a
@@ -157,11 +161,12 @@ func (d destination) sendsTitleSeparately() bool {
 	}
 	switch d.scheme {
 	case "telegram":
-		// Shoutrrr shows a Telegram title only in its HTML parse mode, which
-		// it selects (escaping the body) when no parse mode is set. With an
-		// explicit Markdown parse mode the title would be dropped.
-		mode := strings.ToLower(d.query["parsemode"])
-		return mode == "" || mode == "none"
+		// Shoutrrr shows a Telegram title only in its HTML parse mode: the one
+		// TailState passes with its HTML rendering, the one an operator set,
+		// or the one Shoutrrr selects (escaping a plain body) when no parse
+		// mode is set. With a Markdown parse mode the title would be dropped.
+		mode := strings.ToLower(d.query[paramParseMode])
+		return mode == "" || mode == "none" || mode == "html"
 	case "discord":
 		// In JSON mode Discord sends the body as a raw payload and ignores
 		// every parameter.
@@ -209,6 +214,13 @@ func (d destination) params(message Prepared) *types.Params {
 	if message.Title != "" {
 		if key := d.paramKey(paramTitle); key != "" {
 			params[key] = encodeTitle(d.scheme, message.Title)
+		}
+	}
+	if message.Format == FormatHTML {
+		// The HTML rendering is only shown as such in Telegram's HTML parse
+		// mode; Shoutrrr's own HTML mode would escape it.
+		if key := d.paramKey(paramParseMode); key != "" {
+			params[key] = parseModeHTML
 		}
 	}
 	for param := range severityParams[d.scheme] {

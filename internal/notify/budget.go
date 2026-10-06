@@ -47,6 +47,7 @@ func MessageLimit(serviceURL string) int {
 const (
 	shortenedNoteFormat      = "\n_Shortened for this destination: %s. See TailState History for the full batch._"
 	shortenedPlainNoteFormat = "\nShortened for this destination: %s. See TailState History for the full batch."
+	shortenedHTMLNoteFormat  = "\n<i>Shortened for this destination: %s. See TailState History for the full batch.</i>"
 )
 
 // FitMessage shortens a Markdown message to at most limit bytes. It removes
@@ -64,8 +65,11 @@ func FitMessageFor(message string, limit int, format string) string {
 		return message
 	}
 	noteFormat := shortenedNoteFormat
-	if format == FormatPlain {
+	switch format {
+	case FormatPlain:
 		noteFormat = shortenedPlainNoteFormat
+	case FormatHTML:
+		noteFormat = shortenedHTMLNoteFormat
 	}
 	lines := strings.SplitAfter(message, "\n")
 	for kept := len(lines) - 1; kept >= 1; kept-- {
@@ -95,7 +99,7 @@ func countLines(lines []string) int {
 // digestOmissionPattern matches the digest's own closing note (see
 // omittedEntries), which starts a line, so a tenant value inside a change
 // line cannot imitate it.
-var digestOmissionPattern = regexp.MustCompile(`^_?\d+ more changes? .*omitted, including (\d+) high-severity;`)
+var digestOmissionPattern = regexp.MustCompile(`^(?:_|<i>)?\d+ more changes? .*omitted, including (\d+) high-severity;`)
 
 // countHighSeverity counts the high-severity changes among dropped digest
 // lines: change and summary lines start with the high-severity icon, and a

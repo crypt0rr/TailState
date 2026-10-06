@@ -1,0 +1,98 @@
+# Notifications
+
+TailState delivers every change digest, collector health alert, expiry
+warning, and release notice through [Shoutrrr](https://shoutrrr.nickfedor.com/latest/)
+destinations configured on the authenticated Settings page. Notifications are
+an alerting channel, not the record: every change is also kept in
+[History](evidence.md), and delivery problems are visible in
+[metrics](metrics.md).
+
+## Destinations
+
+Any service registered by the pinned release of the [nicholas-fedor/shoutrrr](https://github.com/nicholas-fedor/shoutrrr) fork (see `go.mod`) is accepted. See the [Shoutrrr service overview](https://shoutrrr.nickfedor.com/latest/services/overview/) for supported endpoint schemes and provider-specific URL formats. Generic webhooks can be configured with `generic://` URLs and Shoutrrr query options such as `template=json&messagekey=text`.
+
+Shoutrrr supports Mattermost natively, for example:
+
+```text
+mattermost://TailState@mattermost.example/hooks-token?icon=satellite
+```
+
+For Matrix, prefer an access-token URL such as `matrix://:<access-token>@matrix.example/?rooms=!roomid:matrix.example`. A `matrix://user:password@host/...` URL makes Shoutrrr log in to the homeserver every time its sender is constructed: once when the destination is saved or tested and once per delivery attempt. Those logins use TailState's bounded, redirect-rejecting transport, and a rejected or rate-limited login is classified like any other provider response, but frequent logins can still hit homeserver login rate limits (for example Synapse's `rc_login`) and each one issues a new access token. Token URLs authenticate without a login request.
+
+Destinations are added, edited, tested, and removed on the Settings page; see
+[Web interface](operations.md#web-interface).
+
+## Message content and rendering
+
+- Every notification names the tailnet (prefixed by `TAILSTATE_INSTANCE_LABEL` when set) in its title and carries an `Observed at <UTC RFC3339>` line. With `TAILSTATE_PUBLIC_URL` set, digests link to their History batch (`/history?batch=<id>`) and health alerts and expiry warnings to `/status`. The Settings test message names the instance, tailnet, TailState version, and time.
+- Multiple changes in one poll become one digest, fanned out into one durable outbox item per enabled destination (subject to its [routing rules](#severity-and-routing)). The outbox stores a format-neutral message that is rendered when it is sent, in the format the receiving service displays: Slack mrkdwn for `slack` and `googlechat` (single-asterisk bold, no `###` headings, `<url|label>` links, and `&`, `<`, `>` escaped so a resource name cannot mention a channel), plain text for `telegram`, `smtp`, `pushover`, `matrix`, `ntfy`, `gotify`, `signal`, `bark`, `join`, `lark`, `wecom`, `pushbullet`, `ifttt`, `opsgenie`, `pagerduty`, `mqtt`, `twilio`, `xmpp`, `signalgrid`, and `hass`, and Markdown for every other service (for example `mattermost`, `discord`, `rocketchat`, `zulip`, `teams`, and `generic`). Each destination can override the automatic choice under **Edit destination** in Settings; the Settings test message uses the same format. Each digest is fitted to the receiving service's message limit (for example 4,096 bytes for Telegram, Lark, WeCom, and ntfy, 1,024 for Pushover, and 10,000 for Zulip) by dropping whole lines from the end and adding an explicit "lines omitted, see History" note. A provider that still rejects a message as too large (or with HTTP 413) dead-letters it immediately instead of retrying for 24 hours.
+
+## Severity and routing
+
+Every change is classified with a built-in severity. The digest prefixes each
+line with 🔴 high, 🟠 medium, or ⚪ low and repeats the severity next to the
+collector, and History can be filtered by severity.
+
+| Severity | Changes |
+| --- | --- |
+| High | Any `policy`, `log_streaming`, `settings` (tailnet settings), `webhooks`, or `oauth_apps` change (OAuth applications grant API access, like keys); a `keys` resource created; a `users` change to `role`; a `devices` change to `tags`, `authorized` false→true, or `keyExpiryDisabled` false→true |
+| Low | A `devices` change whose changed fields are all `clientVersion`, `updateAvailable`, `os`, or `distro` |
+| Medium | Everything else, for example devices created or removed, route changes (`enabledRoutes`, `advertisedRoutes`), user invites, users created or removed, keys removed, DNS, contacts, posture, and `services` changes |
+
+A changed resource takes the highest severity of its changed fields; a change
+whose field list was truncated is at least medium, because the omitted fields
+cannot be shown to be routine.
+
+Each destination has routing rules, edited under **Edit destination** in
+Settings: a minimum severity (all, medium and high, or high only), collectors
+to include (empty means all), collectors to exclude, and change kinds
+(created, changed, removed; none selected means all). Fan-out renders one
+digest per distinct rule set, so each destination receives only its matching
+changes, and a destination whose rules match nothing in a batch receives no
+digest. For example, a paging channel with "high only" receives nothing for a
+batch of client upgrades, while a default destination still receives it.
+Destinations created before routing existed, and new destinations, receive all
+changes. Collector health, expiry warnings, and release notifications are not
+inventory changes and always reach every enabled destination.
+
+## Noise controls
+
+Predictable noise is reduced in the digest without losing the audit trail:
+
+- **Mute rules** are managed under **Noise controls** in Settings (CSRF
+  protected). A rule mutes a collector (`dns`), one field path of a collector
+  (`devices.clientVersion`, which also covers nested paths below it), every
+  device carrying a tag (`tag:ci`, matched in the before or after snapshot), or
+  one resource by ID or exact name. Muted changes are still recorded in History
+  and in the signed evidence ledger, flagged `muted` in the History page and in
+  evidence exports, but are left out of digests; the digest states how many
+  muted changes it omitted, and a batch of only muted changes sends nothing. A
+  change whose fields are only partly muted is notified with its remaining
+  fields. Rules apply to batches recorded after they are added; at most 200
+  rules are kept.
+- **Fleet summarisation:** when the same field transition (for example
+  `updateAvailable` false→true) affects at least 5 resources of a collector in
+  one batch, the digest shows one line such as
+  "`updateAvailable`: `false` → `true` on 143 resources (devices)" with a
+  History link when `TAILSTATE_PUBLIC_URL` is set.
+- **Schema-change detection:** when a field becomes newly present (or absent)
+  on every resource a collector returned in one batch (at least 2 resources),
+  the digest shows one "upstream schema change" line instead of one diff per
+  resource.
+
+## Delivery semantics
+
+- Each destination receives its notifications in the order they were created, also after an outage: while a destination's oldest undelivered item is backing off after a failure (or still in flight), its younger items wait behind it instead of overtaking it when their own shorter retry delay expires, so a "collector recovered" message cannot arrive before the matching "unhealthy" one. Destinations are independent: one that fails or hangs holds back only its own queue. After a destination's first failed send in a delivery pass, its remaining items in that pass are returned unsent (without counting an attempt), so a blackholed destination delays the others by at most one send timeout (15 seconds) per pass.
+- Shoutrrr deliveries retry for up to 24 hours from when each item was queued (including time spent waiting behind an older item), across restarts, then remain visible as dead letters until the 30-day operational retention window expires. Delivery is at-least-once: each outbox row is leased while a sender is in flight, and if the process stops after a provider accepts a message but before the durable bookkeeping update commits, that message may be sent again after the lease expires. Per-lease fencing prevents a stale worker from changing a newer retry attempt. Disabling or removing a destination dead-letters its pending or in-flight items; newly added destinations receive only future notifications. Removing a destination also erases its encrypted URL (and overwrites the freed database space), so a leaked webhook credential is not carried into later backups; History keeps the destination name for past deliveries.
+- Delivery failures are classified from the HTTP response TailState's transport actually received, never from provider error text (so a port such as `:443` or an SMTP code is not mistaken for an HTTP status). Connection failures are recorded as "failed" or "timed out". HTTP 400, 401, 403, and 404 dead-letter on the first attempt as "notification rejected by provider (HTTP *n*)", because a malformed request, revoked token, or deleted webhook cannot succeed on retry. Other statuses (for example 429 and 5xx) are retried; a provider's `Retry-After` header (seconds or HTTP date) sets the next attempt, capped at one hour.
+- If every destination is disabled, or the last destination is removed, monitoring continues and notifications are reported as paused.
+
+## Collector health alerts
+
+- API collector failures alert after three consecutive failures and once on recovery. Transitions observed in one poll are grouped into one message per destination (one "unhealthy" and later one "recovered"), each collector listed with a bounded reason: `auth rejected`, `rate limited`, `timeout`, `upstream 5xx`, `invalid response`, `unsupported`, or `network error`. Provider error text is never included. A revoked OAuth credential therefore produces one grouped alert per poll schedule (device and inventory collectors are polled on separate schedules) instead of one alert per collector.
+
+## Release notifications
+
+- Starting a different TailState release queues one durable notification containing the previous and current versions, provided monitoring is configured and at least one destination is enabled; otherwise the new version is recorded silently. Development builds (version `dev`) are not tracked.
+
+Version tracking is introduced in v0.3.0. Its first startup records the release silently because earlier releases did not persist their version; subsequent upgrades include both exact versions in the notification.

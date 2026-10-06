@@ -1,0 +1,209 @@
+# Example Prometheus alerting rules for TailState.
+#
+# TailState's own notifications cannot report that notification delivery is
+# broken, so these rules use /metrics as the independent safety net. Load the
+# file through `rule_files` in prometheus.yml and adjust the thresholds, `for`
+# durations, and severity labels to your environment. Every expression uses
+# only metric names that TailState exposes; see docs/metrics.md.
+#
+# Validate after editing:
+#   promtool check rules docs/prometheus/alerts.yml
+groups:
+  - name: tailstate-delivery
+    rules:
+      - alert: TailStateNotificationsDeadLettered
+        expr: tailstate_outbox_dead > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "TailState has {{ $value }} dead-lettered notification(s)"
+          description: >-
+            At least one notification exhausted its 24-hour delivery window or
+            was rejected by its provider, so a destination missed a change.
+            Check the Delivery by destination table on the status page, fix the
+            destination, then use Retry dead letters (dead letters otherwise
+            stay until the 30-day retention removes them).
+          runbook_url: https://github.com/crypt0rr/TailState/blob/main/docs/notifications.md#delivery-semantics
+
+      - alert: TailStateNotificationsStuck
+        expr: >-
+          tailstate_outbox_pending > 0
+          and increase(tailstate_outbox_delivery_success_total[1h]) == 0
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "TailState has pending notifications but delivered none in the last hour"
+          description: >-
+            Notifications are queued but no delivery has succeeded for an hour,
+            so every destination is failing or delivery is not running. Items
+            are dead-lettered once their 24-hour delivery window expires.
+          runbook_url: https://github.com/crypt0rr/TailState/blob/main/docs/notifications.md#delivery-semantics
+
+      - alert: TailStateNotificationsPaused
+        expr: tailstate_notification_state{state="paused"} == 1
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "TailState notifications are paused: every destination is disabled"
+          description: >-
+            Monitoring continues and History records every change, but no
+            notification is sent. Enable a destination in Settings.
+          runbook_url: https://github.com/crypt0rr/TailState/blob/main/docs/operations.md#deployment-diagnostics
+
+      - alert: TailStateNoNotificationDestinations
+        expr: tailstate_notification_state{state="no_destinations"} == 1
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "TailState monitoring is configured without any notification destination"
+          description: >-
+            Monitoring continues and History records every change, but no
+            notification is sent. Add a destination in Settings.
+          runbook_url: https://github.com/crypt0rr/TailState/blob/main/docs/operations.md#deployment-diagnostics
+
+  - name: tailstate-collection
+    rules:
+      - alert: TailStateNotReady
+        expr: tailstate_ready == 0
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "TailState setup or its first baseline is incomplete"
+          description: >-
+            /readyz is not ready: setup has not been completed or no baseline
+            has been established yet, so changes are not being reported.
+          runbook_url: https://github.com/crypt0rr/TailState/blob/main/docs/operations.md#health-and-readiness
+
+      - alert: TailStateBaselineDegraded
+        expr: tailstate_baseline_degraded == 1
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "TailState readiness is degraded"
+          description: >-
+            A supported collector is failing, returning partial data, or
+            awaiting a new baseline. Changes it covers may be detected late.
+            The status page and /readyz show the per-collector reason.
+          runbook_url: https://github.com/crypt0rr/TailState/blob/main/docs/operations.md#health-and-readiness
+
+      - alert: TailStateCollectorFailing
+        expr: >-
+          tailstate_collector_failures >= 3
+          and on (job, instance, collector) tailstate_collector_supported == 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "TailState collector {{ $labels.collector }} has failed {{ $value }} consecutive polls"
+          description: >-
+            The collector keeps its last snapshots and retries with backoff,
+            but changes in its area are not detected until it recovers. Common
+            causes are a revoked OAuth credential, rate limiting, or an
+            upstream outage.
+          runbook_url: https://github.com/crypt0rr/TailState/blob/main/docs/monitoring.md#change-detection
+
+      - alert: TailStateCollectorPollOverdue
+        expr: time() - tailstate_collector_next_poll_timestamp_seconds > 900
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "TailState collector {{ $labels.collector }} is more than 15 minutes past its scheduled poll"
+          description: >-
+            The scheduler has not polled the collector at its scheduled time.
+            Check the TailState logs and tailstate_collector_due_errors_total.
+          runbook_url: https://github.com/crypt0rr/TailState/blob/main/docs/monitoring.md#change-detection
+
+      - alert: TailStateSchedulerDatabaseErrors
+        expr: increase(tailstate_collector_due_errors_total[15m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "TailState scheduler could not read due collectors from the database"
+          description: >-
+            Selecting due collectors failed with a database error in the last
+            15 minutes. Check disk space, storage pressure, and the logs.
+          runbook_url: https://github.com/crypt0rr/TailState/blob/main/docs/operations.md#storage-retention-and-compaction
+
+      - alert: TailStateWebhookTriggersDead
+        expr: tailstate_webhook_triggers_dead > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "TailState has {{ $value }} webhook trigger(s) that exhausted their retry window"
+          description: >-
+            Verified Tailscale webhook deliveries could not be reconciled within
+            24 hours. Polling remains the safety net, but the affected
+            collectors are failing; check collector health.
+          runbook_url: https://github.com/crypt0rr/TailState/blob/main/docs/monitoring.md#faster-reconciliation-with-tailscale-webhooks
+
+      - alert: TailStateAttributionLookupsFailing
+        expr: increase(tailstate_attribution_lookups_total{outcome="failed"}[1h]) >= 3
+        labels:
+          severity: info
+        annotations:
+          summary: "TailState change attribution lookups are failing"
+          description: >-
+            Configuration audit log lookups failed or timed out repeatedly in
+            the last hour, so recent changes show "actor unknown". Changes are
+            still detected and notified.
+          runbook_url: https://github.com/crypt0rr/TailState/blob/main/docs/monitoring.md#change-attribution
+
+  - name: tailstate-storage
+    rules:
+      - alert: TailStateStoragePressureHigh
+        expr: tailstate_storage_pressure_ratio > 0.8
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "TailState database uses {{ $value | humanizePercentage }} of its budget"
+          description: >-
+            Writes fail atomically once the database budget is reached. Raise
+            TAILSTATE_DATABASE_LIMIT_BYTES after checking volume space, or
+            reduce history growth.
+          runbook_url: https://github.com/crypt0rr/TailState/blob/main/docs/operations.md#storage-limits
+
+      - alert: TailStateStoragePressureCritical
+        expr: tailstate_storage_pressure_ratio > 0.95
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "TailState database uses {{ $value | humanizePercentage }} of its budget"
+          description: >-
+            The database is about to reach its budget; new snapshots, history,
+            and notifications will fail to be recorded.
+          runbook_url: https://github.com/crypt0rr/TailState/blob/main/docs/operations.md#storage-limits
+
+      - alert: TailStateStorageLimitNotEnforced
+        expr: tailstate_storage_limit_enforced == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "TailState's active SQLite page ceiling exceeds the configured database budget"
+          description: >-
+            SQLite cannot lower its page ceiling below the current file size,
+            so the budget is enforced at the larger size until the database is
+            compacted (doctor reports storage_compaction_needed).
+          runbook_url: https://github.com/crypt0rr/TailState/blob/main/docs/operations.md#compaction
+
+      - alert: TailStateRetentionCleanupFailing
+        expr: increase(tailstate_cleanup_failures_total[1h]) >= 3
+        labels:
+          severity: warning
+        annotations:
+          summary: "TailState retention cleanup is failing"
+          description: >-
+            Retention passes failed repeatedly in the last hour, so expired
+            history is not being removed and storage keeps growing. Check the
+            cleanup log lines and free disk space.
+          runbook_url: https://github.com/crypt0rr/TailState/blob/main/docs/operations.md#retention-cleanup

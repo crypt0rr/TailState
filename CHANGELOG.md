@@ -13,6 +13,9 @@ rollback requires restoring the backup taken before the upgrade. See
 
 ## [Unreleased]
 
+### Documentation
+- The README is split into focused pages under `docs/` (monitoring, notifications, history and evidence, operations, security, metrics) with a concise quick start; per-schema migration details moved to `UPGRADING.md`. New example Prometheus alert rules in `docs/prometheus/alerts.yml` (dead letters, stuck or paused delivery, collector failures and degraded readiness, storage pressure and an unenforced database limit, dead webhook triggers, failing attribution lookups) are validated with `promtool` in CI. Shoutrrr links point to the `nicholas-fedor/shoutrrr` fork's documentation, and `.env.example` lists every Compose variable, including the commented storage limits, with a pinned image version (#194).
+
 ## [0.14.0] - 2026-10-06
 
 - **Schema:** 16 (migrates from 14 through 15)

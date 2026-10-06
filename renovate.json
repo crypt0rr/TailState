@@ -16,6 +16,18 @@
         "# renovate: datasource=(?<datasource>docker) depName=(?<depName>[^\\s]+)\\nbackup_image=\"\\$\\{TAILSTATE_BACKUP_IMAGE:-[^\":]+:(?<currentValue>[^@\"]+)(?:@(?<currentDigest>sha256:[a-f0-9]+))?\\}\""
       ],
       "versioningTemplate": "docker"
+    },
+    {
+      "customType": "regex",
+      "description": "Digest-pinned images used through docker run in workflow steps",
+      "managerFilePatterns": [
+        "/(^|\\/)\\.github\\/workflows\\/[^/]+\\.ya?ml$/"
+      ],
+      "matchStrings": [
+        "(?<depName>prom\\/prometheus):(?<currentValue>v[0-9][^@\\s]*)@(?<currentDigest>sha256:[a-f0-9]+)"
+      ],
+      "datasourceTemplate": "docker",
+      "versioningTemplate": "docker"
     }
   ],
   "osvVulnerabilityAlerts": true,

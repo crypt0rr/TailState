@@ -14,7 +14,7 @@ import (
 )
 
 // Process exit codes. They are part of the operator interface (documented in
-// README.md) so scripts can tell "the check ran and found a problem" apart
+// docs/operations.md) so scripts can tell "the check ran and found a problem" apart
 // from "the command could not run".
 const (
 	exitOK       = 0

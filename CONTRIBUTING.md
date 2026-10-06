@@ -2,7 +2,8 @@
 
 TailState is a read-only Tailscale inventory monitor. Contributions should
 preserve that boundary, the encrypted-at-rest credential model, and the
-explainable history guarantees described in [README.md](README.md).
+explainable history guarantees described in [README.md](README.md) and the
+pages under [docs/](docs/).
 
 ## Before opening a change
 
@@ -35,6 +36,8 @@ docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:1.7.12 -no-color
 docker run --rm -i hadolint/hadolint:v2.15.1 < Dockerfile
 docker run --rm -v "$PWD:/repo" -w /repo ghcr.io/zizmorcore/zizmor:1.30.1 \
   --offline --min-severity low --config .github/zizmor.yml .github/workflows
+docker run --rm --entrypoint promtool -v "$PWD/docs/prometheus:/rules:ro" \
+  prom/prometheus:v3.15.0 check rules /rules/alerts.yml
 ```
 
 When changing dependency declarations or the Renovate configuration, also
@@ -92,6 +95,16 @@ regression test beside the behavior it protects.
 - Treat database migrations and restore scripts as recovery-sensitive code;
   test wrong-key startup, rollback/error paths, and unsafe archive entries.
 
+## Documentation
+
+The README is the entry point: what TailState is, the quick start, the
+configuration summary, development, and releases. Behaviour is documented once,
+in the matching page under `docs/` (`monitoring.md`, `notifications.md`,
+`evidence.md`, `operations.md`, `security.md`, `metrics.md`); migration
+details live in [UPGRADING.md](UPGRADING.md). Update that page in the same
+change as the behaviour, link to it instead of repeating it, and keep
+`docs/prometheus/alerts.yml` in step with renamed or removed metrics.
+
 ## Pull requests
 
 Describe the user-visible behavior, migration/rollback implications, and the
@@ -105,4 +118,6 @@ user-visible change, referencing its issue. When preparing a release, rename
 that section to the version and date and add its `- **Schema:**` and
 `- **Rollback:**` lines; the release workflow refuses a tag whose CHANGELOG
 entry is missing either line. A release that migrates the schema is a minor
-release, and [UPGRADING.md](UPGRADING.md#schema-history) gets a new row.
+release, and [UPGRADING.md](UPGRADING.md#schema-history) gets a new row and a
+[migration details](UPGRADING.md#migration-details) entry. After the release
+is published, point the pinned `TAILSTATE_IMAGE` in `.env.example` at it.

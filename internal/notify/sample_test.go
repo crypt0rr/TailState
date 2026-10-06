@@ -49,8 +49,8 @@ func sampleDigest() Message {
 // the notification assessment's baseline, and with readable values (#230)
 // but the earlier layout.
 var sampleBaselineBytes = []map[string]int{
-	{FormatMarkdown: 1786, FormatSlack: 1794, FormatPlain: 1674},
-	{FormatMarkdown: 1425, FormatSlack: 1433, FormatPlain: 1317},
+	{FormatMarkdown: 1786, FormatSlack: 1794, FormatPlain: 1674, FormatTeams: 1786},
+	{FormatMarkdown: 1425, FormatSlack: 1433, FormatPlain: 1317, FormatTeams: 1425},
 }
 
 // TestAssessmentSampleIsGolden pins the assessment's sample digest in every
@@ -122,6 +122,26 @@ func TestAssessmentSampleIsGolden(t *testing.T) {
 			"⚪ 📦 12 devices: clientVersion 1.80.2 → 1.82.1\n" +
 			"\n" +
 			"3 muted changes not shown · 5 Oct 2026 12:00 UTC · Batch 1842 in History: https://tailstate.example/history?batch=1842",
+		FormatTeams: "**🔴 19 Tailscale changes (5 high) · prod (example.com)**\n" +
+			"2 created, 17 changed · 🔴 5 high, 🟠 2 medium, ⚪ 12 low\n" +
+			"Attributed: 4 of 19 changes\n" +
+			"\n" +
+			"🔴 ✏️ **web-02** (device) changed by ci-bot [api key]\n" +
+			"- tags: +tag:db\n" +
+			"🔴 ➕ **kAbc123CNTRL** (key) created by alice@example.com\n" +
+			"🔴 ✏️ **Tailnet policy** changed by alice@example.com\n" +
+			"- section acls changed (3f9a1c0e → c41b7e2a)\n" +
+			"- section ssh added (9e8d7c6b)\n" +
+			"🔴 ✏️ **bob@example.com** (user) changed by alice@example.com\n" +
+			"- role: member → admin\n" +
+			"🔴 ✏️ **SIEM webhook** (webhook) changed\n" +
+			"- endpointUrl: secret changed (fingerprint aa11bb22 → 99887766)\n" +
+			"🟠 ➕ **laptop-new** (device) created\n" +
+			"🟠 ✏️ **DNS configuration** changed\n" +
+			"- searchPaths: now example.com, corp.example.com\n" +
+			"⚪ 📦 12 devices: clientVersion 1.80.2 → 1.82.1\n" +
+			"\n" +
+			"3 muted changes not shown · 5 Oct 2026 12:00 UTC · [Batch 1842 in History](https://tailstate.example/history?batch=1842)",
 	}
 	message := sampleDigest()
 	hash := regexp.MustCompile(`[0-9a-f]{32,}`)

@@ -47,7 +47,7 @@ func TestDestinationFormatOverrideIsEditableAndUsedForTests(t *testing.T) {
 		t.Fatalf("saved format=%+v err=%v", destinations, err)
 	}
 	page := authenticatedGet(t, server, "/settings", cookies).Body.String()
-	if !strings.Contains(page, "Format: plain") || !strings.Contains(page, `<option value="plain" selected>`) {
+	if !strings.Contains(page, "Format: plain") || !strings.Contains(page, `<option value="plain" selected>`) || !strings.Contains(page, `<option value="teams">Microsoft Teams</option>`) {
 		t.Fatalf("settings page does not show the format override: %s", page)
 	}
 	invalid := cloneForm(form)

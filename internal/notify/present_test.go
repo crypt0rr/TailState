@@ -135,6 +135,32 @@ func TestPresentedValuesAreGolden(t *testing.T) {
 			"  • splitDNS.corp: +10.0.0.53\n" +
 			"\n" +
 			"5 Oct 2026 12:00 UTC",
+		FormatTeams: "**🔴 4 Tailscale changes (3 high) · example.com**\n" +
+			"4 changed · 🔴 3 high, 🟠 1 medium\n" +
+			"\n" +
+			"🔴 ✏️ **web-02** (device) changed\n" +
+			"- tags: +tag:db, −tag:old\n" +
+			"- enabledRoutes: +10.1.0.0/24\n" +
+			"- name: web-02 → web-02b\n" +
+			"- keyExpiryDisabled: false → true\n" +
+			"- retries: 3 → 4.5\n" +
+			"- description: old text → (not set)\n" +
+			"- comment: (not set) → (empty)\n" +
+			"- posture: {\"fingerprint\":\"3f9a1c0e…\",\"ok\":true} → {\"ok\":false}\n" +
+			"🔴 ✏️ **Tailnet policy** changed\n" +
+			"- section acls changed (3f9a1c0e → c41b7e2a)\n" +
+			"- section ssh added (9e8d7c6b)\n" +
+			"- section tests removed\n" +
+			"🔴 ✏️ **SIEM webhook** (webhook) changed\n" +
+			"- endpointUrl: secret changed (fingerprint 3f9a1c0e → c41b7e2a)\n" +
+			"- secret: secret set\n" +
+			"- token: secret removed\n" +
+			"🟠 ✏️ **DNS configuration** changed\n" +
+			"- searchPaths: now example.com, corp.example.com\n" +
+			"- nameservers: now 8.8.8.8, 1.1.1.1 (+8.8.8.8)\n" +
+			"- splitDNS.corp: +10.0.0.53\n" +
+			"\n" +
+			"5 Oct 2026 12:00 UTC",
 	}
 	message := presenterDigest()
 	for format, want := range golden {

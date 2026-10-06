@@ -17,10 +17,13 @@ const (
 	FormatSlack = "slack"
 	// FormatPlain is plain text without any markup.
 	FormatPlain = "plain"
+	// FormatTeams is the Markdown subset of Microsoft Teams Adaptive Card
+	// text blocks: no headings or code spans, **bold**, - lists, and links.
+	FormatTeams = "teams"
 )
 
 // Formats lists the explicit per-destination format overrides.
-var Formats = []string{FormatMarkdown, FormatSlack, FormatPlain}
+var Formats = []string{FormatMarkdown, FormatSlack, FormatPlain, FormatTeams}
 
 // Stored outbox payload kinds. Rows written before schema v14 hold
 // pre-rendered Markdown and keep being delivered exactly as stored.
@@ -38,7 +41,7 @@ var schemeFormats = map[string]string{
 	"discord":    FormatMarkdown,
 	"rocketchat": FormatMarkdown,
 	"zulip":      FormatMarkdown,
-	"teams":      FormatMarkdown,
+	"teams":      FormatTeams,
 	"generic":    FormatMarkdown,
 	"telegram":   FormatPlain,
 	"smtp":       FormatPlain,
@@ -66,7 +69,7 @@ var schemeFormats = map[string]string{
 func ValidateFormat(format string) (string, error) {
 	format = strings.ToLower(strings.TrimSpace(format))
 	switch format {
-	case FormatAuto, FormatMarkdown, FormatSlack, FormatPlain:
+	case FormatAuto, FormatMarkdown, FormatSlack, FormatPlain, FormatTeams:
 		return format, nil
 	}
 	return "", fmt.Errorf("unknown message format %q", format)
@@ -100,6 +103,8 @@ func flavourFor(format string) flavour {
 		return slackFlavour
 	case FormatPlain:
 		return plainFlavour
+	case FormatTeams:
+		return teamsFlavour
 	default:
 		return markdownFlavour
 	}

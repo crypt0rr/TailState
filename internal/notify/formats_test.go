@@ -49,6 +49,14 @@ func TestRenderedFormatsAreGolden(t *testing.T) {
 			"🟠 ➕ web_*1*<!channel> (device) created\n" +
 			"\n" +
 			"1 muted change not shown · 5 Oct 2026 12:00 UTC · Batch 42 in History: https://tailstate.example/history?batch=42",
+		FormatTeams: "**🔴 2 Tailscale changes (1 high) · lab (example.com)**\n" +
+			"1 created, 1 changed · 🔴 1 high, 🟠 1 medium\n" +
+			"\n" +
+			"🔴 ✏️ **alice** (user) changed\n" +
+			"- role: member → admin\n" +
+			"🟠 ➕ **web＿∗1∗<!channel>** (device) created\n" +
+			"\n" +
+			"1 muted change not shown · 5 Oct 2026 12:00 UTC · [Batch 42 in History](https://tailstate.example/history?batch=42)",
 	}
 	message := goldenDigest()
 	for format, want := range golden {
@@ -139,7 +147,7 @@ func TestFormatSelectionByServiceAndOverride(t *testing.T) {
 	if _, err := ValidateFormat("html"); err == nil {
 		t.Fatal("unknown format accepted")
 	}
-	if len(Formats) != 3 {
+	if len(Formats) != 4 {
 		t.Fatalf("formats=%v", Formats)
 	}
 }

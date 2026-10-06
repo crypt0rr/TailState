@@ -25,7 +25,7 @@ Destinations are added, edited, tested, and removed on the Settings page; see
 ## Message content and rendering
 
 - Every notification names the tailnet (prefixed by `TAILSTATE_INSTANCE_LABEL` when set) in its title and states when it was observed, in a compact UTC form such as `6 Oct 2026 09:14 UTC` (History and the API keep full RFC 3339 times): digests on their closing context line, other notifications on an `Observed at` line. With `TAILSTATE_PUBLIC_URL` set, digests link to their History batch (`/history?batch=<id>`) and health alerts and expiry warnings to `/status`. The Settings test message names the instance, tailnet, TailState version, and time.
-- Multiple changes in one poll become one digest, fanned out into one durable outbox item per enabled destination (subject to its [routing rules](#severity-and-routing)). The outbox stores a format-neutral message that is rendered when it is sent, in the format the receiving service displays: Slack mrkdwn for `slack` and `googlechat` (single-asterisk bold, no `###` headings, `<url|label>` links, and `&`, `<`, `>` escaped so a resource name cannot mention a channel), plain text for `telegram`, `smtp`, `pushover`, `matrix`, `ntfy`, `gotify`, `signal`, `bark`, `join`, `lark`, `wecom`, `pushbullet`, `ifttt`, `opsgenie`, `pagerduty`, `mqtt`, `twilio`, `xmpp`, `signalgrid`, and `hass`, and Markdown for every other service (for example `mattermost`, `discord`, `rocketchat`, `zulip`, `teams`, and `generic`). Each destination can override the automatic choice under **Edit destination** in Settings; the Settings test message uses the same format. Each digest is fitted to the receiving service's message limit (for example 4,096 bytes for Telegram, Lark, WeCom, and ntfy, 1,024 for Pushover, and 10,000 for Zulip) by dropping whole lines from the end and adding an explicit "lines omitted, see History" note. A provider that still rejects a message as too large (or with HTTP 413) dead-letters it immediately instead of retrying for 24 hours.
+- Multiple changes in one poll become one digest, fanned out into one durable outbox item per enabled destination (subject to its [routing rules](#severity-and-routing)). The outbox stores a format-neutral message that is rendered when it is sent, in the format the receiving service displays: Slack mrkdwn for `slack` and `googlechat` (single-asterisk bold, no `###` headings, `<url|label>` links, and `&`, `<`, `>` escaped so a resource name cannot mention a channel), the Teams subset of Markdown for `teams` (see [Microsoft Teams](#microsoft-teams)), plain text for `telegram`, `smtp`, `pushover`, `matrix`, `ntfy`, `gotify`, `signal`, `bark`, `join`, `lark`, `wecom`, `pushbullet`, `ifttt`, `opsgenie`, `pagerduty`, `mqtt`, `twilio`, `xmpp`, `signalgrid`, and `hass`, and Markdown for every other service (for example `mattermost`, `discord`, `rocketchat`, `zulip`, and `generic`). Each destination can override the automatic choice under **Edit destination** in Settings (Markdown, Slack mrkdwn, plain text, or Microsoft Teams); the Settings test message uses the same format. Each digest is fitted to the receiving service's message limit (for example 4,096 bytes for Telegram, Lark, WeCom, and ntfy, 1,024 for Pushover, and 10,000 for Zulip) by dropping whole lines from the end and adding an explicit "lines omitted, see History" note. A provider that still rejects a message as too large (or with HTTP 413) dead-letters it immediately instead of retrying for 24 hours.
 
 ## Example digest
 
@@ -97,7 +97,7 @@ The same digest per service:
 | ntfy, Gotify, Pushbullet | Notification title | Plain text as above |
 | Pushover | Notification title | Plain text as above, which fits in 1,024 bytes; a longer digest is shortened ("Shortened for this destination: 7 more lines omitted…" before the context line), so the high-severity changes stay |
 | Discord | Embed title | Markdown in one embed (`**bob@example.com** (user) changed`, `` `role`: `member` → `admin` ``) |
-| Microsoft Teams | Card heading | Markdown, one text block per line |
+| Microsoft Teams | Card title | The Teams subset of Markdown, one text block per line (`**bob@example.com** (user) changed by alice@example.com`, `- role: member → admin`) |
 | Slack | Header block and preview text | Slack mrkdwn in one section (`*bob@example.com*`, links as `<url\|label>`) |
 | Mattermost, Rocket.Chat, Zulip, generic webhooks | `### 🔴 19 Tailscale changes (5 high) · prod (example.com)` heading line | Markdown |
 | Matrix, Signal, other plain-text services | First line | Plain text as above |
@@ -142,6 +142,11 @@ every message type and format.
 - **Slack:** `&`, `<`, and `>` become entities, so a value cannot mention a
   channel or create a link, and `*`, `~`, and `` ` `` in values are replaced
   by look-alike characters.
+- **Microsoft Teams:** Teams shows backslash escapes literally, so values
+  use look-alike characters instead, only where they could change the
+  meaning: `*` becomes `∗`, an `_` that could start or end emphasis becomes
+  `＿` (one inside a word, as in `tag:prod_db`, is kept), and a `]` followed
+  by `(` becomes `］`, so a value cannot form a link.
 - **Plain text:** values are shown as they are.
 
 ## Titles
@@ -156,7 +161,7 @@ with the first content line instead of repeating the title:
 | `smtp` (email) | Subject |
 | `discord` | Embed title |
 | `slack` | Header block, and the message text used for push previews |
-| `teams` | Card heading |
+| `teams` | Card title (a bolder, medium text block) |
 | `telegram` | Bold first line |
 | `gotify`, `ntfy`, `pushover`, `pushbullet` | Notification title |
 
@@ -204,9 +209,39 @@ redirect-rejecting HTTP client as every other delivery, so failures are
 classified the same way (permanent 4xx, `Retry-After`). The URL options
 `botname`/`username`, `icon`, `thread_ts`, `color` (the sections are then
 wrapped in one attachment with that colour bar), and `title` keep their
-meaning. A destination whose format is overridden to Markdown or plain text
+meaning. A destination whose format is overridden to another format
 receives `plain_text` sections, which Slack never parses for mentions or
 links.
+
+## Microsoft Teams
+
+Shoutrrr delivers a `teams://` message to a Power Automate workflow as an
+Adaptive Card: the title is the card title (a bolder, medium text block), and
+every body line becomes its own `TextBlock`. TextBlocks render only a subset
+of Markdown (bold, italic, bulleted lists, and links), so Teams destinations
+receive their own rendering instead of CommonMark:
+
+- no `###` heading (the title is the card title, or a `**bold**` first line
+  when the URL sets its own `title`);
+- names in `**bold**`, and values as plain text instead of code spans;
+- detail lines as `- ` list items;
+- links as `[label](url)`, only to the configured public URL;
+- values escaped for the TextBlock subset without backslashes (see
+  [Escaping](#escaping)).
+
+```text
+2 created, 17 changed · 🔴 5 high, 🟠 2 medium, ⚪ 12 low
+Attributed: 4 of 19 changes
+🔴 ✏️ **web-02** (device) changed by ci-bot [api key]
+- tags: +tag:db
+🔴 ✏️ **Tailnet policy** changed by alice@example.com
+- section acls changed (3f9a1c0e → c41b7e2a)
+…
+3 muted changes not shown · 5 Oct 2026 12:00 UTC · [Batch 1842 in History](https://tailstate.example/history?batch=1842)
+```
+
+The Teams rendering can also be chosen as a destination's format override,
+and a Teams destination can be overridden to Markdown or plain text.
 
 ## Severity and routing
 

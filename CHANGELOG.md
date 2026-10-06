@@ -13,6 +13,11 @@ rollback requires restoring the backup taken before the upgrade. See
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-10-06
+
+- **Schema:** 17 (unchanged)
+- **Rollback:** image-only rollback to 0.15.0 is safe.
+
 ### Changed
 - Notification field lines and fleet summaries show readable values instead of raw JSON and hashes: policy sections as "section `acls` changed/added/removed" with 8-character fingerprints, redacted secrets as "secret changed (fingerprint … → …)", set, or removed, text without JSON quotes, list changes as `+added`/`−removed` elements, ordered DNS lists in their new order, and absent values as "(not set)". History, the API, and evidence packs keep the full values (#230).
 
@@ -134,7 +139,8 @@ Releases before 0.11.16 are described in their
 [GitHub release notes](https://github.com/crypt0rr/TailState/releases); their
 schema versions are listed in [UPGRADING.md](UPGRADING.md#schema-history).
 
-[Unreleased]: https://github.com/crypt0rr/TailState/compare/v0.15.0...HEAD
+[Unreleased]: https://github.com/crypt0rr/TailState/compare/v0.16.0...HEAD
+[0.16.0]: https://github.com/crypt0rr/TailState/compare/v0.15.0...v0.16.0
 [0.15.0]: https://github.com/crypt0rr/TailState/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/crypt0rr/TailState/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/crypt0rr/TailState/compare/v0.12.0...v0.13.0

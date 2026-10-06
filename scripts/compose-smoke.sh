@@ -88,11 +88,36 @@ for _ in $(seq 1 30); do
             echo "Compose container runs as ${configured_user}, expected 10001:10001" >&2
             exit 1
         fi
+        ready=true
+        break
+    fi
+    sleep 1
+done
+if [[ "${ready:-false}" != true ]]; then
+    docker compose logs >&2 || true
+    echo "TailState health endpoint did not become ready on port ${port}" >&2
+    exit 1
+fi
+
+# Follow the README's documented bearer-token scrape: the token lives in .env
+# (not the shell, which Compose would prefer), the container is recreated, and
+# the header is read from a file.
+unset TAILSTATE_METRICS_TOKEN
+metrics_token="$(openssl rand -hex 32)"
+sed -i "s/^TAILSTATE_METRICS_TOKEN=.*/TAILSTATE_METRICS_TOKEN=${metrics_token}/" .env
+docker compose up -d
+printf 'Authorization: Bearer %s\n' "$(sed -n 's/^TAILSTATE_METRICS_TOKEN=//p' .env)" > metrics.header
+for _ in $(seq 1 30); do
+    if curl --fail --silent --show-error --max-time 2 -H @metrics.header "http://127.0.0.1:${port}/metrics" >/dev/null 2>&1; then
+        wrong_status="$(curl --silent --max-time 2 --output /dev/null --write-out '%{http_code}' -H 'Authorization: Bearer wrong' "http://127.0.0.1:${port}/metrics")"
+        if [[ "$wrong_status" != "401" ]]; then
+            echo "TailState metrics accepted a wrong bearer token (HTTP ${wrong_status})" >&2
+            exit 1
+        fi
         exit 0
     fi
     sleep 1
 done
-
 docker compose logs >&2 || true
-echo "TailState health endpoint did not become ready on port ${port}" >&2
+echo "TailState metrics endpoint did not accept the documented bearer token" >&2
 exit 1

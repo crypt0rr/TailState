@@ -28,6 +28,9 @@ rollback requires restoring the backup taken before the upgrade. See
 - Administrative audit trail (`admin_audit`, schema 15, 365-day retention) for sign-ins, password and session changes, settings (including OAuth scopes and expiry warnings), destinations, mute rules, Reconcile now, and Retry dead letters, with a "TailState configuration changed" notice to previously enabled destinations for high-risk changes (#177).
 - Scoped, read-only API tokens (`status:read`, `history:read`, `evidence:read`; hashed in schema 15, shown once after Post/Redirect/Get) and `GET /api/v1/status`, `/api/v1/history` (NDJSON, History filters including dates, bidirectional cursors), and `/api/v1/evidence` (#196).
 
+### Documentation
+- `/metrics` documentation matches the code: Compose and `docker run -p` deployments set the bearer token in `.env` and scrape with a header file, the HTTPS override scrapes through the proxy, and token-less scraping is limited to local loopback (#160).
+
 ## [0.13.0] - 2026-10-06
 
 - **Schema:** 14 (migrates from 13)

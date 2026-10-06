@@ -71,6 +71,7 @@ migration without performing it.
 | 14 | 0.13.0 | Destination routing, mute rules, rendering format, format-neutral outbox payloads, event severity |
 | 15 | 0.14.0 | Session activity, administrative audit trail, API tokens |
 | 16 | 0.14.0 | Change attribution from the configuration audit log |
+| 17 | 0.15.0 | Fixed-width UTC timestamps for correct sub-second ordering |
 
 [Migration details](#migration-details) describes each migration.
 
@@ -163,7 +164,7 @@ previously exported pack still verify. New exports use evidence format version
 4, which adds per-event `severity` and `muted`; `tailstate evidence verify`
 accepts both version 3 and version 4 packs.
 
-### Schema 15
+### Schema 15 (0.14.0)
 
 Schema v15 adds administrative security state. Sessions gain a last-activity
 time for the 60-minute idle timeout; existing sessions are backfilled with
@@ -175,7 +176,7 @@ the audit trail and token list start empty at the upgrade. The migration
 runs in one transaction and changes no existing setting, destination,
 history, or evidence row.
 
-### Schema 16
+### Schema 16 (0.14.0)
 
 Schema v16 adds [change attribution](docs/monitoring.md#change-attribution): an `attribution`
 column on events (the bounded "changed by" record) and an
@@ -191,7 +192,7 @@ carries attribution, so a newer pack cannot be relabelled as an older one.
 Older releases cannot verify version 5 packs. Rolling back requires restoring
 the pre-upgrade backup, as for every schema change.
 
-### Schema 17
+### Schema 17 (0.15.0)
 
 Schema v17 stores every timestamp in a fixed-width UTC form with nine
 fractional digits (`2006-01-02T15:04:05.000000000Z`). Earlier releases dropped

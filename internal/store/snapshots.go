@@ -95,7 +95,7 @@ func (s *Store) ApplyBatchWithOptions(ctx context.Context, generation int64, res
 		return ChangeBatchResult{}, nil
 	}
 	now := time.Now().UTC()
-	apply := &batchApply{ctx: ctx, tx: tx, generation: generation, now: now, observedAt: now.Format(time.RFC3339Nano), limits: s.StorageLimits()}
+	apply := &batchApply{ctx: ctx, tx: tx, generation: generation, now: now, observedAt: formatTimestamp(now), limits: s.StorageLimits()}
 	for resultIndex, result := range results {
 		if result.Error != nil {
 			continue
@@ -192,13 +192,13 @@ func (a *batchApply) unsupportedCollector(result model.Collected) error {
 		return stateErr
 	}
 	if stateErr == nil && supported == 1 && baseline == 1 && lastError != unsupportedConfirmationMessage {
-		next := a.now.Add(unsupportedRetryInterval).Format(time.RFC3339Nano)
+		next := formatTimestamp(a.now.Add(unsupportedRetryInterval))
 		_, err := tx.ExecContext(ctx, `UPDATE collector_state
 					SET supported=1,last_error=?,failure_count=1,next_poll=?,partial=0,partial_error_count=0
 					WHERE generation=? AND collector=?`, unsupportedConfirmationMessage, next, a.generation, result.Collector)
 		return err
 	}
-	next := a.now.Add(unsupportedDemotionInterval).Format(time.RFC3339Nano)
+	next := formatTimestamp(a.now.Add(unsupportedDemotionInterval))
 	reason := strings.TrimSpace(result.UnsupportedReason)
 	if reason == "" {
 		reason = "unsupported"
@@ -305,7 +305,7 @@ func (a *batchApply) upsertResource(collector string, resource model.Resource, c
 		if baselined && !silentLifecycle && !(absorbSharedUsers && isSharedUser(resource)) {
 			a.record(model.Change{Kind: "created", Collector: collector, ResourceID: resource.ID, Type: resource.Type, Name: resource.Name}, storedValue{}, existingStoredValue(raw, hash, int64(len(raw)), false))
 		}
-		_, err = tx.ExecContext(ctx, `INSERT INTO snapshots(generation,collector,resource_id,resource_type,name,canonical_json,content_hash,content_bytes,content_truncated,missing_count,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)`, generation, collector, resource.ID, resource.Type, resource.Name, storedSnapshot.raw, hash, storedSnapshot.bytes, boolInt(storedSnapshot.truncated), 0, a.now.Format(time.RFC3339Nano))
+		_, err = tx.ExecContext(ctx, `INSERT INTO snapshots(generation,collector,resource_id,resource_type,name,canonical_json,content_hash,content_bytes,content_truncated,missing_count,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)`, generation, collector, resource.ID, resource.Type, resource.Name, storedSnapshot.raw, hash, storedSnapshot.bytes, boolInt(storedSnapshot.truncated), 0, formatTimestamp(a.now))
 	case err != nil:
 		return err
 	case oldHash != hash:
@@ -342,7 +342,7 @@ func (a *batchApply) upsertResource(collector string, resource model.Resource, c
 
 // rewriteSnapshot replaces a stored snapshot and clears its missing count.
 func (a *batchApply) rewriteSnapshot(collector string, resource model.Resource, stored storedValue, hash string) error {
-	_, err := a.tx.ExecContext(a.ctx, "UPDATE snapshots SET resource_type=?,name=?,canonical_json=?,content_hash=?,content_bytes=?,content_truncated=?,missing_count=0,updated_at=? WHERE generation=? AND collector=? AND resource_id=?", resource.Type, resource.Name, stored.raw, hash, stored.bytes, boolInt(stored.truncated), a.now.Format(time.RFC3339Nano), a.generation, collector, resource.ID)
+	_, err := a.tx.ExecContext(a.ctx, "UPDATE snapshots SET resource_type=?,name=?,canonical_json=?,content_hash=?,content_bytes=?,content_truncated=?,missing_count=0,updated_at=? WHERE generation=? AND collector=? AND resource_id=?", resource.Type, resource.Name, stored.raw, hash, stored.bytes, boolInt(stored.truncated), formatTimestamp(a.now), a.generation, collector, resource.ID)
 	return err
 }
 

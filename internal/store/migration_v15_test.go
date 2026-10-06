@@ -68,7 +68,7 @@ func TestSchemaV15MigrationKeepsSessionsAndAddsSecurityState(t *testing.T) {
 		t.Fatalf("schema version=%d err=%v", version, err)
 	}
 	var lastSeen string
-	if err := st.db.QueryRow("SELECT last_seen_at FROM sessions WHERE token_hash=?", secret.HashToken("recent")).Scan(&lastSeen); err != nil || lastSeen != recent {
+	if err := st.db.QueryRow("SELECT last_seen_at FROM sessions WHERE token_hash=?", secret.HashToken("recent")).Scan(&lastSeen); err != nil || !sameStoredTime(lastSeen, recent) {
 		t.Fatalf("session activity not backfilled: %q %v", lastSeen, err)
 	}
 	if !st.ValidateSession(ctx, "recent", "csrf", true) {

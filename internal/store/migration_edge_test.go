@@ -218,7 +218,7 @@ CREATE TABLE outbox(id INTEGER PRIMARY KEY AUTOINCREMENT,batch_id INTEGER,destin
 		if err := st.db.QueryRowContext(ctx, "SELECT status,next_attempt_at FROM webhook_triggers WHERE id=1").Scan(&status, &nextAttempt); err != nil {
 			t.Fatal(err)
 		}
-		if status != "pending" || nextAttempt != now {
+		if status != "pending" || !sameStoredTime(nextAttempt, now) {
 			t.Fatalf("migrated webhook trigger = %q/%q", status, nextAttempt)
 		}
 		var linkedTrigger int64

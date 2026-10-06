@@ -129,7 +129,7 @@ func (s *Store) SetDestinationEnabled(ctx context.Context, id int64, enabled boo
 		return err
 	}
 	defer tx.Rollback()
-	now := time.Now().UTC().Format(time.RFC3339Nano)
+	now := formatTimestamp(time.Now())
 	result, err := tx.ExecContext(ctx, "UPDATE notification_destinations SET enabled=?,updated_at=? WHERE id=? AND deleted_at IS NULL", boolInt(enabled), now, id)
 	if err != nil {
 		return err
@@ -156,7 +156,7 @@ func (s *Store) SetDestinationEnabled(ctx context.Context, id int64, enabled boo
 // recoverable from later backups by anyone holding the master key.
 func (s *Store) DeleteDestination(ctx context.Context, id int64) error {
 	return withSecureDelete(ctx, s.db, func(tx *sql.Tx) error {
-		now := time.Now().UTC().Format(time.RFC3339Nano)
+		now := formatTimestamp(time.Now())
 		result, err := tx.ExecContext(ctx, "UPDATE notification_destinations SET enabled=0,service_url_enc='',deleted_at=?,updated_at=? WHERE id=? AND deleted_at IS NULL", now, now, id)
 		if err != nil {
 			return err
@@ -204,7 +204,7 @@ func withSecureDelete(ctx context.Context, db *sql.DB, fn func(*sql.Tx) error) (
 }
 
 func upsertDestinationTx(ctx context.Context, tx *sql.Tx, box *secret.Box, id int64, name, serviceURL string, enabled bool) (int64, error) {
-	now := time.Now().UTC().Format(time.RFC3339Nano)
+	now := formatTimestamp(time.Now())
 	if id > 0 {
 		var existingEncoded string
 		if err := tx.QueryRowContext(ctx, "SELECT service_url_enc FROM notification_destinations WHERE id=? AND deleted_at IS NULL", id).Scan(&existingEncoded); err != nil {

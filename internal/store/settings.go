@@ -136,7 +136,7 @@ func (s *Store) SaveSettings(ctx context.Context, in Settings) (int64, error) {
 			return 0, errors.New("at least one enabled notification destination is required")
 		}
 	}
-	now := time.Now().UTC().Format(time.RFC3339Nano)
+	now := formatTimestamp(time.Now())
 	_, err = tx.ExecContext(ctx, `INSERT INTO settings(id,tailnet,oauth_client_id,oauth_secret_enc,mattermost_url_enc,webhook_secret_enc,device_interval_seconds,inventory_interval_seconds,generation,configured_at,baseline_at)
 	VALUES(1,?,?,?,?,?,?,?,?,?,NULL) ON CONFLICT(id) DO UPDATE SET tailnet=excluded.tailnet,oauth_client_id=excluded.oauth_client_id,oauth_secret_enc=excluded.oauth_secret_enc,mattermost_url_enc=CASE WHEN excluded.mattermost_url_enc='' THEN settings.mattermost_url_enc ELSE excluded.mattermost_url_enc END,webhook_secret_enc=CASE WHEN excluded.webhook_secret_enc='' THEN settings.webhook_secret_enc ELSE excluded.webhook_secret_enc END,device_interval_seconds=excluded.device_interval_seconds,inventory_interval_seconds=excluded.inventory_interval_seconds,generation=excluded.generation,configured_at=excluded.configured_at,baseline_at=CASE WHEN settings.generation=excluded.generation THEN settings.baseline_at ELSE NULL END`, in.Tailnet, in.OAuthClientID, secretEnc, legacyURLEnc, webhookSecretEnc, int64(in.DeviceInterval.Seconds()), int64(in.InventoryInterval.Seconds()), generation, now)
 	if err != nil {
@@ -259,7 +259,7 @@ func (s *Store) TrackAppVersion(ctx context.Context, current string, notificatio
 	}
 	notified := configured > 0 && enabledDestinations > 0
 	if notified {
-		now := time.Now().UTC().Format(time.RFC3339Nano)
+		now := formatTimestamp(time.Now())
 		payloadFormat, payload, encodeErr := notify.EncodePayload(notification(previous, current))
 		if encodeErr != nil {
 			return false, encodeErr

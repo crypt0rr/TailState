@@ -69,8 +69,8 @@ func (s *Store) CreateSession(ctx context.Context) (token, csrf string, err erro
 		return
 	}
 	now := time.Now().UTC()
-	nowValue := now.Format(time.RFC3339Nano)
-	_, err = s.db.ExecContext(ctx, "INSERT INTO sessions(token_hash,csrf_hash,expires_at,created_at,last_seen_at) VALUES(?,?,?,?,?)", secret.HashToken(token), secret.HashToken(csrf), now.Add(SessionLifetime).Format(time.RFC3339Nano), nowValue, nowValue)
+	nowValue := formatTimestamp(now)
+	_, err = s.db.ExecContext(ctx, "INSERT INTO sessions(token_hash,csrf_hash,expires_at,created_at,last_seen_at) VALUES(?,?,?,?,?)", secret.HashToken(token), secret.HashToken(csrf), formatTimestamp(now.Add(SessionLifetime)), nowValue, nowValue)
 	return
 }
 
@@ -115,7 +115,7 @@ func (s *Store) AuthenticateSession(ctx context.Context, token, csrf string, req
 	if activity && now.Sub(info.LastSeenAt) >= sessionTouchInterval {
 		// A failed touch only shortens the idle window; it never grants
 		// access, so the error is not surfaced to the request.
-		if err := s.bookkeepingWrite(ctx, "UPDATE sessions SET last_seen_at=? WHERE token_hash=?", now.Format(time.RFC3339Nano), hash); err == nil {
+		if err := s.bookkeepingWrite(ctx, "UPDATE sessions SET last_seen_at=? WHERE token_hash=?", formatTimestamp(now), hash); err == nil {
 			info.LastSeenAt = now
 			info.IdleUntil = now.Add(SessionIdleTimeout)
 		}
@@ -153,7 +153,7 @@ func (s *Store) DeleteSession(ctx context.Context, token string) {
 // ListSessions returns the sessions that are still valid, most recently
 // active first, marking the one that belongs to currentToken.
 func (s *Store) ListSessions(ctx context.Context, currentToken string) ([]SessionInfo, error) {
-	rows, err := s.readDB().QueryContext(ctx, "SELECT token_hash,expires_at,created_at,last_seen_at FROM sessions WHERE expires_at>? ORDER BY expires_at DESC LIMIT ?", time.Now().UTC().Format(time.RFC3339Nano), maxListedSessions)
+	rows, err := s.readDB().QueryContext(ctx, "SELECT token_hash,expires_at,created_at,last_seen_at FROM sessions WHERE expires_at>? ORDER BY expires_at DESC LIMIT ?", formatTimestamp(time.Now()), maxListedSessions)
 	if err != nil {
 		return nil, err
 	}
@@ -215,7 +215,7 @@ func (s *Store) ChangePassword(ctx context.Context, keepToken, current, password
 		return err
 	}
 	defer tx.Rollback()
-	now := time.Now().UTC().Format(time.RFC3339Nano)
+	now := formatTimestamp(time.Now())
 	result, err := tx.ExecContext(ctx, "UPDATE admin SET password_hash=?,updated_at=? WHERE id=1", hash, now)
 	if err != nil {
 		return err

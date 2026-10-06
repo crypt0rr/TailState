@@ -202,6 +202,7 @@ var migrations = []migration{
 	{from: 13, to: 14, apply: withoutKey(migrateSchemaV13ToV14)},
 	{from: 14, to: 15, apply: withoutKey(migrateSchemaV14ToV15)},
 	{from: 15, to: 16, apply: withoutKey(migrateSchemaV15ToV16)},
+	{from: 16, to: 17, apply: withoutKey(migrateSchemaV16ToV17)},
 }
 
 // withoutKey adapts a migration step that needs no master key.

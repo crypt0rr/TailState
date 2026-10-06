@@ -39,7 +39,7 @@ func (s *Store) EnqueueSystem(ctx context.Context, payload string) error {
 }
 
 func (s *Store) enqueueSystem(ctx context.Context, payloadFormat, payload string) error {
-	now := time.Now().UTC().Format(time.RFC3339Nano)
+	now := formatTimestamp(time.Now())
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -69,8 +69,8 @@ func (s *Store) ClaimDueOutbox(ctx context.Context, limit int, leases ...time.Du
 		lease = leases[0]
 	}
 	now := time.Now().UTC()
-	nowValue := now.Format(time.RFC3339Nano)
-	leaseValue := now.Add(lease).Format(time.RFC3339Nano)
+	nowValue := formatTimestamp(now)
+	leaseValue := formatTimestamp(now.Add(lease))
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
@@ -84,7 +84,7 @@ func (s *Store) ClaimDueOutbox(ctx context.Context, limit int, leases ...time.Du
 	// Cleanup normally enforces the retry horizon, but delivery claims can run
 	// between cleanup passes (including immediately after a restart). Expired
 	// rows must never be sent again just because their next_attempt is due.
-	retryCutoff := now.Add(-outboxRetryWindow).Format(time.RFC3339Nano)
+	retryCutoff := formatTimestamp(now.Add(-outboxRetryWindow))
 	if _, err := tx.ExecContext(ctx, `UPDATE outbox
 		SET status='dead',next_attempt=?,lease_until=NULL,lease_token='',
 			last_error=CASE WHEN TRIM(last_error)='' THEN 'delivery retry window expired' ELSE last_error END
@@ -249,7 +249,7 @@ func (s *Store) DeliveredClaimedResult(ctx context.Context, item OutboxItem) (bo
 	if item.ID <= 0 || strings.TrimSpace(item.LeaseToken) == "" {
 		return false, nil
 	}
-	result, err := s.db.ExecContext(ctx, "UPDATE outbox SET status='delivered',delivered_at=?,last_error='',lease_until=NULL,lease_token='' WHERE id=? AND status='processing' AND lease_token=?", time.Now().UTC().Format(time.RFC3339Nano), item.ID, item.LeaseToken)
+	result, err := s.db.ExecContext(ctx, "UPDATE outbox SET status='delivered',delivered_at=?,last_error='',lease_until=NULL,lease_token='' WHERE id=? AND status='processing' AND lease_token=?", formatTimestamp(time.Now()), item.ID, item.LeaseToken)
 	if err != nil {
 		return false, err
 	}
@@ -278,7 +278,7 @@ func (s *Store) RetryClaimedResult(ctx context.Context, item OutboxItem, next ti
 	if dead {
 		status = "dead"
 	}
-	result, err := s.db.ExecContext(ctx, "UPDATE outbox SET status=?,next_attempt=?,last_error=?,lease_until=NULL,lease_token='' WHERE id=? AND status='processing' AND lease_token=?", status, next.UTC().Format(time.RFC3339Nano), truncate(message, 500), item.ID, item.LeaseToken)
+	result, err := s.db.ExecContext(ctx, "UPDATE outbox SET status=?,next_attempt=?,last_error=?,lease_until=NULL,lease_token='' WHERE id=? AND status='processing' AND lease_token=?", status, formatTimestamp(next), truncate(message, 500), item.ID, item.LeaseToken)
 	if err != nil {
 		return false, err
 	}
@@ -320,7 +320,7 @@ func (s *Store) RenewClaimed(ctx context.Context, item OutboxItem, leases ...tim
 	if len(leases) > 0 && leases[0] >= time.Second {
 		lease = leases[0]
 	}
-	leaseUntil := time.Now().UTC().Add(lease).Format(time.RFC3339Nano)
+	leaseUntil := formatTimestamp(time.Now().UTC().Add(lease))
 	result, err := s.db.ExecContext(ctx, "UPDATE outbox SET lease_until=? WHERE id=? AND status='processing' AND lease_token=?", leaseUntil, item.ID, item.LeaseToken)
 	if err != nil {
 		return false, err
@@ -417,7 +417,7 @@ func (s *Store) RetryDeadOutbox(ctx context.Context, destinationID int64) (int64
 	if enabled != 1 {
 		return 0, ErrDestinationDisabled
 	}
-	now := time.Now().UTC().Format(time.RFC3339Nano)
+	now := formatTimestamp(time.Now())
 	result, err := tx.ExecContext(ctx, `UPDATE outbox
 		SET status='pending',attempts=0,first_attempt=?,next_attempt=?,last_error='',lease_until=NULL,lease_token='',delivered_at=NULL
 		WHERE destination_id=? AND `+retryableDeadOutbox(""), now, now, destinationID)

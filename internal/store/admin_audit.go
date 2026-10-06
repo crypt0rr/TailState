@@ -173,7 +173,7 @@ func (s *Store) RecordAdminAudit(ctx context.Context, entry AdminAuditEntry, not
 		return entry, err
 	}
 	entry.At = time.Now().UTC()
-	now := entry.At.Format(time.RFC3339Nano)
+	now := formatTimestamp(entry.At)
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return entry, err

@@ -225,7 +225,7 @@ func (s *Store) SetDestinationFormat(ctx context.Context, id int64, format strin
 	if err != nil {
 		return err
 	}
-	result, err := s.db.ExecContext(ctx, "UPDATE notification_destinations SET message_format=?,updated_at=? WHERE id=? AND deleted_at IS NULL", format, time.Now().UTC().Format(time.RFC3339Nano), id)
+	result, err := s.db.ExecContext(ctx, "UPDATE notification_destinations SET message_format=?,updated_at=? WHERE id=? AND deleted_at IS NULL", format, formatTimestamp(time.Now()), id)
 	if err != nil {
 		return err
 	}
@@ -247,7 +247,7 @@ func (s *Store) SetDestinationRouting(ctx context.Context, id int64, rules Routi
 	}
 	result, err := s.db.ExecContext(ctx, `UPDATE notification_destinations
 		SET route_min_severity=?,route_include_collectors=?,route_exclude_collectors=?,route_change_kinds=?,updated_at=?
-		WHERE id=? AND deleted_at IS NULL`, string(rules.MinSeverity), joinRoutingList(rules.IncludeCollectors), joinRoutingList(rules.ExcludeCollectors), joinRoutingList(rules.ChangeKinds), time.Now().UTC().Format(time.RFC3339Nano), id)
+		WHERE id=? AND deleted_at IS NULL`, string(rules.MinSeverity), joinRoutingList(rules.IncludeCollectors), joinRoutingList(rules.ExcludeCollectors), joinRoutingList(rules.ChangeKinds), formatTimestamp(time.Now()), id)
 	if err != nil {
 		return err
 	}

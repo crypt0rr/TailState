@@ -105,7 +105,7 @@ func (s *Store) CommitExpiryWarnings(ctx context.Context, generation int64, mess
 	if active != generation {
 		return false, nil
 	}
-	now := time.Now().UTC().Format(time.RFC3339Nano)
+	now := formatTimestamp(time.Now())
 	for _, payload := range payloads {
 		if err := enqueueOutboxTx(ctx, tx, payload.format, payload.payload, now, 0); err != nil {
 			return false, err

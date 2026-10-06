@@ -43,7 +43,7 @@ func (s *Store) Claim(ctx context.Context, token, password string) error {
 	if expiry, err := time.Parse(time.RFC3339Nano, expires); err != nil || !expiry.After(time.Now().UTC()) {
 		return errors.New("setup token has expired")
 	}
-	now := time.Now().UTC().Format(time.RFC3339Nano)
+	now := formatTimestamp(time.Now())
 	if _, err := tx.ExecContext(ctx, "INSERT INTO admin(id,password_hash,created_at,updated_at) VALUES(1,?,?,?)", hash, now, now); err != nil {
 		return err
 	}
@@ -86,7 +86,7 @@ func (s *Store) issueAuthToken(ctx context.Context, kind, legacyKey string, life
 	if _, err := tx.ExecContext(ctx, "DELETE FROM auth_tokens WHERE kind=?", kind); err != nil {
 		return "", err
 	}
-	if _, err := tx.ExecContext(ctx, "INSERT INTO auth_tokens(token_hash,kind,created_at,expires_at) VALUES(?,?,?,?)", secret.HashToken(token), kind, now.Format(time.RFC3339Nano), now.Add(lifetime).Format(time.RFC3339Nano)); err != nil {
+	if _, err := tx.ExecContext(ctx, "INSERT INTO auth_tokens(token_hash,kind,created_at,expires_at) VALUES(?,?,?,?)", secret.HashToken(token), kind, formatTimestamp(now), formatTimestamp(now.Add(lifetime))); err != nil {
 		return "", err
 	}
 	if _, err := tx.ExecContext(ctx, "INSERT INTO meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", legacyKey, secret.HashToken(token)); err != nil {
@@ -130,7 +130,7 @@ func (s *Store) ResetPassword(ctx context.Context, password string) error {
 		return err
 	}
 	defer tx.Rollback()
-	now := time.Now().UTC().Format(time.RFC3339Nano)
+	now := formatTimestamp(time.Now())
 	res, err := tx.ExecContext(ctx, "UPDATE admin SET password_hash=?,updated_at=? WHERE id=1", hash, now)
 	if err != nil {
 		return err
@@ -180,7 +180,7 @@ func (s *Store) ResetWithToken(ctx context.Context, token, password string) erro
 	if expiry, err := time.Parse(time.RFC3339Nano, expires); err != nil || !expiry.After(time.Now().UTC()) {
 		return errors.New("reset token has expired")
 	}
-	now := time.Now().UTC().Format(time.RFC3339Nano)
+	now := formatTimestamp(time.Now())
 	result, err := tx.ExecContext(ctx, "UPDATE admin SET password_hash=?,updated_at=? WHERE id=1", hash, now)
 	if err != nil {
 		return err

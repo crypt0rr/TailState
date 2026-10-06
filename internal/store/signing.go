@@ -384,7 +384,7 @@ func (s *Store) backfillEvidenceLedgerOnStartup(ctx context.Context) error {
 			return err
 		}
 	}
-	_, err = s.db.ExecContext(ctx, "INSERT INTO meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", evidenceLedgerBackfilledMeta, time.Now().UTC().Format(time.RFC3339Nano))
+	_, err = s.db.ExecContext(ctx, "INSERT INTO meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", evidenceLedgerBackfilledMeta, formatTimestamp(time.Now()))
 	return err
 }
 
@@ -435,7 +435,7 @@ func (s *Store) appendEvidenceLedgerTx(ctx context.Context, tx *sql.Tx, batchID 
 	digest := ledgerDigest(previous, payload)
 	entryHash := hex.EncodeToString(digest[:])
 	signature := base64.RawStdEncoding.EncodeToString(ed25519.Sign(s.evidenceKey.private, digest[:]))
-	now := time.Now().UTC().Format(time.RFC3339Nano)
+	now := formatTimestamp(time.Now())
 	if _, err := tx.ExecContext(ctx, `INSERT INTO evidence_ledger(batch_id,generation,observed_at,prev_hash,entry_hash,signature,key_id,created_at) VALUES(?,?,?,?,?,?,?,?)`, batchID, batch.Generation, batch.ObservedAt, previous, entryHash, signature, s.evidenceKey.keyID, now); err != nil {
 		return fmt.Errorf("append evidence ledger batch %d: %w", batchID, err)
 	}

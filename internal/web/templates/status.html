@@ -25,6 +25,16 @@
     <h2 id="summary-reconciliation" class="summary-label">Reconciliation</h2>
     <strong>{{.Status.WebhookPending}} pending · {{.Status.WebhookProcessing}} processing · {{.Status.WebhookDead}} dead</strong>
   </section>
+  <section class="card" aria-labelledby="summary-attribution">
+    <h2 id="summary-attribution" class="summary-label">Change attribution</h2>
+    {{- with .Status.Attribution}}{{if .State}}
+    <strong>{{if eq .State "supported"}}Supported{{else if eq .State "unsupported"}}Unsupported{{else}}Unavailable{{end}}</strong>
+    <small>Configuration audit logs{{if .Reason}}: {{.Reason}}{{end}} · checked {{template "when" (when .CheckedAt $.Now)}}</small>
+    {{- else}}
+    <strong>Not checked yet</strong>
+    <small>Configuration audit logs are read when a change is detected.</small>
+    {{- end}}{{end}}
+  </section>
 </div>
 {{if .Status.BaselineDegraded}}<p class="notice" role="status">{{.Status.BaselineReason}}</p>{{end}}
 

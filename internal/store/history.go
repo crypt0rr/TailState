@@ -45,7 +45,7 @@ func (s *Store) listHistory(ctx context.Context, filter HistoryFilter, byteLimit
 		order = "ASC"
 	}
 	args = append(args, limit+1)
-	rows, err := s.readDB().QueryContext(ctx, `SELECT b.id,b.generation,b.observed_at,b.change_count,COALESCE(b.trigger_id,0)
+	rows, err := s.readDB().QueryContext(ctx, `SELECT b.id,b.generation,b.observed_at,b.change_count,COALESCE(b.trigger_id,0),b.attribution_status
 		FROM event_batches b WHERE `+strings.Join(where, " AND ")+` ORDER BY b.id `+order+` LIMIT ?`, args...)
 	if err != nil {
 		return HistoryPage{}, err
@@ -56,7 +56,7 @@ func (s *Store) listHistory(ctx context.Context, filter HistoryFilter, byteLimit
 	for rows.Next() {
 		var batch HistoryBatch
 		var observed string
-		if err := rows.Scan(&batch.ID, &batch.Generation, &observed, &batch.ChangeCount, &batch.TriggerID); err != nil {
+		if err := rows.Scan(&batch.ID, &batch.Generation, &observed, &batch.ChangeCount, &batch.TriggerID, &batch.AttributionStatus); err != nil {
 			return HistoryPage{}, err
 		}
 		batch.ObservedAt, err = time.Parse(time.RFC3339Nano, observed)
@@ -240,7 +240,7 @@ func (s *Store) historyBatchByteEstimate(ctx context.Context, batchID int64, fil
 	var eventBytes int64
 	if err := s.readDB().QueryRowContext(ctx, `SELECT COALESCE(SUM(
 		length(COALESCE(changes_json,'')) + length(COALESCE(before_json,'')) + length(COALESCE(after_json,'')) +
-		length(collector) + length(event_type) + length(resource_id) + length(name) + 128),0)
+		length(collector) + length(event_type) + length(resource_id) + length(name) + length(attribution) + 128),0)
 		FROM events WHERE `+strings.Join(eventWhere, " AND "), eventArgs...).Scan(&eventBytes); err != nil {
 		return 0, err
 	}
@@ -257,7 +257,7 @@ func (s *Store) historyBatchByteEstimate(ctx context.Context, batchID int64, fil
 		// cannot be bypassed by a narrow filter.
 		if err := s.readDB().QueryRowContext(ctx, `SELECT COALESCE(SUM(
 			length(COALESCE(changes_json,'')) + length(COALESCE(before_json,'')) + length(COALESCE(after_json,'')) +
-			length(collector) + length(event_type) + length(resource_id) + length(name) + 256),0)
+			length(collector) + length(event_type) + length(resource_id) + length(name) + length(attribution) + 256),0)
 			FROM events WHERE batch_id=?`, batchID).Scan(&ledgerBytes); err != nil {
 			return 0, err
 		}
@@ -325,7 +325,7 @@ func (s *Store) loadHistoryBatch(ctx context.Context, batch HistoryBatch, filter
 		eventWhere = append(eventWhere, "severity=?")
 		eventArgs = append(eventArgs, filter.Severity)
 	}
-	rows, err := s.readDB().QueryContext(ctx, `SELECT id,batch_id,generation,observed_at,collector,event_type,resource_id,name,changes_json,before_json,after_json,before_hash,after_hash,before_bytes,after_bytes,before_truncated,after_truncated,severity,muted
+	rows, err := s.readDB().QueryContext(ctx, `SELECT id,batch_id,generation,observed_at,collector,event_type,resource_id,name,changes_json,before_json,after_json,before_hash,after_hash,before_bytes,after_bytes,before_truncated,after_truncated,severity,muted,attribution
 		FROM events WHERE `+strings.Join(eventWhere, " AND ")+` ORDER BY id`, eventArgs...)
 	if err != nil {
 		return HistoryBatch{}, err
@@ -337,10 +337,15 @@ func (s *Store) loadHistoryBatch(ctx context.Context, batch HistoryBatch, filter
 		var observed string
 		var fieldsRaw, beforeRaw, afterRaw []byte
 		var beforeTruncated, afterTruncated, muted int
-		if err := rows.Scan(&event.ID, &event.BatchID, &event.Generation, &observed, &event.Collector, &event.EventType, &event.ResourceID, &event.Name, &fieldsRaw, &beforeRaw, &afterRaw, &event.BeforeHash, &event.AfterHash, &event.BeforeBytes, &event.AfterBytes, &beforeTruncated, &afterTruncated, &event.Severity, &muted); err != nil {
+		var attribution string
+		if err := rows.Scan(&event.ID, &event.BatchID, &event.Generation, &observed, &event.Collector, &event.EventType, &event.ResourceID, &event.Name, &fieldsRaw, &beforeRaw, &afterRaw, &event.BeforeHash, &event.AfterHash, &event.BeforeBytes, &event.AfterBytes, &beforeTruncated, &afterTruncated, &event.Severity, &muted, &attribution); err != nil {
 			return HistoryBatch{}, err
 		}
 		event.Muted = muted == 1
+		if decoded, ok := model.UnmarshalAttribution(attribution); ok {
+			event.Attribution = &decoded
+		}
+		event.ChangedBy = ChangedBy(event.Attribution, batch.AttributionStatus)
 		event.BeforeTruncated = beforeTruncated == 1
 		event.AfterTruncated = afterTruncated == 1
 		if marker, ok := parseTruncationMarker(beforeRaw); ok {

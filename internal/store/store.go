@@ -93,6 +93,9 @@ type Status struct {
 	WebhookPending      int
 	WebhookProcessing   int
 	WebhookDead         int
+	// Attribution is the configuration audit log state for the current
+	// generation; its zero value means it has not been checked yet.
+	Attribution AttributionSource
 }
 
 type OutboxItem struct {
@@ -140,6 +143,11 @@ type WebhookTrigger struct {
 type ChangeBatchResult struct {
 	ChangeBatch
 	Changes []model.Change
+	// AttributionStatus is the configuration audit lookup outcome for the
+	// batch (empty when no lookup ran) and Attributed the number of changes
+	// it explained.
+	AttributionStatus string
+	Attributed        int
 }
 
 type HistoryFieldChange struct {
@@ -172,6 +180,11 @@ type HistoryEvent struct {
 	AfterTruncated  bool
 	Severity        string
 	Muted           bool
+	// Attribution is the configuration audit record that explains the
+	// change, if any; ChangedBy is its display text, "actor unknown" when
+	// the batch lookup ran without a match, or "" when nothing is shown.
+	Attribution *model.Attribution
+	ChangedBy   string
 }
 
 type HistoryDelivery struct {
@@ -187,14 +200,18 @@ type HistoryDelivery struct {
 
 type HistoryBatch struct {
 	ChangeBatch
-	Events          []HistoryEvent
-	Deliveries      []HistoryDelivery
-	LedgerSequence  int64
-	LedgerPrevHash  string
-	LedgerHash      string
-	LedgerSignature string
-	LedgerKeyID     string
-	ledgerPayload   []byte
+	// AttributionStatus is the batch's configuration audit lookup outcome
+	// (AttributionComplete, AttributionUnavailable, AttributionUnsupported,
+	// or empty for batches recorded without a lookup).
+	AttributionStatus string
+	Events            []HistoryEvent
+	Deliveries        []HistoryDelivery
+	LedgerSequence    int64
+	LedgerPrevHash    string
+	LedgerHash        string
+	LedgerSignature   string
+	LedgerKeyID       string
+	ledgerPayload     []byte
 }
 
 type HistoryFilter struct {
@@ -232,7 +249,7 @@ type HistoryPage struct {
 	TruncationReason string
 }
 
-const currentSchemaVersion = 15
+const currentSchemaVersion = 16
 
 const (
 	webhookTriggerRetryWindow = 24 * time.Hour

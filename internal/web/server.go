@@ -1986,6 +1986,20 @@ func (s *Server) writeMetrics(b *bytes.Buffer, status store.Status, storage stor
 		} {
 			fmt.Fprintf(b, "tailstate_cleanup_rows_total{table=%q} %d\n", row.table, row.count)
 		}
+		attribution := s.engine.AttributionMetrics()
+		metricFamily(b, "tailstate_attribution_lookups_total", "counter", "Configuration audit log lookups for change attribution, by outcome.")
+		for _, row := range []struct {
+			outcome string
+			count   uint64
+		}{
+			{"complete", attribution.LookupsComplete},
+			{"unsupported", attribution.LookupsUnsupported},
+			{"failed", attribution.LookupsFailed},
+		} {
+			fmt.Fprintf(b, "tailstate_attribution_lookups_total{outcome=%q} %d\n", row.outcome, row.count)
+		}
+		metricFamily(b, "tailstate_attribution_changes_total", "counter", "Changes in attributed batches, by whether the audit log named an actor.")
+		fmt.Fprintf(b, "tailstate_attribution_changes_total{result=\"matched\"} %d\ntailstate_attribution_changes_total{result=\"unknown\"} %d\n", attribution.ChangesMatched, attribution.ChangesUnknown)
 	}
 	metricValue(b, "tailstate_storage_bytes", "gauge", "Logical bytes allocated by the SQLite database, including free pages.", storage.DatabaseBytes)
 	metricValue(b, "tailstate_storage_used_bytes", "gauge", "Logical bytes in use by the SQLite database, excluding free pages.", storage.DatabaseUsedBytes)

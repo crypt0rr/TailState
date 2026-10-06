@@ -37,6 +37,13 @@ func (s *Store) Status(ctx context.Context) (Status, error) {
 		if err != nil {
 			return out, fmt.Errorf("load settings generation for status: %w", err)
 		}
+		source, err := readAttributionSource(ctx, db)
+		if err != nil {
+			return out, fmt.Errorf("load attribution source state: %w", err)
+		}
+		if source.Generation == generation {
+			out.Attribution = source
+		}
 		rows, err := db.QueryContext(ctx, "SELECT collector,COUNT(*) FROM snapshots WHERE generation=? GROUP BY collector", generation)
 		if err != nil {
 			return out, err

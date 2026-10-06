@@ -55,7 +55,15 @@ const (
 	usersSharedScopeMeta = "users_shared_scope_generation"
 )
 
-func (s *Store) ApplyBatchWithBatch(ctx context.Context, generation int64, results []model.Collected, digest notify.DigestFunc, triggerIDs ...int64) (batchResult ChangeBatchResult, err error) {
+func (s *Store) ApplyBatchWithBatch(ctx context.Context, generation int64, results []model.Collected, digest notify.DigestFunc, triggerIDs ...int64) (ChangeBatchResult, error) {
+	return s.ApplyBatchWithOptions(ctx, generation, results, digest, BatchOptions{}, triggerIDs...)
+}
+
+// ApplyBatchWithOptions applies collector results like ApplyBatchWithBatch
+// and, when options.Attribute is set, attributes the recorded changes to the
+// configuration audit log. The lookup runs before the write transaction and
+// within options.Budget; its failure never fails the batch.
+func (s *Store) ApplyBatchWithOptions(ctx context.Context, generation int64, results []model.Collected, digest notify.DigestFunc, options BatchOptions, triggerIDs ...int64) (batchResult ChangeBatchResult, err error) {
 	defer func() { err = storageWriteError(err) }()
 	triggerIDs = uniquePositiveIDs(triggerIDs)
 	// Canonicalise every resource before opening the write transaction. The
@@ -75,6 +83,9 @@ func (s *Store) ApplyBatchWithBatch(ctx context.Context, generation int64, resul
 			canonical[i][j] = canonicalResource{raw: raw, hash: hash}
 		}
 	}
+	// Attribution needs the network, so it happens before the single writer
+	// is taken and only within its budget.
+	lookup, window := s.lookupAttribution(ctx, generation, results, canonical, options, time.Now().UTC())
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return ChangeBatchResult{}, err
@@ -395,7 +406,8 @@ func (s *Store) ApplyBatchWithBatch(ctx context.Context, generation int64, resul
 		if triggerID > 0 {
 			triggerValue = triggerID
 		}
-		batchResult, err := tx.ExecContext(ctx, "INSERT INTO event_batches(generation,observed_at,change_count,created_at,trigger_id) VALUES(?,?,?,?,?)", generation, observedAt, len(recorded), observedAt, triggerValue)
+		result.AttributionStatus = lookup.Status
+		batchResult, err := tx.ExecContext(ctx, "INSERT INTO event_batches(generation,observed_at,change_count,created_at,trigger_id,attribution_status) VALUES(?,?,?,?,?,?)", generation, observedAt, len(recorded), observedAt, triggerValue, lookup.Status)
 		if err != nil {
 			return ChangeBatchResult{}, err
 		}
@@ -420,14 +432,24 @@ func (s *Store) ApplyBatchWithBatch(ctx context.Context, generation int64, resul
 		notifiable := make([]model.Change, 0, len(recorded))
 		severities := make([]model.Severity, 0, len(recorded))
 		mutedCount := 0
-		for _, entry := range recorded {
+		for index, entry := range recorded {
 			severity := model.Classify(entry.Change)
+			attribution := attributeChange(entry, lookup, window, now)
+			if attribution != nil {
+				result.Attributed++
+				result.Changes[index].Attribution = attribution
+			}
 			muted, shown := mutes.evaluate(entry.Change, entry.Before.raw, entry.After.raw)
 			if muted {
 				mutedCount++
 			} else {
+				shown.Attribution = attribution
 				notifiable = append(notifiable, shown)
 				severities = append(severities, model.Classify(shown))
+			}
+			var storedAttribution string
+			if attribution != nil {
+				storedAttribution = model.MarshalAttribution(*attribution)
 			}
 			fields, marshalErr := json.Marshal(persistedFields{Fields: entry.Change.Fields, FieldsTruncated: entry.Change.FieldsTruncated, TotalFields: entry.Change.TotalFields})
 			if marshalErr != nil {
@@ -437,12 +459,12 @@ func (s *Store) ApplyBatchWithBatch(ctx context.Context, generation int64, resul
 			after := boundedValue(entry.After.raw, entry.After.hash, limits.EventValueBytes, limits.RejectBytes)
 			noteTruncation(entry.Change.Collector, entry.Change.ResourceID, before, limits.EventValueBytes, false)
 			noteTruncation(entry.Change.Collector, entry.Change.ResourceID, after, limits.EventValueBytes, false)
-			_, err = tx.ExecContext(ctx, `INSERT INTO events(batch_id,generation,observed_at,collector,event_type,resource_id,name,changes_json,before_json,after_json,before_hash,after_hash,before_bytes,after_bytes,before_truncated,after_truncated,severity,muted) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, batchID, generation, observedAt, entry.Change.Collector, entry.Change.Kind, entry.Change.ResourceID, entry.Change.Name, fields, nullableJSON(before.raw), nullableJSON(after.raw), before.hash, after.hash, before.bytes, after.bytes, boolInt(before.truncated), boolInt(after.truncated), string(severity), boolInt(muted))
+			_, err = tx.ExecContext(ctx, `INSERT INTO events(batch_id,generation,observed_at,collector,event_type,resource_id,name,changes_json,before_json,after_json,before_hash,after_hash,before_bytes,after_bytes,before_truncated,after_truncated,severity,muted,attribution) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, batchID, generation, observedAt, entry.Change.Collector, entry.Change.Kind, entry.Change.ResourceID, entry.Change.Name, fields, nullableJSON(before.raw), nullableJSON(after.raw), before.hash, after.hash, before.bytes, after.bytes, boolInt(before.truncated), boolInt(after.truncated), string(severity), boolInt(muted), storedAttribution)
 			if err != nil {
 				return ChangeBatchResult{}, err
 			}
 		}
-		input := notify.DigestInput{BatchID: batchID, ObservedAt: now, Changes: notifiable, MutedCount: mutedCount, ResourceCounts: resourceCounts}
+		input := notify.DigestInput{BatchID: batchID, ObservedAt: now, Changes: notifiable, MutedCount: mutedCount, ResourceCounts: resourceCounts, Attributed: attributionShown(lookup.Status)}
 		if err = enqueueDigestTx(ctx, tx, digest, input, severities, observedAt); err != nil {
 			return ChangeBatchResult{}, err
 		}

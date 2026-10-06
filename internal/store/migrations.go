@@ -274,6 +274,12 @@ func migrateSchema(db *sql.DB, box *secret.Box) error {
 		}
 		return migrateSchema(db, box)
 	}
+	if version == 15 {
+		if err := migrateSchemaV15ToV16(db); err != nil {
+			return err
+		}
+		return migrateSchema(db, box)
+	}
 	if version != 1 {
 		return fmt.Errorf("database schema version %d requires a newer migration path", version)
 	}
@@ -926,6 +932,31 @@ func migrateSchemaV14ToV15(db *sql.DB) error {
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit administrative security migration: %w", err)
+	}
+	return nil
+}
+
+// migrateSchemaV15ToV16 adds change attribution: a bounded "changed by"
+// record on each event and the attribution lookup status of each batch. Both
+// default to empty, so existing events show no attribution, their signed
+// ledger payloads are unchanged, and the migration rewrites no row.
+func migrateSchemaV15ToV16(db *sql.DB) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin change attribution migration: %w", err)
+	}
+	defer tx.Rollback()
+	if err := addColumnIfMissing(tx, "events", "attribution", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return fmt.Errorf("add events.attribution: %w", err)
+	}
+	if err := addColumnIfMissing(tx, "event_batches", "attribution_status", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return fmt.Errorf("add event_batches.attribution_status: %w", err)
+	}
+	if _, err := tx.Exec("UPDATE schema_version SET version=16"); err != nil {
+		return fmt.Errorf("record change attribution migration: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit change attribution migration: %w", err)
 	}
 	return nil
 }

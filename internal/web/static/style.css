@@ -298,7 +298,8 @@ code { overflow-wrap: anywhere; }
 .delivery-error { color: var(--bad-text); overflow-wrap: anywhere; }
 .history-pagination { display: flex; justify-content: center; gap: 24px; padding-top: 20px; }
 
-.summary { display: grid; grid-template-columns: repeat(4, 1fr); gap: 18px; margin-bottom: 22px; }
+.summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 18px; margin-bottom: 22px; }
+.summary small { display: block; margin-top: 6px; }
 .summary .card { margin-bottom: 0; }
 .summary-label { display: block; margin: 0; color: var(--muted); font-size: 15px; font-weight: 400; }
 .summary strong { display: block; margin-top: 8px; }

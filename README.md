@@ -16,6 +16,7 @@ of truth and the safety net for missed events.
 - Policy section fingerprints without storing policy contents.
 - Credential metadata, webhook configuration inventory, log-streaming configuration/status, contacts, posture integrations, and tailnet settings.
 - Upcoming expiry of device node keys and auth keys: a daily check warns before they expire (see [Expiry warnings](#expiry-warnings)).
+- Who made each change: the configuration audit log names the actor in History, notifications, the API, and signed evidence (see [Change attribution](#change-attribution)).
 
 The REST API does not expose authoritative online state. TailState therefore does **not** generate online/offline notifications. What is ignored depends on the collector:
 
@@ -122,6 +123,7 @@ requests a write scope.
 | `settings` | `feature_settings:read`; some fields also need `logs:network:read`, `networking_settings:read`, or `policy_file:read` |
 | `services` | `services:read` |
 | `oauth_apps` | `oauth_apps:read` |
+| Change attribution (configuration audit logs, not a collector) | `logs:configuration:read` |
 
 A collector whose endpoint answers `403` is shown on the status page as
 **Unsupported** with the label "insufficient OAuth scope or plan (HTTP 403)"
@@ -134,6 +136,10 @@ unsupported collector due for an immediate re-check; a collector that becomes
 readable baselines silently. Narrowing scopes can hide resources or fields
 (for example other credential types under `keys`), which are then reported as
 removed or changed, so settle on the scopes before the first baseline.
+
+Without `logs:configuration:read` changes are still detected and notified;
+they are only not attributed, and the status page shows **Change
+attribution: Unsupported** with the HTTP 403 label.
 
 Per-service hosts and approvals (`/services/{name}/devices` and
 `/services/{name}/device/{id}/approved`) are not collected: Tailscale requires
@@ -178,6 +184,61 @@ within the widest window (14 days when warnings are disabled), using the same
 exclusions and tag filter. The first check runs two minutes after start-up so
 the first poll can refresh the snapshots; failed checks are retried after 15
 minutes.
+
+### Change attribution
+
+TailState explains **what** changed; the Tailscale configuration audit log
+(`GET /tailnet/{tailnet}/logging/configuration`, scope
+`logs:configuration:read`, included in `all:read`) tells **who** changed it.
+The audit log is an optional source, not a collector: it creates no
+snapshots, never affects collector health or readiness, and is read only
+when a poll can produce a change.
+
+- **When.** Before a poll's changes are recorded, TailState reads the audit
+  log for the window since the previous successful poll of the affected
+  collectors, widened by two minutes on both sides for clock skew (and by the
+  polling interval when a removal is confirmed, because removals are reported
+  one poll after the resource disappeared). The window is at most 24 hours,
+  at most 5,000 entries are read, and the lookup has a strict 10-second
+  budget: a slow or failing audit log delays a batch by at most that budget
+  and never fails it.
+- **Matching.** Entries are correlated with each change by target: devices by
+  their node ID, users, auth keys, invites, and webhooks by ID, and the
+  policy file, DNS, contacts, log streaming, posture integrations, and tailnet
+  settings by the tailnet property the entry changed (for example `ACL` or
+  `DNS_CONFIG`). Only an action that fits the change counts: a created device
+  needs a create/approve/login entry, a removed one a delete, and a device
+  field change an entry for that property (a tag change matches `ACL_TAGS`;
+  client version, OS, or address changes reported by the node itself never
+  match an administrator's edit). The latest matching entry wins; failed
+  attempts are ignored.
+- **What is stored.** Only the actor's login and display name, the actor
+  type, the origin (admin console, API, ...), the audit action (for example
+  `NODE.UPDATE.ACL_TAGS`), the target, and the audit timestamp, each bounded
+  in length and stripped of control characters. The audit log's old and new
+  values (which may contain policy text), action details, and error text are
+  never decoded into a stored value, persisted, logged, or exported.
+- **Where it is shown.** History shows **Changed by** for every change of an
+  attributed batch, for example "alice@example.com (Alice) via admin console"
+  or "k123 [OAuth client] via API", followed by the audit action and time.
+  Digests add a **Changed by** line under each listed change in every message
+  format, `/api/v1/history` adds `changed_by`, the `attribution` record, and
+  the batch `attribution_status`, and evidence packs (format version 5) sign
+  the record (see below).
+- **Unknown actors.** A change without a matching entry, or every change of a
+  batch whose lookup failed or timed out, shows "actor unknown"; the batch
+  itself is recorded and notified as usual.
+- **Unsupported.** A `403` (missing scope or plan) or `404` (logging not
+  available) degrades silently: changes carry no attribution and no
+  "Changed by" line, the status page's **Change attribution** card shows
+  **Unsupported** with the bounded reason, and the audit log is not asked
+  again for six hours or until the tailnet, OAuth client, or OAuth scopes
+  change. The card also shows **Supported** or **Unavailable** (last lookup
+  failed, with a bounded reason such as `timeout`), and `/api/v1/status`
+  reports the same state.
+- **Metrics.** `tailstate_attribution_lookups_total{outcome="complete|unsupported|failed"}`
+  counts lookups and `tailstate_attribution_changes_total{result="matched|unknown"}`
+  counts changes in attributed batches.
 
 ### Faster reconciliation with Tailscale webhooks
 
@@ -500,7 +561,7 @@ trail and notified to every enabled destination; revoking one is recorded.
 | --- | --- | --- |
 | `GET /api/v1/status` | `status:read` | JSON status: setup and baseline state, notification state, destination counts, outbox and webhook queue counts, resource counts, and collectors with the bounded readiness reasons |
 | `GET /api/v1/history` | `history:read` | NDJSON History page (`application/x-ndjson`) |
-| `GET /api/v1/evidence` | `evidence:read` | Signed evidence pack, identical to the History download (format version 4) |
+| `GET /api/v1/evidence` | `evidence:read` | Signed evidence pack, identical to the History download (format version 5) |
 
 ```console
 curl -fsS -H "Authorization: Bearer $TAILSTATE_API_TOKEN" https://tailstate.example/api/v1/status
@@ -714,7 +775,7 @@ in a disposable project before relying on the procedure for an outage.
 - Single-object endpoints (tailnet settings, contacts, policy, the DNS configuration and each legacy DNS sub-endpoint, and log-streaming configuration and status) must return a JSON object. A `null`, empty, array, or scalar body is treated as an invalid upstream response: the collector fails, no events are recorded, and the last snapshot is kept.
 - Multiple changes in one poll become one digest, fanned out into one durable outbox item per enabled destination (subject to its [routing rules](#severity-and-routing)). The outbox stores a format-neutral message that is rendered when it is sent, in the format the receiving service displays: Slack mrkdwn for `slack` and `googlechat` (single-asterisk bold, no `###` headings, `<url|label>` links, and `&`, `<`, `>` escaped so a resource name cannot mention a channel), plain text for `telegram`, `smtp`, `pushover`, `matrix`, `ntfy`, `gotify`, `signal`, `bark`, `join`, `lark`, `wecom`, `pushbullet`, `ifttt`, `opsgenie`, `pagerduty`, `mqtt`, `twilio`, `xmpp`, `signalgrid`, and `hass`, and Markdown for every other service (for example `mattermost`, `discord`, `rocketchat`, `zulip`, `teams`, and `generic`). Each destination can override the automatic choice under **Edit destination** in Settings; the Settings test message uses the same format. Each digest is fitted to the receiving service's message limit (for example 4,096 bytes for Telegram, Lark, WeCom, and ntfy, 1,024 for Pushover, and 10,000 for Zulip) by dropping whole lines from the end and adding an explicit "lines omitted, see History" note. A provider that still rejects a message as too large (or with HTTP 413) dead-letters it immediately instead of retrying for 24 hours.
 - Every change batch is also recorded in the authenticated History page with field-level diffs and redacted normalized before/after snapshots. Filters support collector, change type, severity, resource name or ID, and a single batch (`/history?batch=<id>`, the target of notification links); history is retained for 30 days. Normalized snapshots are capped at 1 MiB and each event before/after value at 512 KiB. Larger values retain their SHA-256, original byte count, configured limit, and a bounded truncation marker instead of the provider body; the authenticated UI calls this out explicitly. A normal history page reads at most 2 MiB of stored event data and displays a truncation notice with a cursor when that budget is reached. The hard 4 MiB raw-write ceiling prevents an unusually large normalized value from entering SQLite unbounded; the small marker remains queryable for audit.
-- The History page can download a filtered, redacted JSON evidence pack for incident reports and offline review. Packs (format version 4) include normalized snapshots, field diffs, each event's severity and `muted` flag, destination delivery outcomes, a SHA-256 content hash, and an Ed25519 signature over a hash-linked event ledger; a pack holds at most 100 batches (fewer with the export's `limit` query parameter), 2,000 events, and 5 MiB. A changed export fails verification.
+- The History page can download a filtered, redacted JSON evidence pack for incident reports and offline review. Packs (format version 5) include normalized snapshots, field diffs, each event's severity and `muted` flag, each batch's `attribution_status` and each attributed event's `attribution` record (see [Change attribution](#change-attribution)), destination delivery outcomes, a SHA-256 content hash, and an Ed25519 signature over a hash-linked event ledger; a pack holds at most 100 batches (fewer with the export's `limit` query parameter), 2,000 events, and 5 MiB. A changed export fails verification.
 - A history larger than one pack is exported as a chain of parts rather than refused. Each part holds the newest batches that fit, newest first; when a budget is reached the pack sets `"truncated": true` and `next_cursor` to its oldest batch ID, its file name ends in `-next-<cursor>`, and the response carries an `X-TailState-Evidence-Next-Cursor` header and a `Link: <...>; rel="next"` URL with the same filters. Enter that cursor in **Download next part** on the History page (the active collector, type, severity, resource, batch, and date filters carry over) to fetch the next part. Following the chain until a pack has `"truncated": false` covers every matching batch exactly once, and every part verifies on its own with `tailstate evidence verify`. Only a single batch that alone exceeds a budget is refused (`413`); narrow the filters to export it.
 - Verify an export offline with `tailstate evidence verify --file tailstate-drift-evidence.json`. Verification checks the content hash, embedded public key fingerprint, signature, and included ledger links; packs and public-key files are bounded before decoding (5 MiB and 4 KiB respectively). For independent trust, print the instance public key with `tailstate evidence public-key`, save it as a base64 file, and pass it with `--public-key public.key`. `evidence public-key` opens the database read-only and fails if the database, the current schema, or the stored signing key is missing; it never creates a database or a new key.
 - Audit the persisted evidence ledger explicitly with `tailstate evidence audit`. The command opens the existing database read-only, verifies sequence continuity, predecessor hashes, signatures, key IDs, stored head, and canonical payload digests, then resumes through bounded pages until the chain is complete. Pass `--public-key public.key` to anchor verification to an independently trusted Ed25519 key; entries whose event snapshots have aged out are reported as cryptographically verified but payload-unverifiable. The audit never creates a database, runs migrations, generates keys, or changes metadata, and can run while TailState is serving from SQLite WAL mode.
@@ -895,6 +956,20 @@ retention index, and the `api_tokens` table for hashed read-only API tokens;
 the audit trail and token list start empty at the upgrade. The migration
 runs in one transaction and changes no existing setting, destination,
 history, or evidence row.
+
+Schema v16 adds [change attribution](#change-attribution): an `attribution`
+column on events (the bounded "changed by" record) and an
+`attribution_status` column on change batches. Both default to empty, so the
+migration rewrites no row, in one transaction: events recorded before the
+upgrade show no "Changed by", and their signed ledger payloads keep their
+exact bytes, so the existing chain still audits. A ledger payload records
+`attribution` only for an attributed event. New exports use evidence format
+version 5, which adds the batch `attribution_status` and the per-event
+`attribution` (bound to the signed ledger payload); `tailstate evidence
+verify` accepts versions 3, 4, and 5, and refuses a version 3 or 4 pack that
+carries attribution, so a newer pack cannot be relabelled as an older one.
+Older releases cannot verify version 5 packs. Rolling back requires restoring
+the pre-upgrade backup, as for every schema change.
 
 ## Runtime configuration
 

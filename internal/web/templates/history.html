@@ -95,6 +95,9 @@
             {{- end}}
             <span><strong>{{.Name}}</strong> <code>{{.Collector}} / {{.ResourceID}}</code></span>
           </summary>
+          {{- if .ChangedBy}}
+          <p class="changed-by"><strong>Changed by:</strong> {{.ChangedBy}}{{with .Attribution}} <span class="muted">(audit <code>{{.Action}}</code>{{if .OccurredAt}} at <time datetime="{{.OccurredAt}}">{{.OccurredAt}}</time>{{end}})</span>{{end}}</p>
+          {{- end}}
           {{- if .Fields}}
           <table class="data-table field-diff">
             <caption class="visually-hidden">Field changes for {{.Name}}</caption>

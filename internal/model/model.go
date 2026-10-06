@@ -50,6 +50,9 @@ type Change struct {
 	Fields          []FieldChange `json:"fields,omitempty"`
 	FieldsTruncated bool          `json:"fields_truncated,omitempty"`
 	TotalFields     int           `json:"total_fields,omitempty"`
+	// Attribution names who made the change when the configuration audit
+	// log explained it. It is set only on changes handed to notifications.
+	Attribution *Attribution `json:"attribution,omitempty"`
 }
 
 var ignored = map[string]struct{}{

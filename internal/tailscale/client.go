@@ -814,6 +814,24 @@ func (c *Client) get(ctx context.Context, endpoint string) (any, error) {
 }
 
 func (c *Client) getWithBytes(ctx context.Context, endpoint string) (any, int64, error) {
+	body, err := c.getBody(ctx, endpoint)
+	if err != nil {
+		return nil, int64(len(body)), err
+	}
+	if len(bytes.TrimSpace(body)) == 0 {
+		return nil, int64(len(body)), nil
+	}
+	var value any
+	if err := json.Unmarshal(body, &value); err != nil {
+		return nil, int64(len(body)), fmt.Errorf("tailscale response was not valid JSON: %w", err)
+	}
+	return value, int64(len(body)), nil
+}
+
+// getBody performs one bounded GET with token refresh and retries and
+// returns the successful response body. On an error the body read so far (if
+// any) is returned for byte accounting.
+func (c *Client) getBody(ctx context.Context, endpoint string) ([]byte, error) {
 	// Bound the complete request, including token refreshes and all backoff
 	// sleeps. If the caller already supplied an earlier deadline,
 	// context.WithTimeout preserves that stricter limit.
@@ -828,11 +846,11 @@ func (c *Client) getWithBytes(ctx context.Context, endpoint string) (any, int64,
 			if delay, transient := transientTokenDelay(err, attempt); transient && attempt < 3 && waitWithinBudget(retryCtx, delay) {
 				continue
 			}
-			return nil, 0, err
+			return nil, err
 		}
 		req, err := http.NewRequestWithContext(retryCtx, http.MethodGet, endpoint, nil)
 		if err != nil {
-			return nil, 0, err
+			return nil, err
 		}
 		req.Header.Set("Authorization", "Bearer "+token)
 		req.Header.Set("Accept", "application/json")
@@ -841,19 +859,19 @@ func (c *Client) getWithBytes(ctx context.Context, endpoint string) (any, int64,
 		if err != nil {
 			if attempt < 3 {
 				if !waitForRetry(retryCtx, time.Duration(1<<attempt)*time.Second) {
-					return nil, 0, retryCtx.Err()
+					return nil, retryCtx.Err()
 				}
 				continue
 			}
-			return nil, 0, err
+			return nil, err
 		}
 		body, readErr := io.ReadAll(io.LimitReader(resp.Body, maxAPIResponseBytes+1))
 		resp.Body.Close()
 		if readErr != nil {
-			return nil, 0, readErr
+			return nil, readErr
 		}
 		if len(body) > maxAPIResponseBytes {
-			return nil, int64(len(body)), fmt.Errorf("tailscale response exceeds %d bytes", maxAPIResponseBytes)
+			return body, fmt.Errorf("tailscale response exceeds %d bytes", maxAPIResponseBytes)
 		}
 		if resp.StatusCode == 401 && attempt == 0 {
 			c.mu.Lock()
@@ -864,7 +882,7 @@ func (c *Client) getWithBytes(ctx context.Context, endpoint string) (any, int64,
 		if resp.StatusCode == 429 && attempt < 3 {
 			delay := retryAfter(resp.Header.Get("Retry-After"), time.Duration(1<<attempt)*time.Second)
 			if !waitForRetry(retryCtx, delay) {
-				return nil, int64(len(body)), retryCtx.Err()
+				return body, retryCtx.Err()
 			}
 			continue
 		}
@@ -878,18 +896,11 @@ func (c *Client) getWithBytes(ctx context.Context, endpoint string) (any, int64,
 			}
 		}
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			return nil, int64(len(body)), &HTTPError{Status: resp.StatusCode, URL: endpoint, Body: safeBody(body)}
+			return body, &HTTPError{Status: resp.StatusCode, URL: endpoint, Body: safeBody(body)}
 		}
-		if len(bytes.TrimSpace(body)) == 0 {
-			return nil, int64(len(body)), nil
-		}
-		var value any
-		if err := json.Unmarshal(body, &value); err != nil {
-			return nil, int64(len(body)), fmt.Errorf("tailscale response was not valid JSON: %w", err)
-		}
-		return value, int64(len(body)), nil
+		return body, nil
 	}
-	return nil, 0, errRetriesExhausted
+	return nil, errRetriesExhausted
 }
 
 var errRetriesExhausted = errors.New("tailscale request retries exhausted")

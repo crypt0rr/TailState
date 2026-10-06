@@ -20,9 +20,11 @@ import (
 
 const (
 	evidencePackFormat  = "tailstate-drift-evidence"
-	evidencePackVersion = 4
-	// evidencePackVersionV3 packs predate per-event severity and mute
-	// flags. They are still verified with their original signature domain.
+	evidencePackVersion = 5
+	// evidencePackVersionV4 packs predate change attribution, and
+	// evidencePackVersionV3 packs also per-event severity and mute flags.
+	// Both are still verified with their original signature domain.
+	evidencePackVersionV4     = 4
 	evidencePackVersionV3     = 3
 	maxEvidenceBatches        = 100
 	maxEvidenceEvents         = 2000
@@ -49,7 +51,8 @@ var ErrEvidencePackTooLarge = errors.New("history evidence pack exceeds the size
 // EvidencePack is a redacted, portable representation of explainable drift
 // history. Packs include an Ed25519 signature over the content hash, ledger
 // head, generation timestamp, and signing-key fingerprint. Version 4 adds the
-// per-event severity and muted flag; version 3 packs remain verifiable.
+// per-event severity and muted flag and version 5 the change attribution;
+// version 3 and 4 packs remain verifiable.
 type EvidencePack struct {
 	Format           string               `json:"format"`
 	Version          int                  `json:"version"`
@@ -103,15 +106,18 @@ type EvidenceBatch struct {
 	// LedgerChangeCount preserves the unfiltered event count used by the
 	// signed ledger payload. A history filter may include only some events from
 	// a batch, while the ledger must still verify the original batch metadata.
-	LedgerChangeCount int                `json:"ledger_change_count,omitempty"`
-	TriggerID         int64              `json:"trigger_id,omitempty"`
-	TriggerIDs        []int64            `json:"trigger_ids,omitempty"`
-	LedgerSequence    int64              `json:"ledger_sequence,omitempty"`
-	LedgerPrevHash    string             `json:"ledger_prev_hash,omitempty"`
-	LedgerHash        string             `json:"ledger_hash,omitempty"`
-	LedgerSignature   string             `json:"ledger_signature,omitempty"`
-	LedgerKeyID       string             `json:"ledger_key_id,omitempty"`
-	LedgerPayload     string             `json:"ledger_payload,omitempty"`
+	LedgerChangeCount int     `json:"ledger_change_count,omitempty"`
+	TriggerID         int64   `json:"trigger_id,omitempty"`
+	TriggerIDs        []int64 `json:"trigger_ids,omitempty"`
+	LedgerSequence    int64   `json:"ledger_sequence,omitempty"`
+	LedgerPrevHash    string  `json:"ledger_prev_hash,omitempty"`
+	LedgerHash        string  `json:"ledger_hash,omitempty"`
+	LedgerSignature   string  `json:"ledger_signature,omitempty"`
+	LedgerKeyID       string  `json:"ledger_key_id,omitempty"`
+	LedgerPayload     string  `json:"ledger_payload,omitempty"`
+	// AttributionStatus is the configuration audit lookup outcome for the
+	// batch (version 5): "complete", "unavailable", or "unsupported".
+	AttributionStatus string             `json:"attribution_status,omitempty"`
 	Events            []EvidenceEvent    `json:"events"`
 	Deliveries        []EvidenceDelivery `json:"deliveries"`
 }
@@ -158,6 +164,9 @@ type EvidenceEvent struct {
 	// Muted marks a change left out of notifications by a mute rule
 	// (version 4). It is bound to the signed ledger payload.
 	Muted bool `json:"muted,omitempty"`
+	// Attribution names who made the change according to the configuration
+	// audit log (version 5). It is bound to the signed ledger payload.
+	Attribution *model.Attribution `json:"attribution,omitempty"`
 }
 
 // EvidenceField is a machine-readable field-level diff. Missing old or new
@@ -383,17 +392,11 @@ func verifyEvidencePack(data, trustedPublic []byte) error {
 	if pack.Format != evidencePackFormat {
 		return fmt.Errorf("unsupported evidence pack format %q version %d", pack.Format, pack.Version)
 	}
-	if pack.Version != evidencePackVersion && pack.Version != evidencePackVersionV3 {
+	if pack.Version != evidencePackVersion && pack.Version != evidencePackVersionV4 && pack.Version != evidencePackVersionV3 {
 		return fmt.Errorf("unsupported evidence pack format %q version %d", pack.Format, pack.Version)
 	}
-	if pack.Version == evidencePackVersionV3 {
-		for _, batch := range pack.Batches {
-			for _, event := range batch.Events {
-				if event.Severity != "" || event.Muted {
-					return fmt.Errorf("evidence pack version %d cannot carry severity or muted flags (event %d)", pack.Version, event.ID)
-				}
-			}
-		}
+	if err := verifyEvidenceVersionFields(pack); err != nil {
+		return err
 	}
 	if pack.Truncated {
 		if pack.NextCursor <= 0 {
@@ -438,6 +441,37 @@ func verifyEvidencePack(data, trustedPublic []byte) error {
 	}
 	if err := verifyLedgerLinks(pack); err != nil {
 		return err
+	}
+	return nil
+}
+
+// verifyEvidenceVersionFields refuses fields that the pack's version cannot
+// carry: an older pack must look exactly like its release exported it, so a
+// newer pack cannot be relabelled as an older version.
+func verifyEvidenceVersionFields(pack EvidencePack) error {
+	for _, batch := range pack.Batches {
+		if pack.Version < evidencePackVersion && batch.AttributionStatus != "" {
+			return fmt.Errorf("evidence pack version %d cannot carry attribution (batch %d)", pack.Version, batch.ID)
+		}
+		switch batch.AttributionStatus {
+		case "", AttributionComplete, AttributionUnavailable, AttributionUnsupported:
+		default:
+			return fmt.Errorf("invalid attribution status for batch %d", batch.ID)
+		}
+		for _, event := range batch.Events {
+			if pack.Version == evidencePackVersionV3 && (event.Severity != "" || event.Muted) {
+				return fmt.Errorf("evidence pack version %d cannot carry severity or muted flags (event %d)", pack.Version, event.ID)
+			}
+			if event.Attribution == nil {
+				continue
+			}
+			if pack.Version < evidencePackVersion {
+				return fmt.Errorf("evidence pack version %d cannot carry attribution (event %d)", pack.Version, event.ID)
+			}
+			if batch.AttributionStatus != AttributionComplete {
+				return fmt.Errorf("attributed event %d in batch %d without a complete attribution lookup", event.ID, batch.ID)
+			}
+		}
 	}
 	return nil
 }
@@ -534,6 +568,9 @@ func verifyLedgerEventBinding(event EvidenceEvent, ledgerEvent evidenceLedgerEve
 	}
 	if event.Muted != ledgerEvent.Muted {
 		return fmt.Errorf("ledger payload event muted flag mismatch for event %d in batch %d", event.ID, batchID)
+	}
+	if !equalAttribution(event.Attribution, ledgerEvent.Attribution) {
+		return fmt.Errorf("ledger payload event attribution mismatch for event %d in batch %d", event.ID, batchID)
 	}
 	if fieldsTruncated != event.FieldsTruncated || totalFields != event.TotalFields || !equalEvidenceFields(fields, event.Fields) {
 		return fmt.Errorf("ledger payload event fields mismatch for event %d in batch %d", event.ID, batchID)
@@ -632,6 +669,13 @@ func canonicalEvidenceJSON(raw json.RawMessage) []byte {
 		return append([]byte(nil), raw...)
 	}
 	return canonical
+}
+
+func equalAttribution(left, right *model.Attribution) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	return *left == *right
 }
 
 func equalInt64Slices(left, right []int64) bool {
@@ -842,6 +886,7 @@ func evidenceBatch(batch HistoryBatch) EvidenceBatch {
 		LedgerSignature:   batch.LedgerSignature,
 		LedgerKeyID:       batch.LedgerKeyID,
 		LedgerPayload:     base64.RawStdEncoding.EncodeToString(batch.ledgerPayload),
+		AttributionStatus: batch.AttributionStatus,
 		Events:            make([]EvidenceEvent, 0, len(batch.Events)),
 		Deliveries:        make([]EvidenceDelivery, 0, len(batch.Deliveries)),
 	}
@@ -867,6 +912,7 @@ func evidenceBatch(batch HistoryBatch) EvidenceBatch {
 			AfterTruncated:  event.AfterTruncated,
 			Severity:        event.Severity,
 			Muted:           event.Muted,
+			Attribution:     event.Attribution,
 			Fields:          make([]EvidenceField, 0, len(event.Fields)),
 		}
 		for _, field := range event.Fields {

@@ -38,7 +38,7 @@ with the first content line instead of repeating the title:
 | --- | --- |
 | `smtp` (email) | Subject |
 | `discord` | Embed title |
-| `slack` | Message text (also the push preview) |
+| `slack` | Header block, and the message text used for push previews |
 | `teams` | Card heading |
 | `telegram` | Bold first line |
 | `gotify`, `ntfy`, `pushover`, `pushbullet` | Notification title |
@@ -73,6 +73,23 @@ later ones. A URL that sets `splitlines` keeps Shoutrrr's own behaviour; with
 warn about this. Remove the parameter, or set `splitlines=no`, to use
 TailState's line-preserving delivery. A URL with `json=yes` sends the body as
 a raw Discord payload, unchanged.
+
+## Slack
+
+`slack://` destinations, in both forms Shoutrrr supports (an incoming-webhook
+token or a bot/user token with a channel), receive one native Slack message
+instead of Shoutrrr's one attachment per line: a top-level `text` with the
+title (shown in push previews), a header block with the title, and the body as
+Block Kit `section` blocks of whole lines (at most 3,000 characters each and 50
+blocks per message). TailState builds this payload itself, parses the URL with
+Shoutrrr's Slack parser, and sends it through the same bounded,
+redirect-rejecting HTTP client as every other delivery, so failures are
+classified the same way (permanent 4xx, `Retry-After`). The URL options
+`botname`/`username`, `icon`, `thread_ts`, `color` (the sections are then
+wrapped in one attachment with that colour bar), and `title` keep their
+meaning. A destination whose format is overridden to Markdown or plain text
+receives `plain_text` sections, which Slack never parses for mentions or
+links.
 
 ## Severity and routing
 

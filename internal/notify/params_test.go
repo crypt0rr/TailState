@@ -202,8 +202,15 @@ func sentTitle(t *testing.T, scheme string, request captured) (title, body strin
 		return title, strings.Join(descriptions, "\n")
 	case "slack":
 		title, _ = payload["text"].(string)
-		raw, _ := json.Marshal(payload["attachments"])
-		return title, string(raw)
+		var decoded slackPayload
+		_ = json.Unmarshal([]byte(request.body), &decoded)
+		var sections []string
+		for _, block := range decoded.Blocks {
+			if block.Type == "section" {
+				sections = append(sections, block.Text.Text)
+			}
+		}
+		return title, strings.Join(sections, "\n")
 	case "telegram":
 		text, _ := payload["text"].(string)
 		title, body, _ = strings.Cut(text, "\n")

@@ -5,9 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
-	"strings"
 	"time"
-	"unicode/utf8"
 
 	"github.com/nicholas-fedor/shoutrrr/pkg/services/chat/discord"
 	"github.com/nicholas-fedor/shoutrrr/pkg/types"
@@ -72,50 +70,10 @@ func (d discordSender) Send(message string, params *types.Params) []error {
 // boundary. Blank lines at the edge of an embed are dropped because Discord
 // rejects an empty description.
 func discordItems(body string) []types.MessageItem {
-	var items []types.MessageItem
-	var current strings.Builder
-	currentRunes := 0
-	flush := func() {
-		if text := strings.Trim(current.String(), "\n"); strings.TrimSpace(text) != "" {
-			items = append(items, types.MessageItem{Text: text})
-		}
-		current.Reset()
-		currentRunes = 0
-	}
-	for _, text := range strings.Split(body, "\n") {
-		for utf8.RuneCountInString(text) > discordEmbedRunes {
-			flush()
-			cut, count := len(text), 0
-			for index := range text {
-				if count == discordEmbedRunes {
-					cut = index
-					break
-				}
-				count++
-			}
-			current.WriteString(text[:cut])
-			flush()
-			text = text[cut:]
-		}
-		runes := utf8.RuneCountInString(text)
-		separator := 0
-		if current.Len() > 0 {
-			separator = 1
-		}
-		if currentRunes+separator+runes > discordEmbedRunes {
-			flush()
-			separator = 0
-		}
-		if separator == 1 {
-			current.WriteByte('\n')
-		}
-		current.WriteString(text)
-		currentRunes += separator + runes
-	}
-	flush()
-	if len(items) == 0 {
-		// Discord rejects an empty message; let Shoutrrr report it.
-		items = append(items, types.MessageItem{Text: body})
+	chunks := partitionLines(body, discordEmbedRunes)
+	items := make([]types.MessageItem, 0, len(chunks))
+	for _, chunk := range chunks {
+		items = append(items, types.MessageItem{Text: chunk})
 	}
 	return items
 }

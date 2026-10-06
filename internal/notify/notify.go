@@ -1,8 +1,10 @@
 // Package notify provides the notification transport used by TailState.
 //
-// Shoutrrr owns provider parsing and payload delivery. This package keeps the
-// application-specific safety guarantees around it: bounded HTTP requests,
-// redirects disabled, and no service credentials in returned errors.
+// Shoutrrr owns provider parsing and, except for Slack, payload delivery.
+// Slack messages are built natively (see sendSlack) from Shoutrrr's parsed
+// Slack URL. This package keeps the application-specific safety guarantees
+// around every delivery: bounded HTTP requests, redirects disabled, and no
+// service credentials in returned errors.
 package notify
 
 import (
@@ -21,6 +23,7 @@ import (
 	"github.com/nicholas-fedor/shoutrrr"
 	"github.com/nicholas-fedor/shoutrrr/pkg/services/chat/discord"
 	"github.com/nicholas-fedor/shoutrrr/pkg/services/chat/matrix"
+	"github.com/nicholas-fedor/shoutrrr/pkg/services/chat/slack"
 	"github.com/nicholas-fedor/shoutrrr/pkg/types"
 
 	"github.com/crypt0rr/tailstate/internal/textutil"
@@ -251,7 +254,8 @@ func (s *SenderImpl) SendPrepared(ctx context.Context, serviceURL string, messag
 		return err
 	}
 	record := &responseRecord{}
-	sender, err := newSender(serviceURL, s.clientFor(record), s.timeout)
+	client := s.clientFor(record)
+	sender, err := newSender(serviceURL, client, s.timeout)
 	if err != nil {
 		// A construction that reached the provider (a Matrix login) is a
 		// delivery outcome: classify it like any other HTTP response so a
@@ -261,8 +265,20 @@ func (s *SenderImpl) SendPrepared(ctx context.Context, serviceURL string, messag
 		}
 		return fmt.Errorf("invalid notification URL (%s): %s", RedactURL(serviceURL), sanitize(err.Error(), serviceURL))
 	}
-	params := parseDestination(serviceURL).params(message.Title)
-	errs := sender.Send(FitMessage(message.Message(), MessageLimit(serviceURL)), params)
+	body := FitMessage(message.Message(), MessageLimit(serviceURL))
+	var errs []error
+	if parsed, parseErr := url.Parse(serviceURL); parseErr == nil && parsed.Scheme == slack.Scheme {
+		// Slack is sent natively (see sendSlack); Shoutrrr only validated
+		// the URL above.
+		if message.Title != "" {
+			message.Body = body
+		} else {
+			message.Text = body
+		}
+		errs = []error{s.sendSlack(ctx, parsed, message, client)}
+	} else {
+		errs = sender.Send(body, parseDestination(serviceURL).params(message.Title))
+	}
 	for _, sendErr := range errs {
 		if sendErr != nil {
 			// The status comes only from the response TailState's transport

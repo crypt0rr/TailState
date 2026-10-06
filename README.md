@@ -96,6 +96,24 @@ Next steps:
   master key separately.
 - Before every upgrade, follow [UPGRADING.md](UPGRADING.md).
 
+Schema v17 stores every timestamp in a fixed-width UTC form with nine
+fractional digits (`2006-01-02T15:04:05.000000000Z`). Earlier releases dropped
+trailing fractional zeros, so a time on a whole second (`…:00Z`) sorted after
+a later time in the same second (`…:00.1Z`) and a lease, token expiry, or
+retry time could be compared the wrong way round for up to a second. The
+migration rewrites the stored times of sessions, setup and reset tokens, API
+tokens, the administrative audit trail, the notification outbox, webhook
+triggers, and the collector schedule in bounded, resumable 64-row
+transactions; each value keeps its instant, and empty or unparseable values
+are left unchanged. An interrupted upgrade simply runs the rewrite again on the
+next start. Observation times of events, change batches, and the evidence
+ledger are part of signed ledger payloads and are deliberately not rewritten:
+the existing chain still audits, and History filters and retention compare
+them against whole-second bounds, which order both forms correctly (an event
+observed within the retention cutoff's second is removed on the next pass).
+Rolling back requires restoring the pre-upgrade backup, as for every schema
+change.
+
 ## Runtime configuration
 
 Only bootstrap settings use environment variables; application credentials and

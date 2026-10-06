@@ -13,6 +13,9 @@ rollback requires restoring the backup taken before the upgrade. See
 
 ## [Unreleased]
 
+### Fixed
+- Notifications carry their title in the service's title field: email has a subject instead of none, Gotify and Pushbullet no longer show "Shoutrrr notification", and Discord, Slack, Teams, Telegram, ntfy, and Pushover show the title once instead of as the first body line. Only Shoutrrr parameters on a per-service allowlist derived from the pinned Shoutrrr release are passed, and a title set in the destination URL wins (#228).
+
 ## [0.15.0] - 2026-10-06
 
 - **Schema:** 17 (migrates from 16)

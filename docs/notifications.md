@@ -27,6 +27,36 @@ Destinations are added, edited, tested, and removed on the Settings page; see
 - Every notification names the tailnet (prefixed by `TAILSTATE_INSTANCE_LABEL` when set) in its title and carries an `Observed at <UTC RFC3339>` line. With `TAILSTATE_PUBLIC_URL` set, digests link to their History batch (`/history?batch=<id>`) and health alerts and expiry warnings to `/status`. The Settings test message names the instance, tailnet, TailState version, and time.
 - Multiple changes in one poll become one digest, fanned out into one durable outbox item per enabled destination (subject to its [routing rules](#severity-and-routing)). The outbox stores a format-neutral message that is rendered when it is sent, in the format the receiving service displays: Slack mrkdwn for `slack` and `googlechat` (single-asterisk bold, no `###` headings, `<url|label>` links, and `&`, `<`, `>` escaped so a resource name cannot mention a channel), plain text for `telegram`, `smtp`, `pushover`, `matrix`, `ntfy`, `gotify`, `signal`, `bark`, `join`, `lark`, `wecom`, `pushbullet`, `ifttt`, `opsgenie`, `pagerduty`, `mqtt`, `twilio`, `xmpp`, `signalgrid`, and `hass`, and Markdown for every other service (for example `mattermost`, `discord`, `rocketchat`, `zulip`, `teams`, and `generic`). Each destination can override the automatic choice under **Edit destination** in Settings; the Settings test message uses the same format. Each digest is fitted to the receiving service's message limit (for example 4,096 bytes for Telegram, Lark, WeCom, and ntfy, 1,024 for Pushover, and 10,000 for Zulip) by dropping whole lines from the end and adding an explicit "lines omitted, see History" note. A provider that still rejects a message as too large (or with HTTP 413) dead-letters it immediately instead of retrying for 24 hours.
 
+## Titles
+
+The title of every notification (its icon, title, instance label, and
+tailnet, for example `🧪 TailState test · lab (example.com)`) is sent in the
+service's own title field where Shoutrrr has one, and the body then starts
+with the first content line instead of repeating the title:
+
+| Service | Where the title appears |
+| --- | --- |
+| `smtp` (email) | Subject |
+| `discord` | Embed title |
+| `slack` | Message text (also the push preview) |
+| `teams` | Card heading |
+| `telegram` | Bold first line |
+| `gotify`, `ntfy`, `pushover`, `pushbullet` | Notification title |
+
+Every other service receives the title as the first line of the message. This
+includes Mattermost and Matrix, which would only prepend a separate title as
+unformatted text, and Zulip, which would use it as the stream topic.
+
+Shoutrrr fails a send that carries a parameter the service does not know, so
+TailState passes only the parameters on a per-service allowlist taken from the
+pinned Shoutrrr release; a test fails when a Shoutrrr update drops or renames
+one of them. A parameter set in the destination URL always wins: with
+`?title=` (for email `?subject=` or `?title=`) in the URL, TailState keeps the
+operator's title and leaves its own as the first line of the body. Telegram
+receives a separate title only when the URL sets no `parsemode` (Shoutrrr shows
+a title only in its HTML mode, escaping the body), and a Discord URL with
+`json=yes` receives the body unchanged.
+
 ## Severity and routing
 
 Every change is classified with a built-in severity. The digest prefixes each

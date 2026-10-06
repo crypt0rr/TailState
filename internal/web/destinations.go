@@ -185,9 +185,8 @@ func (s *Server) destinationPost(w http.ResponseWriter, r *http.Request) {
 		}
 		testCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 		defer cancel()
-		format := notify.FormatFor(serviceURL, override)
-		message := notify.FitMessageFor(notify.Render(s.notificationContext(ctx).Test(time.Now()), format), notify.MessageLimit(serviceURL), format)
-		if err := notify.New().Send(testCtx, serviceURL, message); err != nil {
+		message := notify.PrepareMessage(s.notificationContext(ctx).Test(time.Now()), serviceURL, override)
+		if err := notify.New().SendPrepared(testCtx, serviceURL, message); err != nil {
 			s.redirectWithFlash(w, r, "/settings", flashKindError, "Notification test failed: "+notify.SafeTestError(err, serviceURL))
 			return
 		}

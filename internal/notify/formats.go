@@ -122,23 +122,82 @@ func EncodePayload(m Message) (string, string, error) {
 // ErrInvalidPayload reports a stored outbox payload that cannot be decoded.
 var ErrInvalidPayload = errors.New("stored notification payload is invalid")
 
+// Prepared is one notification rendered and fitted for one destination.
+type Prepared struct {
+	// Text is the complete message, title line included, fitted to the
+	// destination's budget. It is what a sender without title support
+	// receives, and it is the whole payload of a legacy row.
+	Text string
+	// Title is the plain-text title when the destination receives it as a
+	// separate field (see serviceParams), otherwise "".
+	Title string
+	// Body is the message without its title line, fitted to the budget left
+	// after the title. It is set exactly when Title is.
+	Body string
+	// Format is the rendering format of Text and Body.
+	Format string
+}
+
+// Message returns what is sent as the message body: Body when the title is
+// sent separately, otherwise Text.
+func (p Prepared) Message() string {
+	if p.Title != "" {
+		return p.Body
+	}
+	return p.Text
+}
+
 // Prepare renders a stored outbox payload for one destination and fits it to
 // the destination's message budget, so rendering and fitting happen in one
-// place. Legacy Markdown rows are returned unchanged.
+// place. Legacy Markdown rows are returned unchanged. It returns the complete
+// message including its title line; see PrepareFor for the form senders use.
 func Prepare(payloadFormat, payload, serviceURL, override string) (string, error) {
+	prepared, err := PrepareFor(payloadFormat, payload, serviceURL, override)
+	return prepared.Text, err
+}
+
+// PrepareFor renders a stored outbox payload for one destination. Legacy
+// Markdown rows are delivered exactly as stored, without a separate title.
+func PrepareFor(payloadFormat, payload, serviceURL, override string) (Prepared, error) {
 	switch payloadFormat {
 	case "", PayloadMarkdown:
-		return payload, nil
+		return Prepared{Text: payload, Format: FormatMarkdown}, nil
 	case PayloadMessage:
 	default:
-		return "", ErrInvalidPayload
+		return Prepared{}, ErrInvalidPayload
 	}
 	var message Message
 	if err := json.Unmarshal([]byte(payload), &message); err != nil {
-		return "", ErrInvalidPayload
+		return Prepared{}, ErrInvalidPayload
 	}
+	return PrepareMessage(message, serviceURL, override), nil
+}
+
+// PrepareMessage renders a message for one destination: in the destination's
+// format, fitted to its budget, and with the title split from the body when
+// the destination receives the title as a separate field.
+func PrepareMessage(message Message, serviceURL, override string) Prepared {
 	format := FormatFor(serviceURL, override)
-	return FitMessageFor(Render(message, format), MessageLimit(serviceURL), format), nil
+	limit := MessageLimit(serviceURL)
+	rendered := Render(message, format)
+	prepared := Prepared{Text: FitMessageFor(rendered, limit, format), Format: format}
+	if message.IsText() || !parseDestination(serviceURL).sendsTitleSeparately() {
+		return prepared
+	}
+	title := plainTitle(message)
+	// Every renderer writes the title as the first line, and a title never
+	// contains a line break (control characters become spaces).
+	_, body, _ := strings.Cut(rendered, "\n")
+	body = strings.TrimLeft(body, "\n")
+	if title == "" || strings.TrimSpace(body) == "" {
+		return prepared
+	}
+	// Discord counts embed titles and Telegram counts the title line
+	// against the same limit as the body, so the title's size is reserved
+	// for every service.
+	prepared.Title = title
+	prepared.Body = FitMessageFor(body, limit-len(title)-1, format)
+	return prepared
 }
 
 // Slack renders a message as Slack mrkdwn: single-asterisk bold, no

@@ -173,7 +173,8 @@ func (c Context) schemaLine(change schemaChange, batchID int64) Line {
 
 func (c Context) fleetLine(transition fleetTransition, batchID int64) Line {
 	severity := transition.severity()
-	l := line(lit(severityIcons[severity]+" 📦 "), code(transition.field.Field), lit(": "), code(shortValue(transition.field.Old)), lit(" → "), code(shortValue(transition.field.New)), lit(fmt.Sprintf(" on %d resources (", transition.count)), txt(transition.collector), lit(")"))
+	spans := append([]Span{lit(severityIcons[severity] + " 📦 ")}, presentField(transition.collector, transition.field)...)
+	l := line(append(spans, lit(fmt.Sprintf(" on %d resources (", transition.count)), txt(transition.collector), lit(")"))...)
 	return c.withDetails(l, batchID)
 }
 

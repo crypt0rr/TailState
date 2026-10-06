@@ -100,7 +100,7 @@ func (c Context) Digest(in DigestInput) Message {
 		}
 		omittedFields := 0
 		for fieldIndex, field := range change.Fields {
-			if !add(item(code(field.Field), lit(": "), code(shortValue(field.Old)), lit(" → "), code(shortValue(field.New)))) {
+			if !add(item(presentField(change.Collector, field)...)) {
 				omittedFields = len(change.Fields) - fieldIndex
 				break
 			}

@@ -13,6 +13,9 @@ rollback requires restoring the backup taken before the upgrade. See
 
 ## [Unreleased]
 
+### Changed
+- Notification field lines and fleet summaries show readable values instead of raw JSON and hashes: policy sections as "section `acls` changed/added/removed" with 8-character fingerprints, redacted secrets as "secret changed (fingerprint … → …)", set, or removed, text without JSON quotes, list changes as `+added`/`−removed` elements, ordered DNS lists in their new order, and absent values as "(not set)". History, the API, and evidence packs keep the full values (#230).
+
 ### Fixed
 - Slack notifications arrive as one message with a title, a non-empty preview text, and the body in Block Kit sections, instead of one attachment bar per line. The payload is sent by TailState's own bounded, redirect-rejecting HTTP client for both webhook and token URLs, with the same error classification, mention and link escaping, and size fitting as before (#229).
 - Digests list changes by severity (high, then medium, then low; fleet and schema summaries included, by collector and name within a severity), so destinations with small message budgets such as Telegram and Pushover drop the least important changes first; when high-severity changes must still be dropped, the shortening note says how many (#226).

@@ -33,7 +33,7 @@ func TestFleetRolloutCollapsesToOneSummaryLine(t *testing.T) {
 	if strings.Contains(got, "host\\-001") {
 		t.Fatalf("summarised devices are still listed individually:\n%s", got)
 	}
-	if !strings.Contains(got, "**odd\\-one**") || !strings.Contains(got, "`name`: `\"a\"` → `\"b\"`") || !strings.Contains(got, "**144 change(s):**") {
+	if !strings.Contains(got, "**odd\\-one**") || !strings.Contains(got, "`name`: `a` → `b`") || !strings.Contains(got, "**144 change(s):**") {
 		t.Fatalf("remaining field or header counts were lost:\n%s", got)
 	}
 	// Below the threshold every device is listed.

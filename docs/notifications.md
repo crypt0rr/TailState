@@ -27,6 +27,78 @@ Destinations are added, edited, tested, and removed on the Settings page; see
 - Every notification names the tailnet (prefixed by `TAILSTATE_INSTANCE_LABEL` when set) in its title and carries an `Observed at <UTC RFC3339>` line. With `TAILSTATE_PUBLIC_URL` set, digests link to their History batch (`/history?batch=<id>`) and health alerts and expiry warnings to `/status`. The Settings test message names the instance, tailnet, TailState version, and time.
 - Multiple changes in one poll become one digest, fanned out into one durable outbox item per enabled destination (subject to its [routing rules](#severity-and-routing)). The outbox stores a format-neutral message that is rendered when it is sent, in the format the receiving service displays: Slack mrkdwn for `slack` and `googlechat` (single-asterisk bold, no `###` headings, `<url|label>` links, and `&`, `<`, `>` escaped so a resource name cannot mention a channel), plain text for `telegram`, `smtp`, `pushover`, `matrix`, `ntfy`, `gotify`, `signal`, `bark`, `join`, `lark`, `wecom`, `pushbullet`, `ifttt`, `opsgenie`, `pagerduty`, `mqtt`, `twilio`, `xmpp`, `signalgrid`, and `hass`, and Markdown for every other service (for example `mattermost`, `discord`, `rocketchat`, `zulip`, `teams`, and `generic`). Each destination can override the automatic choice under **Edit destination** in Settings; the Settings test message uses the same format. Each digest is fitted to the receiving service's message limit (for example 4,096 bytes for Telegram, Lark, WeCom, and ntfy, 1,024 for Pushover, and 10,000 for Zulip) by dropping whole lines from the end and adding an explicit "lines omitted, see History" note. A provider that still rejects a message as too large (or with HTTP 413) dead-letters it immediately instead of retrying for 24 hours.
 
+## Example digest
+
+A batch of 19 changes (with attribution, 3 muted changes, and a 12-device
+client rollout) as an email, Telegram, ntfy, Gotify, or Pushbullet
+destination receives it in plain text. The first line is the title, which
+these services show in their own title field (see [Titles](#titles)):
+
+```text
+Tailscale inventory changed · prod (example.com)
+19 change(s): 2 created, 17 changed, 0 removed
+Severity: 🔴 5 high, 🟠 2 medium, ⚪ 12 low
+Observed at 2026-10-05T12:00:00Z
+View batch #1842 in TailState History: https://tailstate.example/history?batch=1842
+3 muted change(s) not shown; they are recorded in TailState History.
+
+🔴 ✏️ web-02.tail1234.ts.net changed (devices, high)
+  • Changed by: ci-bot [api key]
+  • tags: +tag:db
+🔴 ➕ kAbc123CNTRL created (keys, high)
+  • Changed by: alice@example.com
+🔴 ✏️ Tailnet policy changed (policy, high)
+  • Changed by: alice@example.com
+  • section acls changed (3f9a1c0e → c41b7e2a)
+  • section ssh added (9e8d7c6b)
+🔴 ✏️ bob@example.com changed (users, high)
+  • Changed by: alice@example.com
+  • role: member → admin
+🔴 ✏️ SIEM webhook changed (webhooks, high)
+  • Changed by: actor unknown
+  • endpointUrl: secret changed (fingerprint aa11bb22 → 99887766)
+🟠 ➕ laptop-new.tail1234.ts.net created (devices, medium)
+  • Changed by: actor unknown
+🟠 ✏️ DNS configuration changed (dns, medium)
+  • Changed by: actor unknown
+  • searchPaths: now example.com, corp.example.com
+⚪ 📦 clientVersion: 1.80.2 → 1.82.1 on 12 resources (devices) details: https://tailstate.example/history?batch=1842
+```
+
+The same digest per service:
+
+| Service | Title | Body |
+| --- | --- | --- |
+| Email (`smtp`) | Subject | Plain text as above, without the title line |
+| Telegram | Bold first line (HTML mode) | Plain text as above |
+| ntfy, Gotify, Pushbullet | Notification title | Plain text as above |
+| Pushover | Notification title | Plain text, shortened to 1,024 bytes from the end ("Shortened for this destination: 7 more line(s) omitted…"), so the high-severity changes stay |
+| Discord | Embed title | Markdown in one embed (`**bob@example.com**`, `` `role`: `member` → `admin` ``) |
+| Microsoft Teams | Card heading | Markdown, one text block per line |
+| Slack | Header block and preview text | Slack mrkdwn in one section (`*bob@example.com*`, links as `<url\|label>`) |
+| Mattermost, Rocket.Chat, Zulip, generic webhooks | `### Tailscale inventory changed · prod \(example.com\)` heading line | Markdown |
+| Matrix, Signal, other plain-text services | First line | Plain text as above |
+
+## How values are shown
+
+Field changes are written for reading, not as raw JSON. History, the API, and
+evidence packs keep the full normalized values; only notifications present
+them this way, and every value stays escaped for the destination's format.
+
+| Value | Shown as |
+| --- | --- |
+| Policy section (TailState stores only a SHA-256 fingerprint of each section, never policy text) | ``section `acls` changed (`3f9a1c0e` → `c41b7e2a`)``, ``section `ssh` added (`9e8d7c6b`)``, ``section `tests` removed`` |
+| Redacted secret (`{"redacted_sha256": …}`) | ``secret changed (fingerprint `aa11bb22` → `99887766`)``, `secret set`, `secret removed` |
+| Text, number, or boolean | Without JSON quotes: `` `member` → `admin` ``, `` `false` → `true` `` |
+| Other 64-character fingerprints | The first 8 characters and `…` |
+| List of values (tags, routes, addresses) | The elements added and removed: ``+`tag:db`, −`tag:old` `` (at most 10 per side, then "N more") |
+| Ordered DNS lists (nameservers, search paths) | The new order, plus what was added or removed: ``now `8.8.8.8`, `1.1.1.1` (+`8.8.8.8`)`` |
+| Absent or null value | `(not set)`; an empty string is `(empty)` |
+| Object | Bounded compact JSON, with fingerprints shortened |
+
+Fleet summaries use the same presentation, for example
+"🔴 📦 `tags`: +`tag:db` on 6 resources (devices)".
+
 ## Titles
 
 The title of every notification (its icon, title, instance label, and

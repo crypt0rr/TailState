@@ -3,7 +3,7 @@ package store
 const schema = `
 PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);
-INSERT INTO schema_version(version) SELECT 15 WHERE NOT EXISTS (SELECT 1 FROM schema_version);
+INSERT INTO schema_version(version) SELECT 16 WHERE NOT EXISTS (SELECT 1 FROM schema_version);
 
 CREATE TABLE IF NOT EXISTS meta (
   key TEXT PRIMARY KEY,
@@ -147,7 +147,8 @@ CREATE TABLE IF NOT EXISTS event_batches (
   observed_at TEXT NOT NULL,
   change_count INTEGER NOT NULL,
   created_at TEXT NOT NULL,
-  trigger_id INTEGER
+  trigger_id INTEGER,
+  attribution_status TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS event_batches_observed_at ON event_batches(observed_at DESC, id DESC);
 CREATE TABLE IF NOT EXISTS event_batch_triggers (
@@ -190,7 +191,10 @@ CREATE TABLE IF NOT EXISTS events (
   before_truncated INTEGER NOT NULL DEFAULT 0,
   after_truncated INTEGER NOT NULL DEFAULT 0,
   severity TEXT NOT NULL DEFAULT '',
-  muted INTEGER NOT NULL DEFAULT 0
+  muted INTEGER NOT NULL DEFAULT 0,
+  -- Bounded "changed by" record from the configuration audit log (actor,
+  -- action, target, time); never the audit log's old/new values.
+  attribution TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS mute_rules (
   id INTEGER PRIMARY KEY AUTOINCREMENT,

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/crypt0rr/tailstate/internal/diagnostics"
+	"github.com/crypt0rr/tailstate/internal/model"
 	"github.com/crypt0rr/tailstate/internal/store"
 )
 
@@ -155,6 +156,16 @@ type apiStatusResponse struct {
 	WebhookTriggers     apiQueue       `json:"webhook_triggers"`
 	ResourceCounts      map[string]int `json:"resource_counts"`
 	Collectors          []apiCollector `json:"collectors"`
+	Attribution         apiAttribution `json:"attribution"`
+}
+
+// apiAttribution is the configuration audit log state used for change
+// attribution: "supported", "unsupported", "failing", or "unchecked". The
+// reason is a bounded label, never provider text.
+type apiAttribution struct {
+	State     string     `json:"state"`
+	Reason    string     `json:"reason,omitempty"`
+	CheckedAt *time.Time `json:"checked_at,omitempty"`
 }
 
 func (s *Server) apiStatus(w http.ResponseWriter, r *http.Request) {
@@ -180,6 +191,11 @@ func (s *Server) apiStatus(w http.ResponseWriter, r *http.Request) {
 		WebhookTriggers:     apiQueue{Pending: status.WebhookPending, Processing: status.WebhookProcessing, Dead: status.WebhookDead},
 		ResourceCounts:      status.ResourceCounts,
 		Collectors:          make([]apiCollector, 0, len(status.Collectors)),
+	}
+	response.Attribution = apiAttribution{State: "unchecked"}
+	if source := status.Attribution; source.State != "" {
+		checked := source.CheckedAt
+		response.Attribution = apiAttribution{State: source.State, Reason: source.Reason, CheckedAt: &checked}
 	}
 	if response.ResourceCounts == nil {
 		response.ResourceCounts = map[string]int{}
@@ -221,6 +237,10 @@ type apiEvent struct {
 	AfterBytes      int64           `json:"after_bytes"`
 	BeforeTruncated bool            `json:"before_truncated"`
 	AfterTruncated  bool            `json:"after_truncated"`
+	// ChangedBy is the History "Changed by" text ("actor unknown" when the
+	// audit log had no match); Attribution is the matching audit record.
+	ChangedBy   string             `json:"changed_by,omitempty"`
+	Attribution *model.Attribution `json:"attribution,omitempty"`
 }
 
 // apiDelivery reports a delivery by destination ID and display name only;
@@ -235,16 +255,18 @@ type apiDelivery struct {
 }
 
 type apiBatch struct {
-	Type        string        `json:"type"`
-	ID          int64         `json:"id"`
-	Generation  int64         `json:"generation"`
-	ObservedAt  time.Time     `json:"observed_at"`
-	ChangeCount int           `json:"change_count"`
-	TriggerIDs  []int64       `json:"trigger_ids,omitempty"`
-	LedgerSeq   int64         `json:"ledger_sequence,omitempty"`
-	LedgerHash  string        `json:"ledger_hash,omitempty"`
-	Events      []apiEvent    `json:"events"`
-	Deliveries  []apiDelivery `json:"deliveries"`
+	Type        string    `json:"type"`
+	ID          int64     `json:"id"`
+	Generation  int64     `json:"generation"`
+	ObservedAt  time.Time `json:"observed_at"`
+	ChangeCount int       `json:"change_count"`
+	TriggerIDs  []int64   `json:"trigger_ids,omitempty"`
+	LedgerSeq   int64     `json:"ledger_sequence,omitempty"`
+	LedgerHash  string    `json:"ledger_hash,omitempty"`
+	// AttributionStatus is the configuration audit lookup outcome.
+	AttributionStatus string        `json:"attribution_status,omitempty"`
+	Events            []apiEvent    `json:"events"`
+	Deliveries        []apiDelivery `json:"deliveries"`
 }
 
 type apiPage struct {
@@ -303,9 +325,9 @@ func (s *Server) apiHistory(w http.ResponseWriter, r *http.Request) {
 	var body bytes.Buffer
 	encoder := json.NewEncoder(&body)
 	for _, batch := range page.Batches {
-		line := apiBatch{Type: "batch", ID: batch.ID, Generation: batch.Generation, ObservedAt: batch.ObservedAt, ChangeCount: batch.ChangeCount, TriggerIDs: batch.TriggerIDs, LedgerSeq: batch.LedgerSequence, LedgerHash: batch.LedgerHash, Events: make([]apiEvent, 0, len(batch.Events)), Deliveries: make([]apiDelivery, 0, len(batch.Deliveries))}
+		line := apiBatch{Type: "batch", ID: batch.ID, Generation: batch.Generation, ObservedAt: batch.ObservedAt, ChangeCount: batch.ChangeCount, TriggerIDs: batch.TriggerIDs, LedgerSeq: batch.LedgerSequence, LedgerHash: batch.LedgerHash, AttributionStatus: batch.AttributionStatus, Events: make([]apiEvent, 0, len(batch.Events)), Deliveries: make([]apiDelivery, 0, len(batch.Deliveries))}
 		for _, event := range batch.Events {
-			item := apiEvent{ID: event.ID, Collector: event.Collector, EventType: event.EventType, ResourceID: event.ResourceID, Name: event.Name, Severity: event.Severity, Muted: event.Muted, Fields: make([]apiField, 0, len(event.Fields)), FieldsTruncated: event.FieldsTruncated, TotalFields: event.TotalFields, Before: rawJSON(event.BeforeJSON), After: rawJSON(event.AfterJSON), BeforeHash: event.BeforeHash, AfterHash: event.AfterHash, BeforeBytes: event.BeforeBytes, AfterBytes: event.AfterBytes, BeforeTruncated: event.BeforeTruncated, AfterTruncated: event.AfterTruncated}
+			item := apiEvent{ID: event.ID, Collector: event.Collector, EventType: event.EventType, ResourceID: event.ResourceID, Name: event.Name, Severity: event.Severity, Muted: event.Muted, Fields: make([]apiField, 0, len(event.Fields)), FieldsTruncated: event.FieldsTruncated, TotalFields: event.TotalFields, Before: rawJSON(event.BeforeJSON), After: rawJSON(event.AfterJSON), BeforeHash: event.BeforeHash, AfterHash: event.AfterHash, BeforeBytes: event.BeforeBytes, AfterBytes: event.AfterBytes, BeforeTruncated: event.BeforeTruncated, AfterTruncated: event.AfterTruncated, ChangedBy: event.ChangedBy, Attribution: event.Attribution}
 			for _, field := range event.Fields {
 				item.Fields = append(item.Fields, apiField{Field: field.Field, Old: field.Old, New: field.New, HasOld: field.HasOld, HasNew: field.HasNew})
 			}

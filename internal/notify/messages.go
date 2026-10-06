@@ -26,6 +26,10 @@ type DigestInput struct {
 	// ResourceCounts is the number of resources each collector returned in
 	// this poll, used to recognise upstream schema changes.
 	ResourceCounts map[string]int
+	// Attributed is set when the configuration audit log was consulted for
+	// the batch: every listed change then names its actor (Change.Attribution)
+	// or "actor unknown".
+	Attributed bool
 }
 
 // DigestFunc builds the notification for one digest.
@@ -94,6 +98,9 @@ func (c Context) Digest(in DigestInput) Message {
 			message.Lines = append(message.Lines, blank(), line(emph(fmt.Sprintf("%d more change(s) omitted; total: %d. See TailState History for the full batch.", len(listed)-index, len(in.Changes)))))
 			break
 		}
+		if in.Attributed {
+			add(changedByLine(change))
+		}
 		omittedFields := 0
 		for fieldIndex, field := range change.Fields {
 			if !add(item(code(field.Field), lit(": "), code(shortValue(field.Old)), lit(" → "), code(shortValue(field.New)))) {
@@ -111,6 +118,15 @@ func (c Context) Digest(in DigestInput) Message {
 		}
 	}
 	return message
+}
+
+// changedByLine names who made a change: the audit log actor, or "actor
+// unknown" when the configuration audit log had no matching entry.
+func changedByLine(change model.Change) Line {
+	if change.Attribution == nil || change.Attribution.IsZero() {
+		return item(strong("Changed by:"), lit(" "+model.ActorUnknown))
+	}
+	return item(strong("Changed by:"), lit(" "), txt(change.Attribution.Display()))
 }
 
 // ExpiryLine is one resource listed in an expiry warning.

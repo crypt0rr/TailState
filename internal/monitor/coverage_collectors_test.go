@@ -67,6 +67,9 @@ func (a *fakeTailnetAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if strings.HasPrefix(r.URL.Path, "/api/v2/tailnet/-/logging/") {
 			needed, known = "log_streaming:read", true
 		}
+		if r.URL.Path == "/api/v2/tailnet/-/logging/configuration" {
+			needed, known = tailscale.ConfigurationAuditScope, true
+		}
 		if !known || !a.granted[needed] {
 			http.Error(w, `{"message":"insufficient scope"}`, http.StatusForbidden)
 			return

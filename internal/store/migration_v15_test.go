@@ -64,7 +64,7 @@ func TestSchemaV15MigrationKeepsSessionsAndAddsSecurityState(t *testing.T) {
 	}
 	defer st.Close()
 	var version int
-	if err := st.db.QueryRow("SELECT version FROM schema_version").Scan(&version); err != nil || version != 15 {
+	if err := st.db.QueryRow("SELECT version FROM schema_version").Scan(&version); err != nil || version != currentSchemaVersion {
 		t.Fatalf("schema version=%d err=%v", version, err)
 	}
 	var lastSeen string

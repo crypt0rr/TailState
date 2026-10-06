@@ -13,6 +13,9 @@ rollback requires restoring the backup taken before the upgrade. See
 
 ## [Unreleased]
 
+### Added
+- Change attribution from the Tailscale configuration audit log (`logs:configuration:read`, included in `all:read`): History, digests in every message format, `/api/v1/history`, and evidence packs (format version 5, signed in the ledger payload) name who made each change, or "actor unknown" without failing the batch. Only the actor, action, target, and time are stored, never the audit log's old/new values. A `403`/`404` degrades silently and shows as unsupported on the status page; lookups have a 10-second budget and are counted in `tailstate_attribution_lookups_total`. Schema 16 adds `events.attribution` and `event_batches.attribution_status`; version 3 and 4 packs still verify (#173).
+
 ### Changed
 - `oauth_apps` changes (created, removed, or changed) are classified as high severity, like keys, because OAuth applications grant API access. Events recorded earlier keep their stored severity (#174).
 

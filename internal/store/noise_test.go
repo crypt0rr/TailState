@@ -160,7 +160,7 @@ func TestMutedChangesAreRecordedFlaggedAndSigned(t *testing.T) {
 	if err := json.Unmarshal(encoded, &pack); err != nil {
 		t.Fatal(err)
 	}
-	if pack.Version != 4 {
+	if pack.Version != evidencePackVersion {
 		t.Fatalf("pack version=%d", pack.Version)
 	}
 	exported := 0
@@ -264,7 +264,7 @@ func TestVersionThreeEvidencePacksStillVerify(t *testing.T) {
 	if err := VerifyEvidencePack(replayed); err == nil {
 		t.Fatal("a version 4 signature verified as a version 3 pack")
 	}
-	pack.Version = 5
+	pack.Version = evidencePackVersion + 1
 	if err := VerifyEvidencePack(resignEvidencePack(t, st, pack)); err == nil || !strings.Contains(err.Error(), "unsupported evidence pack") {
 		t.Fatalf("future pack version error=%v", err)
 	}

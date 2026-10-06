@@ -30,6 +30,7 @@ type Engine struct {
 	dueErrors                  atomic.Uint64
 	deliveryStats              deliveryStats
 	cleanupStats               cleanupTelemetry
+	attributionStats           attributionStats
 	instanceLabel, publicURL   string
 }
 
@@ -610,7 +611,7 @@ func (e *Engine) pollWithOutcomes(ctx context.Context, client *tailscale.Client,
 		outcome.success = success
 		return outcome
 	}
-	batch, err := e.store.ApplyBatchWithBatch(ctx, settings.Generation, results, messages.Digest, triggerIDs...)
+	batch, err := e.store.ApplyBatchWithOptions(ctx, settings.Generation, results, messages.Digest, e.batchOptions(ctx, client, settings, polled), triggerIDs...)
 	if err != nil {
 		slog.Error("apply collected inventory", "error", err)
 		if retryErr := e.store.SetNextPollErr(ctx, settings.Generation, polled, time.Now().Add(collectorRetryInterval)); retryErr != nil {
@@ -637,7 +638,8 @@ func (e *Engine) pollWithOutcomes(ctx context.Context, client *tailscale.Client,
 		}
 	}
 	if len(batch.Changes) > 0 {
-		slog.Info("inventory changes detected", "batch_id", batch.ID, "count", len(batch.Changes))
+		e.recordAttributionOutcome(batch)
+		slog.Info("inventory changes detected", "batch_id", batch.ID, "count", len(batch.Changes), "attributed", batch.Attributed)
 	}
 	deviceCollectors := make([]string, 0, 1)
 	inventoryCollectors := make([]string, 0, len(polled))

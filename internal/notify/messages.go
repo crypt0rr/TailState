@@ -3,6 +3,7 @@ package notify
 import (
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 	"unicode"
@@ -70,7 +71,7 @@ func (c Context) Digest(in DigestInput) Message {
 		message.Lines = append(message.Lines, line(emph(fmt.Sprintf("%d muted change(s) not shown; they are recorded in TailState History.", in.MutedCount))))
 	}
 	message.Lines = append(message.Lines, blank())
-	schema, fleet, listed := summarize(in)
+	entries := c.digestEntries(in)
 	// Every line is complete on its own, so the digest is only ever shortened
 	// at line boundaries and each omission is stated explicitly. The budget is
 	// measured in Markdown, the most verbose rendering.
@@ -85,19 +86,15 @@ func (c Context) Digest(in DigestInput) Message {
 		size += rendered
 		return true
 	}
-	// Summaries come first: they are short and stand for many resources.
-	for _, change := range schema {
-		add(c.schemaLine(change, in.BatchID))
-	}
-	for _, transition := range fleet {
-		add(c.fleetLine(transition, in.BatchID))
-	}
-	for index, change := range listed {
-		severity := model.Classify(change)
-		if !add(line(lit(severityIcons[severity]+" "+changeIcons[change.Kind]+" "), bold(change.Name), lit(" "), code(change.Kind), lit(" ("), txt(change.Collector), lit(", "+string(severity)+")"))) {
-			message.Lines = append(message.Lines, blank(), line(emph(fmt.Sprintf("%d more change(s) omitted; total: %d. See TailState History for the full batch.", len(listed)-index, len(in.Changes)))))
+	for index, entry := range entries {
+		if !add(entry.line) {
+			message.Lines = append(message.Lines, blank(), line(emph(omittedEntries(entries[index:], len(in.Changes)))))
 			break
 		}
+		if entry.change == nil {
+			continue
+		}
+		change := *entry.change
 		if in.Attributed {
 			add(changedByLine(change))
 		}
@@ -118,6 +115,75 @@ func (c Context) Digest(in DigestInput) Message {
 		}
 	}
 	return message
+}
+
+// digestEntry is one top-level digest line: a schema or fleet summary, or a
+// listed change (whose attribution and field lines follow it).
+type digestEntry struct {
+	severity model.Severity
+	line     Line
+	change   *model.Change
+}
+
+// severityRank orders severities from most to least important.
+var severityRank = map[model.Severity]int{model.SeverityHigh: 0, model.SeverityMedium: 1, model.SeverityLow: 2}
+
+// digestEntries returns the digest's top-level lines ordered by severity
+// (high, medium, low), so a small destination budget, which drops lines from
+// the end, cuts the least important changes first. Within a severity,
+// summaries come first (they are short and stand for many resources), then
+// changes by collector and name; the sort is stable, so ties keep the
+// batch's order.
+func (c Context) digestEntries(in DigestInput) []digestEntry {
+	schema, fleet, listed := summarize(in)
+	entries := make([]digestEntry, 0, len(schema)+len(fleet)+len(listed))
+	for _, change := range schema {
+		entries = append(entries, digestEntry{severity: change.severity(), line: c.schemaLine(change, in.BatchID)})
+	}
+	for _, transition := range fleet {
+		entries = append(entries, digestEntry{severity: transition.severity(), line: c.fleetLine(transition, in.BatchID)})
+	}
+	summaries := len(entries)
+	for index := range listed {
+		change := &listed[index]
+		severity := model.Classify(*change)
+		entries = append(entries, digestEntry{severity: severity, change: change, line: line(lit(severityIcons[severity]+" "+changeIcons[change.Kind]+" "), bold(change.Name), lit(" "), code(change.Kind), lit(" ("), txt(change.Collector), lit(", "+string(severity)+")"))})
+	}
+	sort.SliceStable(entries[summaries:], func(i, j int) bool {
+		a, b := entries[summaries+i].change, entries[summaries+j].change
+		if a.Collector != b.Collector {
+			return a.Collector < b.Collector
+		}
+		return a.Name < b.Name
+	})
+	sort.SliceStable(entries, func(i, j int) bool {
+		return severityRank[entries[i].severity] < severityRank[entries[j].severity]
+	})
+	return entries
+}
+
+// omittedEntries is the closing note for digest entries left out at the
+// default budget. It names the omitted high-severity entries explicitly.
+func omittedEntries(entries []digestEntry, total int) string {
+	changes, summaries, high := 0, 0, 0
+	for _, entry := range entries {
+		if entry.change != nil {
+			changes++
+		} else {
+			summaries++
+		}
+		if entry.severity == model.SeverityHigh {
+			high++
+		}
+	}
+	omitted := fmt.Sprintf("%d more change(s)", changes)
+	if summaries > 0 {
+		omitted += fmt.Sprintf(" and %d summary line(s)", summaries)
+	}
+	if high > 0 {
+		omitted += fmt.Sprintf(", including %d high-severity,", high)
+	}
+	return fmt.Sprintf("%s omitted; total: %d. See TailState History for the full batch.", omitted, total)
 }
 
 // changedByLine names who made a change: the audit log actor, or "actor

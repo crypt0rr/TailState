@@ -80,6 +80,18 @@ Every change is classified with a built-in severity. The digest prefixes each
 line with 🔴 high, 🟠 medium, or ⚪ low and repeats the severity next to the
 collector, and History can be filtered by severity.
 
+The digest lists its lines by severity: every high-severity line comes before
+any medium one, and every medium line before any low one. Fleet and schema
+summaries are ordered by their own severity like individual changes (a low
+client rollout summary never precedes a high-severity change), and lead their
+severity group; within a group, changes are ordered by collector and then
+name. Because a digest that is too large for a destination is shortened from
+the end, the least important changes are dropped first. When high-severity
+changes still have to be dropped (a batch with more of them than the
+destination's budget holds), the closing note says how many, for example
+"Shortened for this destination: 31 more line(s) omitted, including 29
+high-severity change(s). See TailState History for the full batch."
+
 | Severity | Changes |
 | --- | --- |
 | High | Any `policy`, `log_streaming`, `settings` (tailnet settings), `webhooks`, or `oauth_apps` change (OAuth applications grant API access, like keys); a `keys` resource created; a `users` change to `role`; a `devices` change to `tags`, `authorized` false→true, or `keyExpiryDisabled` false→true |

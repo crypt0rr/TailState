@@ -13,6 +13,11 @@ rollback requires restoring the backup taken before the upgrade. See
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-10-06
+
+- **Schema:** 17 (unchanged)
+- **Rollback:** image-only rollback to 0.16.0 is safe; destinations that select the new Teams or Telegram HTML format fall back to the automatic format on 0.16.0.
+
 ### Added
 - Notifications carry their severity to services that support it: the highest severity of a digest (or a fixed level for health alerts, expiry warnings, configuration changes, and the Settings test) sets the ntfy priority and tags (4/3/2, `rotating_light`/`warning`/`information_source`), the Pushover priority (1/0/-1, never the acknowledgement-only 2), the Gotify priority (8/5/2), the Opsgenie priority (P2/P3/P5), and a red, orange, or grey colour for Discord embeds, Slack attachments, and Teams card titles. A value set in the destination URL wins, services without these keys receive none, and messages queued before the upgrade keep the provider's default (#234).
 - Telegram notifications use Telegram's HTML formatting: names in bold, values in `<code>`, remarks in italics, and the History and Status links as labelled anchors to the public URL, sent with `parsemode=HTML` and the title. Every value is HTML-escaped, the 4,096-byte budget is counted on the rendered HTML, and a `parsemode` set in the URL is respected (Markdown modes receive plain text). Plain text stays available as a format override, and "Telegram HTML" is a new override (#235).
@@ -151,7 +156,8 @@ Releases before 0.11.16 are described in their
 [GitHub release notes](https://github.com/crypt0rr/TailState/releases); their
 schema versions are listed in [UPGRADING.md](UPGRADING.md#schema-history).
 
-[Unreleased]: https://github.com/crypt0rr/TailState/compare/v0.16.0...HEAD
+[Unreleased]: https://github.com/crypt0rr/TailState/compare/v0.17.0...HEAD
+[0.17.0]: https://github.com/crypt0rr/TailState/compare/v0.16.0...v0.17.0
 [0.16.0]: https://github.com/crypt0rr/TailState/compare/v0.15.0...v0.16.0
 [0.15.0]: https://github.com/crypt0rr/TailState/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/crypt0rr/TailState/compare/v0.13.0...v0.14.0

@@ -169,21 +169,18 @@ func (s *Server) destinationPost(w http.ResponseWriter, r *http.Request) {
 		s.engine.Wake()
 		s.redirectWithFlash(w, r, "/settings", flashKindSuccess, "Notification destination saved.")
 	case "test":
+		// A blank URL tests the saved destination. The test is rendered
+		// exactly as deliveries to it are: by URL scheme, or by the saved or
+		// submitted format override.
 		serviceURL := strings.TrimSpace(r.FormValue("service_url"))
-		if serviceURL == "" && id > 0 {
-			serviceURL = s.storedDestinationURL(ctx, id)
-		}
-		// Render the test exactly as deliveries to this destination are
-		// rendered: by URL scheme, or by the saved or submitted override.
 		override := strings.TrimSpace(r.FormValue("message_format"))
-		if override == "" && id > 0 {
-			if existing, err := s.store.ListDestinations(ctx); err == nil {
-				for _, destination := range existing {
-					if destination.ID == id {
-						override = destination.Format
-						break
-					}
-				}
+		if id > 0 && (serviceURL == "" || override == "") {
+			stored, _ := s.storedDestination(ctx, id)
+			if serviceURL == "" {
+				serviceURL = stored.ServiceURL
+			}
+			if override == "" {
+				override = stored.Format
 			}
 		}
 		testCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
@@ -278,16 +275,24 @@ func (s *Server) notificationContext(ctx context.Context) notify.Context {
 // storedDestinationURL returns the saved URL of an active destination, or
 // "" when it cannot be read.
 func (s *Server) storedDestinationURL(ctx context.Context, id int64) string {
+	destination, _ := s.storedDestination(ctx, id)
+	return destination.ServiceURL
+}
+
+// storedDestination returns a saved, active destination. found is false
+// (and the zero destination is returned) when it does not exist or cannot be
+// read.
+func (s *Server) storedDestination(ctx context.Context, id int64) (destination store.NotificationDestination, found bool) {
 	existing, err := s.store.ListDestinations(ctx)
 	if err != nil {
-		return ""
+		return store.NotificationDestination{}, false
 	}
-	for _, destination := range existing {
-		if destination.ID == id {
-			return destination.ServiceURL
+	for _, candidate := range existing {
+		if candidate.ID == id {
+			return candidate, true
 		}
 	}
-	return ""
+	return store.NotificationDestination{}, false
 }
 
 // destinationPending returns a destination's display name and the number of

@@ -6,7 +6,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/crypt0rr/tailstate/internal/secret"
 	"github.com/crypt0rr/tailstate/internal/store"
 )
 
@@ -57,53 +56,23 @@ func (s *Server) claim(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "installation already claimed", http.StatusConflict)
 		return
 	}
-	ip := s.throttleKey(credentialActionSetup, s.clientIP(r))
-	if retry, limited := s.throttled(credentialActionSetup, ip); limited {
-		s.renderThrottled(w, r, "setup", credentialActionSetup, "Too many setup attempts. Try again later.", retry)
+	flow := credentialFlow{server: s, page: "setup", action: credentialActionSetup, throttledMessage: "Too many setup attempts. Try again later."}
+	release, ok := flow.begin(w, r)
+	if !ok {
 		return
 	}
-	if err := r.ParseForm(); err != nil {
-		http.Error(w, "invalid form", http.StatusBadRequest)
-		return
-	}
-	if !s.validateCredentialChallenge(r, credentialActionSetup) {
-		s.renderCredential(w, r, "setup", credentialActionSetup, pageData{Error: credentialChallengeError})
-		return
-	}
-	select {
-	case s.authWork <- struct{}{}:
-		defer func() { <-s.authWork }()
-	default:
-		http.Error(w, "authentication busy", http.StatusServiceUnavailable)
-		return
-	}
-	if r.FormValue("password") != r.FormValue("confirm") {
-		// Password confirmation is part of the unauthenticated setup surface.
-		// Count mismatches as failed claims so an attacker cannot bypass the
-		// endpoint throttle by repeatedly submitting different confirmations.
-		s.recordFailure(credentialActionSetup, ip)
-		s.recordCredentialRejection(credentialActionSetup)
-		s.renderCredential(w, r, "setup", credentialActionSetup, pageData{Error: "Passwords do not match."})
-		return
-	}
-	// The policy is checked before the token so a weak password gets a
-	// specific explanation instead of the generic token error. It reveals
-	// nothing about the token.
-	if err := secret.CheckPasswordPolicy(r.FormValue("password")); err != nil {
-		s.renderCredential(w, r, "setup", credentialActionSetup, pageData{Error: secret.PasswordPolicyMessage(err)})
+	defer release()
+	if !flow.newPassword(w, r) {
 		return
 	}
 	if err := s.store.Claim(r.Context(), r.FormValue("token"), r.FormValue("password")); err != nil {
-		s.recordFailure(credentialActionSetup, ip)
-		s.recordCredentialRejection(credentialActionSetup)
 		// Setup is unauthenticated. Keep storage, token, and migration details
 		// out of the response so this endpoint cannot become an oracle.
 		slog.Debug("setup claim rejected", "error", err)
-		s.renderCredential(w, r, "setup", credentialActionSetup, pageData{Error: "Setup could not be completed. Check the setup token and try again."})
+		flow.reject(w, r, "Setup could not be completed. Check the setup token and try again.")
 		return
 	}
-	s.clearFailures(ip)
-	s.clearCredentialChallengeCookie(w, credentialActionSetup)
+	flow.succeed(w)
 	token, ok := s.startSession(w, r)
 	if !ok {
 		return
@@ -143,36 +112,25 @@ func (s *Server) adminExists(w http.ResponseWriter, r *http.Request) (bool, bool
 }
 
 func (s *Server) loginPost(w http.ResponseWriter, r *http.Request) {
-	ip := s.throttleKey(credentialActionLogin, s.clientIP(r))
-	if retry, limited := s.throttled(credentialActionLogin, ip); limited {
-		s.renderThrottled(w, r, "login", credentialActionLogin, "Too many login attempts. Try again later.", retry)
+	var next string
+	flow := credentialFlow{server: s, page: "login", action: credentialActionLogin, throttledMessage: "Too many login attempts. Try again later.",
+		// The validated return path survives a re-rendered form.
+		form: func(r *http.Request) pageData {
+			next, _ = safeReturnPath(r.FormValue("next"))
+			return pageData{Next: next}
+		}}
+	release, ok := flow.begin(w, r)
+	if !ok {
 		return
 	}
-	if err := r.ParseForm(); err != nil {
-		http.Error(w, "invalid form", http.StatusBadRequest)
-		return
-	}
-	next, _ := safeReturnPath(r.FormValue("next"))
-	if !s.validateCredentialChallenge(r, credentialActionLogin) {
-		s.renderCredential(w, r, "login", credentialActionLogin, pageData{Error: credentialChallengeError, Next: next})
-		return
-	}
-	select {
-	case s.authWork <- struct{}{}:
-		defer func() { <-s.authWork }()
-	default:
-		http.Error(w, "authentication busy", http.StatusServiceUnavailable)
-		return
-	}
+	defer release()
 	if !s.store.Authenticate(r.Context(), r.FormValue("password")) {
-		s.recordFailure(credentialActionLogin, ip)
-		s.recordCredentialRejection(credentialActionLogin)
+		flow.countFailure()
 		s.recordAdmin(r, "", adminChange{event: store.AuditLoginFailure, outcome: store.AuditFailure}, nil, 0)
-		s.renderCredential(w, r, "login", credentialActionLogin, pageData{Error: "Invalid password.", Next: next})
+		flow.render(w, r, "Invalid password.")
 		return
 	}
-	s.clearFailures(ip)
-	s.clearCredentialChallengeCookie(w, credentialActionLogin)
+	flow.succeed(w)
 	token, ok := s.startSession(w, r)
 	if !ok {
 		return
@@ -201,49 +159,25 @@ func (s *Server) reset(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) resetPost(w http.ResponseWriter, r *http.Request) {
-	ip := s.throttleKey(credentialActionReset, s.clientIP(r))
-	if retry, limited := s.throttled(credentialActionReset, ip); limited {
-		s.renderThrottled(w, r, "reset", credentialActionReset, "Too many reset attempts. Try again later.", retry)
+	flow := credentialFlow{server: s, page: "reset", action: credentialActionReset, throttledMessage: "Too many reset attempts. Try again later."}
+	release, ok := flow.begin(w, r)
+	if !ok {
 		return
 	}
-	if err := r.ParseForm(); err != nil {
-		http.Error(w, "invalid form", http.StatusBadRequest)
-		return
-	}
-	if !s.validateCredentialChallenge(r, credentialActionReset) {
-		s.renderCredential(w, r, "reset", credentialActionReset, pageData{Error: credentialChallengeError})
-		return
-	}
-	select {
-	case s.authWork <- struct{}{}:
-		defer func() { <-s.authWork }()
-	default:
-		http.Error(w, "authentication busy", http.StatusServiceUnavailable)
-		return
-	}
-	if r.FormValue("password") != r.FormValue("confirm") {
-		s.recordFailure(credentialActionReset, ip)
-		s.recordCredentialRejection(credentialActionReset)
-		s.renderCredential(w, r, "reset", credentialActionReset, pageData{Error: "Passwords do not match."})
-		return
-	}
-	if err := secret.CheckPasswordPolicy(r.FormValue("password")); err != nil {
-		s.renderCredential(w, r, "reset", credentialActionReset, pageData{Error: secret.PasswordPolicyMessage(err)})
+	defer release()
+	if !flow.newPassword(w, r) {
 		return
 	}
 	before := s.enabledDestinations(r.Context())
 	if err := s.store.ResetWithToken(r.Context(), r.FormValue("token"), r.FormValue("password")); err != nil {
-		s.recordFailure(credentialActionReset, ip)
-		s.recordCredentialRejection(credentialActionReset)
 		// Do not disclose whether a reset token is missing, invalid, expired,
 		// or temporarily unreadable. The token is deliberately a single
 		// generic oracle to unauthenticated callers.
 		slog.Debug("password reset rejected", "error", err)
-		s.renderCredential(w, r, "reset", credentialActionReset, pageData{Error: "The reset token is invalid or expired."})
+		flow.reject(w, r, "The reset token is invalid or expired.")
 		return
 	}
-	s.clearFailures(ip)
-	s.clearCredentialChallengeCookie(w, credentialActionReset)
+	flow.succeed(w)
 	s.recordAdmin(r, "", adminChange{event: store.AuditPasswordReset, highRisk: true}, before, 0)
 	s.clearCookies(w)
 	http.Redirect(w, r, "/login", http.StatusSeeOther)

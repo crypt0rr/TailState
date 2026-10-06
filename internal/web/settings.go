@@ -17,6 +17,15 @@ import (
 	"github.com/crypt0rr/tailstate/internal/tailscale"
 )
 
+// defaultTailnet selects the tailnet that owns the OAuth client.
+const defaultTailnet = "-"
+
+// defaultSettings is the single source of the values an unconfigured
+// installation shows on the Settings form.
+func defaultSettings() store.Settings {
+	return store.Settings{Tailnet: defaultTailnet, DeviceInterval: 60 * time.Second, InventoryInterval: 5 * time.Minute}
+}
+
 func (s *Server) settings(w http.ResponseWriter, r *http.Request) {
 	csrf, ok := s.requireAuth(w, r, false)
 	if !ok {
@@ -33,7 +42,7 @@ func (s *Server) settings(w http.ResponseWriter, r *http.Request) {
 	}
 	configured := err == nil
 	if !configured {
-		current = store.Settings{Tailnet: "-", DeviceInterval: 60 * time.Second, InventoryInterval: 5 * time.Minute}
+		current = defaultSettings()
 	}
 	if _, err := s.store.ListDestinations(r.Context()); err != nil {
 		slog.Error("load notification destinations", "error", err)
@@ -85,7 +94,7 @@ func (s *Server) settingsPost(w http.ResponseWriter, r *http.Request) {
 		input.OAuthScopes = current.OAuthScopes
 	}
 	if input.Tailnet == "" {
-		input.Tailnet = "-"
+		input.Tailnet = defaultTailnet
 	}
 	if configured {
 		if input.OAuthClientSecret == "" {

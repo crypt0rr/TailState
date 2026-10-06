@@ -66,7 +66,7 @@ var lowImpactDeviceFields = map[string]struct{}{
 }
 
 // Classify returns the built-in severity of a change. The table is
-// documented in the README ("Severity and routing") and is evaluated as:
+// documented in docs/notifications.md ("Severity and routing") and is evaluated as:
 //
 //   - high: any policy, log_streaming, settings, webhooks, or oauth_apps
 //     change; a keys resource created; a users change touching role; a devices change to

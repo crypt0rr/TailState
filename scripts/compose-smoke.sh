@@ -99,7 +99,7 @@ if [[ "${ready:-false}" != true ]]; then
     exit 1
 fi
 
-# Follow the README's documented bearer-token scrape: the token lives in .env
+# Follow the documented bearer-token scrape (docs/metrics.md): the token lives in .env
 # (not the shell, which Compose would prefer), the container is recreated, and
 # the header is read from a file.
 unset TAILSTATE_METRICS_TOKEN

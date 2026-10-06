@@ -6,8 +6,8 @@ func fieldChange(field string, old, new any) FieldChange {
 	return FieldChange{Field: field, Old: old, New: new, OldPresent: old != nil, NewPresent: new != nil}
 }
 
-// TestSeverityTable is the documented, built-in severity table (README
-// "Severity and routing"). Every row of the table has a case here.
+// TestSeverityTable is the documented, built-in severity table
+// (docs/notifications.md, "Severity and routing"). Every row of the table has a case here.
 func TestSeverityTable(t *testing.T) {
 	cases := []struct {
 		name   string

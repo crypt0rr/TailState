@@ -2,7 +2,9 @@
 
 TailState holds Tailscale OAuth credentials, notification destination
 secrets, and a signing key for its evidence ledger, so security reports are
-welcome and handled with priority.
+welcome and handled with priority. How TailState protects those secrets,
+administrator access, and its read-only API is described in
+[docs/security.md](docs/security.md).
 
 ## Supported versions
 

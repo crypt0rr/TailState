@@ -289,7 +289,7 @@ Shoutrrr supports Mattermost natively, for example:
 mattermost://TailState@mattermost.example/hooks-token?icon=satellite
 ```
 
-Any service registered by the pinned Shoutrrr release is accepted. See the [Shoutrrr service overview](https://containrrr.dev/shoutrrr/dev/services/overview/) for supported endpoint schemes and provider-specific URL formats. Generic webhooks can be configured with `generic://` URLs and Shoutrrr query options such as `template=json&messagekey=text`.
+Any service registered by the pinned release of the [nicholas-fedor/shoutrrr](https://github.com/nicholas-fedor/shoutrrr) fork (see `go.mod`) is accepted. See the [Shoutrrr service overview](https://shoutrrr.nickfedor.com/latest/services/overview/) for supported endpoint schemes and provider-specific URL formats. Generic webhooks can be configured with `generic://` URLs and Shoutrrr query options such as `template=json&messagekey=text`.
 
 For Matrix, prefer an access-token URL such as `matrix://:<access-token>@matrix.example/?rooms=!roomid:matrix.example`. A `matrix://user:password@host/...` URL makes Shoutrrr log in to the homeserver every time its sender is constructed: once when the destination is saved or tested and once per delivery attempt. Those logins use TailState's bounded, redirect-rejecting transport, and a rejected or rate-limited login is classified like any other provider response, but frequent logins can still hit homeserver login rate limits (for example Synapse's `rc_login`) and each one issues a new access token. Token URLs authenticate without a login request.
 

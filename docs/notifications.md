@@ -24,46 +24,65 @@ Destinations are added, edited, tested, and removed on the Settings page; see
 
 ## Message content and rendering
 
-- Every notification names the tailnet (prefixed by `TAILSTATE_INSTANCE_LABEL` when set) in its title and carries an `Observed at <UTC RFC3339>` line. With `TAILSTATE_PUBLIC_URL` set, digests link to their History batch (`/history?batch=<id>`) and health alerts and expiry warnings to `/status`. The Settings test message names the instance, tailnet, TailState version, and time.
+- Every notification names the tailnet (prefixed by `TAILSTATE_INSTANCE_LABEL` when set) in its title and states when it was observed, in a compact UTC form such as `6 Oct 2026 09:14 UTC` (History and the API keep full RFC 3339 times): digests on their closing context line, other notifications on an `Observed at` line. With `TAILSTATE_PUBLIC_URL` set, digests link to their History batch (`/history?batch=<id>`) and health alerts and expiry warnings to `/status`. The Settings test message names the instance, tailnet, TailState version, and time.
 - Multiple changes in one poll become one digest, fanned out into one durable outbox item per enabled destination (subject to its [routing rules](#severity-and-routing)). The outbox stores a format-neutral message that is rendered when it is sent, in the format the receiving service displays: Slack mrkdwn for `slack` and `googlechat` (single-asterisk bold, no `###` headings, `<url|label>` links, and `&`, `<`, `>` escaped so a resource name cannot mention a channel), plain text for `telegram`, `smtp`, `pushover`, `matrix`, `ntfy`, `gotify`, `signal`, `bark`, `join`, `lark`, `wecom`, `pushbullet`, `ifttt`, `opsgenie`, `pagerduty`, `mqtt`, `twilio`, `xmpp`, `signalgrid`, and `hass`, and Markdown for every other service (for example `mattermost`, `discord`, `rocketchat`, `zulip`, `teams`, and `generic`). Each destination can override the automatic choice under **Edit destination** in Settings; the Settings test message uses the same format. Each digest is fitted to the receiving service's message limit (for example 4,096 bytes for Telegram, Lark, WeCom, and ntfy, 1,024 for Pushover, and 10,000 for Zulip) by dropping whole lines from the end and adding an explicit "lines omitted, see History" note. A provider that still rejects a message as too large (or with HTTP 413) dead-letters it immediately instead of retrying for 24 hours.
 
 ## Example digest
 
 A batch of 19 changes (with attribution, 3 muted changes, and a 12-device
-client rollout) as an email, Telegram, ntfy, Gotify, or Pushbullet
-destination receives it in plain text. The first line is the title, which
-these services show in their own title field (see [Titles](#titles)):
+client rollout) as an email, ntfy, Gotify, or Pushbullet destination receives
+it in plain text. The first line is the title, which these services show in
+their own title field (see [Titles](#titles)):
 
 ```text
-Tailscale inventory changed · prod (example.com)
-19 change(s): 2 created, 17 changed, 0 removed
-Severity: 🔴 5 high, 🟠 2 medium, ⚪ 12 low
-Observed at 2026-10-05T12:00:00Z
-View batch #1842 in TailState History: https://tailstate.example/history?batch=1842
-3 muted change(s) not shown; they are recorded in TailState History.
+🔴 19 Tailscale changes (5 high) · prod (example.com)
+2 created, 17 changed · 🔴 5 high, 🟠 2 medium, ⚪ 12 low
 
-🔴 ✏️ web-02.tail1234.ts.net changed (devices, high)
+🔴 ✏️ web-02 (device) changed
   • Changed by: ci-bot [api key]
   • tags: +tag:db
-🔴 ➕ kAbc123CNTRL created (keys, high)
+🔴 ➕ kAbc123CNTRL (key) created
   • Changed by: alice@example.com
-🔴 ✏️ Tailnet policy changed (policy, high)
+🔴 ✏️ Tailnet policy changed
   • Changed by: alice@example.com
   • section acls changed (3f9a1c0e → c41b7e2a)
   • section ssh added (9e8d7c6b)
-🔴 ✏️ bob@example.com changed (users, high)
+🔴 ✏️ bob@example.com (user) changed
   • Changed by: alice@example.com
   • role: member → admin
-🔴 ✏️ SIEM webhook changed (webhooks, high)
+🔴 ✏️ SIEM webhook (webhook) changed
   • Changed by: actor unknown
   • endpointUrl: secret changed (fingerprint aa11bb22 → 99887766)
-🟠 ➕ laptop-new.tail1234.ts.net created (devices, medium)
+🟠 ➕ laptop-new (device) created
   • Changed by: actor unknown
-🟠 ✏️ DNS configuration changed (dns, medium)
+🟠 ✏️ DNS configuration changed
   • Changed by: actor unknown
   • searchPaths: now example.com, corp.example.com
-⚪ 📦 clientVersion: 1.80.2 → 1.82.1 on 12 resources (devices) details: https://tailstate.example/history?batch=1842
+⚪ 📦 12 devices: clientVersion 1.80.2 → 1.82.1
+
+3 muted changes not shown · 5 Oct 2026 12:00 UTC · Batch 1842 in History: https://tailstate.example/history?batch=1842
 ```
+
+The layout is compact:
+
+- **Title:** the number of changes, led by the icon of the highest severity
+  and with the count of that severity (high or medium), so push and e-mail
+  previews show volume and urgency. Services with a title field receive it
+  there.
+- **Header:** the counts by kind and by severity; zero counts are left out.
+- **Change lines:** the severity and kind icons, the name, the resource type
+  ("device", "user", "key"; left out for the single policy, DNS, settings,
+  contacts, and log streaming resources), and the kind as a word, so the line
+  reads the same in plain text and to screen readers. Field changes follow as
+  bullets. Device names lose the tailnet's MagicDNS suffix
+  (`web-02.tail1234.ts.net` is shown as `web-02`); History, the API, and
+  evidence packs keep the full name.
+- **Fleet lines:** field transitions shared by the same resources are one line,
+  for example "12 devices: clientVersion 1.80.2 → 1.82.0, updateAvailable
+  true → false".
+- **Context line:** the muted count, the observation time, and the History
+  link close the digest. When a digest is shortened for a small destination,
+  change lines are dropped before this line, so it is always delivered.
 
 The same digest per service:
 
@@ -72,11 +91,11 @@ The same digest per service:
 | Email (`smtp`) | Subject | Plain text as above, without the title line |
 | Telegram | Bold first line (HTML mode) | Plain text as above |
 | ntfy, Gotify, Pushbullet | Notification title | Plain text as above |
-| Pushover | Notification title | Plain text, shortened to 1,024 bytes from the end ("Shortened for this destination: 7 more line(s) omitted…"), so the high-severity changes stay |
-| Discord | Embed title | Markdown in one embed (`**bob@example.com**`, `` `role`: `member` → `admin` ``) |
+| Pushover | Notification title | Plain text, shortened to 1,024 bytes ("Shortened for this destination: 3 more lines omitted…" before the context line), so the high-severity changes stay |
+| Discord | Embed title | Markdown in one embed (`**bob@example.com** (user) changed`, `` `role`: `member` → `admin` ``) |
 | Microsoft Teams | Card heading | Markdown, one text block per line |
 | Slack | Header block and preview text | Slack mrkdwn in one section (`*bob@example.com*`, links as `<url\|label>`) |
-| Mattermost, Rocket.Chat, Zulip, generic webhooks | `### Tailscale inventory changed · prod \(example.com\)` heading line | Markdown |
+| Mattermost, Rocket.Chat, Zulip, generic webhooks | `### 🔴 19 Tailscale changes (5 high) · prod \(example.com\)` heading line | Markdown |
 | Matrix, Signal, other plain-text services | First line | Plain text as above |
 
 ## How values are shown
@@ -97,7 +116,7 @@ them this way, and every value stays escaped for the destination's format.
 | Object | Bounded compact JSON, with fingerprints shortened |
 
 Fleet summaries use the same presentation, for example
-"🔴 📦 `tags`: +`tag:db` on 6 resources (devices)".
+"🔴 📦 6 devices: `tags` +`tag:db`".
 
 ## Titles
 
@@ -166,8 +185,8 @@ links.
 ## Severity and routing
 
 Every change is classified with a built-in severity. The digest prefixes each
-line with 🔴 high, 🟠 medium, or ⚪ low and repeats the severity next to the
-collector, and History can be filtered by severity.
+line with 🔴 high, 🟠 medium, or ⚪ low, the header counts the changes per
+severity, and History can be filtered by severity.
 
 The digest lists its lines by severity: every high-severity line comes before
 any medium one, and every medium line before any low one. Fleet and schema
@@ -178,8 +197,8 @@ name. Because a digest that is too large for a destination is shortened from
 the end, the least important changes are dropped first. When high-severity
 changes still have to be dropped (a batch with more of them than the
 destination's budget holds), the closing note says how many, for example
-"Shortened for this destination: 31 more line(s) omitted, including 29
-high-severity change(s). See TailState History for the full batch."
+"Shortened for this destination: 31 more lines omitted, including 29
+high-severity changes. See TailState History for the full batch."
 
 | Severity | Changes |
 | --- | --- |
@@ -220,9 +239,9 @@ Predictable noise is reduced in the digest without losing the audit trail:
   rules are kept.
 - **Fleet summarisation:** when the same field transition (for example
   `updateAvailable` false→true) affects at least 5 resources of a collector in
-  one batch, the digest shows one line such as
-  "`updateAvailable`: `false` → `true` on 143 resources (devices)" with a
-  History link when `TAILSTATE_PUBLIC_URL` is set.
+  one batch, the digest shows one line such as "143 devices: `updateAvailable`
+  `false` → `true`". Transitions that affect exactly the same resources share
+  one line; the digest's context line links to the batch in History.
 - **Schema-change detection:** when a field becomes newly present (or absent)
   on every resource a collector returned in one batch (at least 2 resources),
   the digest shows one "upstream schema change" line instead of one diff per

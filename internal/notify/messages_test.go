@@ -17,7 +17,8 @@ func TestDigestRendersEscapedChangesAndCounts(t *testing.T) {
 	})
 
 	for _, want := range []string{
-		"**3 change(s):** 1 created, 1 changed, 1 removed",
+		"### 🔴 3 Tailscale changes (1 high)",
+		"1 created, 1 changed, 1 removed · 🔴 1 high, 🟠 2 medium",
 		"new server",
 		"de'vices",
 		"`role`: `viewer` → `admin`",
@@ -40,7 +41,7 @@ func TestDigestBoundsLargePayload(t *testing.T) {
 	if len(message) > 12000 {
 		t.Fatalf("digest exceeded size limit: %d", len(message))
 	}
-	if !strings.Contains(message, "more change(s) omitted; total: 500") {
+	if !strings.Contains(message, "more changes omitted; total: 500") {
 		t.Fatal("large digest did not report omitted changes")
 	}
 }
@@ -107,19 +108,19 @@ func TestCodeSpansRenderValuesWithoutMarkdownEscapes(t *testing.T) {
 		"  - `last_seen`: `2026-10-05T12:00:00Z` → `2026-10-05T13:00:00Z`\n",
 		"  - `tags`: +`tag:#ops`",
 		// Bold and prose contexts keep their Markdown escapes.
-		"🟠 ✏️ **db\\-1** `changed` (device\\_details, medium)\n",
+		"🟠 ✏️ **db\\-1** (device) changed\n",
 	} {
 		if !strings.Contains(digest, want) {
 			t.Fatalf("digest missing %q:\n%s", want, digest)
 		}
 	}
-	if got, want := sourceHealth("device_details", false), "### ⚠️ Tailscale API collector unhealthy · example.com\n1 collector failed three consecutive polls. TailState will keep retrying.\n  - `device_details`: auth rejected\nObserved at 2026-10-05T12:00:00Z"; got != want {
+	if got, want := sourceHealth("device_details", false), "### ⚠️ Tailscale API collector unhealthy · example.com\n1 collector failed three consecutive polls. TailState will keep retrying.\n  - `device_details`: auth rejected\nObserved at 5 Oct 2026 12:00 UTC"; got != want {
 		t.Fatalf("source health message=%q, want %q", got, want)
 	}
-	if got, want := sourceHealth("device_details", true), "### ✅ Tailscale API collector recovered · example.com\n1 collector is responding successfully again.\n  - `device_details`\nObserved at 2026-10-05T12:00:00Z"; got != want {
+	if got, want := sourceHealth("device_details", true), "### ✅ Tailscale API collector recovered · example.com\n1 collector is responding successfully again.\n  - `device_details`\nObserved at 5 Oct 2026 12:00 UTC"; got != want {
 		t.Fatalf("source recovery message=%q, want %q", got, want)
 	}
-	if got, want := update("v1.2.0-rc.1", "v1.3.0_beta#2"), "### 🚀 TailState updated · example.com\n**Previous version:** `v1.2.0-rc.1`\n**Current version:** `v1.3.0_beta#2`\nObserved at 2026-10-05T12:00:00Z"; got != want {
+	if got, want := update("v1.2.0-rc.1", "v1.3.0_beta#2"), "### 🚀 TailState updated · example.com\n**Previous version:** `v1.2.0-rc.1`\n**Current version:** `v1.3.0_beta#2`\nObserved at 5 Oct 2026 12:00 UTC"; got != want {
 		t.Fatalf("update message=%q, want %q", got, want)
 	}
 }
@@ -133,7 +134,7 @@ func TestCodeSpansCannotBeClosedOrBrokenByValues(t *testing.T) {
 		Old:   "x` [click](https://evil.example) <img src=x>",
 		New:   "line\u2028break\rreturn",
 	}}}})
-	if strings.Count(got, "`") != 8 {
+	if strings.Count(got, "`") != 6 {
 		t.Fatalf("value changed the number of code-span fences: %s", got)
 	}
 	for _, unwanted := range []string{"\n# heading", "\u2028", "\r"} {

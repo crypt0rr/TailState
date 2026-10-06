@@ -94,14 +94,14 @@ func TestSlackDigestArrivesAsOneMessage(t *testing.T) {
 		t.Fatalf("requests=%+v", mock.requests)
 	}
 	payload := mock.payloads(t)[0]
-	if payload.Text != "Tailscale inventory changed · prod (example.com)" || len(payload.Attachments) != 0 || payload.Channel != "" {
+	if payload.Text != "🔴 19 Tailscale changes (5 high) · prod (example.com)" || len(payload.Attachments) != 0 || payload.Channel != "" {
 		t.Fatalf("payload text=%q attachments=%d channel=%q", payload.Text, len(payload.Attachments), payload.Channel)
 	}
 	header, sections, types := sectionsOf(payload.Blocks)
 	if header != plainTitle(message) || strings.Join(sections, "\n") != prepared.Body || types[0] != "mrkdwn" {
 		t.Fatalf("header=%q sections=%q", header, sections)
 	}
-	if strings.Contains(prepared.Body, "Tailscale inventory changed") {
+	if strings.Contains(prepared.Body, "Tailscale changes") {
 		t.Fatal("the title is repeated in the body")
 	}
 

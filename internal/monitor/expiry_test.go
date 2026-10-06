@@ -75,7 +75,7 @@ func TestDeviceKeyExpiryWarnsOncePerWindowAndResetsOnReauthentication(t *testing
 	if len(payloads) != 1 {
 		t.Fatalf("payloads=%d, want exactly one notification", len(payloads))
 	}
-	for _, want := range []string{"within 14 day(s)", "server.example.ts.net", "ci enrolment", "tag:server"} {
+	for _, want := range []string{"within 14 days", "**server**", "ci enrolment", "tag:server"} {
 		if !strings.Contains(payloads[0], want) {
 			t.Fatalf("payload missing %q:\n%s", want, payloads[0])
 		}
@@ -141,7 +141,7 @@ func TestExpiryCheckHonorsTagFilterAndDisabledWindows(t *testing.T) {
 	if report.Warnings != 1 || report.Items != 1 {
 		t.Fatalf("tag filter report=%#v", report)
 	}
-	if payloads := pendingPayloads(t, st); len(payloads) != 1 || strings.Contains(payloads[0], "laptop") || !strings.Contains(payloads[0], "within 3 day(s)") {
+	if payloads := pendingPayloads(t, st); len(payloads) != 1 || strings.Contains(payloads[0], "laptop") || !strings.Contains(payloads[0], "within 3 days") {
 		t.Fatalf("filtered payloads=%v", payloads)
 	}
 
@@ -261,7 +261,7 @@ func TestExpiryWarningsBypassRoutingAndMutesWithInstanceContext(t *testing.T) {
 	if len(payloads) != len(destinations) {
 		t.Fatalf("payloads=%d, want one per enabled destination (%d)", len(payloads), len(destinations))
 	}
-	for _, want := range []string{"within 3 day(s)", "primary", "default tailnet", "Observed at " + now.Format(time.RFC3339), "https://tailstate.example/status", "server.example.ts.net"} {
+	for _, want := range []string{"within 3 days", "primary", "default tailnet", "Observed at " + now.UTC().Format("2 Jan 2006 15:04 UTC"), "https://tailstate.example/status", "**server**"} {
 		if !strings.Contains(payloads[0], want) {
 			t.Fatalf("payload missing %q:\n%s", want, payloads[0])
 		}

@@ -112,7 +112,7 @@ func TestDigestSeverityOrderingSurvivesSmallestBudget(t *testing.T) {
 				kept++
 			}
 		}
-		match := regexp.MustCompile(`including (\d+) high-severity change\(s\)`).FindStringSubmatch(sent)
+		match := regexp.MustCompile(`including (\d+) high-severity changes?`).FindStringSubmatch(sent)
 		if match == nil {
 			t.Fatalf("%s: footer does not name omitted high-severity changes:\n%s", format, sent)
 		}
@@ -124,17 +124,17 @@ func TestDigestSeverityOrderingSurvivesSmallestBudget(t *testing.T) {
 	}
 }
 
-// TestBusyTelegramDigestKeepsPolicyChange is R-043's reproduction: 70 new
+// TestBusyTelegramDigestKeepsPolicyChange is R-043's reproduction: 150 new
 // devices (medium) collected before one policy change (high), fitted to
 // Telegram's 4,096 bytes.
 func TestBusyTelegramDigestKeepsPolicyChange(t *testing.T) {
 	var changes []model.Change
-	for i := 1; i <= 70; i++ {
+	for i := 1; i <= 150; i++ {
 		changes = append(changes, model.Change{Kind: "created", Collector: "devices", Name: fmt.Sprintf("ephemeral-ci-runner-%d.tail1234.ts.net", i)})
 	}
 	changes = append(changes, model.Change{Kind: "changed", Collector: "policy", Name: "Tailnet policy", Fields: []model.FieldChange{{Field: "acls", Old: "a", New: "b", OldPresent: true, NewPresent: true}}})
 	prepared := PrepareMessage(Context{Tailnet: "example.com"}.Digest(DigestInput{ObservedAt: testObservedAt, Changes: changes}), telegramURL, "")
-	if len(prepared.Message()) > 4096 || !strings.Contains(prepared.Message(), "🔴 ✏️ Tailnet policy changed (policy, high)") || !strings.Contains(prepared.Message(), "Shortened for this destination") {
+	if len(prepared.Message()) > 4096 || !strings.Contains(prepared.Message(), "🔴 ✏️ Tailnet policy changed\n") || !strings.Contains(prepared.Message(), "Shortened for this destination") {
 		t.Fatalf("telegram digest lost the policy change:\n%s", prepared.Message())
 	}
 }
@@ -151,17 +151,17 @@ func TestChangesAreOrderedByCollectorAndNameWithinSeverity(t *testing.T) {
 	changes = append(changes, rollout(5)...)
 	got := Plain(Context{}.Digest(DigestInput{ObservedAt: testObservedAt, Changes: changes}))
 	var order []string
-	for _, current := range strings.Split(got, "\n") {
+	for _, current := range strings.Split(got, "\n")[1:] { // after the title
 		if severityOfLine(current) >= 0 {
 			order = append(order, current)
 		}
 	}
 	want := []string{
-		"🔴 ➕ key created (keys, high)",
-		"🟠 ➕ a-host created (devices, medium)",
-		"🟠 ➕ b-host created (devices, medium)",
-		"🟠 ➕ zed created (users, medium)",
-		"⚪ 📦 updateAvailable: false → true on 5 resources (devices)",
+		"🔴 ➕ key (key) created",
+		"🟠 ➕ a-host (device) created",
+		"🟠 ➕ b-host (device) created",
+		"🟠 ➕ zed (user) created",
+		"⚪ 📦 5 devices: updateAvailable false → true",
 	}
 	if strings.Join(order, "\n") != strings.Join(want, "\n") {
 		t.Fatalf("order:\n%s", strings.Join(order, "\n"))
@@ -178,14 +178,14 @@ func TestDigestOmissionNoteNamesHighSeverity(t *testing.T) {
 	}
 	message := Context{}.Digest(DigestInput{ObservedAt: testObservedAt, Changes: changes})
 	text := Plain(message)
-	match := regexp.MustCompile(`(\d+) more change\(s\), including (\d+) high-severity, omitted; total: 400\.`).FindStringSubmatch(text)
+	match := regexp.MustCompile(`(\d+) more changes omitted, including (\d+) high-severity; total: 400\.`).FindStringSubmatch(text)
 	if match == nil || match[1] != match[2] {
 		t.Fatalf("digest omission note: %s", text[len(text)-300:])
 	}
-	if got := omittedEntries([]digestEntry{{severity: model.SeverityLow}, {severity: model.SeverityHigh, change: &model.Change{}}}, 9); got != "1 more change(s) and 1 summary line(s), including 1 high-severity, omitted; total: 9. See TailState History for the full batch." {
+	if got := omittedEntries([]digestEntry{{severity: model.SeverityLow}, {severity: model.SeverityHigh, change: &model.Change{}}}, 9); got != "1 more change and 1 summary line omitted, including 1 high-severity; total: 9. See TailState History for the full batch." {
 		t.Fatalf("note=%q", got)
 	}
-	dropped := []string{"🔴 a\n", "  • detail\n", "🟠 b\n", "\n", "_12 more change(s), including 5 high-severity, omitted; total: 20._\n", "🟠 x including 7 high-severity, omitted\n"}
+	dropped := []string{"🔴 a\n", "  • detail\n", "🟠 b\n", "\n", "_12 more changes omitted, including 5 high-severity; total: 20._\n", "🟠 x omitted, including 7 high-severity;\n"}
 	if got := countHighSeverity(dropped); got != 6 {
 		t.Fatalf("high-severity count=%d", got)
 	}

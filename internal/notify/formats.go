@@ -92,17 +92,23 @@ func FormatFor(serviceURL, override string) string {
 	return FormatMarkdown
 }
 
+// flavourFor returns the renderer of a format; unknown formats render as
+// Markdown, the historical default.
+func flavourFor(format string) flavour {
+	switch format {
+	case FormatSlack:
+		return slackFlavour
+	case FormatPlain:
+		return plainFlavour
+	default:
+		return markdownFlavour
+	}
+}
+
 // Render renders a message in one format. A pre-rendered Text message is
 // returned unchanged in every format.
 func Render(m Message, format string) string {
-	switch format {
-	case FormatSlack:
-		return Slack(m)
-	case FormatPlain:
-		return Plain(m)
-	default:
-		return Markdown(m)
-	}
+	return flavourFor(format).render(m)
 }
 
 // EncodePayload converts a message into its stored outbox form. Pre-rendered
@@ -175,12 +181,32 @@ func PrepareFor(payloadFormat, payload, serviceURL, override string) (Prepared, 
 
 // PrepareMessage renders a message for one destination: in the destination's
 // format, fitted to its budget, and with the title split from the body when
-// the destination receives the title as a separate field.
+// the destination receives the title as a separate field. A digest's
+// trailing context line (time, muted count, History link) is kept when the
+// message is shortened: change lines are dropped before it.
 func PrepareMessage(message Message, serviceURL, override string) Prepared {
 	format := FormatFor(serviceURL, override)
 	limit := MessageLimit(serviceURL)
-	rendered := Render(message, format)
-	prepared := Prepared{Text: FitMessageFor(rendered, limit, format), Format: format}
+	render := flavourFor(format)
+	head, context := splitContext(message)
+	rendered := render.render(head)
+	footer := ""
+	if len(context) > 0 {
+		footer = render.lines(context)
+	}
+	fit := func(text string, limit int) string {
+		if footer == "" {
+			return FitMessageFor(text, limit, format)
+		}
+		if whole := text + "\n" + footer; len(whole) <= limit || limit <= 0 {
+			return whole
+		}
+		if room := limit - len(footer) - 1; room > len(footer) {
+			return FitMessageFor(text, room, format) + "\n" + footer
+		}
+		return FitMessageFor(text+"\n"+footer, limit, format)
+	}
+	prepared := Prepared{Text: fit(rendered, limit), Format: format}
 	if message.IsText() || !parseDestination(serviceURL).sendsTitleSeparately() {
 		return prepared
 	}
@@ -196,103 +222,6 @@ func PrepareMessage(message Message, serviceURL, override string) Prepared {
 	// against the same limit as the body, so the title's size is reserved
 	// for every service.
 	prepared.Title = title
-	prepared.Body = FitMessageFor(body, limit-len(title)-1, format)
+	prepared.Body = fit(body, limit-len(title)-1)
 	return prepared
-}
-
-// Slack renders a message as Slack mrkdwn: single-asterisk bold, no
-// headings, <url|label> links, and &, <, > escaped so a value cannot create
-// a mention or link.
-func Slack(m Message) string {
-	if m.IsText() {
-		return m.Text
-	}
-	var b strings.Builder
-	title := escapeSlack(titleText(m), false)
-	if scope := strings.TrimSpace(m.Scope); scope != "" {
-		title += " · " + escapeSlack(scope, true)
-	}
-	b.WriteString("*" + title + "*")
-	for _, l := range m.Lines {
-		b.WriteByte('\n')
-		switch l.Kind {
-		case LineItem:
-			b.WriteString("    • ")
-		case LineNote:
-			b.WriteString("    ")
-		}
-		for _, span := range l.Spans {
-			switch span.Style {
-			case SpanLiteral:
-				b.WriteString(escapeSlack(span.Text, false))
-			case SpanBold:
-				b.WriteString("*" + escapeSlack(span.Text, true) + "*")
-			case SpanStrong:
-				b.WriteString("*" + escapeSlack(span.Text, false) + "*")
-			case SpanCode:
-				b.WriteString("`" + truncate(strings.ReplaceAll(escapeSlack(span.Text, false), "`", "'"), 256) + "`")
-			case SpanEmph:
-				b.WriteString("_" + escapeSlack(span.Text, false) + "_")
-			case SpanLink:
-				if safeLinkURL(span.URL) {
-					b.WriteString("<" + span.URL + "|" + escapeSlack(span.Text, true) + ">")
-				} else {
-					b.WriteString(escapeSlack(span.Text, true))
-				}
-			default:
-				b.WriteString(escapeSlack(span.Text, true))
-			}
-		}
-	}
-	return strings.TrimRight(b.String(), "\n")
-}
-
-// escapeSlack applies Slack's required entity escaping. Untrusted values
-// additionally lose the characters that open or close bold, strike, and code
-// formatting, so they cannot restyle the rest of the line.
-func escapeSlack(value string, untrusted bool) string {
-	value = strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;").Replace(stripControl(value))
-	if untrusted {
-		value = strings.NewReplacer("*", "∗", "~", "∼", "`", "'").Replace(value)
-		value = truncate(value, 256)
-	}
-	return value
-}
-
-// Plain renders a message as plain text without any markup, for services
-// that show text verbatim (email, SMS, push, Matrix, Telegram by default).
-func Plain(m Message) string {
-	if m.IsText() {
-		return m.Text
-	}
-	var b strings.Builder
-	b.WriteString(stripControl(titleText(m)))
-	if scope := strings.TrimSpace(m.Scope); scope != "" {
-		b.WriteString(" · " + truncate(stripControl(scope), 256))
-	}
-	for _, l := range m.Lines {
-		b.WriteByte('\n')
-		switch l.Kind {
-		case LineItem:
-			b.WriteString("  • ")
-		case LineNote:
-			b.WriteString("  ")
-		}
-		for _, span := range l.Spans {
-			text := stripControl(span.Text)
-			switch span.Style {
-			case SpanLiteral, SpanStrong, SpanEmph:
-				b.WriteString(text)
-			case SpanLink:
-				if safeLinkURL(span.URL) {
-					b.WriteString(text + ": " + span.URL)
-				} else {
-					b.WriteString(truncate(text, 256))
-				}
-			default:
-				b.WriteString(truncate(text, 256))
-			}
-		}
-	}
-	return strings.TrimRight(b.String(), "\n")
 }

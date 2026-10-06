@@ -11,7 +11,7 @@ func TestAdminChangeNamesActionFieldsAndClientOnly(t *testing.T) {
 	message := Context{Tailnet: "example.ts.net", PublicURL: "https://tailstate.example"}.AdminChange("Notification destination disabled", []string{"enabled", "routing"}, "destination:3", "192.0.2.4", observed)
 	for _, format := range []string{FormatMarkdown, FormatSlack, FormatPlain} {
 		rendered := Render(message, format)
-		for _, want := range []string{"TailState configuration changed", "Notification destination disabled", "enabled", "routing", "destination:3", "192.0.2.4", "2026-10-06T12:00:00Z", "https://tailstate.example/settings"} {
+		for _, want := range []string{"TailState configuration changed", "Notification destination disabled", "enabled", "routing", "destination:3", "192.0.2.4", "Observed at 6 Oct 2026 12:00 UTC", "https://tailstate.example/settings"} {
 			if !strings.Contains(rendered, want) {
 				t.Fatalf("%s rendering lacks %q:\n%s", format, want, rendered)
 			}

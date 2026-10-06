@@ -45,95 +45,96 @@ func sampleDigest() Message {
 	return sampleContext.Digest(DigestInput{BatchID: 1842, ObservedAt: testObservedAt, Changes: changes, MutedCount: 3, Attributed: true})
 }
 
+// Rendered sizes of the sample digest in v0.15.0, the notification
+// assessment's baseline, before readable values and the compact layout.
+var sampleBaselineBytes = map[string]int{FormatMarkdown: 1786, FormatSlack: 1794, FormatPlain: 1674}
+
 // TestAssessmentSampleIsGolden pins the assessment's sample digest in every
-// format: high-severity changes first, readable values without hashes, and
-// no duplicate lines.
+// format: the counts and top severity in the title, high-severity changes
+// first, compact change lines, one merged fleet line, readable values without
+// hashes, no duplicate lines, and one closing context line. The compact
+// layout keeps every change, actor, and field while the rendering is at
+// least 25% smaller than before (E-036).
 func TestAssessmentSampleIsGolden(t *testing.T) {
 	golden := map[string]string{
-		FormatMarkdown: "### Tailscale inventory changed · prod \\(example.com\\)\n" +
-			"**19 change(s):** 2 created, 17 changed, 0 removed\n" +
-			"**Severity:** 🔴 5 high, 🟠 2 medium, ⚪ 12 low\n" +
-			"Observed at 2026-10-05T12:00:00Z\n" +
-			"[View batch \\#1842 in TailState History](https://tailstate.example/history?batch=1842)\n" +
-			"_3 muted change(s) not shown; they are recorded in TailState History._\n" +
+		FormatMarkdown: "### 🔴 19 Tailscale changes (5 high) · prod \\(example.com\\)\n" +
+			"2 created, 17 changed · 🔴 5 high, 🟠 2 medium, ⚪ 12 low\n" +
 			"\n" +
-			"🔴 ✏️ **web\\-02.tail1234.ts.net** `changed` (devices, high)\n" +
+			"🔴 ✏️ **web\\-02** (device) changed\n" +
 			"  - **Changed by:** ci\\-bot \\[api key\\]\n" +
 			"  - `tags`: +`tag:db`\n" +
-			"🔴 ➕ **kAbc123CNTRL** `created` (keys, high)\n" +
+			"🔴 ➕ **kAbc123CNTRL** (key) created\n" +
 			"  - **Changed by:** alice@example.com\n" +
-			"🔴 ✏️ **Tailnet policy** `changed` (policy, high)\n" +
+			"🔴 ✏️ **Tailnet policy** changed\n" +
 			"  - **Changed by:** alice@example.com\n" +
 			"  - section `acls` changed (`3f9a1c0e` → `c41b7e2a`)\n" +
 			"  - section `ssh` added (`9e8d7c6b`)\n" +
-			"🔴 ✏️ **bob@example.com** `changed` (users, high)\n" +
+			"🔴 ✏️ **bob@example.com** (user) changed\n" +
 			"  - **Changed by:** alice@example.com\n" +
 			"  - `role`: `member` → `admin`\n" +
-			"🔴 ✏️ **SIEM webhook** `changed` (webhooks, high)\n" +
+			"🔴 ✏️ **SIEM webhook** (webhook) changed\n" +
 			"  - **Changed by:** actor unknown\n" +
 			"  - `endpointUrl`: secret changed (fingerprint `aa11bb22` → `99887766`)\n" +
-			"🟠 ➕ **laptop\\-new.tail1234.ts.net** `created` (devices, medium)\n" +
+			"🟠 ➕ **laptop\\-new** (device) created\n" +
 			"  - **Changed by:** actor unknown\n" +
-			"🟠 ✏️ **DNS configuration** `changed` (dns, medium)\n" +
+			"🟠 ✏️ **DNS configuration** changed\n" +
 			"  - **Changed by:** actor unknown\n" +
 			"  - `searchPaths`: now `example.com`, `corp.example.com`\n" +
-			"⚪ 📦 `clientVersion`: `1.80.2` → `1.82.1` on 12 resources (devices) [details](https://tailstate.example/history?batch=1842)",
-		FormatSlack: "*Tailscale inventory changed · prod (example.com)*\n" +
-			"*19 change(s):* 2 created, 17 changed, 0 removed\n" +
-			"*Severity:* 🔴 5 high, 🟠 2 medium, ⚪ 12 low\n" +
-			"Observed at 2026-10-05T12:00:00Z\n" +
-			"<https://tailstate.example/history?batch=1842|View batch #1842 in TailState History>\n" +
-			"_3 muted change(s) not shown; they are recorded in TailState History._\n" +
+			"⚪ 📦 12 devices: `clientVersion` `1.80.2` → `1.82.1`\n" +
 			"\n" +
-			"🔴 ✏️ *web-02.tail1234.ts.net* `changed` (devices, high)\n" +
+			"3 muted changes not shown · 5 Oct 2026 12:00 UTC · [Batch 1842 in History](https://tailstate.example/history?batch=1842)",
+		FormatSlack: "*🔴 19 Tailscale changes (5 high) · prod (example.com)*\n" +
+			"2 created, 17 changed · 🔴 5 high, 🟠 2 medium, ⚪ 12 low\n" +
+			"\n" +
+			"🔴 ✏️ *web-02* (device) changed\n" +
 			"    • *Changed by:* ci-bot [api key]\n" +
 			"    • `tags`: +`tag:db`\n" +
-			"🔴 ➕ *kAbc123CNTRL* `created` (keys, high)\n" +
+			"🔴 ➕ *kAbc123CNTRL* (key) created\n" +
 			"    • *Changed by:* alice@example.com\n" +
-			"🔴 ✏️ *Tailnet policy* `changed` (policy, high)\n" +
+			"🔴 ✏️ *Tailnet policy* changed\n" +
 			"    • *Changed by:* alice@example.com\n" +
 			"    • section `acls` changed (`3f9a1c0e` → `c41b7e2a`)\n" +
 			"    • section `ssh` added (`9e8d7c6b`)\n" +
-			"🔴 ✏️ *bob@example.com* `changed` (users, high)\n" +
+			"🔴 ✏️ *bob@example.com* (user) changed\n" +
 			"    • *Changed by:* alice@example.com\n" +
 			"    • `role`: `member` → `admin`\n" +
-			"🔴 ✏️ *SIEM webhook* `changed` (webhooks, high)\n" +
+			"🔴 ✏️ *SIEM webhook* (webhook) changed\n" +
 			"    • *Changed by:* actor unknown\n" +
 			"    • `endpointUrl`: secret changed (fingerprint `aa11bb22` → `99887766`)\n" +
-			"🟠 ➕ *laptop-new.tail1234.ts.net* `created` (devices, medium)\n" +
+			"🟠 ➕ *laptop-new* (device) created\n" +
 			"    • *Changed by:* actor unknown\n" +
-			"🟠 ✏️ *DNS configuration* `changed` (dns, medium)\n" +
+			"🟠 ✏️ *DNS configuration* changed\n" +
 			"    • *Changed by:* actor unknown\n" +
 			"    • `searchPaths`: now `example.com`, `corp.example.com`\n" +
-			"⚪ 📦 `clientVersion`: `1.80.2` → `1.82.1` on 12 resources (devices) <https://tailstate.example/history?batch=1842|details>",
-		FormatPlain: "Tailscale inventory changed · prod (example.com)\n" +
-			"19 change(s): 2 created, 17 changed, 0 removed\n" +
-			"Severity: 🔴 5 high, 🟠 2 medium, ⚪ 12 low\n" +
-			"Observed at 2026-10-05T12:00:00Z\n" +
-			"View batch #1842 in TailState History: https://tailstate.example/history?batch=1842\n" +
-			"3 muted change(s) not shown; they are recorded in TailState History.\n" +
+			"⚪ 📦 12 devices: `clientVersion` `1.80.2` → `1.82.1`\n" +
 			"\n" +
-			"🔴 ✏️ web-02.tail1234.ts.net changed (devices, high)\n" +
+			"3 muted changes not shown · 5 Oct 2026 12:00 UTC · <https://tailstate.example/history?batch=1842|Batch 1842 in History>",
+		FormatPlain: "🔴 19 Tailscale changes (5 high) · prod (example.com)\n" +
+			"2 created, 17 changed · 🔴 5 high, 🟠 2 medium, ⚪ 12 low\n" +
+			"\n" +
+			"🔴 ✏️ web-02 (device) changed\n" +
 			"  • Changed by: ci-bot [api key]\n" +
 			"  • tags: +tag:db\n" +
-			"🔴 ➕ kAbc123CNTRL created (keys, high)\n" +
+			"🔴 ➕ kAbc123CNTRL (key) created\n" +
 			"  • Changed by: alice@example.com\n" +
-			"🔴 ✏️ Tailnet policy changed (policy, high)\n" +
+			"🔴 ✏️ Tailnet policy changed\n" +
 			"  • Changed by: alice@example.com\n" +
 			"  • section acls changed (3f9a1c0e → c41b7e2a)\n" +
 			"  • section ssh added (9e8d7c6b)\n" +
-			"🔴 ✏️ bob@example.com changed (users, high)\n" +
+			"🔴 ✏️ bob@example.com (user) changed\n" +
 			"  • Changed by: alice@example.com\n" +
 			"  • role: member → admin\n" +
-			"🔴 ✏️ SIEM webhook changed (webhooks, high)\n" +
+			"🔴 ✏️ SIEM webhook (webhook) changed\n" +
 			"  • Changed by: actor unknown\n" +
 			"  • endpointUrl: secret changed (fingerprint aa11bb22 → 99887766)\n" +
-			"🟠 ➕ laptop-new.tail1234.ts.net created (devices, medium)\n" +
+			"🟠 ➕ laptop-new (device) created\n" +
 			"  • Changed by: actor unknown\n" +
-			"🟠 ✏️ DNS configuration changed (dns, medium)\n" +
+			"🟠 ✏️ DNS configuration changed\n" +
 			"  • Changed by: actor unknown\n" +
 			"  • searchPaths: now example.com, corp.example.com\n" +
-			"⚪ 📦 clientVersion: 1.80.2 → 1.82.1 on 12 resources (devices) details: https://tailstate.example/history?batch=1842",
+			"⚪ 📦 12 devices: clientVersion 1.80.2 → 1.82.1\n" +
+			"\n" +
+			"3 muted changes not shown · 5 Oct 2026 12:00 UTC · Batch 1842 in History: https://tailstate.example/history?batch=1842",
 	}
 	message := sampleDigest()
 	hash := regexp.MustCompile(`[0-9a-f]{32,}`)
@@ -143,7 +144,7 @@ func TestAssessmentSampleIsGolden(t *testing.T) {
 			t.Fatalf("%s rendering mismatch\n got: %q\nwant: %q", format, got, want)
 		}
 		seen := map[string]bool{}
-		for _, current := range strings.Split(got, "\n") {
+		for _, current := range strings.Split(got, "\n")[1:] {
 			if severityOfLine(current) >= 0 && seen[current] {
 				t.Fatalf("%s: duplicate line %q", format, current)
 			}
@@ -153,5 +154,15 @@ func TestAssessmentSampleIsGolden(t *testing.T) {
 			t.Fatalf("%s: hash in rendering", format)
 		}
 		assertSeverityOrder(t, format, got)
+		if baseline := sampleBaselineBytes[format]; len(got)*4 > baseline*3 {
+			t.Fatalf("%s: %d bytes is not at least 25%% smaller than %d", format, len(got), baseline)
+		}
+		// No information is lost: every change, actor, field, the muted
+		// count, the time, and the History link are still present.
+		for _, text := range []string{"web-02", "kAbc123CNTRL", "Tailnet policy", "bob@example.com", "SIEM webhook", "laptop-new", "DNS configuration", "12 devices", "ci-bot", "alice@example.com", "tags", "acls", "ssh", "role", "endpointUrl", "searchPaths", "clientVersion", "3 muted changes", "5 Oct 2026 12:00 UTC", "history?batch=1842"} {
+			if !strings.Contains(strings.ReplaceAll(got, "\\", ""), text) {
+				t.Fatalf("%s: %q was lost", format, text)
+			}
+		}
 	}
 }

@@ -98,7 +98,7 @@ func TestFitMessageEdges(t *testing.T) {
 		t.Fatalf("message within limit was changed: %q", fitted)
 	}
 	fitted = FitMessage("### title\n"+strings.Repeat("a line of text\n", 50), 150)
-	if len(fitted) > 150 || !strings.HasPrefix(fitted, "### title\n") || !strings.Contains(fitted, "more line(s) omitted") {
+	if len(fitted) > 150 || !strings.HasPrefix(fitted, "### title\n") || !strings.Contains(fitted, "more lines omitted") {
 		t.Fatalf("fitted message = %q", fitted)
 	}
 }

@@ -64,13 +64,23 @@ func plainJSON(value any) any {
 // "`role`: `member` → `admin`", "`tags`: +`tag:db`", "section `ssh` added",
 // or "`endpointUrl`: secret changed (fingerprint `aa11bb22` → `99887766`)".
 func presentField(collector string, field model.FieldChange) []Span {
+	return presentFieldWith(collector, field, ": ")
+}
+
+// presentFieldInline is presentField for a field listed inside a sentence,
+// such as a fleet summary: "`clientVersion` `1.80.2` → `1.82.1`".
+func presentFieldInline(collector string, field model.FieldChange) []Span {
+	return presentFieldWith(collector, field, " ")
+}
+
+func presentFieldWith(collector string, field model.FieldChange, separator string) []Span {
 	old, current := valueOf(field.Old, field.OldPresent), valueOf(field.New, field.NewPresent)
 	if collector == "policy" {
 		if spans, ok := presentPolicySection(field.Field, old, current); ok {
 			return spans
 		}
 	}
-	label := []Span{code(field.Field), lit(": ")}
+	label := []Span{code(field.Field), lit(separator)}
 	if spans, ok := presentSecret(old, current); ok {
 		return append(label, spans...)
 	}

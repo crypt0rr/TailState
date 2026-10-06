@@ -25,11 +25,14 @@ type Message struct {
 }
 
 // Line kinds. A plain line is a paragraph line, an item is a bulleted detail
-// below the previous line, and a note is an indented, emphasised remark.
+// below the previous line, and a note is an indented, emphasised remark. A
+// context line is rendered like a plain line, but trailing context lines are
+// kept when a message is shortened for a destination (see PrepareMessage).
 const (
-	LinePlain = ""
-	LineItem  = "item"
-	LineNote  = "note"
+	LinePlain   = ""
+	LineItem    = "item"
+	LineNote    = "note"
+	LineContext = "context"
 )
 
 // Line is one rendered line. Every line is complete on its own in every
@@ -80,7 +83,21 @@ func item(spans ...Span) Line   { return Line{Kind: LineItem, Spans: spans} }
 func note(text string) Line     { return Line{Kind: LineNote, Spans: []Span{emph(text)}} }
 func blank() Line               { return Line{} }
 func observedLine(at time.Time) Line {
-	return line(lit("Observed at "), lit(at.UTC().Format(time.RFC3339)))
+	return line(lit("Observed at "), lit(compactTime(at)))
+}
+
+// compactTimeLayout is the notification time format, for example
+// "6 Oct 2026 09:14 UTC". History and the API keep full RFC 3339 times.
+const compactTimeLayout = "2 Jan 2006 15:04 UTC"
+
+func compactTime(at time.Time) string { return at.UTC().Format(compactTimeLayout) }
+
+// plural returns "1 change" or "3 changes".
+func plural(count int, singular, pluralForm string) string {
+	if count == 1 {
+		return "1 " + singular
+	}
+	return fmt.Sprintf("%d %s", count, pluralForm)
 }
 
 // Context is the instance identity added to every notification: the

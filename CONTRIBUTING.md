@@ -119,4 +119,5 @@ that section to the version and date and add its `- **Schema:**` and
 `- **Rollback:**` lines; the release workflow refuses a tag whose CHANGELOG
 entry is missing either line. A release that migrates the schema is a minor
 release, and [UPGRADING.md](UPGRADING.md#schema-history) gets a new row and a
-[migration details](UPGRADING.md#migration-details) entry.
+[migration details](UPGRADING.md#migration-details) entry. After the release
+is published, point the pinned `TAILSTATE_IMAGE` in `.env.example` at it.

@@ -277,7 +277,7 @@ func (s *SenderImpl) SendPrepared(ctx context.Context, serviceURL string, messag
 		}
 		errs = []error{s.sendSlack(ctx, parsed, message, client)}
 	} else {
-		errs = sender.Send(body, parseDestination(serviceURL).params(message.Title))
+		errs = sender.Send(body, parseDestination(serviceURL).params(message))
 	}
 	for _, sendErr := range errs {
 		if sendErr != nil {

@@ -62,6 +62,15 @@ func (m *slackMock) payloads(t *testing.T) []slackPayload {
 	return out
 }
 
+// allBlocks returns the message blocks, which a colour (from the URL or the
+// severity) wraps in one attachment.
+func (p slackPayload) allBlocks() []slackBlock {
+	if len(p.Attachments) > 0 {
+		return p.Attachments[0].Blocks
+	}
+	return p.Blocks
+}
+
 func sectionsOf(blocks []slackBlock) (header string, sections []string, types []string) {
 	for _, block := range blocks {
 		if block.Type == "header" {
@@ -94,10 +103,10 @@ func TestSlackDigestArrivesAsOneMessage(t *testing.T) {
 		t.Fatalf("requests=%+v", mock.requests)
 	}
 	payload := mock.payloads(t)[0]
-	if payload.Text != "🔴 19 Tailscale changes (5 high) · prod (example.com)" || len(payload.Attachments) != 0 || payload.Channel != "" {
+	if payload.Text != "🔴 19 Tailscale changes (5 high) · prod (example.com)" || len(payload.Attachments) != 1 || payload.Attachments[0].Color != "#d60510" || payload.Channel != "" {
 		t.Fatalf("payload text=%q attachments=%d channel=%q", payload.Text, len(payload.Attachments), payload.Channel)
 	}
-	header, sections, types := sectionsOf(payload.Blocks)
+	header, sections, types := sectionsOf(payload.allBlocks())
 	if header != plainTitle(message) || strings.Join(sections, "\n") != prepared.Body || types[0] != "mrkdwn" {
 		t.Fatalf("header=%q sections=%q", header, sections)
 	}
@@ -113,8 +122,8 @@ func TestSlackDigestArrivesAsOneMessage(t *testing.T) {
 		t.Fatal(err)
 	}
 	payload = mock.payloads(t)[0]
-	_, sections, _ = sectionsOf(payload.Blocks)
-	if len(mock.requests) != 1 || len(sections) < 4 || len(payload.Blocks) > slackMaxBlocks || strings.Join(sections, "\n") != large.Body {
+	_, sections, _ = sectionsOf(payload.allBlocks())
+	if len(mock.requests) != 1 || len(sections) < 4 || len(payload.allBlocks()) > slackMaxBlocks || strings.Join(sections, "\n") != large.Body {
 		t.Fatalf("large digest: requests=%d sections=%d", len(mock.requests), len(sections))
 	}
 	for _, section := range sections {
@@ -189,7 +198,7 @@ func TestSlackURLOptionsAreKept(t *testing.T) {
 	if payload.IconEmoji != "ghost" || payload.Text != "legacy title" {
 		t.Fatalf("legacy payload=%+v", payload)
 	}
-	if _, sections, _ := sectionsOf(payload.Blocks); len(sections) != 1 || sections[0] != "### legacy title\nlegacy body" {
+	if _, sections, _ := sectionsOf(payload.allBlocks()); len(sections) != 1 || sections[0] != "### legacy title\nlegacy body" {
 		t.Fatalf("legacy row changed: %q", sections)
 	}
 	if err := New().Send(context.Background(), "slack://hook:short@webhook", "x"); err == nil || !strings.HasPrefix(err.Error(), "invalid notification URL") {
@@ -213,7 +222,7 @@ func TestSlackNativePayloadBlocksMentionsAndLinks(t *testing.T) {
 			t.Fatal(err)
 		}
 		payload := mock.payloads(t)[0]
-		header, sections, types := sectionsOf(payload.Blocks)
+		header, sections, types := sectionsOf(payload.allBlocks())
 		if strings.Contains(payload.Text, "<!") || strings.Contains(payload.Text, "<https") {
 			t.Fatalf("%q summary is active: %q", override, payload.Text)
 		}
@@ -280,9 +289,9 @@ func TestSlackDeliveryErrorsKeepTheirClassification(t *testing.T) {
 func TestSlackPayloadEdges(t *testing.T) {
 	long := Prepared{Title: strings.Repeat("t", 400), Body: strings.Repeat("line\n", 2000), Format: FormatSlack}
 	payload := slackPayloadFor(long, &slackConfigForTest)
-	header, sections, _ := sectionsOf(payload.Blocks)
-	if utf8.RuneCountInString(header) != slackHeaderRunes || len(payload.Blocks) > slackMaxBlocks || len(sections) == 0 {
-		t.Fatalf("header=%d blocks=%d", utf8.RuneCountInString(header), len(payload.Blocks))
+	header, sections, _ := sectionsOf(payload.allBlocks())
+	if utf8.RuneCountInString(header) != slackHeaderRunes || len(payload.allBlocks()) > slackMaxBlocks || len(sections) == 0 {
+		t.Fatalf("header=%d blocks=%d", utf8.RuneCountInString(header), len(payload.allBlocks()))
 	}
 	many := Prepared{Text: strings.Repeat(strings.Repeat("x", slackSectionRunes)+"\n", 60), Format: FormatSlack}
 	if payload := slackPayloadFor(many, &slackConfigForTest); len(payload.Blocks) != slackMaxBlocks {

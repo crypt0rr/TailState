@@ -147,6 +147,10 @@ type Prepared struct {
 	Body string
 	// Format is the rendering format of Text and Body.
 	Format string
+	// Severity is the message's severity ("high", "medium", or "low"),
+	// mapped to the destination's priority, tags, or colour (see
+	// severityParams). It is "" for a legacy row, which gets none.
+	Severity string
 }
 
 // Message returns what is sent as the message body: Body when the title is
@@ -211,7 +215,7 @@ func PrepareMessage(message Message, serviceURL, override string) Prepared {
 		}
 		return FitMessageFor(text+"\n"+footer, limit, format)
 	}
-	prepared := Prepared{Text: fit(rendered, limit), Format: format}
+	prepared := Prepared{Text: fit(rendered, limit), Format: format, Severity: message.Severity}
 	if message.IsText() || !parseDestination(serviceURL).sendsTitleSeparately() {
 		return prepared
 	}

@@ -21,6 +21,8 @@ import (
 	"github.com/nicholas-fedor/shoutrrr/pkg/format"
 	"github.com/nicholas-fedor/shoutrrr/pkg/router"
 	"github.com/nicholas-fedor/shoutrrr/pkg/types"
+
+	"github.com/crypt0rr/tailstate/internal/model"
 )
 
 // shoutrrrConfig returns a zero config of the service registered for scheme
@@ -79,14 +81,37 @@ func TestServiceParamAllowlistMatchesShoutrrrKeys(t *testing.T) {
 			if want := fieldKeys[keys[0]]; !slices.Equal(keys, want) {
 				t.Errorf("%s: parameter %q lists keys %v, Shoutrrr field has %v", scheme, param, keys, want)
 			}
-			// The value TailState passes must be accepted by the field.
-			value := "TailState title"
+			// Every value TailState passes must be accepted by the field.
+			values := []string{"TailState title"}
 			if fixed, ok := serviceDefaults[scheme][param]; ok {
-				value = fixed
+				values = []string{fixed}
+			} else if mapped, ok := severityParams[scheme][param]; ok {
+				values = values[:0]
+				for _, severity := range []model.Severity{model.SeverityHigh, model.SeverityMedium, model.SeverityLow} {
+					if mapped[severity] == "" {
+						t.Errorf("%s %s has no value for %s", scheme, param, severity)
+					}
+					values = append(values, mapped[severity])
+				}
 			}
-			if err := resolver.Set(keys[0], value); err != nil {
-				t.Errorf("%s: setting %q to %q failed: %v", scheme, keys[0], value, err)
+			for _, value := range values {
+				if err := resolver.Set(keys[0], value); err != nil {
+					t.Errorf("%s: setting %q to %q failed: %v", scheme, keys[0], value, err)
+				}
 			}
+		}
+	}
+	for scheme, params := range severityParams {
+		for param := range params {
+			if len(serviceParams[scheme][param]) == 0 {
+				t.Errorf("%s severity parameter %q is not on the allowlist", scheme, param)
+			}
+		}
+	}
+	// Pushover's priority 2 requires acknowledgement and is never used.
+	for _, value := range severityParams["pushover"][paramPriority] {
+		if value == "2" {
+			t.Fatal("a severity maps to Pushover's emergency priority")
 		}
 	}
 	for scheme, defaults := range serviceDefaults {
@@ -205,7 +230,7 @@ func sentTitle(t *testing.T, scheme string, request captured) (title, body strin
 		var decoded slackPayload
 		_ = json.Unmarshal([]byte(request.body), &decoded)
 		var sections []string
-		for _, block := range decoded.Blocks {
+		for _, block := range decoded.allBlocks() {
 			if block.Type == "section" {
 				sections = append(sections, block.Text.Text)
 			}
@@ -299,7 +324,7 @@ func TestShoutrrrDefaultTitlesAreReplaced(t *testing.T) {
 func TestServicesWithoutTitleKeyReceiveNoParams(t *testing.T) {
 	message := Context{Tailnet: "example.com"}.Test(testObservedAt)
 	for _, serviceURL := range []string{wecomURL, googleChatURL, "rocketchat://rocketchat.example/token/token2", "mattermost://mattermost.example/hooktoken", "zulip://bot%40example.com:key@zulip.example/?stream=ops"} {
-		if params := parseDestination(serviceURL).params("a title"); params != nil {
+		if params := parseDestination(serviceURL).params(Prepared{Title: "a title", Severity: "high"}); params != nil {
 			t.Fatalf("%s receives params %v", serviceURL, *params)
 		}
 		if prepared := PrepareMessage(message, serviceURL, ""); prepared.Title != "" || !strings.HasPrefix(prepared.Message(), prepared.Text) || !strings.Contains(prepared.Text, "TailState test ·") {
@@ -335,7 +360,7 @@ func TestOperatorTitleInURLWins(t *testing.T) {
 		if prepared.Title != "" || prepared.Message() != prepared.Text || !strings.Contains(prepared.Text, "TailState test ·") {
 			t.Fatalf("%s prepared=%+v", serviceURL, prepared)
 		}
-		if params := parseDestination(serviceURL).params("TailState"); params != nil && ((*params)["title"] != "" || (*params)["subject"] != "") {
+		if params := parseDestination(serviceURL).params(Prepared{Title: "TailState"}); params != nil && ((*params)["title"] != "" || (*params)["subject"] != "") {
 			t.Fatalf("%s overrides the operator title: %v", serviceURL, *params)
 		}
 	}

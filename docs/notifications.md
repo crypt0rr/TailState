@@ -207,8 +207,9 @@ blocks per message). TailState builds this payload itself, parses the URL with
 Shoutrrr's Slack parser, and sends it through the same bounded,
 redirect-rejecting HTTP client as every other delivery, so failures are
 classified the same way (permanent 4xx, `Retry-After`). The URL options
-`botname`/`username`, `icon`, `thread_ts`, `color` (the sections are then
-wrapped in one attachment with that colour bar), and `title` keep their
+`botname`/`username`, `icon`, `thread_ts`, `color` (which replaces the
+severity colour, see [Priority and colour](#priority-and-colour); the blocks
+are wrapped in one attachment with the colour bar), and `title` keep their
 meaning. A destination whose format is overridden to another format
 receives `plain_text` sections, which Slack never parses for mentions or
 links.
@@ -270,6 +271,31 @@ high-severity changes. See TailState History for the full batch."
 A changed resource takes the highest severity of its changed fields; a change
 whose field list was truncated is at least medium, because the omitted fields
 cannot be shown to be routine.
+
+### Priority and colour
+
+Services that support it deliver a notification with a priority, tags, or
+colour taken from its severity: the highest severity in a digest, or a fixed
+level for other notifications (high for collector failures and TailState
+configuration changes, medium for expiry warnings, low for recoveries,
+release notices, and the Settings test).
+
+| Service | High | Medium | Low |
+| --- | --- | --- | --- |
+| ntfy (`priority`, `tags`) | 4, `rotating_light` | 3, `warning` | 2, `information_source` |
+| Pushover (`priority`) | 1 | 0 | -1 |
+| Gotify (`priority`) | 8 | 5 | 2 |
+| Opsgenie (`priority`) | P2 | P3 | P5 |
+| Discord (embed `color`) | red `0xd60510` | orange `0xff8c00` | grey `0x95a5a6` |
+| Slack (attachment colour bar) | red `#d60510` | orange `#ff8c00` | grey `#95a5a6` |
+| Microsoft Teams (card title `color`) | `attention` | `warning` | `default` |
+
+A value set in the destination URL always wins, per parameter: an ntfy URL
+with `?priority=5` keeps priority 5 and still receives the severity's tags.
+No mapping uses a priority that needs acknowledgement (Pushover's emergency
+priority 2). Services without these keys receive none, and messages queued
+before this release keep the provider's default. The parameters are on the
+same per-service allowlist as titles (see [Titles](#titles)).
 
 Each destination has routing rules, edited under **Edit destination** in
 Settings: a minimum severity (all, medium and high, or high only), collectors

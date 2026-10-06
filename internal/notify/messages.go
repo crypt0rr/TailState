@@ -74,7 +74,7 @@ func (c Context) Digest(in DigestInput) Message {
 	if top != model.SeverityLow && counts[string(top)] > 0 {
 		title += fmt.Sprintf(" (%d %s)", counts[string(top)], top)
 	}
-	message := c.message(severityIcons[top], title, line(lit(digestCounts(counts))))
+	message := c.message(top, severityIcons[top], title, line(lit(digestCounts(counts))))
 	if header, ok := attributionHeader(in); ok {
 		message.Lines = append(message.Lines, header)
 	}
@@ -366,7 +366,7 @@ type ExpiryLine struct {
 // page when a public URL is configured, and is shortened only at line
 // boundaries with an explicit count of the omitted resources.
 func (c Context) ExpiryWarning(windowDays int, lines []ExpiryLine, observedAt time.Time) Message {
-	message := c.message("⏳", "Tailscale keys expiring within "+plural(windowDays, "day", "days"),
+	message := c.message(severityExpiry, "⏳", "Tailscale keys expiring within "+plural(windowDays, "day", "days"),
 		line(strong(plural(len(lines), "resource", "resources")), lit(fmt.Sprintf(" entered the %d-day expiry warning window. Re-authenticate devices or replace auth keys before they expire.", windowDays))),
 		observedLine(observedAt),
 	)

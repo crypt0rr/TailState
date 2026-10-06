@@ -112,7 +112,7 @@ func TestDiscordOversizedDigestIsOneRequest(t *testing.T) {
 // sends splitlines=no unless the URL sets it, and a forced splitlines=yes is
 // kept but warned about.
 func TestDiscordSplitLinesParameter(t *testing.T) {
-	if params := parseDestination(discordURL).params(""); params == nil || (*params)["splitlines"] != "no" {
+	if params := parseDestination(discordURL).params(Prepared{}); params == nil || (*params)["splitlines"] != "no" {
 		t.Fatalf("default params=%v", params)
 	}
 	for serviceURL, warn := range map[string]bool{
@@ -122,7 +122,7 @@ func TestDiscordSplitLinesParameter(t *testing.T) {
 		discordURL + "?splitlines=no":            false,
 		discordURL + "?splitlines=0":             false,
 	} {
-		if params := parseDestination(serviceURL).params("title"); params != nil {
+		if params := parseDestination(serviceURL).params(Prepared{Title: "title"}); params != nil {
 			if _, set := (*params)["splitlines"]; set {
 				t.Fatalf("%s: operator splitlines overridden: %v", serviceURL, *params)
 			}

@@ -13,6 +13,9 @@ rollback requires restoring the backup taken before the upgrade. See
 
 ## [Unreleased]
 
+### Added
+- Notifications carry their severity to services that support it: the highest severity of a digest (or a fixed level for health alerts, expiry warnings, configuration changes, and the Settings test) sets the ntfy priority and tags (4/3/2, `rotating_light`/`warning`/`information_source`), the Pushover priority (1/0/-1, never the acknowledgement-only 2), the Gotify priority (8/5/2), the Opsgenie priority (P2/P3/P5), and a red, orange, or grey colour for Discord embeds, Slack attachments, and Teams card titles. A value set in the destination URL wins, services without these keys receive none, and messages queued before the upgrade keep the provider's default (#234).
+
 ## [0.16.0] - 2026-10-06
 
 - **Schema:** 17 (unchanged)

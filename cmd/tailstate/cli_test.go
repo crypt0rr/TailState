@@ -386,6 +386,9 @@ func TestAdminBackupProducesRestorableSnapshotWhileServing(t *testing.T) {
 				servingErr = err
 				return
 			}
+			// Keep the writer realistic: a zero-pause loop can starve other
+			// connections on a loaded CI runner.
+			time.Sleep(time.Millisecond)
 		}
 	}()
 	backupDir := t.TempDir()

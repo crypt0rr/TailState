@@ -481,7 +481,7 @@ func TestSchemaV16MigrationKeepsLedgerBytesAndAddsAttribution(t *testing.T) {
 	}
 	defer st.Close()
 	var version int
-	if err := st.db.QueryRow("SELECT version FROM schema_version").Scan(&version); err != nil || version != 16 {
+	if err := st.db.QueryRow("SELECT version FROM schema_version").Scan(&version); err != nil || version != currentSchemaVersion {
 		t.Fatalf("schema version=%d err=%v", version, err)
 	}
 	after, _, err := evidenceLedgerPayload(ctx, st.db, existing.ID)

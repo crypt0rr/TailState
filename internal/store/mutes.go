@@ -141,7 +141,7 @@ func (s *Store) AddMuteRule(ctx context.Context, kind, value string) (int64, err
 	if count >= MaxMuteRules {
 		return 0, invalidMuteRule("at most %d mute rules are supported", MaxMuteRules)
 	}
-	result, err := tx.ExecContext(ctx, "INSERT INTO mute_rules(kind,value,created_at) VALUES(?,?,?)", kind, value, time.Now().UTC().Format(time.RFC3339Nano))
+	result, err := tx.ExecContext(ctx, "INSERT INTO mute_rules(kind,value,created_at) VALUES(?,?,?)", kind, value, formatTimestamp(time.Now()))
 	if err != nil {
 		return 0, err
 	}

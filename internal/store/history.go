@@ -161,11 +161,11 @@ func historyBatchConditions(filter HistoryFilter) ([]string, []any) {
 	}
 	if !filter.From.IsZero() {
 		where = append(where, "b.observed_at >= ?")
-		args = append(args, historyTimeBound(filter.From))
+		args = append(args, observationBound(filter.From))
 	}
 	if !filter.Until.IsZero() {
 		where = append(where, "b.observed_at < ?")
-		args = append(args, historyTimeBound(filter.Until))
+		args = append(args, observationBound(filter.Until))
 	}
 	if filter.Collector != "" {
 		where = append(where, "EXISTS (SELECT 1 FROM events e WHERE e.batch_id=b.id AND e.collector=?)")
@@ -185,15 +185,6 @@ func historyBatchConditions(filter HistoryFilter) ([]string, []any) {
 		args = append(args, filter.Severity)
 	}
 	return where, args
-}
-
-// historyTimeBound renders a range boundary for comparison with the stored
-// RFC 3339 UTC observation time. The bound deliberately omits the zone
-// designator and fractional seconds: every stored value within that second
-// has the bound as a prefix and therefore sorts at or after it, whereas a
-// "Z"-terminated bound would sort after stored values with a fraction.
-func historyTimeBound(value time.Time) string {
-	return value.UTC().Format("2006-01-02T15:04:05")
 }
 
 // historyHasBatch reports whether a batch matching filter exists with an ID

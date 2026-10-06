@@ -139,7 +139,7 @@ func (s *Store) CreateAPIToken(ctx context.Context, name string, scopes []string
 	}
 	token := APITokenPrefix + random
 	now := time.Now().UTC()
-	nowValue := now.Format(time.RFC3339Nano)
+	nowValue := formatTimestamp(now)
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return APIToken{}, "", err
@@ -153,7 +153,7 @@ func (s *Store) CreateAPIToken(ctx context.Context, name string, scopes []string
 		return APIToken{}, "", fmt.Errorf("%w: at most %d active tokens; revoke one first", ErrAPITokenRequest, MaxActiveAPITokens)
 	}
 	expires := now.Add(lifetime)
-	result, err := tx.ExecContext(ctx, "INSERT INTO api_tokens(name,token_hash,scopes,created_at,expires_at) VALUES(?,?,?,?,?)", name, secret.HashToken(token), strings.Join(scopes, " "), nowValue, expires.Format(time.RFC3339Nano))
+	result, err := tx.ExecContext(ctx, "INSERT INTO api_tokens(name,token_hash,scopes,created_at,expires_at) VALUES(?,?,?,?,?)", name, secret.HashToken(token), strings.Join(scopes, " "), nowValue, formatTimestamp(expires))
 	if err != nil {
 		return APIToken{}, "", err
 	}
@@ -223,7 +223,7 @@ func (s *Store) ListAPITokens(ctx context.Context) ([]APIToken, error) {
 // RevokeAPIToken revokes a token immediately: the next request that presents
 // it is rejected.
 func (s *Store) RevokeAPIToken(ctx context.Context, id int64) error {
-	result, err := s.db.ExecContext(ctx, "UPDATE api_tokens SET revoked_at=? WHERE id=? AND revoked_at IS NULL", time.Now().UTC().Format(time.RFC3339Nano), id)
+	result, err := s.db.ExecContext(ctx, "UPDATE api_tokens SET revoked_at=? WHERE id=? AND revoked_at IS NULL", formatTimestamp(time.Now()), id)
 	if err != nil {
 		return err
 	}
@@ -260,7 +260,7 @@ func (s *Store) AuthenticateAPIToken(ctx context.Context, presented string) (API
 	if token.LastUsedAt == nil || now.Sub(*token.LastUsedAt) >= apiTokenTouchInterval {
 		// Best effort and bounded: a busy writer must not stall a read-only
 		// API request.
-		if err := s.bookkeepingWrite(ctx, "UPDATE api_tokens SET last_used_at=? WHERE id=?", now.Format(time.RFC3339Nano), token.ID); err == nil {
+		if err := s.bookkeepingWrite(ctx, "UPDATE api_tokens SET last_used_at=? WHERE id=?", formatTimestamp(now), token.ID); err == nil {
 			token.LastUsedAt = &now
 		}
 	}

@@ -13,6 +13,9 @@ rollback requires restoring the backup taken before the upgrade. See
 
 ## [Unreleased]
 
+### Changed
+- Leases, token and session expiries, retry times, and retention compare correctly within the same second: timestamps are stored in a fixed-width UTC form (`2006-01-02T15:04:05.000000000Z`) instead of RFC 3339 with trailing zeros dropped, which sorted `…:00Z` after `…:00.1Z`. Schema 17 rewrites stored operational timestamps in bounded, resumable transactions; signed observation times keep their bytes and are compared against whole-second bounds. The web server, collector batch application, schema migrations, monitor engine, and Tailscale client are split into smaller files and named phases without other behaviour changes (#197).
+
 ### Documentation
 - The README is split into focused pages under `docs/` (monitoring, notifications, history and evidence, operations, security, metrics) with a concise quick start; per-schema migration details moved to `UPGRADING.md`. New example Prometheus alert rules in `docs/prometheus/alerts.yml` (dead letters, stuck or paused delivery, collector failures and degraded readiness, storage pressure and an unenforced database limit, dead webhook triggers, failing attribution lookups) are validated with `promtool` in CI. Shoutrrr links point to the `nicholas-fedor/shoutrrr` fork's documentation, and `.env.example` lists every Compose variable, including the commented storage limits, with a pinned image version (#194).
 

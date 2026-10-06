@@ -242,7 +242,7 @@ func (s *Store) SetNextPollErr(ctx context.Context, generation int64, collectors
 	if activeGeneration != generation {
 		return nil
 	}
-	value := next.UTC().Format(time.RFC3339Nano)
+	value := formatTimestamp(next)
 	args := make([]any, 0, len(ordered)*3)
 	placeholders := make([]string, 0, len(ordered))
 	for _, collector := range ordered {
@@ -511,11 +511,15 @@ func (s *Store) reclaimAfterCleanup(ctx context.Context, stats *CleanupStats) {
 // a few index probes instead of a full table scan that could exceed the
 // per-transaction budget on large or slow hosts.
 func cleanupPhases(stats *CleanupStats, now time.Time, retention time.Duration) []cleanupPhase {
-	nowValue := now.Format(time.RFC3339Nano)
-	retryCutoff := now.Add(-outboxRetryWindow).Format(time.RFC3339Nano)
-	webhookRetryCutoff := now.Add(-webhookTriggerRetryWindow).Format(time.RFC3339Nano)
-	cutoff := now.Add(-retention).Format(time.RFC3339Nano)
-	adminAuditCutoff := now.Add(-AdminAuditRetention).Format(time.RFC3339Nano)
+	nowValue := formatTimestamp(now)
+	retryCutoff := formatTimestamp(now.Add(-outboxRetryWindow))
+	webhookRetryCutoff := formatTimestamp(now.Add(-webhookTriggerRetryWindow))
+	cutoff := formatTimestamp(now.Add(-retention))
+	// Observation times are signed evidence and may still hold the legacy
+	// RFC 3339 form, so they are compared with a whole-second bound that
+	// orders both forms (see observationBound).
+	observedCutoff := observationBound(now.Add(-retention))
+	adminAuditCutoff := formatTimestamp(now.Add(-AdminAuditRetention))
 	return []cleanupPhase{
 		{name: "sessions", query: `DELETE FROM sessions WHERE rowid IN (SELECT rowid FROM sessions WHERE expires_at<=? ORDER BY expires_at,rowid LIMIT ?)`, args: []any{nowValue}, add: func(n int64) { stats.SessionsDeleted += n }},
 		{name: "auth_tokens", query: `DELETE FROM auth_tokens WHERE rowid IN (SELECT rowid FROM auth_tokens WHERE expires_at<=? ORDER BY expires_at,rowid LIMIT ?)`, args: []any{nowValue}, add: func(n int64) { stats.AuthTokensDeleted += n }},
@@ -527,17 +531,17 @@ func cleanupPhases(stats *CleanupStats, now time.Time, retention time.Duration) 
 		// first_attempt across two status values would force a temporary sort.
 		{name: "outbox_dead_letter", query: `UPDATE outbox SET status='dead',next_attempt=?,lease_until=NULL,lease_token='',last_error=CASE WHEN TRIM(last_error)='' THEN 'delivery retry window expired' ELSE last_error END WHERE rowid IN (SELECT rowid FROM outbox WHERE status IN ('pending','processing') AND first_attempt<=? AND (status='pending' OR lease_until IS NULL OR lease_until<=?) LIMIT ?)`, args: []any{nowValue, retryCutoff, nowValue}, add: func(n int64) { stats.OutboxDeadLettered += n }},
 		{name: "webhook_dead_letter", query: `UPDATE webhook_triggers SET status='dead',next_attempt_at=?,lease_until=NULL,lease_token='',last_error=CASE WHEN TRIM(last_error)='' THEN 'reconciliation retry window expired' ELSE last_error END WHERE rowid IN (SELECT rowid FROM webhook_triggers WHERE status IN ('pending','processing') AND received_at<=? AND (status='pending' OR lease_until IS NULL OR lease_until<=?) LIMIT ?)`, args: []any{nowValue, webhookRetryCutoff, nowValue}, add: func(n int64) { stats.WebhookDeadLettered += n }},
-		{name: "events", query: `DELETE FROM events WHERE rowid IN (SELECT rowid FROM events WHERE observed_at<? ORDER BY observed_at,rowid LIMIT ?)`, args: []any{cutoff}, add: func(n int64) { stats.EventsDeleted += n }},
+		{name: "events", query: `DELETE FROM events WHERE rowid IN (SELECT rowid FROM events WHERE observed_at<? ORDER BY observed_at,rowid LIMIT ?)`, args: []any{observedCutoff}, add: func(n int64) { stats.EventsDeleted += n }},
 		// A batch and its events share one observed_at, so only batches older
 		// than the retention cutoff can have lost their events. Bounding the
 		// candidates by that cutoff turns the orphan check into an index range.
-		{name: "event_batches", query: `DELETE FROM event_batches WHERE rowid IN (SELECT b.rowid FROM event_batches b WHERE b.observed_at<? AND NOT EXISTS (SELECT 1 FROM events WHERE events.batch_id=b.id) ORDER BY b.observed_at,b.rowid LIMIT ?)`, args: []any{cutoff}, add: func(n int64) { stats.EventBatchesDeleted += n }},
+		{name: "event_batches", query: `DELETE FROM event_batches WHERE rowid IN (SELECT b.rowid FROM event_batches b WHERE b.observed_at<? AND NOT EXISTS (SELECT 1 FROM events WHERE events.batch_id=b.id) ORDER BY b.observed_at,b.rowid LIMIT ?)`, args: []any{observedCutoff}, add: func(n int64) { stats.EventBatchesDeleted += n }},
 		// Trigger links are removed after their batch. Batch IDs are
 		// allocated in observation order, so links of expired batches sort
 		// below the first batch that is still inside the retention window;
 		// the NOT EXISTS guard keeps any out-of-order link that still has a
 		// batch. When no batch remains, every link is a candidate.
-		{name: "event_batch_triggers", query: `DELETE FROM event_batch_triggers WHERE rowid IN (SELECT t.rowid FROM event_batch_triggers t WHERE t.batch_id<COALESCE((SELECT b.id FROM event_batches b WHERE b.observed_at>=? ORDER BY b.observed_at,b.id LIMIT 1),9223372036854775807) AND NOT EXISTS (SELECT 1 FROM event_batches WHERE event_batches.id=t.batch_id) ORDER BY t.batch_id,t.trigger_id LIMIT ?)`, args: []any{cutoff}, add: func(n int64) { stats.EventBatchTriggersDeleted += n }},
+		{name: "event_batch_triggers", query: `DELETE FROM event_batch_triggers WHERE rowid IN (SELECT t.rowid FROM event_batch_triggers t WHERE t.batch_id<COALESCE((SELECT b.id FROM event_batches b WHERE b.observed_at>=? ORDER BY b.observed_at,b.id LIMIT 1),9223372036854775807) AND NOT EXISTS (SELECT 1 FROM event_batches WHERE event_batches.id=t.batch_id) ORDER BY t.batch_id,t.trigger_id LIMIT ?)`, args: []any{observedCutoff}, add: func(n int64) { stats.EventBatchTriggersDeleted += n }},
 		// Ledger entries are intentionally absent from this list. They outlive
 		// event snapshots so the signed chain remains an audit trail.
 		// Only rows past the retention cutoff are candidates, so drive the

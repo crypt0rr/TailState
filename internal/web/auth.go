@@ -1,0 +1,224 @@
+package web
+
+import (
+	"log/slog"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/crypt0rr/tailstate/internal/store"
+)
+
+func (s *Server) home(w http.ResponseWriter, r *http.Request) {
+	exists, ok := s.adminExists(w, r)
+	if !ok {
+		return
+	}
+	if !exists {
+		http.Redirect(w, r, "/setup", http.StatusSeeOther)
+		return
+	}
+	if !s.authenticated(r, false) {
+		http.Redirect(w, r, "/login", http.StatusSeeOther)
+		return
+	}
+	status, err := s.store.Status(r.Context())
+	if err != nil {
+		slog.Error("load status for home redirect", "error", err)
+		http.Error(w, "service temporarily unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	if !status.Configured {
+		http.Redirect(w, r, "/settings", http.StatusSeeOther)
+		return
+	}
+	http.Redirect(w, r, "/status", http.StatusSeeOther)
+}
+
+func (s *Server) setup(w http.ResponseWriter, r *http.Request) {
+	exists, ok := s.adminExists(w, r)
+	if !ok {
+		return
+	}
+	if exists {
+		http.Redirect(w, r, "/settings", http.StatusSeeOther)
+		return
+	}
+	s.renderCredential(w, r, "setup", credentialActionSetup, pageData{})
+}
+
+func (s *Server) claim(w http.ResponseWriter, r *http.Request) {
+	exists, ok := s.adminExists(w, r)
+	if !ok {
+		return
+	}
+	if exists {
+		http.Error(w, "installation already claimed", http.StatusConflict)
+		return
+	}
+	flow := credentialFlow{server: s, page: "setup", action: credentialActionSetup, throttledMessage: "Too many setup attempts. Try again later."}
+	release, ok := flow.begin(w, r)
+	if !ok {
+		return
+	}
+	defer release()
+	if !flow.newPassword(w, r) {
+		return
+	}
+	if err := s.store.Claim(r.Context(), r.FormValue("token"), r.FormValue("password")); err != nil {
+		// Setup is unauthenticated. Keep storage, token, and migration details
+		// out of the response so this endpoint cannot become an oracle.
+		slog.Debug("setup claim rejected", "error", err)
+		flow.reject(w, r, "Setup could not be completed. Check the setup token and try again.")
+		return
+	}
+	flow.succeed(w)
+	token, ok := s.startSession(w, r)
+	if !ok {
+		return
+	}
+	s.recordAdmin(r, store.SessionRef(token), adminChange{event: store.AuditSetupClaim}, nil, 0)
+	http.Redirect(w, r, "/settings", http.StatusSeeOther)
+}
+
+func (s *Server) login(w http.ResponseWriter, r *http.Request) {
+	exists, ok := s.adminExists(w, r)
+	if !ok {
+		return
+	}
+	if !exists {
+		http.Redirect(w, r, "/setup", http.StatusSeeOther)
+		return
+	}
+	next, _ := safeReturnPath(r.URL.Query().Get("next"))
+	if s.authenticated(r, false) {
+		if next == "" {
+			next = "/status"
+		}
+		http.Redirect(w, r, next, http.StatusSeeOther)
+		return
+	}
+	s.renderCredential(w, r, "login", credentialActionLogin, pageData{Next: next})
+}
+
+func (s *Server) adminExists(w http.ResponseWriter, r *http.Request) (bool, bool) {
+	exists, err := s.store.AdminExists(r.Context())
+	if err != nil {
+		slog.Error("check administrator state", "error", err)
+		http.Error(w, "service temporarily unavailable", http.StatusServiceUnavailable)
+		return false, false
+	}
+	return exists, true
+}
+
+func (s *Server) loginPost(w http.ResponseWriter, r *http.Request) {
+	var next string
+	flow := credentialFlow{server: s, page: "login", action: credentialActionLogin, throttledMessage: "Too many login attempts. Try again later.",
+		// The validated return path survives a re-rendered form.
+		form: func(r *http.Request) pageData {
+			next, _ = safeReturnPath(r.FormValue("next"))
+			return pageData{Next: next}
+		}}
+	release, ok := flow.begin(w, r)
+	if !ok {
+		return
+	}
+	defer release()
+	if !s.store.Authenticate(r.Context(), r.FormValue("password")) {
+		flow.countFailure()
+		s.recordAdmin(r, "", adminChange{event: store.AuditLoginFailure, outcome: store.AuditFailure}, nil, 0)
+		flow.render(w, r, "Invalid password.")
+		return
+	}
+	flow.succeed(w)
+	token, ok := s.startSession(w, r)
+	if !ok {
+		return
+	}
+	s.recordAdmin(r, store.SessionRef(token), adminChange{event: store.AuditLoginSuccess}, nil, 0)
+	if next == "" {
+		next = "/"
+	}
+	http.Redirect(w, r, next, http.StatusSeeOther)
+}
+
+func (s *Server) logout(w http.ResponseWriter, r *http.Request) {
+	auth, ok := s.session(r, true, true)
+	if !ok {
+		s.rejectUnauthenticated(w, r, true)
+		return
+	}
+	s.store.DeleteSession(r.Context(), auth.token)
+	s.recordAdmin(r, auth.ref, adminChange{event: store.AuditLogout}, nil, 0)
+	s.clearCookies(w)
+	http.Redirect(w, r, "/login", http.StatusSeeOther)
+}
+
+func (s *Server) reset(w http.ResponseWriter, r *http.Request) {
+	s.renderCredential(w, r, "reset", credentialActionReset, pageData{})
+}
+
+func (s *Server) resetPost(w http.ResponseWriter, r *http.Request) {
+	flow := credentialFlow{server: s, page: "reset", action: credentialActionReset, throttledMessage: "Too many reset attempts. Try again later."}
+	release, ok := flow.begin(w, r)
+	if !ok {
+		return
+	}
+	defer release()
+	if !flow.newPassword(w, r) {
+		return
+	}
+	before := s.enabledDestinations(r.Context())
+	if err := s.store.ResetWithToken(r.Context(), r.FormValue("token"), r.FormValue("password")); err != nil {
+		// Do not disclose whether a reset token is missing, invalid, expired,
+		// or temporarily unreadable. The token is deliberately a single
+		// generic oracle to unauthenticated callers.
+		slog.Debug("password reset rejected", "error", err)
+		flow.reject(w, r, "The reset token is invalid or expired.")
+		return
+	}
+	flow.succeed(w)
+	s.recordAdmin(r, "", adminChange{event: store.AuditPasswordReset, highRisk: true}, before, 0)
+	s.clearCookies(w)
+	http.Redirect(w, r, "/login", http.StatusSeeOther)
+}
+
+func (s *Server) startSession(w http.ResponseWriter, r *http.Request) (string, bool) {
+	token, csrf, err := s.store.CreateSession(r.Context())
+	if err != nil {
+		http.Error(w, "create session", http.StatusInternalServerError)
+		return "", false
+	}
+	// With secure cookies a sign-in expires the unprefixed cookies of an
+	// earlier sign-in, so the browser holds one generation only.
+	if s.config.CookieSecure {
+		for _, name := range []string{sessionCookieBase, csrfCookieBase} {
+			http.SetCookie(w, &http.Cookie{Name: name, Path: "/", MaxAge: -1, HttpOnly: name == sessionCookieBase, Secure: true, SameSite: http.SameSiteStrictMode})
+		}
+	}
+	maxAge := int(store.SessionLifetime / time.Second)
+	http.SetCookie(w, &http.Cookie{Name: s.cookieName(sessionCookieBase), Value: token, Path: "/", MaxAge: maxAge, HttpOnly: true, Secure: s.config.CookieSecure, SameSite: http.SameSiteStrictMode})
+	http.SetCookie(w, &http.Cookie{Name: s.cookieName(csrfCookieBase), Value: csrf, Path: "/", MaxAge: maxAge, HttpOnly: false, Secure: s.config.CookieSecure, SameSite: http.SameSiteStrictMode})
+	return token, true
+}
+
+// clearCookies expires the session cookies under both namings.
+func (s *Server) clearCookies(w http.ResponseWriter) {
+	names := []string{sessionCookieBase, csrfCookieBase}
+	if s.config.CookieSecure {
+		names = append(names, hostCookiePrefix+sessionCookieBase, hostCookiePrefix+csrfCookieBase)
+	}
+	for _, name := range names {
+		http.SetCookie(w, &http.Cookie{Name: name, Path: "/", MaxAge: -1, HttpOnly: strings.HasSuffix(name, sessionCookieBase), Secure: s.config.CookieSecure, SameSite: http.SameSiteStrictMode})
+	}
+}
+
+func (s *Server) authenticated(r *http.Request, requireCSRF bool) bool {
+	_, ok := s.session(r, requireCSRF, true)
+	return ok
+}
+
+func (s *Server) requireAuth(w http.ResponseWriter, r *http.Request, csrf bool) (string, bool) {
+	auth, ok := s.requireSession(w, r, csrf, true)
+	return auth.csrf, ok
+}

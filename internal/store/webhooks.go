@@ -96,7 +96,7 @@ func (s *Store) RecordWebhookTrigger(ctx context.Context, bodyHash string, event
 		return WebhookTrigger{}, false, err
 	}
 	now := time.Now().UTC()
-	nowValue := now.Format(time.RFC3339Nano)
+	nowValue := formatTimestamp(now)
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return WebhookTrigger{}, false, err
@@ -241,9 +241,9 @@ func (s *Store) ClaimWebhookTrigger(ctx context.Context, id int64, lease time.Du
 		lease = webhookTriggerLease
 	}
 	now := time.Now().UTC()
-	nowValue := now.Format(time.RFC3339Nano)
-	deadline := now.Add(-webhookTriggerRetryWindow).Format(time.RFC3339Nano)
-	leaseValue := now.Add(lease).Format(time.RFC3339Nano)
+	nowValue := formatTimestamp(now)
+	deadline := formatTimestamp(now.Add(-webhookTriggerRetryWindow))
+	leaseValue := formatTimestamp(now.Add(lease))
 	leaseToken, err := newWebhookLeaseToken()
 	if err != nil {
 		return WebhookTrigger{}, false, err
@@ -306,9 +306,9 @@ func (s *Store) ClaimWebhookTriggers(ctx context.Context, limit int, lease time.
 		lease = webhookTriggerLease
 	}
 	now := time.Now().UTC()
-	nowValue := now.Format(time.RFC3339Nano)
-	deadline := now.Add(-webhookTriggerRetryWindow).Format(time.RFC3339Nano)
-	leaseValue := now.Add(lease).Format(time.RFC3339Nano)
+	nowValue := formatTimestamp(now)
+	deadline := formatTimestamp(now.Add(-webhookTriggerRetryWindow))
+	leaseValue := formatTimestamp(now.Add(lease))
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
@@ -370,8 +370,8 @@ func (s *Store) ClaimWebhookTriggers(ctx context.Context, limit int, lease time.
 // current webhook secret: a trigger accepted before the secret was cleared
 // must remain durable and recoverable after a restart.
 func (s *Store) HasDueWebhookTriggers(ctx context.Context, now time.Time) (bool, error) {
-	nowValue := now.UTC().Format(time.RFC3339Nano)
-	deadline := now.UTC().Add(-webhookTriggerRetryWindow).Format(time.RFC3339Nano)
+	nowValue := formatTimestamp(now)
+	deadline := formatTimestamp(now.UTC().Add(-webhookTriggerRetryWindow))
 	var due int
 	err := s.db.QueryRowContext(ctx, `SELECT EXISTS(
 		SELECT 1 FROM webhook_triggers
@@ -389,7 +389,7 @@ func (s *Store) CompleteClaimedWebhookTriggers(ctx context.Context, claims []Web
 	if len(claims) == 0 {
 		return nil
 	}
-	now := time.Now().UTC().Format(time.RFC3339Nano)
+	now := formatTimestamp(time.Now())
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -443,7 +443,7 @@ func (s *Store) RetryClaimedWebhookTriggers(ctx context.Context, claims []Webhoo
 				lastError = "reconciliation retry window expired"
 			}
 		}
-		if _, err := tx.ExecContext(ctx, "UPDATE webhook_triggers SET status=?,next_attempt_at=?,lease_until=NULL,lease_token='',last_error=? WHERE id=? AND status='processing' AND lease_token=?", status, attempt.Format(time.RFC3339Nano), lastError, claim.ID, claim.LeaseToken); err != nil {
+		if _, err := tx.ExecContext(ctx, "UPDATE webhook_triggers SET status=?,next_attempt_at=?,lease_until=NULL,lease_token='',last_error=? WHERE id=? AND status='processing' AND lease_token=?", status, formatTimestamp(attempt), lastError, claim.ID, claim.LeaseToken); err != nil {
 			return err
 		}
 	}

@@ -77,10 +77,19 @@ audit trail and its notices; `api_tokens.go` owns hashed read-only API
 tokens; `settings.go` owns encrypted application
 settings; `snapshots.go` owns collector application and baseline transitions;
 `outbox.go` owns notification delivery bookkeeping; `status.go` owns health,
-scheduling, and retention queries; and `history.go`, `destinations.go`,
-`webhooks.go`, and `migrations.go` contain the corresponding audit, endpoint,
-trigger, and schema seams. Keep changes in the narrowest seam and add a store
-regression test beside the behavior it protects.
+scheduling, and retention queries; `evidence.go` builds signed evidence
+packs and `evidence_verify.go` verifies them; and `history.go`,
+`destinations.go`, and `webhooks.go` contain the corresponding audit,
+endpoint, and trigger seams. `migrations.go` holds the preflight checks and
+the `migrations` table that drives every schema upgrade; the steps live in
+`migrations_v*.go`, and a new step is one function plus one table row. Keep
+changes in the narrowest seam and add a store regression test beside the
+behavior it protects.
+
+The web package follows the same rule: `server.go` owns construction,
+routing, and rendering; `auth.go`, `credential_flow.go`, and `throttle.go`
+own the credential forms; and the remaining files are named after the page
+or endpoint they serve.
 
 ## Data and security rules
 

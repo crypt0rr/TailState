@@ -6,12 +6,14 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	"github.com/nicholas-fedor/shoutrrr/pkg/format"
 	"github.com/nicholas-fedor/shoutrrr/pkg/types"
 )
 
 // Shoutrrr parameters TailState may set when it sends a message.
 const (
-	paramTitle = "title"
+	paramTitle      = "title"
+	paramSplitLines = "splitlines"
 )
 
 // serviceParams is the per-service allowlist of Shoutrrr config keys
@@ -30,7 +32,7 @@ const (
 // are deliberately not listed: Mattermost and Matrix only prepend it to the
 // body as unformatted text, and Zulip uses it as the stream topic.
 var serviceParams = map[string]map[string][]string{
-	"discord":    {paramTitle: {"title"}},
+	"discord":    {paramTitle: {"title"}, paramSplitLines: {"splitlines"}},
 	"gotify":     {paramTitle: {"title"}},
 	"ntfy":       {paramTitle: {"title"}},
 	"pushbullet": {paramTitle: {"title"}},
@@ -39,6 +41,21 @@ var serviceParams = map[string]map[string][]string{
 	"smtp":       {paramTitle: {"subject", "title"}},
 	"teams":      {paramTitle: {"title"}},
 	"telegram":   {paramTitle: {"title"}},
+}
+
+// serviceDefaults are fixed parameter values TailState passes unless the
+// destination URL sets the parameter itself.
+//
+// Discord defaults to splitlines=yes in Shoutrrr v0.21.1: one embed per line,
+// batched ten per webhook request by util.MessageItemsFromLines, which reuses
+// one backing array for every batch (items = items[:0]). Each new batch
+// overwrites the embeds of batches already queued, so a message longer than
+// ten lines loses its first lines and repeats later ones. With splitlines=no
+// Shoutrrr partitions the body into embeds of at most 2,000 characters within
+// the 6,000-character message budget, a path that does not use that batching.
+// SplitLinesWarning flags destinations that force splitlines=yes.
+var serviceDefaults = map[string]map[string]string{
+	"discord": {paramSplitLines: "no"},
 }
 
 // maxTitleBytes bounds a title passed as a parameter. It stays below the
@@ -116,12 +133,34 @@ func (d destination) sendsTitleSeparately() bool {
 	return true
 }
 
+// truthy parses a boolean query value the way Shoutrrr does.
 func truthy(value string) bool {
-	switch strings.ToLower(strings.TrimSpace(value)) {
-	case "1", "true", "yes", "y", "on":
-		return true
+	enabled, _ := format.ParseBool(strings.TrimSpace(value), false)
+	return enabled
+}
+
+// SplitLinesWarning returns an operator-facing warning when a destination
+// URL forces Discord's splitlines=yes, which the pinned Shoutrrr release
+// corrupts for messages longer than ten lines (see serviceDefaults), or ""
+// otherwise. The warning names no part of the URL.
+func SplitLinesWarning(serviceURL string) string {
+	d := parseDestination(serviceURL)
+	if d.scheme != "discord" || !truthy(d.query[paramSplitLines]) || truthy(d.query["json"]) {
+		return ""
 	}
-	return false
+	return "This Discord destination sets splitlines=yes: the pinned Shoutrrr release loses or repeats lines of messages longer than 10 lines in that mode. Remove splitlines from the URL (TailState then sends splitlines=no) or set splitlines=no."
+}
+
+// CountSplitLinesWarnings returns how many of serviceURLs have a
+// SplitLinesWarning, for the deployment diagnostics.
+func CountSplitLinesWarnings(serviceURLs []string) int {
+	count := 0
+	for _, serviceURL := range serviceURLs {
+		if SplitLinesWarning(serviceURL) != "" {
+			count++
+		}
+	}
+	return count
 }
 
 // params returns the Shoutrrr parameters for one send, or nil when the
@@ -132,6 +171,11 @@ func (d destination) params(title string) *types.Params {
 	if title != "" {
 		if key := d.paramKey(paramTitle); key != "" {
 			params[key] = encodeTitle(d.scheme, title)
+		}
+	}
+	for param, value := range serviceDefaults[d.scheme] {
+		if key := d.paramKey(param); key != "" {
+			params[key] = value
 		}
 	}
 	if len(params) == 0 {

@@ -57,6 +57,23 @@ receives a separate title only when the URL sets no `parsemode` (Shoutrrr shows
 a title only in its HTML mode, escaping the body), and a Discord URL with
 `json=yes` receives the body unchanged.
 
+## Discord
+
+A Discord message arrives as one webhook request: the title is the embed
+title, and the body follows as embeds of whole lines (at most 2,000
+characters each, within Discord's 6,000-character message budget), so every
+line arrives exactly once and in order. TailState also passes
+`splitlines=no` unless the URL sets `splitlines`.
+
+The pinned Shoutrrr release defaults to `splitlines=yes`, which sends one
+embed per line in batches of ten, and its batching overwrites lines already
+queued: a message longer than ten lines loses its first lines and repeats
+later ones. A URL that sets `splitlines` keeps Shoutrrr's own behaviour; with
+`splitlines=yes` the Settings test and `doctor` (`discord_splitlines_forced`)
+warn about this. Remove the parameter, or set `splitlines=no`, to use
+TailState's line-preserving delivery. A URL with `json=yes` sends the body as
+a raw Discord payload, unchanged.
+
 ## Severity and routing
 
 Every change is classified with a built-in severity. The digest prefixes each

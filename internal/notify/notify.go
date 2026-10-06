@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/nicholas-fedor/shoutrrr"
+	"github.com/nicholas-fedor/shoutrrr/pkg/services/chat/discord"
 	"github.com/nicholas-fedor/shoutrrr/pkg/services/chat/matrix"
 	"github.com/nicholas-fedor/shoutrrr/pkg/types"
 
@@ -177,6 +178,8 @@ type messageSender interface {
 // router only injects a custom HTTP client after initialisation. Matrix is
 // therefore built directly with client in place first, so its login uses
 // TailState's bounded, redirect-rejecting transport like every other request.
+// Discord is also built directly, so its body can be sent as embeds of whole
+// lines (see newDiscordSender).
 func newSender(serviceURL string, client *http.Client, timeout time.Duration) (messageSender, error) {
 	if parsed, err := url.Parse(serviceURL); err == nil && parsed.Scheme == matrix.Scheme {
 		service := &matrix.Service{}
@@ -185,6 +188,8 @@ func newSender(serviceURL string, client *http.Client, timeout time.Duration) (m
 			return nil, fmt.Errorf("%s: %w", matrix.Scheme, err)
 		}
 		return matrixSender{service: service, timeout: timeout}, nil
+	} else if err == nil && parsed.Scheme == discord.Scheme {
+		return newDiscordSender(parsed, client, timeout)
 	}
 	return shoutrrr.CreateSenderWithOptions(types.SenderOptions{HTTPClient: client, Timeout: timeout}, serviceURL)
 }

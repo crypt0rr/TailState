@@ -80,8 +80,19 @@ func TestServiceParamAllowlistMatchesShoutrrrKeys(t *testing.T) {
 				t.Errorf("%s: parameter %q lists keys %v, Shoutrrr field has %v", scheme, param, keys, want)
 			}
 			// The value TailState passes must be accepted by the field.
-			if err := resolver.Set(keys[0], "TailState title"); err != nil {
-				t.Errorf("%s: setting %q failed: %v", scheme, keys[0], err)
+			value := "TailState title"
+			if fixed, ok := serviceDefaults[scheme][param]; ok {
+				value = fixed
+			}
+			if err := resolver.Set(keys[0], value); err != nil {
+				t.Errorf("%s: setting %q to %q failed: %v", scheme, keys[0], value, err)
+			}
+		}
+	}
+	for scheme, defaults := range serviceDefaults {
+		for param := range defaults {
+			if len(serviceParams[scheme][param]) == 0 {
+				t.Errorf("%s default %q is not on the allowlist", scheme, param)
 			}
 		}
 	}
@@ -317,7 +328,7 @@ func TestOperatorTitleInURLWins(t *testing.T) {
 		if prepared.Title != "" || prepared.Message() != prepared.Text || !strings.Contains(prepared.Text, "TailState test ·") {
 			t.Fatalf("%s prepared=%+v", serviceURL, prepared)
 		}
-		if params := parseDestination(serviceURL).params("TailState"); params != nil {
+		if params := parseDestination(serviceURL).params("TailState"); params != nil && ((*params)["title"] != "" || (*params)["subject"] != "") {
 			t.Fatalf("%s overrides the operator title: %v", serviceURL, *params)
 		}
 	}

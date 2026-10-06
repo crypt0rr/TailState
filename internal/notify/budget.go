@@ -17,7 +17,7 @@ var serviceMessageLimits = map[string]int{
 	"wecom":      4096,
 	"ntfy":       4096,
 	"rocketchat": 5000,
-	"discord":    6000, // Shoutrrr splits into 2000-byte chunks, 6000 bytes in total
+	"discord":    6000, // sent as embeds of at most 2000 characters, 6000 in total
 	"zulip":      10000,
 	"pushover":   1024,
 	"mattermost": 16383,

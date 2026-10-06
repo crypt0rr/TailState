@@ -14,6 +14,7 @@ rollback requires restoring the backup taken before the upgrade. See
 ## [Unreleased]
 
 ### Fixed
+- Discord notifications longer than 10 lines no longer lose their first lines and repeat later ones: the body is sent in one webhook request as embeds of whole lines, with `splitlines=no` unless the URL sets it. A URL that forces `splitlines=yes` keeps Shoutrrr's behaviour and is flagged by the Settings test and `doctor` (`discord_splitlines_forced`) (#227).
 - Notifications carry their title in the service's title field: email has a subject instead of none, Gotify and Pushbullet no longer show "Shoutrrr notification", and Discord, Slack, Teams, Telegram, ntfy, and Pushover show the title once instead of as the first body line. Only Shoutrrr parameters on a per-service allowlist derived from the pinned Shoutrrr release are passed, and a title set in the destination URL wins (#228).
 
 ## [0.15.0] - 2026-10-06

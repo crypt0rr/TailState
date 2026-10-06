@@ -353,6 +353,15 @@ func (s *Server) diagnosticReport(ctx context.Context, request *http.Request) di
 		runtime.Destinations = status.Destinations
 		runtime.EnabledDestinations = status.EnabledDestinations
 	}
+	if destinations, err := s.store.ListDestinations(ctx); err == nil {
+		urls := make([]string, 0, len(destinations))
+		for _, destination := range destinations {
+			if destination.Enabled {
+				urls = append(urls, destination.ServiceURL)
+			}
+		}
+		runtime.DiscordSplitLines = notify.CountSplitLinesWarnings(urls)
+	}
 	if metrics, err := s.store.StorageMetrics(ctx); err == nil {
 		limits := s.store.StorageLimits()
 		runtime.Storage = diagnostics.StorageRuntime{

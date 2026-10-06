@@ -13,6 +13,11 @@ rollback requires restoring the backup taken before the upgrade. See
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-10-06
+
+- **Schema:** 16 (migrates from 14 through 15)
+- **Rollback:** restore the pre-upgrade backup; older releases refuse a schema 16 database. New evidence exports use format v5, which older releases cannot verify (v3 and v4 packs still verify).
+
 ### Added
 - Change attribution from the Tailscale configuration audit log (`logs:configuration:read`, included in `all:read`): History, digests in every message format, `/api/v1/history`, and evidence packs (format version 5, signed in the ledger payload) name who made each change, or "actor unknown" without failing the batch. Only the actor, action, target, and time are stored, never the audit log's old/new values. A `403`/`404` degrades silently and shows as unsupported on the status page; lookups have a 10-second budget and are counted in `tailstate_attribution_lookups_total`. Schema 16 adds `events.attribution` and `event_batches.attribution_status`; version 3 and 4 packs still verify (#173).
 
@@ -109,7 +114,8 @@ Releases before 0.11.16 are described in their
 [GitHub release notes](https://github.com/crypt0rr/TailState/releases); their
 schema versions are listed in [UPGRADING.md](UPGRADING.md#schema-history).
 
-[Unreleased]: https://github.com/crypt0rr/TailState/compare/v0.13.0...HEAD
+[Unreleased]: https://github.com/crypt0rr/TailState/compare/v0.14.0...HEAD
+[0.14.0]: https://github.com/crypt0rr/TailState/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/crypt0rr/TailState/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/crypt0rr/TailState/compare/v0.11.16...v0.12.0
 [0.11.16]: https://github.com/crypt0rr/TailState/compare/v0.11.15...v0.11.16

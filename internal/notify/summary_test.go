@@ -30,10 +30,10 @@ func TestFleetRolloutCollapsesToOneSummaryLine(t *testing.T) {
 	if strings.Count(got, "updateAvailable") != 1 || !strings.Contains(got, "\n⚪ 📦 144 devices: `updateAvailable` `false` → `true`\n") {
 		t.Fatalf("rollout was not summarised in one line:\n%s", got)
 	}
-	if strings.Contains(got, "host\\-001") {
+	if strings.Contains(got, "host-001") {
 		t.Fatalf("summarised devices are still listed individually:\n%s", got)
 	}
-	if !strings.Contains(got, "**odd\\-one**") || !strings.Contains(got, "`name`: `a` → `b`") || !strings.Contains(got, "144 changed · 🟠 1 medium, ⚪ 143 low") {
+	if !strings.Contains(got, "**odd-one**") || !strings.Contains(got, "`name`: `a` → `b`") || !strings.Contains(got, "144 changed · 🟠 1 medium, ⚪ 143 low") {
 		t.Fatalf("remaining field or header counts were lost:\n%s", got)
 	}
 	// Below the threshold every device is listed.
@@ -57,7 +57,7 @@ func TestUpstreamFieldAdditionProducesOneSchemaChangeLine(t *testing.T) {
 		return out
 	}
 	got := Markdown(Context{}.Digest(DigestInput{ObservedAt: testObservedAt, Changes: keys(12), ResourceCounts: map[string]int{"keys": 12}}))
-	if strings.Count(got, "Upstream schema change") != 1 || !strings.Contains(got, "🟠 🧩 Upstream schema change: `audience` newly present on all 12 keys\n") || strings.Contains(got, "key\\-3") {
+	if strings.Count(got, "Upstream schema change") != 1 || !strings.Contains(got, "🟠 🧩 Upstream schema change: `audience` newly present on all 12 keys\n") || strings.Contains(got, "key-3") {
 		t.Fatalf("schema addition was not one line:\n%s", got)
 	}
 	removed := []model.Change{

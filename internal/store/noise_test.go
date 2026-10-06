@@ -39,7 +39,7 @@ func TestFleetRolloutSendsOneSummaryLineAndHistoryListsEveryDevice(t *testing.T)
 		t.Fatal(err)
 	}
 	payloads := pendingPayloads(t, st, batch.ID)
-	if len(payloads) != 1 || strings.Count(payloads[0], "updateAvailable") != 1 || !strings.Contains(payloads[0], fmt.Sprintf("📦 %d devices: `updateAvailable`", devices)) || strings.Contains(payloads[0], "host\\-a") {
+	if len(payloads) != 1 || strings.Count(payloads[0], "updateAvailable") != 1 || !strings.Contains(payloads[0], fmt.Sprintf("📦 %d devices: `updateAvailable`", devices)) || strings.Contains(payloads[0], "host-a") {
 		t.Fatalf("rollout digest is not one summary line: %q", payloads)
 	}
 	page, err := st.ListHistory(ctx, HistoryFilter{BatchID: batch.ID})
@@ -78,7 +78,7 @@ func TestUpstreamSchemaAdditionFixtureProducesOneLine(t *testing.T) {
 		t.Fatalf("schema batch=%+v err=%v", batch, err)
 	}
 	payloads := pendingPayloads(t, st, batch.ID)
-	if len(payloads) != 1 || strings.Count(payloads[0], "Upstream schema change") != 1 || !strings.Contains(payloads[0], "`audience` newly present on all 3 keys\n") || strings.Contains(payloads[0], "**key\\-1**") {
+	if len(payloads) != 1 || strings.Count(payloads[0], "Upstream schema change") != 1 || !strings.Contains(payloads[0], "`audience` newly present on all 3 keys\n") || strings.Contains(payloads[0], "**key-1**") {
 		t.Fatalf("schema addition digest: %q", payloads)
 	}
 }

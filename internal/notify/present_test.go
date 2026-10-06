@@ -60,7 +60,7 @@ func TestPresentedValuesAreGolden(t *testing.T) {
 		FormatMarkdown: "### 🔴 4 Tailscale changes (3 high) · example.com\n" +
 			"4 changed · 🔴 3 high, 🟠 1 medium\n" +
 			"\n" +
-			"🔴 ✏️ **web\\-02** (device) changed\n" +
+			"🔴 ✏️ **web-02** (device) changed\n" +
 			"  - `tags`: +`tag:db`, −`tag:old`\n" +
 			"  - `enabledRoutes`: +`10.1.0.0/24`\n" +
 			"  - `name`: `web-02` → `web-02b`\n" +

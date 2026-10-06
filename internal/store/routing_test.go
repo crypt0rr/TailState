@@ -81,7 +81,7 @@ func TestHighSeverityDestinationSkipsRoutineClientUpdates(t *testing.T) {
 	if _, paged := deliveries[pagerID]; paged || len(deliveries) != 1 {
 		t.Fatalf("client-version-only batch reached the high-severity destination: %v", deliveries)
 	}
-	if !strings.Contains(deliveries[defaultID], "⚪ ✏️ **host\\-a**") || !strings.Contains(deliveries[defaultID], "(device) changed") {
+	if !strings.Contains(deliveries[defaultID], "⚪ ✏️ **host-a**") || !strings.Contains(deliveries[defaultID], "(device) changed") {
 		t.Fatalf("default digest does not show the low severity:\n%s", deliveries[defaultID])
 	}
 	retag, err := st.ApplyBatchWithBatch(ctx, generation, []model.Collected{deviceFleet(func(index int) map[string]any {

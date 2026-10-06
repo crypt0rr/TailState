@@ -85,7 +85,7 @@ func TestRevokedCredentialsSendOneGroupedHealthMessagePerDestination(t *testing.
 		t.Fatalf("revocation queued %d messages for %d destinations, want one per destination: %q", len(payloads), len(perDestination), payloads)
 	}
 	for _, payload := range payloads {
-		for _, want := range []string{"collectors unhealthy", "lab \\(default tailnet\\)", "`devices`: auth rejected", "`users`: auth rejected", "`dns`: auth rejected", "Observed at ", "https://tailstate.example/status"} {
+		for _, want := range []string{"collectors unhealthy", "lab (default tailnet)", "`devices`: auth rejected", "`users`: auth rejected", "`dns`: auth rejected", "Observed at ", "https://tailstate.example/status"} {
 			if !strings.Contains(payload, want) {
 				t.Fatalf("grouped health message missing %q:\n%s", want, payload)
 			}

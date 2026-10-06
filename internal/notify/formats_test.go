@@ -25,12 +25,12 @@ func goldenDigest() Message {
 // one digest (E-019 golden tests).
 func TestRenderedFormatsAreGolden(t *testing.T) {
 	golden := map[string]string{
-		FormatMarkdown: "### 🔴 2 Tailscale changes (1 high) · lab \\(example.com\\)\n" +
+		FormatMarkdown: "### 🔴 2 Tailscale changes (1 high) · lab (example.com)\n" +
 			"1 created, 1 changed · 🔴 1 high, 🟠 1 medium\n" +
 			"\n" +
 			"🔴 ✏️ **alice** (user) changed\n" +
 			"  - `role`: `member` → `admin`\n" +
-			"🟠 ➕ **web\\_\\*1\\*\\<\\!channel\\>** (device) created\n" +
+			"🟠 ➕ **web\\_\\*1\\*\\<!channel>** (device) created\n" +
 			"\n" +
 			"1 muted change not shown · 5 Oct 2026 12:00 UTC · [Batch 42 in History](https://tailstate.example/history?batch=42)",
 		FormatSlack: "*🔴 2 Tailscale changes (1 high) · lab (example.com)*\n" +

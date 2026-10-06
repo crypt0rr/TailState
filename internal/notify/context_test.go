@@ -22,7 +22,7 @@ func TestEveryNotificationIncludesTailnetAndObservedTime(t *testing.T) {
 	for name, message := range cases {
 		rendered := Markdown(message)
 		title, _, _ := strings.Cut(rendered, "\n")
-		if !strings.Contains(title, `prod\-eu \(example.com\)`) {
+		if !strings.Contains(title, "prod-eu (example.com)") {
 			t.Fatalf("%s title does not name the instance and tailnet: %q", name, title)
 		}
 		// Digests state the time on their closing context line, every other

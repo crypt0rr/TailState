@@ -394,35 +394,34 @@ func (c Context) ExpiryWarning(windowDays int, lines []ExpiryLine, observedAt ti
 	return message
 }
 
-// escape makes value inert in bold and prose Markdown contexts. It must not
-// be used inside a code span: CommonMark does not process backslash escapes
-// there, so every escape would be shown literally. Use escapeCode instead.
+// markdownInline escapes the characters that can change the meaning of text
+// in an inline Markdown position: the emphasis delimiters * and _, the link
+// delimiters [ and ], the code and HTML characters ` and <, the backslash
+// itself, and ~ and | for the strike-through and table extensions. Other
+// punctuation (# + - > ! digits) only has meaning at the start of a line or
+// right after a ], and a tenant value never starts a line: every title and
+// line begins with trusted text written by TailState.
+var markdownInline = strings.NewReplacer(
+	"\\", "\\\\",
+	"*", "\\*",
+	"_", "\\_",
+	"[", "\\[",
+	"]", "\\]",
+	"`", "\\`",
+	"<", "\\<",
+	"~", "\\~",
+	"|", "\\|",
+)
+
+// escape makes value inert in bold and prose Markdown contexts, so names,
+// e-mail addresses, and labels keep their hyphens, dots, and parentheses
+// without backslashes. Control characters become spaces, and the value is
+// bounded before it is escaped, so an escape is never cut in half. It must
+// not be used inside a code span: CommonMark does not process backslash
+// escapes there, so every escape would be shown literally. Use escapeCode
+// instead.
 func escape(value string) string {
-	value = stripControl(value)
-	// Escape Markdown syntax that can change links, emphasis, headings, HTML,
-	// or block structure. Backticks are rendered as apostrophes so a value
-	// cannot open a code span that swallows the rest of the line.
-	value = strings.NewReplacer(
-		"\\", "\\\\",
-		"`", "'",
-		"*", "\\*",
-		"_", "\\_",
-		"[", "\\[",
-		"]", "\\]",
-		"(", "\\(",
-		")", "\\)",
-		"#", "\\#",
-		"+", "\\+",
-		"-", "\\-",
-		"!", "\\!",
-		"{", "\\{",
-		"}", "\\}",
-		"<", "\\<",
-		"|", "\\|",
-		"~", "\\~",
-		">", "\\>",
-	).Replace(value)
-	return truncate(value, 256)
+	return markdownInline.Replace(truncate(stripControl(value), 256))
 }
 
 // escapeCode makes value safe inside a single-backtick code span. Code span

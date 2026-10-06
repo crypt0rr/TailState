@@ -99,7 +99,7 @@ The same digest per service:
 | Discord | Embed title | Markdown in one embed (`**bob@example.com** (user) changed`, `` `role`: `member` → `admin` ``) |
 | Microsoft Teams | Card heading | Markdown, one text block per line |
 | Slack | Header block and preview text | Slack mrkdwn in one section (`*bob@example.com*`, links as `<url\|label>`) |
-| Mattermost, Rocket.Chat, Zulip, generic webhooks | `### 🔴 19 Tailscale changes (5 high) · prod \(example.com\)` heading line | Markdown |
+| Mattermost, Rocket.Chat, Zulip, generic webhooks | `### 🔴 19 Tailscale changes (5 high) · prod (example.com)` heading line | Markdown |
 | Matrix, Signal, other plain-text services | First line | Plain text as above |
 
 ## How values are shown
@@ -121,6 +121,28 @@ them this way, and every value stays escaped for the destination's format.
 
 Fleet summaries use the same presentation, for example
 "🔴 📦 6 devices: `tags` +`tag:db`".
+
+## Escaping
+
+Resource names, field values, tags, actors, the instance label, and the
+tailnet are tenant- or operator-controlled, so every renderer escapes them
+for its format, and control characters and Unicode line separators always
+become spaces. Every line of a notification starts with text TailState
+writes itself (an icon, a label, or a list marker), so a value can never
+start a heading, quote, or list; a test checks this for generated values in
+every message type and format.
+
+- **Markdown:** values in names, prose, titles, and link labels escape only
+  the characters that change inline meaning: `*` and `_` (emphasis), `[` and
+  `]` (links and images), `` ` `` and `<` (code, HTML, and autolinks), `\`,
+  and `~` and `|` (strike-through and tables). Hyphens, dots, parentheses,
+  and `#` keep their form, so `prod-monitor (example.com)`, `ci-runner auth
+  key`, and e-mail addresses read and copy without backslashes. Values in
+  code spans are shown verbatim, with backticks replaced by apostrophes.
+- **Slack:** `&`, `<`, and `>` become entities, so a value cannot mention a
+  channel or create a link, and `*`, `~`, and `` ` `` in values are replaced
+  by look-alike characters.
+- **Plain text:** values are shown as they are.
 
 ## Titles
 

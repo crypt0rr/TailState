@@ -62,11 +62,11 @@ var sampleBaselineBytes = []map[string]int{
 // least 25% smaller than before.
 func TestAssessmentSampleIsGolden(t *testing.T) {
 	golden := map[string]string{
-		FormatMarkdown: "### 🔴 19 Tailscale changes (5 high) · prod \\(example.com\\)\n" +
+		FormatMarkdown: "### 🔴 19 Tailscale changes (5 high) · prod (example.com)\n" +
 			"2 created, 17 changed · 🔴 5 high, 🟠 2 medium, ⚪ 12 low\n" +
 			"Attributed: 4 of 19 changes\n" +
 			"\n" +
-			"🔴 ✏️ **web\\-02** (device) changed by ci\\-bot \\[api key\\]\n" +
+			"🔴 ✏️ **web-02** (device) changed by ci-bot \\[api key\\]\n" +
 			"  - `tags`: +`tag:db`\n" +
 			"🔴 ➕ **kAbc123CNTRL** (key) created by alice@example.com\n" +
 			"🔴 ✏️ **Tailnet policy** changed by alice@example.com\n" +
@@ -76,7 +76,7 @@ func TestAssessmentSampleIsGolden(t *testing.T) {
 			"  - `role`: `member` → `admin`\n" +
 			"🔴 ✏️ **SIEM webhook** (webhook) changed\n" +
 			"  - `endpointUrl`: secret changed (fingerprint `aa11bb22` → `99887766`)\n" +
-			"🟠 ➕ **laptop\\-new** (device) created\n" +
+			"🟠 ➕ **laptop-new** (device) created\n" +
 			"🟠 ✏️ **DNS configuration** changed\n" +
 			"  - `searchPaths`: now `example.com`, `corp.example.com`\n" +
 			"⚪ 📦 12 devices: `clientVersion` `1.80.2` → `1.82.1`\n" +

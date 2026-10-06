@@ -20,7 +20,7 @@ func TestDigestRendersEscapedChangesAndCounts(t *testing.T) {
 		"### 🔴 3 Tailscale changes (1 high)",
 		"1 created, 1 changed, 1 removed · 🔴 1 high, 🟠 2 medium",
 		"new server",
-		"de'vices",
+		"(de\\`vices)",
 		"`role`: `viewer` → `admin`",
 	} {
 		if !strings.Contains(message, want) {
@@ -61,7 +61,7 @@ func TestHealthAndUpdateMessagesEscapeInput(t *testing.T) {
 		t.Fatalf("device name retained active Markdown: %s", got)
 	}
 	got = digestText([]model.Change{{Kind: "created", Collector: "devices", Name: "!<img src=x> a+b-c"}})
-	if strings.Contains(got, "!<img src=x>") || !strings.Contains(got, `\!\<img src=x\>`) {
+	if strings.Contains(got, "!<img src=x>") || !strings.Contains(got, `!\<img src=x> a+b-c`) {
 		t.Fatalf("device name retained HTML or image syntax: %s", got)
 	}
 	got = digestText([]model.Change{{Kind: "created", Collector: "devices", Name: "prod\x00\x07\tserver"}})
@@ -107,8 +107,9 @@ func TestCodeSpansRenderValuesWithoutMarkdownEscapes(t *testing.T) {
 	for _, want := range []string{
 		"  - `last_seen`: `2026-10-05T12:00:00Z` → `2026-10-05T13:00:00Z`\n",
 		"  - `tags`: +`tag:#ops`",
-		// Bold and prose contexts keep their Markdown escapes.
-		"🟠 ✏️ **db\\-1** (device) changed\n",
+		// Bold and prose contexts escape only inline syntax, so ordinary
+		// names keep their hyphens without backslashes.
+		"🟠 ✏️ **db-1** (device) changed\n",
 	} {
 		if !strings.Contains(digest, want) {
 			t.Fatalf("digest missing %q:\n%s", want, digest)

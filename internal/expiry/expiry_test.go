@@ -213,7 +213,7 @@ func TestUpcomingHorizonAndMessage(t *testing.T) {
 		t.Fatalf("days left=%d/%d", upcoming[0].DaysLeft(testNow), items[0].DaysLeft(testNow))
 	}
 	message := notify.Markdown(Message(notify.Context{Label: "lab", Tailnet: "example.com", PublicURL: "https://tailstate.example"}, Warning{WindowDays: 3, Items: upcoming[:1]}, testNow))
-	for _, want := range []string{"within 3 days · lab \\(example.com\\)", "Device node key", "`tag:a, tag:b`", "7 Oct 2026 12:00 UTC", "2 days left", "Observed at 5 Oct 2026 12:00 UTC", "(https://tailstate.example/status)"} {
+	for _, want := range []string{"within 3 days · lab (example.com)", "Device node key", "`tag:a, tag:b`", "7 Oct 2026 12:00 UTC", "2 days left", "Observed at 5 Oct 2026 12:00 UTC", "(https://tailstate.example/status)"} {
 		if !strings.Contains(message, want) {
 			t.Fatalf("message missing %q:\n%s", want, message)
 		}

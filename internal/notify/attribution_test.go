@@ -21,7 +21,7 @@ func TestDigestNamesActorInEveryRenderer(t *testing.T) {
 	}
 	attributed := Context{Tailnet: "example.com"}.Digest(DigestInput{BatchID: 1, ObservedAt: testObservedAt, Changes: changes, Attributed: true})
 	for format, want := range map[string][]string{
-		FormatMarkdown: {"\nAttributed: 1 of 2 changes\n", "**db\\-01** (device) changed by alice@example.com \\(\\<\\!channel\\> \\*Alice\\*\\) via admin console\n", "**web\\-01** (device) changed\n"},
+		FormatMarkdown: {"\nAttributed: 1 of 2 changes\n", "**db-01** (device) changed by alice@example.com (\\<!channel> \\*Alice\\*) via admin console\n", "**web-01** (device) changed\n"},
 		FormatSlack:    {"\nAttributed: 1 of 2 changes\n", "*db-01* (device) changed by alice@example.com (&lt;!channel&gt; ∗Alice∗) via admin console\n", "*web-01* (device) changed\n"},
 		FormatPlain:    {"\nAttributed: 1 of 2 changes\n", "db-01 (device) changed by alice@example.com (<!channel> *Alice*) via admin console\n", "web-01 (device) changed\n"},
 	} {

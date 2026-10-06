@@ -146,6 +146,11 @@ func TestAdminResetSucceedsWhileServeWrites(t *testing.T) {
 				servingErr = err
 				return
 			}
+			// SQLite's busy handler sleeps and is not fair: a writer that
+			// re-acquires the lock in a zero-pause loop can starve the admin
+			// command past busy_timeout on a loaded machine, which no real
+			// serving workload does. A short pause keeps the writers interleaved.
+			time.Sleep(time.Millisecond)
 		}
 	}()
 	deadline := time.Now().Add(time.Second)

@@ -224,6 +224,61 @@ func TestForwardedClientAddressRequiresTrustedProxy(t *testing.T) {
 	}
 }
 
+func TestForwardedClientAddressHandlesMalformedAndTrustedChains(t *testing.T) {
+	server, _, _ := testServer(t)
+	server.config.TrustedProxies = []netip.Prefix{
+		netip.MustParsePrefix("192.0.2.0/24"),
+		netip.MustParsePrefix("2001:db8:1::/48"),
+	}
+	tests := []struct {
+		name       string
+		remoteAddr string
+		forwarded  string
+		want       string
+	}{
+		{name: "empty header", remoteAddr: "192.0.2.10:1234", want: "192.0.2.10"},
+		{name: "malformed only", remoteAddr: "192.0.2.10:1234", forwarded: "unknown, 999.1.1.1", want: "192.0.2.10"},
+		{name: "skip malformed and trusted hops", remoteAddr: "192.0.2.10:1234", forwarded: "198.51.100.8, unknown, 192.0.2.9", want: "198.51.100.8"},
+		{name: "nearest untrusted hop", remoteAddr: "192.0.2.10:1234", forwarded: "198.51.100.8, 203.0.113.9, 192.0.2.9", want: "203.0.113.9"},
+		{name: "all trusted hops", remoteAddr: "192.0.2.10:1234", forwarded: "192.0.2.8, 2001:db8:1::9", want: "192.0.2.8"},
+		{name: "IPv6 client behind trusted proxy", remoteAddr: "192.0.2.10:1234", forwarded: "2001:db8:2::8, 2001:db8:1::9", want: "2001:db8:2::8"},
+		{name: "untrusted peer ignores header", remoteAddr: "203.0.113.10:1234", forwarded: "198.51.100.8", want: "203.0.113.10"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodPost, "/login", nil)
+			request.RemoteAddr = tc.remoteAddr
+			request.Header.Set("X-Forwarded-For", tc.forwarded)
+			if got := server.clientIP(request); got != tc.want {
+				t.Fatalf("clientIP=%q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestTrustedProxyLoginThrottleAggregatesForwardedClient(t *testing.T) {
+	server, _, token := testServer(t)
+	claimCoverageAdmin(t, server, token)
+	server.config.TrustedProxies = []netip.Prefix{netip.MustParsePrefix("192.0.2.0/24")}
+	post := func(proxy string) *httptest.ResponseRecorder {
+		headers := make(http.Header)
+		headers.Set("X-Forwarded-For", "198.51.100.8")
+		return coverageCredentialPost(t, server, "/login", url.Values{"password": {"wrong password"}}, nil, "", proxy, headers)
+	}
+	for i := 0; i < loginFailuresPerClient; i++ {
+		proxy := "192.0.2.10:1234"
+		if i%2 == 1 {
+			proxy = "192.0.2.11:1234"
+		}
+		if response := post(proxy); response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "Invalid password") {
+			t.Fatalf("proxied login failure %d status=%d body=%s", i+1, response.Code, response.Body.String())
+		}
+	}
+	if response := post("192.0.2.12:1234"); response.Code != http.StatusTooManyRequests {
+		t.Fatalf("same forwarded client escaped login throttle through another proxy: status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
 func TestLoginRejectsWhenAuthenticationCapacityIsExhausted(t *testing.T) {
 	server, _, token := testServer(t)
 	claim := url.Values{"token": {token}, "password": {"a secure password"}, "confirm": {"a secure password"}}

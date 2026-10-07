@@ -133,6 +133,95 @@ func TestRekeyRollsBackWhenAnEncryptedValueIsCorrupt(t *testing.T) {
 	}
 }
 
+func TestRekeyRollsBackWhenDestinationWriteFails(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "tailstate.db")
+	oldBox, err := secret.NewBox([]byte(strings.Repeat("f", 32)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err := Open(path, oldBox)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.SaveSettings(ctx, settings()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.SaveDestination(ctx, NotificationDestination{Name: "secondary", ServiceURL: "generic://notify.example/secret-path", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	keyID, err := st.EvidenceSigningKeyID(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.db.ExecContext(ctx, `CREATE TRIGGER fail_secondary_destination_rekey
+		BEFORE UPDATE OF service_url_enc ON notification_destinations
+		WHEN NEW.name='secondary'
+		BEGIN SELECT RAISE(ABORT,'destination rotation failed'); END`); err != nil {
+		t.Fatal(err)
+	}
+	newBox, err := secret.NewBox([]byte(strings.Repeat("g", 32)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Rekey(ctx, newBox); err == nil || !strings.Contains(err.Error(), "destination rotation failed") {
+		t.Fatalf("rekey error=%v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := Open(path, newBox); err == nil || !strings.Contains(err.Error(), "master key") {
+		t.Fatal("new master key opened database after a rolled-back destination update")
+	}
+	reopened, err := Open(path, oldBox)
+	if err != nil {
+		t.Fatalf("original master key could not open database after rollback: %v", err)
+	}
+	gotSettings, err := reopened.Settings(ctx)
+	if err != nil || gotSettings.OAuthClientSecret != "secret" {
+		reopened.Close()
+		t.Fatalf("settings after rollback=%#v err=%v", gotSettings, err)
+	}
+	destinations, err := reopened.ListDestinations(ctx)
+	if err != nil {
+		reopened.Close()
+		t.Fatalf("destinations after rollback: %v", err)
+	}
+	found := false
+	for _, destination := range destinations {
+		if destination.Name == "secondary" && destination.ServiceURL == "generic://notify.example/secret-path" {
+			found = true
+		}
+	}
+	if !found {
+		reopened.Close()
+		t.Fatalf("original destination was not preserved after rollback: %+v", destinations)
+	}
+	if got, err := reopened.EvidenceSigningKeyID(ctx); err != nil || got != keyID {
+		reopened.Close()
+		t.Fatalf("evidence identity after rollback=%q/%v, want %q", got, err, keyID)
+	}
+	if _, err := reopened.db.ExecContext(ctx, "DROP TRIGGER fail_secondary_destination_rekey"); err != nil {
+		reopened.Close()
+		t.Fatal(err)
+	}
+	if err := reopened.Rekey(ctx, newBox); err != nil {
+		reopened.Close()
+		t.Fatalf("rekey retry after removing injected failure: %v", err)
+	}
+	if err := reopened.Close(); err != nil {
+		t.Fatal(err)
+	}
+	verified, err := Open(path, newBox)
+	if err != nil {
+		t.Fatalf("new master key could not open database after retry: %v", err)
+	}
+	if err := verified.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestRekeyFailureLeavesOriginalDatabaseUsable(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "tailstate.db")

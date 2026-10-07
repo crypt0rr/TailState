@@ -24,12 +24,9 @@ var errDiscordTimeout = errors.New("discord: service send timeout")
 // discordSender sends to a directly constructed Shoutrrr Discord service.
 //
 // By default the body is sent as embeds of whole lines that TailState
-// partitions itself, all in one webhook request. Shoutrrr's own partitioning
-// either splits a line between two embeds at the nearest space
-// (splitlines=no) or, with its default splitlines=yes, loses and repeats
-// lines of messages longer than ten lines (see serviceDefaults). An operator
-// who set splitlines in the URL keeps Shoutrrr's behaviour, and JSON mode
-// sends the body as is.
+// partitions itself, all in one webhook request. An operator who sets
+// splitlines in the URL keeps Shoutrrr's behavior, including its own
+// message partitioning, and JSON mode sends the body as is.
 type discordSender struct {
 	service *discord.Service
 	timeout time.Duration

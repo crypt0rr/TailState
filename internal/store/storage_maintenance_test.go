@@ -437,6 +437,10 @@ func TestCompactLeavesDatabaseIntactOnFailure(t *testing.T) {
 	if err := other.QueryRow("SELECT COUNT(*) FROM meta").Scan(&count); err != nil {
 		t.Fatal(err)
 	}
+	var setupTokenHash string
+	if err := other.QueryRow("SELECT value FROM meta WHERE key='setup_token_hash'").Scan(&setupTokenHash); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := Compact(ctx, path, box, CompactOptions{}); err == nil || !strings.Contains(err.Error(), "still open") {
 		t.Fatalf("compact with another open connection err=%v", err)
 	}
@@ -458,5 +462,26 @@ func TestCompactLeavesDatabaseIntactOnFailure(t *testing.T) {
 	}
 	if err := st.Close(); err != nil {
 		t.Fatal(err)
+	}
+	compactBeforeReplace = nil
+	retry, err := Compact(ctx, path, box, CompactOptions{})
+	if err != nil {
+		t.Fatalf("compact after an injected replacement failure: %v", err)
+	}
+	if retry.PagesAfter == 0 {
+		t.Fatalf("successful retry returned no database pages: %+v", retry)
+	}
+	st, err = OpenExisting(path, box)
+	if err != nil {
+		t.Fatalf("database unusable after a successful retry: %v", err)
+	}
+	defer st.Close()
+	var after int
+	if err := st.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM meta").Scan(&after); err != nil || after != count {
+		t.Fatalf("meta rows after failed compaction and retry=%d, want %d (err=%v)", after, count, err)
+	}
+	var afterSetupTokenHash string
+	if err := st.db.QueryRowContext(ctx, "SELECT value FROM meta WHERE key='setup_token_hash'").Scan(&afterSetupTokenHash); err != nil || afterSetupTokenHash != setupTokenHash {
+		t.Fatalf("setup-token hash after failed compaction and retry=%q, want original value (err=%v)", afterSetupTokenHash, err)
 	}
 }

@@ -223,14 +223,10 @@ characters each, within Discord's 6,000-character message budget), so every
 line arrives exactly once and in order. TailState also passes
 `splitlines=no` unless the URL sets `splitlines`.
 
-The pinned Shoutrrr release defaults to `splitlines=yes`, which sends one
-embed per line in batches of ten, and its batching overwrites lines already
-queued: a message longer than ten lines loses its first lines and repeats
-later ones. A URL that sets `splitlines` keeps Shoutrrr's own behaviour; with
-`splitlines=yes` the Settings test and `doctor` (`discord_splitlines_forced`)
-warn about this. Remove the parameter, or set `splitlines=no`, to use
-TailState's line-preserving delivery. A URL with `json=yes` sends the body as
-a raw Discord payload, unchanged.
+Shoutrrr's `splitlines=yes` mode preserves long messages, including when the
+URL explicitly sets that value. TailState continues to send whole-line embeds
+by default unless the URL sets `splitlines`. A URL with `json=yes` sends the
+body as a raw Discord payload, unchanged.
 
 ## Slack
 

@@ -283,9 +283,6 @@ func doctor(args []string) error {
 		runtime.BaselineReason = status.BaselineReason
 		runtime.Destinations = status.Destinations
 		runtime.EnabledDestinations = status.EnabledDestinations
-		if urls, urlErr := st.EnabledDestinationURLs(context.Background()); urlErr == nil {
-			runtime.DiscordSplitLines = notify.CountSplitLinesWarnings(urls)
-		}
 	}
 	if storage, storageErr := st.StorageMetrics(context.Background()); storageErr == nil {
 		runtime.Storage.DatabaseLimitBytes = storage.DatabaseLimitBytes

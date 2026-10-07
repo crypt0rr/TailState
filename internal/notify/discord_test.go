@@ -46,8 +46,7 @@ func discordDelivery(t *testing.T, requests []captured) (string, []string) {
 // notification longer than ten lines reaches Discord with every line exactly
 // once and in order, in a single webhook request when it fits the budget,
 // and with the title in the embed title instead of a heading line.
-// Shoutrrr's default splitlines=yes lost the first lines of such messages
-// and repeated later ones.
+// TailState sends whole-line embeds for its default Discord delivery.
 func TestDiscordDeliversEveryLineExactlyOnce(t *testing.T) {
 	lines := make([]Line, 0, 25)
 	want := make([]string, 0, 25)
@@ -108,71 +107,39 @@ func TestDiscordOversizedDigestIsOneRequest(t *testing.T) {
 	}
 }
 
-// TestDiscordSplitLinesParameter covers R-046's operator control: TailState
-// sends splitlines=no unless the URL sets it, and a forced splitlines=yes is
-// kept but warned about.
+// TestDiscordSplitLinesParameter preserves the operator's explicit setting
+// and checks Shoutrrr's splitlines=yes delivery with a long message.
 func TestDiscordSplitLinesParameter(t *testing.T) {
 	if params := parseDestination(discordURL).params(Prepared{}); params == nil || (*params)["splitlines"] != "no" {
 		t.Fatalf("default params=%v", params)
 	}
-	for serviceURL, warn := range map[string]bool{
-		discordURL + "?splitlines=yes":           true,
-		discordURL + "?SplitLines=Y":             true,
-		discordURL + "?splitlines=true&json=yes": false,
-		discordURL + "?splitlines=no":            false,
-		discordURL + "?splitlines=0":             false,
+	for _, serviceURL := range []string{
+		discordURL + "?splitlines=yes",
+		discordURL + "?SplitLines=Y",
+		discordURL + "?splitlines=true&json=yes",
+		discordURL + "?splitlines=no",
+		discordURL + "?splitlines=0",
 	} {
 		if params := parseDestination(serviceURL).params(Prepared{Title: "title"}); params != nil {
 			if _, set := (*params)["splitlines"]; set {
 				t.Fatalf("%s: operator splitlines overridden: %v", serviceURL, *params)
 			}
 		}
-		if got := SplitLinesWarning(serviceURL) != ""; got != warn {
-			t.Fatalf("%s warning=%t, want %t", serviceURL, got, warn)
-		}
 	}
-	for _, serviceURL := range []string{discordURL, slackURL, "generic://example.com/hook?splitlines=yes"} {
-		if warning := SplitLinesWarning(serviceURL); warning != "" {
-			t.Fatalf("%s warned: %s", serviceURL, warning)
-		}
-	}
-	if got := CountSplitLinesWarnings([]string{discordURL, discordURL + "?splitlines=yes", slackURL}); got != 1 {
-		t.Fatalf("count=%d", got)
-	}
-	if warning := SplitLinesWarning(discordURL + "?splitlines=yes"); strings.Contains(warning, "token") || strings.Contains(warning, "123456789") {
-		t.Fatalf("warning names the URL: %s", warning)
-	}
-	// An operator's splitlines=yes is passed through to Shoutrrr unchanged.
+	// An operator's splitlines=yes is passed to Shoutrrr unchanged. The
+	// dependency fix must preserve every line across its ten-item batches.
 	mock := &mockProviders{}
 	serviceURL := discordURL + "?splitlines=yes"
-	if err := senderWithTransport(mock).SendPrepared(context.Background(), serviceURL, PrepareMessage(Context{}.Test(testObservedAt), serviceURL, "")); err != nil {
+	want := make([]string, 25)
+	for i := range want {
+		want[i] = fmt.Sprintf("line-%02d", i+1)
+	}
+	prepared := Prepared{Title: "25-line digest", Body: strings.Join(want, "\n")}
+	if err := senderWithTransport(mock).SendPrepared(context.Background(), serviceURL, prepared); err != nil {
 		t.Fatal(err)
 	}
-	if _, got := discordDelivery(t, mock.all()); len(got) < 3 {
-		t.Fatalf("splitlines=yes did not send one embed per line: %q", got)
-	}
-}
-
-// TestShoutrrrDiscordSplitLinesStillCorruptsLongMessages pins the upstream
-// defect TailState works around. When a Shoutrrr update fixes
-// util.MessageItemsFromLines, this test fails: then drop SplitLinesWarning,
-// its diagnostics finding, and the note in docs/notifications.md.
-func TestShoutrrrDiscordSplitLinesStillCorruptsLongMessages(t *testing.T) {
-	lines := make([]string, 0, 25)
-	for i := 1; i <= 25; i++ {
-		lines = append(lines, fmt.Sprintf("line-%02d", i))
-	}
-	var got []string
-	for _, batch := range discord.CreateItemsFromPlain(strings.Join(lines, "\n"), true) {
-		for _, item := range batch {
-			got = append(got, item.Text)
-		}
-	}
-	if slices.Equal(got, lines) {
-		t.Fatal("Shoutrrr's splitlines=yes now delivers every line once; remove the splitlines warning")
-	}
-	if !slices.Equal(got[:5], lines[20:25]) || slices.Contains(got, "line-01") {
-		t.Fatalf("the upstream corruption changed shape: %q", got)
+	if title, got := discordDelivery(t, mock.all()); title != prepared.Title || !slices.Equal(got, want) {
+		t.Fatalf("splitlines=yes delivery title=%q lines=%q, want title=%q and every line once", title, got, prepared.Title)
 	}
 }
 

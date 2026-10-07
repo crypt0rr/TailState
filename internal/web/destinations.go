@@ -186,18 +186,8 @@ func (s *Server) destinationPost(w http.ResponseWriter, r *http.Request) {
 		testCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 		defer cancel()
 		message := notify.PrepareMessage(s.notificationContext(ctx).Test(time.Now()), serviceURL, override)
-		// The short test message arrives intact even with Discord's
-		// splitlines=yes, so the warning is shown whatever the outcome.
-		warning := notify.SplitLinesWarning(serviceURL)
-		if warning != "" {
-			warning = ". Warning: " + warning
-		}
 		if err := s.destinationTester.SendPrepared(testCtx, serviceURL, message); err != nil {
-			s.redirectWithFlash(w, r, "/settings", flashKindError, "Notification test failed: "+notify.SafeTestError(err, serviceURL)+warning)
-			return
-		}
-		if warning != "" {
-			s.redirectWithFlash(w, r, "/settings", flashKindError, "Notification test sent"+warning)
+			s.redirectWithFlash(w, r, "/settings", flashKindError, "Notification test failed: "+notify.SafeTestError(err, serviceURL))
 			return
 		}
 		s.redirectWithFlash(w, r, "/settings", flashKindSuccess, "Notification test sent.")

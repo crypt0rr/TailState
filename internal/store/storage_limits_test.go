@@ -214,6 +214,57 @@ func TestSchemaV11ToV12ResumesAfterAChunkFailure(t *testing.T) {
 	if migrated != migrationChunkSize+1 {
 		t.Fatalf("resumed snapshot rows=%d, want %d", migrated, migrationChunkSize+1)
 	}
+	var progressRows int
+	if err := db.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='schema_migration_progress'").Scan(&progressRows); err != nil || progressRows != 0 {
+		t.Fatalf("completed migration progress tables=%d, want 0 (err=%v)", progressRows, err)
+	}
+}
+
+func TestSchemaV11ToV12ResumesAfterAnEventChunkFailure(t *testing.T) {
+	db := currentSchemaMigrationDB(t, 11)
+	for i := 0; i < migrationChunkSize+1; i++ {
+		if _, err := db.Exec(`INSERT INTO events(generation,observed_at,collector,event_type,resource_id,name,changes_json,before_json,after_json)
+VALUES(1,'2026-01-01T00:00:00Z','devices','changed',?,'server','{}','{"hostname":"old"}','{"hostname":"new"}')`, "device-"+strconv.Itoa(i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := db.Exec("CREATE TRIGGER fail_second_event_chunk BEFORE UPDATE OF before_hash ON events WHEN NEW.id=" + strconv.Itoa(migrationChunkSize+1) + " BEGIN SELECT RAISE(ABORT,'pause event migration'); END"); err != nil {
+		t.Fatal(err)
+	}
+	if err := migrateSchemaV11ToV12(db); err == nil || !strings.Contains(err.Error(), "backfill event snapshot metadata") {
+		t.Fatalf("first migration error=%v", err)
+	}
+	var migrated int
+	if err := db.QueryRow("SELECT COUNT(*) FROM events WHERE before_hash<>'' AND after_hash<>''").Scan(&migrated); err != nil {
+		t.Fatal(err)
+	}
+	if migrated != migrationChunkSize {
+		t.Fatalf("completed event rows=%d, want %d", migrated, migrationChunkSize)
+	}
+	var phase string
+	var cursor int64
+	if err := db.QueryRow("SELECT phase,cursor FROM schema_migration_progress WHERE migration=?", boundedHistoryMigration).Scan(&phase, &cursor); err != nil {
+		t.Fatal(err)
+	}
+	if phase != "events" || cursor != migrationChunkSize {
+		t.Fatalf("persisted migration progress=%q/%d, want events/%d", phase, cursor, migrationChunkSize)
+	}
+	if _, err := db.Exec("DROP TRIGGER fail_second_event_chunk"); err != nil {
+		t.Fatal(err)
+	}
+	if err := migrateSchemaV11ToV12(db); err != nil {
+		t.Fatal(err)
+	}
+	var version, progressRows int
+	if err := db.QueryRow("SELECT version FROM schema_version").Scan(&version); err != nil || version != 12 {
+		t.Fatalf("schema version=%d err=%v", version, err)
+	}
+	if err := db.QueryRow("SELECT COUNT(*) FROM events WHERE before_hash<>'' AND after_hash<>''").Scan(&migrated); err != nil || migrated != migrationChunkSize+1 {
+		t.Fatalf("resumed event rows=%d, want %d (err=%v)", migrated, migrationChunkSize+1, err)
+	}
+	if err := db.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='schema_migration_progress'").Scan(&progressRows); err != nil || progressRows != 0 {
+		t.Fatalf("completed migration progress tables=%d, want 0 (err=%v)", progressRows, err)
+	}
 }
 
 func TestBoundedSnapshotsRetainHashAndTruncationMetadata(t *testing.T) {

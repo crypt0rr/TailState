@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1.27.1
+# syntax=docker/dockerfile:1.28.0
 # Keep this compiler aligned with the `go` directive in go.mod. CI checks the
 # two declarations so the tested and published binaries use the same toolchain.
 # The builder runs on the build host's native platform and cross-compiles the

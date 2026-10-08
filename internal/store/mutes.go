@@ -203,11 +203,14 @@ func compactPath(path string) string {
 }
 
 // fieldMuted reports whether a field path is covered by a field rule: the
-// rule path equals the field or is one of its parent paths.
+// rule path equals the field or is one of its parent paths. The elements of
+// a list are inside the list's path: a "device_details.deviceInvites" rule
+// covers "deviceInvites[5861427050514914].tailnetId", and a rule for
+// "deviceInvites[5861427050514914]" covers only that invite.
 func (m muteSet) fieldMuted(collector, field string) bool {
 	field = compactPath(field)
 	for _, rule := range m.fields[collector] {
-		if field == rule || strings.HasPrefix(field, rule+".") {
+		if field == rule || strings.HasPrefix(field, rule+".") || strings.HasPrefix(field, rule+"[") {
 			return true
 		}
 	}

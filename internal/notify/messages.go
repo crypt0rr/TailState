@@ -183,8 +183,15 @@ var severityRank = map[model.Severity]int{model.SeverityHigh: 0, model.SeverityM
 // changes by collector and name; the sort is stable, so ties keep the
 // batch's order.
 func (c Context) digestEntries(in DigestInput) []digestEntry {
-	schema, fleet, listed := summarize(in)
-	entries := make([]digestEntry, 0, len(schema)+len(fleet)+len(listed))
+	shares, schema, fleet, listed := summarize(in)
+	entries := make([]digestEntry, 0, len(shares)+len(schema)+len(fleet)+len(listed))
+	for _, share := range shares {
+		l := share.line
+		if in.Attributed {
+			l.Spans = append(l.Spans, summaryActors(in.Changes, share.changes)...)
+		}
+		entries = append(entries, digestEntry{severity: share.severity, line: l})
+	}
 	for _, change := range schema {
 		l := c.schemaLine(change)
 		if in.Attributed {

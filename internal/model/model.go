@@ -5,8 +5,10 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/crypt0rr/tailstate/internal/textutil"
 )
@@ -53,6 +55,11 @@ type Change struct {
 	// Attribution names who made the change when the configuration audit
 	// log explained it. It is set only on changes handed to notifications.
 	Attribution *Attribution `json:"attribution,omitempty"`
+	// Invites describes the share invites of a changed device_details
+	// resource by invite ID (see DeviceInvites), so severity and
+	// notifications can name the recipient of an invite whose recorded
+	// fields do not. It is never persisted or exported.
+	Invites map[string]DeviceInvite `json:"-"`
 }
 
 var ignored = map[string]struct{}{
@@ -381,25 +388,42 @@ type DiffResult struct {
 	TotalFields     int
 }
 
+// DiffDetailed returns the field changes between two canonical JSON values.
+// Objects are compared field by field. Arrays of objects that carry a
+// usable identity (see arrayIdentity) are compared element by element: a
+// changed element reports its fields at paths such as
+// "deviceInvites[5861427050514914].tailnetId", and an added or removed
+// element is one change at "deviceInvites[5861427050514914]". Any other
+// array is compared as one value.
 func DiffDetailed(oldRaw, newRaw []byte) DiffResult {
-	result := DiffResult{}
+	return DiffDetailedFor("", oldRaw, newRaw)
+}
+
+// DiffDetailedFor is DiffDetailed for one collector's canonical values.
+// Arrays whose order the collector keeps (DNS resolvers and search paths)
+// are always compared as one value, so a reorder is still reported.
+func DiffDetailedFor(collector string, oldRaw, newRaw []byte) DiffResult {
+	d := differ{collector: collector}
 	var oldValue, newValue any
 	if json.Unmarshal(oldRaw, &oldValue) != nil || json.Unmarshal(newRaw, &newValue) != nil {
-		result.Fields = []FieldChange{valueChange("value", string(oldRaw), true, string(newRaw), true)}
-		result.TotalFields = 1
-		return result
+		d.result.Fields = []FieldChange{valueChange("value", string(oldRaw), true, string(newRaw), true)}
+		d.result.TotalFields = 1
+		return d.result
 	}
-	diffValue("", oldValue, newValue, &result)
-	return result
+	d.diff("", oldValue, true, newValue, true)
+	return d.result
 }
 
 const maxDiffFields = 24
 
-func diffValue(path string, oldValue, newValue any, result *DiffResult) {
-	diffValuePresent(path, oldValue, true, newValue, true, result)
+// differ accumulates the field changes of one comparison.
+type differ struct {
+	collector string
+	result    DiffResult
 }
 
-func diffValuePresent(path string, oldValue any, oldPresent bool, newValue any, newPresent bool, result *DiffResult) {
+func (d *differ) diff(path string, oldValue any, oldPresent bool, newValue any, newPresent bool) {
+	result := &d.result
 	oldMap, oldOK := oldValue.(map[string]any)
 	newMap, newOK := newValue.(map[string]any)
 	if oldPresent && newPresent && oldOK && newOK {
@@ -422,9 +446,17 @@ func diffValuePresent(path string, oldValue any, oldPresent bool, newValue any, 
 			}
 			oldChild, oldExists := oldMap[key]
 			newChild, newExists := newMap[key]
-			diffValuePresent(child, oldChild, oldExists, newChild, newExists, result)
+			d.diff(child, oldChild, oldExists, newChild, newExists)
 		}
 		return
+	}
+	oldList, oldIsList := oldValue.([]any)
+	newList, newIsList := newValue.([]any)
+	if oldPresent && newPresent && oldIsList && newIsList && !orderedArray(d.collector, path) {
+		if key, ok := arrayIdentity(oldList, newList); ok {
+			d.diffKeyed(path, key, oldList, newList)
+			return
+		}
 	}
 	oldJSON := diffJSON(oldValue, oldPresent)
 	newJSON := diffJSON(newValue, newPresent)
@@ -474,4 +506,145 @@ func compact(value any) any {
 		return value
 	}
 	return textutil.Truncate(string(raw), 240)
+}
+
+// identityKeys are the element fields that identify an object in an array,
+// in order of preference: Tailscale's resource "id" (device invites), a
+// device's "nodeId", and a resolver's "address".
+var identityKeys = []string{"id", "nodeId", "address"}
+
+// maxIdentityBytes bounds an element identity used in a field path.
+const maxIdentityBytes = 128
+
+// arrayIdentity returns the identity key shared by every element of both
+// arrays: each element must be an object whose value for the key is a
+// usable scalar, unique within its array. Arrays of scalars, mixed arrays,
+// and arrays with missing or duplicate identities have none and are compared
+// as one value.
+func arrayIdentity(oldList, newList []any) (string, bool) {
+	for _, key := range identityKeys {
+		if identifiedBy(key, oldList) && identifiedBy(key, newList) {
+			return key, true
+		}
+	}
+	return "", false
+}
+
+func identifiedBy(key string, list []any) bool {
+	seen := make(map[string]struct{}, len(list))
+	for _, element := range list {
+		id, ok := elementIdentity(key, element)
+		if !ok {
+			return false
+		}
+		if _, duplicate := seen[id]; duplicate {
+			return false
+		}
+		seen[id] = struct{}{}
+	}
+	return true
+}
+
+// elementIdentity returns the path text of an element's identity: a
+// non-empty string or a number, bounded and without brackets or control
+// characters, so the path "list[<id>].field" stays unambiguous.
+func elementIdentity(key string, element any) (string, bool) {
+	object, ok := element.(map[string]any)
+	if !ok {
+		return "", false
+	}
+	var id string
+	switch value := object[key].(type) {
+	case string:
+		id = value
+	case float64:
+		id = strconv.FormatFloat(value, 'f', -1, 64)
+	default:
+		return "", false
+	}
+	if id == "" || len(id) > maxIdentityBytes || strings.ContainsAny(id, "[]") || strings.IndexFunc(id, unicode.IsControl) >= 0 {
+		return "", false
+	}
+	return id, true
+}
+
+// diffKeyed compares two arrays element by element, matching elements by
+// their identity. Identities are visited in sorted order, so the field
+// order does not depend on the arrays' order.
+func (d *differ) diffKeyed(path, key string, oldList, newList []any) {
+	oldByID := make(map[string]any, len(oldList))
+	newByID := make(map[string]any, len(newList))
+	ids := make([]string, 0, len(oldList)+len(newList))
+	for _, element := range oldList {
+		id, _ := elementIdentity(key, element)
+		oldByID[id] = element
+		ids = append(ids, id)
+	}
+	for _, element := range newList {
+		id, _ := elementIdentity(key, element)
+		newByID[id] = element
+		if _, matched := oldByID[id]; !matched {
+			ids = append(ids, id)
+		}
+	}
+	sort.Strings(ids)
+	for _, id := range ids {
+		oldElement, oldExists := oldByID[id]
+		newElement, newExists := newByID[id]
+		d.diff(ElementPath(path, id), oldElement, oldExists, newElement, newExists)
+	}
+}
+
+// ElementPath is the field path of one identified array element, for
+// example "deviceInvites[5861427050514914]".
+func ElementPath(path, id string) string {
+	return path + "[" + id + "]"
+}
+
+// ElementPathParts splits an element path such as
+// "deviceInvites[5861427050514914]" into the list path and the identity. It
+// reports false for any other path, including a field inside an element.
+func ElementPathParts(path string) (list, id string, ok bool) {
+	if !strings.HasSuffix(path, "]") {
+		return "", "", false
+	}
+	open := strings.LastIndexByte(path, '[')
+	if open <= 0 || open == len(path)-2 {
+		return "", "", false
+	}
+	return path[:open], path[open+1 : len(path)-1], true
+}
+
+// GenericPath replaces the element identities of a field path with "[]":
+// "deviceInvites[5861427050514914].tailnetId" becomes
+// "deviceInvites[].tailnetId". Paths of the same field in different elements
+// share their generic path.
+func GenericPath(path string) string {
+	if !strings.Contains(path, "[") {
+		return path
+	}
+	var b strings.Builder
+	inside := false
+	for _, r := range path {
+		switch {
+		case r == '[':
+			inside = true
+			b.WriteRune(r)
+		case r == ']':
+			inside = false
+			b.WriteRune(r)
+		case !inside:
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+// FieldRoot returns the first segment of a field path: "deviceInvites" for
+// "deviceInvites[5861427050514914].tailnetId" and "tags" for "tags".
+func FieldRoot(path string) string {
+	if index := strings.IndexAny(path, ".["); index >= 0 {
+		return path[:index]
+	}
+	return path
 }

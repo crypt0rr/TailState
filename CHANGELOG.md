@@ -13,6 +13,12 @@ rollback requires restoring the backup taken before the upgrade. See
 
 ## [Unreleased]
 
+### Added
+- Device sharing changes are described by recipient and get their own severity: digests show "🔴 🔗 **build-01** share accepted by bob@example.com", "shared via a new invite link (multi-use, exit node allowed)", "share with alice@example.com removed", "exit node allowed", or "invite e-mail resent" instead of invite JSON. A share accepted (or accepted by another user), newly allowed to use the exit node, or created multi-use, with the exit node allowed, or already accepted is high; a new single-use share, a removed share, and other invite changes are medium; an e-mail resend and identifier changes (`tailnetId`, `sharerId`, `deviceId`, `created`, `acceptedBy.id`, the invite URL fingerprint of an accepted share) are low. The same bookkeeping on two or more shares with the same recipient is one line ("2 device shares with alice@example.com (ludus, spraakwater): `tailnetId` changed"). Routing by minimum severity follows the new levels; History, the API, and evidence packs keep the recorded fields and values (#251).
+
+### Changed
+- Changes inside lists of objects are reported per element instead of as two truncated JSON blobs: a list whose objects carry a unique `id` (or `nodeId`/`address`), such as a device's `deviceInvites`, is compared element by element, so one changed invite field is one change at `deviceInvites[5861427050514914].tailnetId`, and an added or removed invite is one change at `deviceInvites[<id>]`. Reordering such a list is no longer a change. Lists of plain values, lists without such an identity, and the ordered DNS lists are compared as before. History, the API, and evidence packs show the new paths verbatim (events recorded earlier keep theirs, and old and new evidence packs verify), a field mute rule for a list (`device_details.deviceInvites`) covers its elements, and fleet and schema summaries group the same field of different elements. No re-baseline or schema change is needed (#250).
+
 ## [0.17.1] - 2026-10-07
 
 - **Schema:** 17 (unchanged)

@@ -148,15 +148,50 @@ them this way, and every value stays escaped for the destination's format.
 | Other 64-character fingerprints | The first 8 characters and `…` |
 | List of values (tags, routes, addresses) | The elements added and removed: ``+`tag:db`, −`tag:old` `` (at most 10 per side, then "N more") |
 | Ordered DNS lists (nameservers, search paths) | The new order, plus what was added or removed: ``now `8.8.8.8`, `1.1.1.1` (+`8.8.8.8`)`` |
+| Element of a list of identified objects (see [Change detection](monitoring.md#change-detection)) | Added or removed as `` `splitDNS.corp`: +`10.0.0.53` `` or ``−`10.0.0.53` ``; a field inside an element under its element path, for example `` `splitDNS.corp[10.0.0.53].useWithExitNode`: `false` → `true` `` |
 | Absent or null value | `(not set)`; an empty string is `(empty)` |
 | Object | Bounded compact JSON, with fingerprints shortened |
 
 Fleet summaries use the same presentation, for example
 "🔴 📦 6 devices: `tags` +`tag:db`".
 
+## Device shares
+
+A device's share invites (`device_details.deviceInvites`) get their own
+🔗 lines instead of field lines. Each invite is named by its recipient: the
+login name of the user who accepted it, else the invited e-mail address, else
+"invite link"; flags follow in parentheses. An invite that the snapshots do
+not describe is named by its ID.
+
+| Transition | Line | Severity |
+| --- | --- | --- |
+| Invite created | "🔴 🔗 **nas** shared via a new invite link (multi-use, exit node allowed)", "🟠 🔗 **printer** shared via a new invite to carol@example.com" | Medium; high when multi-use, the exit node is allowed, or it is already accepted |
+| `accepted` false→true | "🔴 🔗 **build-01** share accepted by bob@example.com" | High |
+| `acceptedBy` set to another user | "🔴 🔗 **build-01** share now accepted by erin@example.com" | High |
+| Invite removed | "🟠 🔗 **camera** share with alice@example.com removed" | Medium |
+| `allowExitNode` false→true | "🔴 🔗 **gateway** share with alice@example.com: exit node allowed" | High |
+| `multiUse` false→true | "… : multi-use enabled" | Medium |
+| `lastEmailSentAt` | "⚪ 🔗 **kiosk** share with carol@example.com: invite e-mail resent" | Low |
+| Identifiers: `tailnetId`, `sharerId`, `deviceId`, `created`, `acceptedBy.id`, and the `inviteUrl` fingerprint of an accepted share | "… : `tailnetId` changed" | Low |
+| Anything else (an invited e-mail address, a flag switched off, the invite URL of a pending share, an unknown field) | The field and its values, for example "exit node no longer allowed" | Medium |
+
+A changed invite takes the highest severity of its fields, and a device
+takes the highest severity of its invites and other detail fields (posture
+attributes are medium). The same bookkeeping (an e-mail resend, an identifier
+change) on two or more shares with the same recipient in one batch is one
+line, naming at most three devices:
+
+```text
+⚪ 🔗 2 device shares with alice@example.com (ludus, spraakwater): `tailnetId` changed
+```
+
+Recipients and device names are tenant values and are escaped like any
+other (see [Escaping](#escaping)). History, the API, and evidence packs keep
+the recorded invite fields and values.
+
 ## Escaping
 
-Resource names, field values, tags, actors, the instance label, and the
+Resource names, field values, tags, actors, share recipients, the instance label, and the
 tailnet are tenant- or operator-controlled, so every renderer escapes them
 for its format, and control characters and Unicode line separators always
 become spaces. Every line of a notification starts with text TailState
@@ -326,9 +361,9 @@ high-severity changes. See TailState History for the full batch."
 
 | Severity | Changes |
 | --- | --- |
-| High | Any `policy`, `log_streaming`, `settings` (tailnet settings), `webhooks`, or `oauth_apps` change (OAuth applications grant API access, like keys); a `keys` resource created; a `users` change to `role`; a `devices` change to `tags`, `authorized` false→true, or `keyExpiryDisabled` false→true |
-| Low | A `devices` change whose changed fields are all `clientVersion`, `updateAvailable`, `os`, or `distro` |
-| Medium | Everything else, for example devices created or removed, route changes (`enabledRoutes`, `advertisedRoutes`), user invites, users created or removed, keys removed, DNS, contacts, posture, and `services` changes |
+| High | Any `policy`, `log_streaming`, `settings` (tailnet settings), `webhooks`, or `oauth_apps` change (OAuth applications grant API access, like keys); a `keys` resource created; a `users` change to `role`; a `devices` change to `tags`, `authorized` false→true, or `keyExpiryDisabled` false→true; a device share created multi-use, with the exit node allowed, or already accepted, accepted (or accepted by another user), or newly allowed to use the exit node (see [Device shares](#device-shares)) |
+| Low | A `devices` change whose changed fields are all `clientVersion`, `updateAvailable`, `os`, or `distro`; a `device_details` change whose changed fields are all share bookkeeping (an invite e-mail resent, identifier changes) |
+| Medium | Everything else, for example devices created or removed, route changes (`enabledRoutes`, `advertisedRoutes`), user invites, users created or removed, keys removed, DNS, contacts, posture, posture attributes, new single-use device shares, device shares removed, and `services` changes |
 
 A changed resource takes the highest severity of its changed fields; a change
 whose field list was truncated is at least medium, because the omitted fields
@@ -377,7 +412,9 @@ Predictable noise is reduced in the digest without losing the audit trail:
 
 - **Mute rules** are managed under **Noise controls** in Settings (CSRF
   protected). A rule mutes a collector (`dns`), one field path of a collector
-  (`devices.clientVersion`, which also covers nested paths below it), every
+  (`devices.clientVersion`, which also covers nested paths below it, and
+  `device_details.deviceInvites`, which covers every invite such as
+  `deviceInvites[5861427050514914].tailnetId`), every
   device carrying a tag (`tag:ci`, matched in the before or after snapshot), or
   one resource by ID or exact name. Muted changes are still recorded in History
   and in the signed evidence ledger, flagged `muted` in the History page and in
@@ -395,6 +432,9 @@ Predictable noise is reduced in the digest without losing the audit trail:
   on every resource a collector returned in one batch (at least 2 resources),
   the digest shows one "upstream schema change" line instead of one diff per
   resource.
+- Both summaries treat the same field of different list elements as one
+  field, shown with `[]` in place of the element: `backends[].weight`. An
+  element added or removed is listed with its resource.
 
 ## Delivery semantics
 

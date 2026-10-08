@@ -80,6 +80,9 @@ func presentFieldWith(collector string, field model.FieldChange, separator strin
 			return spans
 		}
 	}
+	if spans, ok := presentElement(field.Field, old, current, separator); ok {
+		return spans
+	}
 	label := []Span{code(field.Field), lit(separator)}
 	if spans, ok := presentSecret(old, current); ok {
 		return append(label, spans...)
@@ -88,6 +91,22 @@ func presentFieldWith(collector string, field model.FieldChange, separator strin
 		return append(label, spans...)
 	}
 	return append(label, presentScalar(old), lit(" → "), presentScalar(current))
+}
+
+// presentElement shows an identified list element that was added or
+// removed, recorded at a path such as "splitDNS.corp[10.0.0.53]", like a
+// list difference: "`splitDNS.corp`: +`10.0.0.53`". History keeps the
+// element's full value.
+func presentElement(path string, old, current fieldValue, separator string) ([]Span, bool) {
+	list, id, ok := model.ElementPathParts(path)
+	if !ok || old.set == current.set {
+		return nil, false
+	}
+	prefix := "+"
+	if old.set {
+		prefix = "−"
+	}
+	return []Span{code(list), lit(separator + prefix), code(id)}, true
 }
 
 // presentPolicySection shows a policy section, which TailState stores only

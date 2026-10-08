@@ -120,6 +120,19 @@ func tenantMessages(r *rand.Rand) []Message {
 	for i := 0; i < FleetSummaryMinimum; i++ {
 		changes = append(changes, model.Change{Kind: "changed", Collector: "devices", ResourceID: value(), Name: value(), Attribution: &model.Attribution{ActorLogin: value()}, Fields: []model.FieldChange{set("clientVersion", "1", "2")}})
 	}
+	// Device shares: recipients, device names, and other field values are
+	// tenant values on single and grouped share lines.
+	recipient := value()
+	for i := 0; i < 2; i++ {
+		changes = append(changes, model.Change{Kind: "changed", Collector: "device_details", ResourceID: value(), Name: value(), Attribution: &model.Attribution{ActorLogin: value()},
+			Invites: map[string]model.DeviceInvite{"1": {Recipient: recipient, Accepted: true}, "2": {Recipient: value(), MultiUse: true}, "3": {Recipient: value(), AllowExitNode: true}},
+			Fields: []model.FieldChange{
+				set("deviceInvites[1].tailnetId", value(), value()),
+				set("deviceInvites[2].accepted", false, true),
+				set("deviceInvites[2]."+value(), value(), value()),
+				{Field: "deviceInvites[3]", New: map[string]any{"id": "3"}, NewPresent: true},
+			}})
+	}
 	return []Message{
 		context.Digest(DigestInput{BatchID: 7, ObservedAt: testObservedAt, Changes: changes, MutedCount: 2, Attributed: true}),
 		context.CollectorsUnhealthy([]CollectorHealth{{Collector: value(), Reason: value()}}, testObservedAt),

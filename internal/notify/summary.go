@@ -67,13 +67,18 @@ func summarize(in DigestInput) ([]schemaChange, []fleetTransition, []model.Chang
 			continue
 		}
 		for fieldIndex, field := range change.Fields {
-			if field.OldPresent == field.NewPresent {
+			if field.OldPresent == field.NewPresent || removed[fieldRef{changeIndex, fieldIndex}] || isElement(field.Field) {
 				continue
 			}
-			key := change.Collector + "\x00" + field.Field + "\x00" + fmt.Sprint(field.NewPresent)
+			// A field inside list elements ("deviceInvites[5861…].note") is
+			// grouped by its generic path ("deviceInvites[].note").
+			path := model.GenericPath(field.Field)
+			key := change.Collector + "\x00" + path + "\x00" + fmt.Sprint(field.NewPresent)
 			group := schemaGroups[key]
 			if group == nil {
-				group = &schemaChange{collector: change.Collector, field: field.Field, added: field.NewPresent, sample: field}
+				sample := field
+				sample.Field = path
+				group = &schemaChange{collector: change.Collector, field: path, added: field.NewPresent, sample: sample}
 				schemaGroups[key] = group
 			}
 			if refs := schemaRefs[key]; len(refs) == 0 || refs[len(refs)-1].change != changeIndex {
@@ -114,15 +119,18 @@ func summarize(in DigestInput) ([]schemaChange, []fleetTransition, []model.Chang
 			continue
 		}
 		for fieldIndex, field := range change.Fields {
-			if removed[fieldRef{changeIndex, fieldIndex}] {
+			if removed[fieldRef{changeIndex, fieldIndex}] || isElement(field.Field) {
 				continue
 			}
 			oldJSON, _ := json.Marshal(field.Old)
 			newJSON, _ := json.Marshal(field.New)
-			key := fmt.Sprintf("%s\x00%s\x00%t%s\x00%t%s", change.Collector, field.Field, field.OldPresent, oldJSON, field.NewPresent, newJSON)
+			path := model.GenericPath(field.Field)
+			key := fmt.Sprintf("%s\x00%s\x00%t%s\x00%t%s", change.Collector, path, field.OldPresent, oldJSON, field.NewPresent, newJSON)
 			group := fleetGroups[key]
 			if group == nil {
-				group = &transition{collector: change.Collector, field: field}
+				sample := field
+				sample.Field = path
+				group = &transition{collector: change.Collector, field: sample}
 				fleetGroups[key] = group
 			}
 			// Count resources, not field occurrences.
@@ -188,6 +196,14 @@ func summarize(in DigestInput) ([]schemaChange, []fleetTransition, []model.Chang
 		remaining = append(remaining, change)
 	}
 	return schema, fleet, remaining
+}
+
+// isElement reports a whole list element added or removed (a path such as
+// "deviceInvites[5861427050514914]"). Such a change names one element, so
+// it is listed with its resource instead of being summarised.
+func isElement(path string) bool {
+	_, _, ok := model.ElementPathParts(path)
+	return ok
 }
 
 // fieldSortKey orders field transitions by field name, then by value, so

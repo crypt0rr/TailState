@@ -148,6 +148,7 @@ them this way, and every value stays escaped for the destination's format.
 | Other 64-character fingerprints | The first 8 characters and `…` |
 | List of values (tags, routes, addresses) | The elements added and removed: ``+`tag:db`, −`tag:old` `` (at most 10 per side, then "N more") |
 | Ordered DNS lists (nameservers, search paths) | The new order, plus what was added or removed: ``now `8.8.8.8`, `1.1.1.1` (+`8.8.8.8`)`` |
+| Element of a list of identified objects (see [Change detection](monitoring.md#change-detection)) | Added or removed as `` `splitDNS.corp`: +`10.0.0.53` `` or ``−`10.0.0.53` ``; a field inside an element under its element path, for example `` `splitDNS.corp[10.0.0.53].useWithExitNode`: `false` → `true` `` |
 | Absent or null value | `(not set)`; an empty string is `(empty)` |
 | Object | Bounded compact JSON, with fingerprints shortened |
 
@@ -377,7 +378,9 @@ Predictable noise is reduced in the digest without losing the audit trail:
 
 - **Mute rules** are managed under **Noise controls** in Settings (CSRF
   protected). A rule mutes a collector (`dns`), one field path of a collector
-  (`devices.clientVersion`, which also covers nested paths below it), every
+  (`devices.clientVersion`, which also covers nested paths below it, and
+  `device_details.deviceInvites`, which covers every invite such as
+  `deviceInvites[5861427050514914].tailnetId`), every
   device carrying a tag (`tag:ci`, matched in the before or after snapshot), or
   one resource by ID or exact name. Muted changes are still recorded in History
   and in the signed evidence ledger, flagged `muted` in the History page and in
@@ -395,6 +398,9 @@ Predictable noise is reduced in the digest without losing the audit trail:
   on every resource a collector returned in one batch (at least 2 resources),
   the digest shows one "upstream schema change" line instead of one diff per
   resource.
+- Both summaries treat the same field of different list elements as one
+  field, shown with `[]` in place of the element: `backends[].weight`. An
+  element added or removed is listed with its resource.
 
 ## Delivery semantics
 

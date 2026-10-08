@@ -13,6 +13,9 @@ rollback requires restoring the backup taken before the upgrade. See
 
 ## [Unreleased]
 
+### Changed
+- Changes inside lists of objects are reported per element instead of as two truncated JSON blobs: a list whose objects carry a unique `id` (or `nodeId`/`address`), such as a device's `deviceInvites`, is compared element by element, so one changed invite field is one change at `deviceInvites[5861427050514914].tailnetId`, and an added or removed invite is one change at `deviceInvites[<id>]`. Reordering such a list is no longer a change. Lists of plain values, lists without such an identity, and the ordered DNS lists are compared as before. History, the API, and evidence packs show the new paths verbatim (events recorded earlier keep theirs, and old and new evidence packs verify), a field mute rule for a list (`device_details.deviceInvites`) covers its elements, and fleet and schema summaries group the same field of different elements. No re-baseline or schema change is needed (#250).
+
 ## [0.17.1] - 2026-10-07
 
 - **Schema:** 17 (unchanged)

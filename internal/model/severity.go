@@ -127,9 +127,11 @@ func classifyDeviceFields(change Change) Severity {
 	return severity
 }
 
-// fieldRoot returns the compact, lower-case first segment of a field path.
+// fieldRoot returns the compact, lower-case first segment of a field path;
+// the root of an element path such as "deviceInvites[123].tailnetId" is
+// "deviceinvites".
 func fieldRoot(path string) string {
-	root, _, _ := strings.Cut(path, ".")
+	root := FieldRoot(path)
 	return strings.ToLower(strings.ReplaceAll(strings.ReplaceAll(root, "_", ""), "-", ""))
 }
 

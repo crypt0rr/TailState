@@ -321,9 +321,9 @@ func (a *batchApply) upsertResource(collector string, resource model.Resource, c
 		if baselined && !(transition && bytes.Equal(oldComparable, newComparable)) {
 			diff := model.DiffResult{}
 			if transition {
-				diff = model.DiffDetailed(oldComparable, newComparable)
+				diff = model.DiffDetailedFor(collector, oldComparable, newComparable)
 			} else if !oldValue.truncated {
-				diff = model.DiffDetailed(oldRaw, raw)
+				diff = model.DiffDetailedFor(collector, oldRaw, raw)
 			}
 			a.record(model.Change{Kind: "changed", Collector: collector, ResourceID: resource.ID, Type: resource.Type, Name: resource.Name, Fields: diff.Fields, FieldsTruncated: diff.FieldsTruncated, TotalFields: diff.TotalFields}, oldValue, existingStoredValue(raw, hash, int64(len(raw)), false))
 		}

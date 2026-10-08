@@ -13,6 +13,11 @@ rollback requires restoring the backup taken before the upgrade. See
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-10-08
+
+- **Schema:** 17 (unchanged)
+- **Rollback:** image-only rollback to 0.17.1 is safe; events recorded on 0.18.0 keep their element-level field paths in History.
+
 ### Added
 - Device sharing changes are described by recipient and get their own severity: digests show "🔴 🔗 **build-01** share accepted by bob@example.com", "shared via a new invite link (multi-use, exit node allowed)", "share with alice@example.com removed", "exit node allowed", or "invite e-mail resent" instead of invite JSON. A share accepted (or accepted by another user), newly allowed to use the exit node, or created multi-use, with the exit node allowed, or already accepted is high; a new single-use share, a removed share, and other invite changes are medium; an e-mail resend and identifier changes (`tailnetId`, `sharerId`, `deviceId`, `created`, `acceptedBy.id`, the invite URL fingerprint of an accepted share) are low. The same bookkeeping on two or more shares with the same recipient is one line ("2 device shares with alice@example.com (ludus, spraakwater): `tailnetId` changed"). Routing by minimum severity follows the new levels; History, the API, and evidence packs keep the recorded fields and values (#251).
 
@@ -170,7 +175,8 @@ Releases before 0.11.16 are described in their
 [GitHub release notes](https://github.com/crypt0rr/TailState/releases); their
 schema versions are listed in [UPGRADING.md](UPGRADING.md#schema-history).
 
-[Unreleased]: https://github.com/crypt0rr/TailState/compare/v0.17.1...HEAD
+[Unreleased]: https://github.com/crypt0rr/TailState/compare/v0.18.0...HEAD
+[0.18.0]: https://github.com/crypt0rr/TailState/compare/v0.17.1...v0.18.0
 [0.17.1]: https://github.com/crypt0rr/TailState/compare/v0.17.0...v0.17.1
 [0.17.0]: https://github.com/crypt0rr/TailState/compare/v0.16.0...v0.17.0
 [0.16.0]: https://github.com/crypt0rr/TailState/compare/v0.15.0...v0.16.0

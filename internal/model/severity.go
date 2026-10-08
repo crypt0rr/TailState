@@ -70,9 +70,12 @@ var lowImpactDeviceFields = map[string]struct{}{
 //
 //   - high: any policy, log_streaming, settings, webhooks, or oauth_apps
 //     change; a keys resource created; a users change touching role; a devices change to
-//     tags, authorized false→true, or keyExpiryDisabled false→true.
+//     tags, authorized false→true, or keyExpiryDisabled false→true; a
+//     device share created multi-use, with the exit node allowed, or
+//     already accepted, accepted, or newly allowed to use the exit node.
 //   - low: a devices change whose fields are all clientVersion,
-//     updateAvailable, os, or distro.
+//     updateAvailable, os, or distro; a device_details change whose fields
+//     are all share bookkeeping (see ShareTransition.Severity).
 //   - medium: everything else, including devices created or removed, route
 //     changes, and user invites.
 //
@@ -99,6 +102,10 @@ func Classify(change Change) Severity {
 	case "devices":
 		if change.Kind == "changed" {
 			return classifyDeviceFields(change)
+		}
+	case "device_details":
+		if change.Kind == "changed" {
+			return classifyDeviceDetails(change)
 		}
 	}
 	return SeverityMedium

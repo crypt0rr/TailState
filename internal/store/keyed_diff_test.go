@@ -123,6 +123,51 @@ func TestKeyedInvitePathsFlowThroughHistoryEvidenceAndMutes(t *testing.T) {
 	}
 }
 
+// TestShareSeverityAndDigestUseTheSnapshots guards E-038 in the store: the
+// recorded severity and the queued digest describe an invite by the
+// recipient in the snapshot, which the changed fields do not name.
+func TestShareSeverityAndDigestUseTheSnapshots(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	generation, err := st.SaveSettings(ctx, settings())
+	if err != nil {
+		t.Fatal(err)
+	}
+	invite := shareInvite("5861427050514914", "T1000EXAMPLE")
+	if _, err := testApplyBatch(st, ctx, generation, sharedDevice(invite), notify.TextDigest("baseline")); err != nil {
+		t.Fatal(err)
+	}
+	bookkeeping, err := st.ApplyBatchWithBatch(ctx, generation, sharedDevice(shareInvite("5861427050514914", "T2000EXAMPLE")), notify.Context{}.Digest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	exitNode := shareInvite("5861427050514914", "T2000EXAMPLE")
+	exitNode["allowExitNode"] = true
+	elevated, err := st.ApplyBatchWithBatch(ctx, generation, sharedDevice(exitNode), notify.Context{}.Digest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, check := range []struct {
+		batch    int64
+		severity string
+		line     string
+	}{
+		{bookkeeping.ID, "low", "share with alice@example.com: `tailnetId` changed"},
+		{elevated.ID, "high", "share with alice@example.com: exit node allowed"},
+	} {
+		page, err := st.ListHistory(ctx, HistoryFilter{BatchID: check.batch})
+		if err != nil || len(page.Batches) != 1 || len(page.Batches[0].Events) != 1 {
+			t.Fatalf("batch %d history: %+v %v", check.batch, page.Batches, err)
+		}
+		if got := page.Batches[0].Events[0].Severity; got != check.severity {
+			t.Fatalf("batch %d severity = %s, want %s", check.batch, got, check.severity)
+		}
+		if payloads := pendingPayloads(t, st, check.batch); len(payloads) != 1 || !strings.Contains(payloads[0], check.line) {
+			t.Fatalf("batch %d digest lacks %q: %q", check.batch, check.line, payloads)
+		}
+	}
+}
+
 func TestFieldRulesCoverListElements(t *testing.T) {
 	set := newMuteSet([]MuteRule{{Kind: MuteField, Value: "device_details.deviceInvites[5861427050514914]"}, {Kind: MuteField, Value: "dns.splitDNS"}})
 	cases := map[string]bool{

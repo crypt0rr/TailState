@@ -40,13 +40,16 @@ type fleetTransition struct {
 	changes []int
 }
 
-// summarize collapses upstream schema changes and fleet-wide transitions.
-// It returns the summaries and the changes with summarized fields removed; a
-// changed resource left without fields is not listed individually. History
-// still lists every resource and field.
-func summarize(in DigestInput) ([]schemaChange, []fleetTransition, []model.Change) {
-	type fieldRef struct{ change, field int }
+// fieldRef is one field of one change in a digest's input.
+type fieldRef struct{ change, field int }
+
+// summarize collapses device-share changes, upstream schema changes, and
+// fleet-wide transitions. It returns the summaries and the changes with
+// summarized fields removed; a changed resource left without fields is not
+// listed individually. History still lists every resource and field.
+func summarize(in DigestInput) ([]shareLine, []schemaChange, []fleetTransition, []model.Change) {
 	removed := map[fieldRef]bool{}
+	shares := shareLines(in, removed)
 	// resources returns the distinct change indices of refs, in order.
 	resources := func(refs []fieldRef) []int {
 		var out []int
@@ -175,7 +178,7 @@ func summarize(in DigestInput) ([]schemaChange, []fleetTransition, []model.Chang
 	})
 
 	if len(removed) == 0 {
-		return schema, fleet, in.Changes
+		return shares, schema, fleet, in.Changes
 	}
 	remaining := make([]model.Change, 0, len(in.Changes))
 	for changeIndex, change := range in.Changes {
@@ -195,7 +198,7 @@ func summarize(in DigestInput) ([]schemaChange, []fleetTransition, []model.Chang
 		change.Fields = kept
 		remaining = append(remaining, change)
 	}
-	return schema, fleet, remaining
+	return shares, schema, fleet, remaining
 }
 
 // isElement reports a whole list element added or removed (a path such as

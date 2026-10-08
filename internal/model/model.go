@@ -55,6 +55,11 @@ type Change struct {
 	// Attribution names who made the change when the configuration audit
 	// log explained it. It is set only on changes handed to notifications.
 	Attribution *Attribution `json:"attribution,omitempty"`
+	// Invites describes the share invites of a changed device_details
+	// resource by invite ID (see DeviceInvites), so severity and
+	// notifications can name the recipient of an invite whose recorded
+	// fields do not. It is never persisted or exported.
+	Invites map[string]DeviceInvite `json:"-"`
 }
 
 var ignored = map[string]struct{}{

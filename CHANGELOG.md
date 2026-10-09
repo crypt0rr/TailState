@@ -13,6 +13,11 @@ rollback requires restoring the backup taken before the upgrade. See
 
 ## [Unreleased]
 
+## [0.18.1] - 2026-10-09
+
+- **Schema:** 17 (unchanged)
+- **Rollback:** image-only rollback to 0.18.0 is safe.
+
 ### Changed
 - Digests no longer carry an "Attributed: X of Y changes" header line. Most changes (client versions, addresses, OS updates) are reported by the device itself and never have an administrator to attribute, so the line mostly read "Attributed: 0 of N". Known actors are still named on each change line, and "Attribution unavailable" still appears when the audit log lookup failed. The counts line ("3 changed · ⚪ 3 low") is left out when the batch has a single change kind and a single severity, since the title already says it (#256).
 
@@ -181,7 +186,8 @@ Releases before 0.11.16 are described in their
 [GitHub release notes](https://github.com/crypt0rr/TailState/releases); their
 schema versions are listed in [UPGRADING.md](UPGRADING.md#schema-history).
 
-[Unreleased]: https://github.com/crypt0rr/TailState/compare/v0.18.0...HEAD
+[Unreleased]: https://github.com/crypt0rr/TailState/compare/v0.18.1...HEAD
+[0.18.1]: https://github.com/crypt0rr/TailState/compare/v0.18.0...v0.18.1
 [0.18.0]: https://github.com/crypt0rr/TailState/compare/v0.17.1...v0.18.0
 [0.17.1]: https://github.com/crypt0rr/TailState/compare/v0.17.0...v0.17.1
 [0.17.0]: https://github.com/crypt0rr/TailState/compare/v0.16.0...v0.17.0

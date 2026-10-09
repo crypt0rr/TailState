@@ -228,9 +228,9 @@ func TestAttributionLookupFailuresNeverFailTheBatch(t *testing.T) {
 				t.Fatalf("changed by=%q, want %q", got, tc.want)
 			}
 			payloads := pendingPayloads(t, st, batch.ID)
-			// The digest states the lookup outcome in its header and names
-			// only known actors; History keeps "actor unknown".
-			header := map[string]string{AttributionUnavailable: "\nAttribution unavailable\n", AttributionComplete: "\nAttributed: 1 of 1 change\n"}[tc.status]
+			// The digest header warns only when the lookup failed, and lines
+			// name only known actors; History keeps "actor unknown".
+			header := map[string]string{AttributionUnavailable: "\nAttribution unavailable\n", AttributionComplete: ""}[tc.status]
 			if len(payloads) != 1 || strings.Contains(payloads[0], model.ActorUnknown) || strings.Contains(payloads[0], "Attribut") != (header != "") || !strings.Contains(payloads[0], header) || strings.Contains(payloads[0], "changed by alice via admin console") != (tc.status == AttributionComplete) {
 				t.Fatalf("digest attribution for %s: %v", tc.name, payloads)
 			}

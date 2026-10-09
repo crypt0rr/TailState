@@ -13,6 +13,9 @@ rollback requires restoring the backup taken before the upgrade. See
 
 ## [Unreleased]
 
+### Changed
+- Digests no longer carry an "Attributed: X of Y changes" header line. Most changes (client versions, addresses, OS updates) are reported by the device itself and never have an administrator to attribute, so the line mostly read "Attributed: 0 of N". Known actors are still named on each change line, and "Attribution unavailable" still appears when the audit log lookup failed. The counts line ("3 changed · ⚪ 3 low") is left out when the batch has a single change kind and a single severity, since the title already says it (#256).
+
 ### Security
 - Builds with Go 1.27.2 and `golang.org/x/net` v0.60.0, which fix vulnerabilities in `net/http` (HTTP/2), `crypto/tls`, `html/template`, and `mime/multipart` reported by govulncheck in TailState's call paths (#254, #255).
 

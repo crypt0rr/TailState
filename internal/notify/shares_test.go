@@ -84,13 +84,11 @@ func TestIdentifierOnlyShareChangesAreOneLowLine(t *testing.T) {
 		message := realShareDigest(t, field)
 		golden := map[string]string{
 			FormatPlain: "⚪ 2 Tailscale changes · prod (example.com)\n" +
-				"2 changed · ⚪ 2 low\n" +
 				"\n" +
 				"⚪ 🔗 2 device shares with octo-user@github (ludus, spraakwater): " + field + " changed\n" +
 				"\n" +
 				"5 Oct 2026 12:00 UTC",
 			FormatMarkdown: "### ⚪ 2 Tailscale changes · prod (example.com)\n" +
-				"2 changed · ⚪ 2 low\n" +
 				"\n" +
 				"⚪ 🔗 2 device shares with octo-user@github (ludus, spraakwater): `" + field + "` changed\n" +
 				"\n" +

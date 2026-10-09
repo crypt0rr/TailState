@@ -37,7 +37,6 @@ their own title field (see [Titles](#titles)):
 ```text
 🔴 19 Tailscale changes (5 high) · prod (example.com)
 2 created, 17 changed · 🔴 5 high, 🟠 2 medium, ⚪ 12 low
-Attributed: 4 of 19 changes
 
 🔴 ✏️ web-02 (device) changed by ci-bot [api key]
   • tags: +tag:db
@@ -64,9 +63,10 @@ The layout is compact:
   previews show volume and urgency. Services with a title field receive it
   there.
 - **Header:** the counts by kind and by severity; zero counts are left out.
-  When the configuration audit log was consulted, a second line states how
-  many changes it attributed ("Attributed: 4 of 19 changes"), or "Attribution
-  unavailable" when the lookup failed (see
+  The line is left out when the batch has a single kind and a single
+  severity, since the title already says it ("⚪ 3 Tailscale changes" for
+  three low-severity changes). When the configuration audit log lookup
+  failed, the header states "Attribution unavailable" (see
   [Change attribution](monitoring.md#change-attribution)).
 - **Actors:** a known actor is named on the change's own line ("changed by
   alice@example.com"), or on a "Changed by" line below it when the line would
@@ -109,7 +109,6 @@ separate field):
 ```markdown
 ### 🔴 19 Tailscale changes (5 high) · prod (example.com)
 2 created, 17 changed · 🔴 5 high, 🟠 2 medium, ⚪ 12 low
-Attributed: 4 of 19 changes
 
 🔴 ✏️ **web-02** (device) changed by ci-bot \[api key\]
   - `tags`: +`tag:db`
@@ -123,7 +122,6 @@ And in Slack mrkdwn (the title is the header block and preview text):
 
 ```text
 2 created, 17 changed · 🔴 5 high, 🟠 2 medium, ⚪ 12 low
-Attributed: 4 of 19 changes
 
 🔴 ✏️ *web-02* (device) changed by ci-bot [api key]
     • `tags`: +`tag:db`
@@ -299,7 +297,6 @@ receive their own rendering instead of CommonMark:
 
 ```text
 2 created, 17 changed · 🔴 5 high, 🟠 2 medium, ⚪ 12 low
-Attributed: 4 of 19 changes
 🔴 ✏️ **web-02** (device) changed by ci-bot [api key]
 - tags: +tag:db
 🔴 ✏️ **Tailnet policy** changed by alice@example.com
@@ -322,7 +319,6 @@ on the first line:
 ```text
 <b>🔴 19 Tailscale changes (5 high) · prod (example.com)</b>
 2 created, 17 changed · 🔴 5 high, 🟠 2 medium, ⚪ 12 low
-Attributed: 4 of 19 changes
 
 🔴 ✏️ <b>web-02</b> (device) changed by ci-bot [api key]
   • <code>tags</code>: +<code>tag:db</code>

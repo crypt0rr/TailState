@@ -186,7 +186,7 @@ func TestChangeAttributionNamesActorInHistoryDigestAndEvidence(t *testing.T) {
 		if len(messages) != 1 {
 			t.Fatalf("%s received %d digests", serviceURL, len(messages))
 		}
-		for _, text := range []string{"changed by alice@example.com", "Alice Example", "via admin console", "changed by kCIclient", "via API", "Attributed: 2 of 3 changes"} {
+		for _, text := range []string{"changed by alice@example.com", "Alice Example", "via admin console", "changed by kCIclient", "via API"} {
 			if !strings.Contains(messages[0], text) {
 				t.Fatalf("%s digest is missing %q:\n%s", serviceURL, text, messages[0])
 			}

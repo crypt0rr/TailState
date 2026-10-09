@@ -74,7 +74,12 @@ func (c Context) Digest(in DigestInput) Message {
 	if top != model.SeverityLow && counts[string(top)] > 0 {
 		title += fmt.Sprintf(" (%d %s)", counts[string(top)], top)
 	}
-	message := c.message(top, severityIcons[top], title, line(lit(digestCounts(counts))))
+	message := c.message(top, severityIcons[top], title)
+	// The counts line only adds information when the batch mixes change kinds
+	// or severities; otherwise the title already says it.
+	if distinctCounts(counts, "created", "changed", "removed") > 1 || distinctCounts(counts, string(model.SeverityHigh), string(model.SeverityMedium), string(model.SeverityLow)) > 1 {
+		message.Lines = append(message.Lines, line(lit(digestCounts(counts))))
+	}
 	if header, ok := attributionHeader(in); ok {
 		message.Lines = append(message.Lines, header)
 	}
@@ -299,24 +304,26 @@ func knownActor(change model.Change) string {
 	return change.Attribution.Display()
 }
 
-// attributionHeader is the digest header line for an attributed batch:
-// "Attributed: 3 of 7 changes", or "Attribution unavailable" when the audit
-// log lookup failed. A batch whose lookup did not run (or is unsupported)
-// has none.
+// attributionHeader warns when the configuration audit log lookup failed for
+// an attributed batch. Known actors are shown on each change line instead of
+// a count: most changes (client versions, addresses, OS updates) are reported
+// by the device itself and never have an administrator to attribute.
 func attributionHeader(in DigestInput) (Line, bool) {
-	if !in.Attributed {
+	if !in.Attributed || !in.AttributionUnavailable {
 		return Line{}, false
 	}
-	if in.AttributionUnavailable {
-		return line(lit("Attribution unavailable")), true
-	}
-	attributed := 0
-	for _, change := range in.Changes {
-		if knownActor(change) != "" {
-			attributed++
+	return line(lit("Attribution unavailable")), true
+}
+
+// distinctCounts reports how many of the given keys have a non-zero count.
+func distinctCounts(counts map[string]int, keys ...string) int {
+	distinct := 0
+	for _, key := range keys {
+		if counts[key] > 0 {
+			distinct++
 		}
 	}
-	return line(lit(fmt.Sprintf("Attributed: %d of %s", attributed, plural(len(in.Changes), "change", "changes")))), true
+	return distinct
 }
 
 // summaryActors names the known actors of the changes a fleet or schema

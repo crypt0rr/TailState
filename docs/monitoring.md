@@ -199,8 +199,8 @@ when a poll can produce a change.
   format ("🔴 ✏️ **Tailnet policy** changed by alice@example.com via admin
   console", or on a separate **Changed by** line when the change line is
   long), and fleet and schema summaries name the actors of the changes they
-  stand for; the digest header states "Attributed: 3 of 7 changes", or
-  "Attribution unavailable" when the lookup failed. `/api/v1/history` adds
+  stand for; the digest header states "Attribution unavailable" when the
+  lookup failed. `/api/v1/history` adds
   `changed_by`, the `attribution` record, and
   the batch `attribution_status`, and evidence packs (format version 5) sign
   the record (see [History and evidence](evidence.md#evidence-packs)).

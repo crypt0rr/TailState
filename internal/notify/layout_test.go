@@ -48,12 +48,24 @@ func TestCompactDigestLayout(t *testing.T) {
 	one := Context{Tailnet: "example.com"}.Digest(DigestInput{ObservedAt: testObservedAt, Changes: []model.Change{
 		{Kind: "removed", Collector: "devices", Name: "db-01.tail1234.ts.net"},
 	}, MutedCount: 1})
-	if got, want := Plain(one), "🟠 1 Tailscale change (1 medium) · example.com\n1 removed · 🟠 1 medium\n\n🟠 ➖ db-01 (device) removed\n\n1 muted change not shown · 5 Oct 2026 12:00 UTC"; got != want {
+	if got, want := Plain(one), "🟠 1 Tailscale change (1 medium) · example.com\n\n🟠 ➖ db-01 (device) removed\n\n1 muted change not shown · 5 Oct 2026 12:00 UTC"; got != want {
 		t.Fatalf("single change digest:\n got: %q\nwant: %q", got, want)
 	}
 	low := Context{Tailnet: "example.com"}.Digest(DigestInput{ObservedAt: testObservedAt, Changes: rollout(2)})
 	if title := plainTitle(low); title != "⚪ 2 Tailscale changes · example.com" {
 		t.Fatalf("low-only title=%q", title)
+	}
+	// The counts line appears only when it adds to the title: a batch that
+	// mixes change kinds or severities.
+	if got := Plain(low); strings.Contains(got, "2 changed") {
+		t.Fatalf("single kind and severity digest repeats its title:\n%s", got)
+	}
+	mixedKinds := Context{}.Digest(DigestInput{ObservedAt: testObservedAt, Changes: append(rollout(1), model.Change{Kind: "created", Collector: "devices", Name: "new"})})
+	mixedSeverities := Context{}.Digest(DigestInput{ObservedAt: testObservedAt, Changes: append(rollout(1), model.Change{Kind: "changed", Collector: "devices", Name: "tagged", Fields: []model.FieldChange{set("tags", []any{"tag:a"}, []any{"tag:b"})}})})
+	for name, message := range map[string]Message{"kinds": mixedKinds, "severities": mixedSeverities} {
+		if got := Plain(message); !strings.Contains(got, ", ⚪ 1 low\n") {
+			t.Fatalf("mixed %s digest has no counts line:\n%s", name, got)
+		}
 	}
 	for collector, want := range map[string]string{"users": " (user)", "oauth_apps": " (OAuth app)", "policy": "", "unknown_thing": " (unknown_thing)"} {
 		if got := Plain(Message{Title: "t", Lines: []Line{line(append([]Span{lit("x")}, typeSpans(collector)...)...)}}); got != "t\nx"+want {

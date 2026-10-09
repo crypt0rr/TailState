@@ -21,9 +21,9 @@ func TestDigestNamesActorInEveryRenderer(t *testing.T) {
 	}
 	attributed := Context{Tailnet: "example.com"}.Digest(DigestInput{BatchID: 1, ObservedAt: testObservedAt, Changes: changes, Attributed: true})
 	for format, want := range map[string][]string{
-		FormatMarkdown: {"\nAttributed: 1 of 2 changes\n", "**db-01** (device) changed by alice@example.com (\\<!channel> \\*Alice\\*) via admin console\n", "**web-01** (device) changed\n"},
-		FormatSlack:    {"\nAttributed: 1 of 2 changes\n", "*db-01* (device) changed by alice@example.com (&lt;!channel&gt; ∗Alice∗) via admin console\n", "*web-01* (device) changed\n"},
-		FormatPlain:    {"\nAttributed: 1 of 2 changes\n", "db-01 (device) changed by alice@example.com (<!channel> *Alice*) via admin console\n", "web-01 (device) changed\n"},
+		FormatMarkdown: {"**db-01** (device) changed by alice@example.com (\\<!channel> \\*Alice\\*) via admin console\n", "**web-01** (device) changed\n"},
+		FormatSlack:    {"*db-01* (device) changed by alice@example.com (&lt;!channel&gt; ∗Alice∗) via admin console\n", "*web-01* (device) changed\n"},
+		FormatPlain:    {"db-01 (device) changed by alice@example.com (<!channel> *Alice*) via admin console\n", "web-01 (device) changed\n"},
 	} {
 		rendered := Render(attributed, format)
 		for _, text := range want {
@@ -31,7 +31,7 @@ func TestDigestNamesActorInEveryRenderer(t *testing.T) {
 				t.Fatalf("%s digest is missing %q:\n%s", format, text, rendered)
 			}
 		}
-		if strings.Contains(rendered, model.ActorUnknown) || strings.Contains(rendered, "Changed by") {
+		if strings.Contains(rendered, model.ActorUnknown) || strings.Contains(rendered, "Changed by") || strings.Contains(rendered, "Attributed:") {
 			t.Fatalf("%s digest shows an unknown actor:\n%s", format, rendered)
 		}
 	}
@@ -68,7 +68,6 @@ func TestKnownActorsSurviveLongLinesAndSummaries(t *testing.T) {
 	}
 	got := Plain(Context{}.Digest(DigestInput{ObservedAt: testObservedAt, Changes: changes, Attributed: true, ResourceCounts: map[string]int{"keys": 3}}))
 	for _, want := range []string{
-		"\nAttributed: 8 of 10 changes\n",
 		strings.Repeat("n", 90) + " (user) changed\n  • Changed by: alice@example.com (Alice Admin) via admin console\n  • role: member → admin\n",
 		"🔴 📦 6 devices: tags +tag:b · by ci-bot [api key] (4 of 6)\n",
 		"🟠 🧩 Upstream schema change: audience newly present on all 3 keys · by user0@example.com, user1@example.com, user2@example.com\n",

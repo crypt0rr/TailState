@@ -66,7 +66,6 @@ func TestAssessmentSampleIsGolden(t *testing.T) {
 	golden := map[string]string{
 		FormatMarkdown: "### 🔴 19 Tailscale changes (5 high) · prod (example.com)\n" +
 			"2 created, 17 changed · 🔴 5 high, 🟠 2 medium, ⚪ 12 low\n" +
-			"Attributed: 4 of 19 changes\n" +
 			"\n" +
 			"🔴 ✏️ **web-02** (device) changed by ci-bot \\[api key\\]\n" +
 			"  - `tags`: +`tag:db`\n" +
@@ -86,7 +85,6 @@ func TestAssessmentSampleIsGolden(t *testing.T) {
 			"3 muted changes not shown · 5 Oct 2026 12:00 UTC · [Batch 1842 in History](https://tailstate.example/history?batch=1842)",
 		FormatSlack: "*🔴 19 Tailscale changes (5 high) · prod (example.com)*\n" +
 			"2 created, 17 changed · 🔴 5 high, 🟠 2 medium, ⚪ 12 low\n" +
-			"Attributed: 4 of 19 changes\n" +
 			"\n" +
 			"🔴 ✏️ *web-02* (device) changed by ci-bot [api key]\n" +
 			"    • `tags`: +`tag:db`\n" +
@@ -106,7 +104,6 @@ func TestAssessmentSampleIsGolden(t *testing.T) {
 			"3 muted changes not shown · 5 Oct 2026 12:00 UTC · <https://tailstate.example/history?batch=1842|Batch 1842 in History>",
 		FormatPlain: "🔴 19 Tailscale changes (5 high) · prod (example.com)\n" +
 			"2 created, 17 changed · 🔴 5 high, 🟠 2 medium, ⚪ 12 low\n" +
-			"Attributed: 4 of 19 changes\n" +
 			"\n" +
 			"🔴 ✏️ web-02 (device) changed by ci-bot [api key]\n" +
 			"  • tags: +tag:db\n" +
@@ -126,7 +123,6 @@ func TestAssessmentSampleIsGolden(t *testing.T) {
 			"3 muted changes not shown · 5 Oct 2026 12:00 UTC · Batch 1842 in History: https://tailstate.example/history?batch=1842",
 		FormatTeams: "**🔴 19 Tailscale changes (5 high) · prod (example.com)**\n" +
 			"2 created, 17 changed · 🔴 5 high, 🟠 2 medium, ⚪ 12 low\n" +
-			"Attributed: 4 of 19 changes\n" +
 			"\n" +
 			"🔴 ✏️ **web-02** (device) changed by ci-bot [api key]\n" +
 			"- tags: +tag:db\n" +
@@ -146,7 +142,6 @@ func TestAssessmentSampleIsGolden(t *testing.T) {
 			"3 muted changes not shown · 5 Oct 2026 12:00 UTC · [Batch 1842 in History](https://tailstate.example/history?batch=1842)",
 		FormatHTML: "<b>🔴 19 Tailscale changes (5 high) · prod (example.com)</b>\n" +
 			"2 created, 17 changed · 🔴 5 high, 🟠 2 medium, ⚪ 12 low\n" +
-			"Attributed: 4 of 19 changes\n" +
 			"\n" +
 			"🔴 ✏️ <b>web-02</b> (device) changed by ci-bot [api key]\n" +
 			"  • <code>tags</code>: +<code>tag:db</code>\n" +

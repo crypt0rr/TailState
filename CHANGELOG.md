@@ -13,6 +13,9 @@ rollback requires restoring the backup taken before the upgrade. See
 
 ## [Unreleased]
 
+### Security
+- Builds with Go 1.27.2 and `golang.org/x/net` v0.60.0, which fix vulnerabilities in `net/http` (HTTP/2), `crypto/tls`, `html/template`, and `mime/multipart` reported by govulncheck in TailState's call paths (#254, #255).
+
 ## [0.18.0] - 2026-10-08
 
 - **Schema:** 17 (unchanged)

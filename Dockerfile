@@ -4,7 +4,7 @@
 # The builder runs on the build host's native platform and cross-compiles the
 # pure-Go binary for each target, so multi-architecture builds do not compile
 # under QEMU emulation.
-FROM --platform=$BUILDPLATFORM golang:1.27.1-alpine3.24@sha256:8a5910f31396cd4d89662f56c68b3ae31d374308270a1c3bd96672ee5ed43414 AS builder
+FROM --platform=$BUILDPLATFORM golang:1.27.2-alpine3.24@sha256:85dc1069ac644ea3c527b177303a406eb3358192816cd7f9e5848eb658851673 AS builder
 ARG VERSION=dev
 ARG TARGETOS
 ARG TARGETARCH
@@ -30,7 +30,7 @@ RUN mkdir -p /data \
 
 FROM scratch
 ARG VERSION=dev
-ARG GO_VERSION=1.27.1
+ARG GO_VERSION=1.27.2
 ARG BUILD_COMMIT=unknown
 ARG TARGETOS
 ARG TARGETARCH

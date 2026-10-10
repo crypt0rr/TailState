@@ -13,6 +13,11 @@ rollback requires restoring the backup taken before the upgrade. See
 
 ## [Unreleased]
 
+## [0.18.2] - 2026-10-10
+
+- **Schema:** 17 (unchanged)
+- **Rollback:** image-only rollback to 0.18.1 is safe. API tokens revoked by a password reset or change stay revoked after a rollback; create new ones if needed.
+
 ### Security
 - Setup and reset forms check the new password against the password policy before validating the form's challenge, so a weak password no longer spends a challenge. An unauthenticated client could previously fill the shared replay cache with unthrottled weak-password submissions and lock every login, setup, and reset out for about five minutes. A mismatched confirmation still spends its challenge and counts against the throttle (#260).
 - A password reset now revokes every active API token in the same transaction, and a password change does too, so a token created with a stolen session no longer outlives credential recovery; the audit record lists `api_tokens_revoked` when tokens were revoked. A password change also replaces the session that made it with a new one, so the old session cookie stops working (#261).
@@ -213,7 +218,8 @@ Releases before 0.11.16 are described in their
 [GitHub release notes](https://github.com/crypt0rr/TailState/releases); their
 schema versions are listed in [UPGRADING.md](UPGRADING.md#schema-history).
 
-[Unreleased]: https://github.com/crypt0rr/TailState/compare/v0.18.1...HEAD
+[Unreleased]: https://github.com/crypt0rr/TailState/compare/v0.18.2...HEAD
+[0.18.2]: https://github.com/crypt0rr/TailState/compare/v0.18.1...v0.18.2
 [0.18.1]: https://github.com/crypt0rr/TailState/compare/v0.18.0...v0.18.1
 [0.18.0]: https://github.com/crypt0rr/TailState/compare/v0.17.1...v0.18.0
 [0.17.1]: https://github.com/crypt0rr/TailState/compare/v0.17.0...v0.17.1

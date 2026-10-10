@@ -247,6 +247,16 @@ func TestPresentedValuesStayInert(t *testing.T) {
 	// TailState's own links still render.
 	inert := []string{"https://evil.example", "www.evil.example", "WWW.evil.example", "@channel", "@all", "@here", "@room", "@everyone", "@Channel"}
 	value := strings.Join(inert, " ")
+	// E-mail addresses whose domain starts like a mention keyword stay
+	// exactly as written, so they can still be copied.
+	for _, address := range []string{"bob@allcorp.example", "carol@hereford.example", "dave@room.example", "x.y@channel.example"} {
+		if got := neutralize(address); got != address {
+			t.Fatalf("address %q became %q", address, got)
+		}
+	}
+	if got := neutralize("(@here) ping"); !strings.Contains(got, "@"+wordJoiner+"here") {
+		t.Fatalf("mention after punctuation stays active: %q", got)
+	}
 	tenant := Context{Label: value, Tailnet: "example.com", PublicURL: "https://tailstate.example"}
 	messages := []Message{
 		tenant.Digest(DigestInput{BatchID: 7, ObservedAt: testObservedAt, Attributed: true, Changes: []model.Change{

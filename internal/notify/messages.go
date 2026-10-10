@@ -444,8 +444,11 @@ func escape(value string) string {
 const wordJoiner = "\u2060"
 
 var (
-	bareWebPattern   = regexp.MustCompile(`(?i)\bwww\.`)
-	broadcastPattern = regexp.MustCompile(`(?i)@(channel|all|here|room|everyone)`)
+	bareWebPattern = regexp.MustCompile(`(?i)\bwww\.`)
+	// A mention stands on its own: no address local part before the "@"
+	// (bob@allcorp.example is an e-mail address, not @all) and a word
+	// boundary after it.
+	broadcastPattern = regexp.MustCompile(`(?i)(^|[^\w.+\-])@(channel|all|here|room|everyone)\b`)
 )
 
 // neutralize inserts a word joiner inside "://" and "www." and after the "@"
@@ -456,7 +459,7 @@ var (
 func neutralize(value string) string {
 	value = strings.ReplaceAll(value, "://", ":"+wordJoiner+"//")
 	value = bareWebPattern.ReplaceAllStringFunc(value, func(match string) string { return match[:3] + wordJoiner + "." })
-	return broadcastPattern.ReplaceAllString(value, "@"+wordJoiner+"$1")
+	return broadcastPattern.ReplaceAllString(value, "${1}@"+wordJoiner+"${2}")
 }
 
 // escapeCode makes value safe inside a single-backtick code span. Code span

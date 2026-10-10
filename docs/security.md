@@ -32,6 +32,18 @@ The command re-encrypts all protected values in one transaction and preserves
 the evidence signing identity. If it fails, the old key remains valid; do not
 replace the configured key file until the command reports success. Keep the old
 key and a verified database backup until the new deployment has been checked.
+Like `admin compact`, `admin rekey` takes the service lock on
+`tailstate.db.lock` and refuses to run (exit code `1`) while `serve` holds it,
+because a running service keeps the old key in memory and would seal values it
+saves afterwards under that key.
+
+If a notification destination's URL still cannot be decrypted with the current
+key (for example a destination saved by a service that kept running through a
+rotation on a host without `flock(2)`), its notifications are dead-lettered
+with a reason naming the destination, and delivery to every other destination
+continues. Settings and the Status page's **Delivery by destination** table
+flag the destination; enter its URL again under **Edit destination** (then
+retry its dead letters), or disable or remove it.
 
 Each encrypted value is bound to the row and column that stores it (AES-GCM
 additional data), so a ciphertext copied to another row or column fails to

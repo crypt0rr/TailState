@@ -152,12 +152,12 @@ func (s *Server) expiringSoon(ctx context.Context, now time.Time) ([]expiringRes
 	}
 	horizon := expiry.HorizonDays(settings.WarningDays)
 	filtered := len(settings.TagFilter) > 0
-	devices, err := s.store.CollectorSnapshots(ctx, settings.Generation, "devices")
+	devices, err := s.store.ExpirySnapshots(ctx, settings.Generation, "devices")
 	if err != nil {
 		slog.Error("load device snapshots for expiry card", "error", err)
 		return nil, horizon, filtered
 	}
-	keys, err := s.store.CollectorSnapshots(ctx, settings.Generation, "keys")
+	keys, err := s.store.ExpirySnapshots(ctx, settings.Generation, "keys")
 	if err != nil {
 		slog.Error("load key snapshots for expiry card", "error", err)
 		return nil, horizon, filtered

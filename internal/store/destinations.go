@@ -30,11 +30,18 @@ type NotificationDestination struct {
 	// Format overrides the message format chosen from the URL scheme
 	// (notify.FormatAuto when empty). It is written by SetDestinationFormat.
 	Format string
+	// ServiceURLUnreadable reports that the stored service URL cannot be
+	// decrypted with the current master key (for example because it was
+	// sealed under a previous key). ServiceURL is then empty; saving the
+	// destination with its URL again repairs it.
+	ServiceURLUnreadable bool
 }
 
 // ListDestinations returns active notification destinations. Pass true to
 // include soft-deleted destinations; their service URL was scrubbed when they
-// were deleted, so they are returned with an empty ServiceURL.
+// were deleted, so they are returned with an empty ServiceURL. A destination
+// whose URL cannot be decrypted is still listed, flagged with
+// ServiceURLUnreadable, so it can be repaired, disabled, or removed.
 func (s *Store) ListDestinations(ctx context.Context, includeDeleted ...bool) ([]NotificationDestination, error) {
 	query := "SELECT id,name,service_url_enc,enabled,created_at,updated_at,COALESCE(deleted_at,''),route_min_severity,route_include_collectors,route_exclude_collectors,route_change_kinds,message_format FROM notification_destinations"
 	if len(includeDeleted) == 0 || !includeDeleted[0] {
@@ -57,9 +64,8 @@ func (s *Store) ListDestinations(ctx context.Context, includeDeleted ...bool) ([
 		}
 		d.Routing = routingFromColumns(minSeverity, include, exclude, kinds)
 		if encrypted != "" {
-			d.ServiceURL, err = s.box.Open(destinationBinding(d.ID), encrypted)
-			if err != nil {
-				return nil, err
+			if d.ServiceURL, err = s.box.Open(destinationBinding(d.ID), encrypted); err != nil {
+				d.ServiceURL, d.ServiceURLUnreadable = "", true
 			}
 		}
 		d.Enabled = enabled == 1

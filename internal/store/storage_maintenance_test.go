@@ -194,6 +194,78 @@ func TestWALReturnsToCapAfterBurst(t *testing.T) {
 	}
 }
 
+// TestCleanupCheckpointDoesNotWaitForReaders guards R-072: with a reader
+// transaction open, the post-cleanup TRUNCATE checkpoint gives up at once
+// instead of holding the write lock for the 5 s busy timeout, the writer
+// connection gets its busy timeout back, and the next pass without a reader
+// still truncates the WAL.
+func TestCleanupCheckpointDoesNotWaitForReaders(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "tailstate.db")
+	st, err := Open(path, maintenanceBox(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	ctx := context.Background()
+	expireSession := func(name string) {
+		t.Helper()
+		if _, err := st.db.ExecContext(ctx, "INSERT INTO sessions(token_hash,csrf_hash,expires_at,created_at) VALUES(?,'csrf',?2,?2)", name, time.Now().Add(-time.Hour).UTC().Format(time.RFC3339Nano)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	expireSession("before-reader")
+	reader, err := st.readDB().BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sessions int
+	if err := reader.QueryRowContext(ctx, "SELECT COUNT(*) FROM sessions").Scan(&sessions); err != nil {
+		t.Fatal(err)
+	}
+	started := time.Now()
+	stats, err := st.CleanupWithOptions(ctx, CleanupOptions{Retention: 30 * 24 * time.Hour})
+	elapsed := time.Since(started)
+	if err != nil || stats.SessionsDeleted != 1 || stats.WALCheckpointed {
+		t.Fatalf("cleanup with an open reader stats=%+v err=%v", stats, err)
+	}
+	if elapsed >= 100*time.Millisecond {
+		t.Fatalf("cleanup with an open reader took %s, want under 100ms", elapsed)
+	}
+	var timeout int
+	if err := st.db.QueryRowContext(ctx, "PRAGMA busy_timeout").Scan(&timeout); err != nil || timeout != 5000 {
+		t.Fatalf("writer busy_timeout=%d err=%v, want 5000", timeout, err)
+	}
+	// Later writes still wait normally: a write that has to wait for another
+	// process holding the write lock succeeds once the lock is released.
+	other, err := sql.Open("sqlite", "file:"+path+"?_pragma=busy_timeout(5000)&_txlock=immediate")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer other.Close()
+	holder, err := other.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	released := make(chan struct{})
+	go func() {
+		time.Sleep(200 * time.Millisecond)
+		_ = holder.Rollback()
+		close(released)
+	}()
+	expireSession("waited")
+	<-released
+	if err := reader.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	stats, err = st.CleanupWithOptions(ctx, CleanupOptions{Retention: 30 * 24 * time.Hour})
+	if err != nil || stats.SessionsDeleted != 1 || !stats.WALCheckpointed {
+		t.Fatalf("cleanup without a reader stats=%+v err=%v", stats, err)
+	}
+	if size := fileSize(t, path+"-wal"); size != 0 {
+		t.Fatalf("WAL=%d bytes after a cleanup pass without readers, want 0", size)
+	}
+}
+
 func fillProbe(t *testing.T, st *Store, mebibytes int) {
 	t.Helper()
 	if _, err := st.db.Exec("CREATE TABLE IF NOT EXISTS retention_probe(b BLOB)"); err != nil {

@@ -157,9 +157,13 @@ func (s *ReadOnlyStore) EnabledDestinationURLs(ctx context.Context) ([]string, e
 	}
 	urls := make([]string, 0, len(destinations))
 	for _, destination := range destinations {
-		if destination.Enabled {
-			urls = append(urls, destination.ServiceURL)
+		if !destination.Enabled {
+			continue
 		}
+		if destination.ServiceURLUnreadable {
+			return nil, fmt.Errorf("service URL of notification destination %d cannot be decrypted with the current master key", destination.ID)
+		}
+		urls = append(urls, destination.ServiceURL)
 	}
 	return urls, nil
 }

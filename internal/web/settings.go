@@ -303,16 +303,21 @@ func (s *Server) settingsData(ctx context.Context, csrf string, configured bool,
 			for _, kind := range destination.Routing.ChangeKinds {
 				kinds[kind] = true
 			}
+			displayURL := ""
+			if !destination.ServiceURLUnreadable {
+				displayURL = notify.RedactURL(destination.ServiceURL)
+			}
 			data.Destinations = append(data.Destinations, destinationPage{
-				ID: destination.ID, Name: destination.Name, DisplayURL: notify.RedactURL(destination.ServiceURL), Enabled: destination.Enabled,
-				MinSeverity:       string(destination.Routing.MinSeverity),
-				IncludeCollectors: strings.Join(destination.Routing.IncludeCollectors, ", "),
-				ExcludeCollectors: strings.Join(destination.Routing.ExcludeCollectors, ", "),
-				ChangeKinds:       kinds,
-				RoutingSummary:    routingSummary(destination.Routing),
-				Format:            destination.Format,
-				EffectiveFormat:   notify.FormatFor(destination.ServiceURL, destination.Format),
-				Pending:           pending[destination.ID],
+				ID: destination.ID, Name: destination.Name, DisplayURL: displayURL, Enabled: destination.Enabled,
+				ServiceURLUnreadable: destination.ServiceURLUnreadable,
+				MinSeverity:          string(destination.Routing.MinSeverity),
+				IncludeCollectors:    strings.Join(destination.Routing.IncludeCollectors, ", "),
+				ExcludeCollectors:    strings.Join(destination.Routing.ExcludeCollectors, ", "),
+				ChangeKinds:          kinds,
+				RoutingSummary:       routingSummary(destination.Routing),
+				Format:               destination.Format,
+				EffectiveFormat:      notify.FormatFor(destination.ServiceURL, destination.Format),
+				Pending:              pending[destination.ID],
 			})
 		}
 		enabled := 0

@@ -712,3 +712,72 @@ func TestAdminRekeyRotatesConfiguredStore(t *testing.T) {
 		t.Fatalf("original key file disappeared during rekey: %v", err)
 	}
 }
+
+// TestAdminRekeyRefusesWhileServiceLockHeld guards R-055: a running service
+// keeps the old key in memory, so rekey must refuse to run while the service
+// lock is held and must not open or change the database.
+func TestAdminRekeyRefusesWhileServiceLockHeld(t *testing.T) {
+	dataDir := t.TempDir()
+	configureCommandEnvironment(t, dataDir)
+	_, st, err := load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.SaveSettings(context.Background(), store.Settings{
+		Tailnet: "-", OAuthClientID: "client", OAuthClientSecret: "secret",
+		MattermostURL:  "https://mattermost.example/hooks/token",
+		DeviceInterval: time.Minute, InventoryInterval: 5 * time.Minute,
+	}); err != nil {
+		st.Close()
+		t.Fatal(err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dataDir, "tailstate.db")
+	snapshot := func() map[string]string {
+		t.Helper()
+		files := map[string]string{}
+		for _, name := range []string{path, path + "-wal", path + "-shm"} {
+			if content, err := os.ReadFile(name); err == nil {
+				files[name] = string(content)
+			} else if !errors.Is(err, os.ErrNotExist) {
+				t.Fatal(err)
+			}
+		}
+		return files
+	}
+	before := snapshot()
+	newKeyPath := filepath.Join(dataDir, "master.key.new")
+	if err := os.WriteFile(newKeyPath, []byte(base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0x42}, 32))), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	lock, err := store.LockService(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = adminRekey([]string{"-new-key-file", newKeyPath})
+	if releaseErr := lock.Release(); releaseErr != nil {
+		t.Fatal(releaseErr)
+	}
+	if !errors.Is(err, store.ErrServiceRunning) || exitCode(err) != exitRuntime {
+		t.Fatalf("rekey while the service lock is held err=%v exit=%d", err, exitCode(err))
+	}
+	after := snapshot()
+	if len(after) != len(before) {
+		t.Fatalf("refused rekey changed the database files: before=%d after=%d", len(before), len(after))
+	}
+	for name, content := range before {
+		if after[name] != content {
+			t.Fatalf("refused rekey changed %s", name)
+		}
+	}
+	_, reopened, err := load()
+	if err != nil {
+		t.Fatalf("old key no longer opens the database: %v", err)
+	}
+	defer reopened.Close()
+	if _, err := reopened.Settings(context.Background()); err != nil {
+		t.Fatalf("settings unreadable with the old key: %v", err)
+	}
+}

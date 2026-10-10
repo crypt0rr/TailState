@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -56,7 +57,9 @@ func (s *Store) enqueueSystem(ctx context.Context, payloadFormat, payload string
 // second worker or a restarted process cannot send the same pending row just
 // because the first worker is still in flight. Expired leases are returned to
 // pending before the next claim; completion and retry methods fence the old
-// worker with the lease token.
+// worker with the lease token. A due row whose destination URL cannot be
+// decrypted is dead-lettered instead of claimed, so it cannot block delivery
+// to the other destinations.
 func (s *Store) ClaimDueOutbox(ctx context.Context, limit int, leases ...time.Duration) ([]OutboxItem, error) {
 	if limit <= 0 {
 		limit = 10
@@ -109,8 +112,14 @@ func (s *Store) ClaimDueOutbox(ctx context.Context, limit int, leases ...time.Du
 		return nil, err
 	}
 	items := make([]OutboxItem, 0, limit)
+	var unreadable []*unreadableDestinationError
 	for rows.Next() {
 		item, scanErr := s.readOutboxItem(rows)
+		var urlErr *unreadableDestinationError
+		if errors.As(scanErr, &urlErr) {
+			unreadable = append(unreadable, urlErr)
+			continue
+		}
 		if scanErr != nil {
 			rows.Close()
 			return nil, scanErr
@@ -123,6 +132,17 @@ func (s *Store) ClaimDueOutbox(ctx context.Context, limit int, leases ...time.Du
 	}
 	if err := rows.Close(); err != nil {
 		return nil, err
+	}
+	// A row whose destination URL cannot be decrypted (for example one
+	// sealed under a previous master key) can never be sent. It is
+	// dead-lettered with a reason naming the destination instead of failing
+	// the claim, which would stop delivery to every other destination.
+	for _, urlErr := range unreadable {
+		if _, err := tx.ExecContext(ctx, `UPDATE outbox
+			SET status='dead',next_attempt=?,last_error=?,lease_until=NULL,lease_token=''
+			WHERE id=? AND status='pending'`, nowValue, truncate(urlErr.reason(), 500), urlErr.outboxID); err != nil {
+			return nil, err
+		}
 	}
 	claimed := make([]OutboxItem, 0, len(items))
 	for i := range items {
@@ -153,7 +173,30 @@ func (s *Store) ClaimDueOutbox(ctx context.Context, limit int, leases ...time.Du
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
+	for _, urlErr := range unreadable {
+		slog.Warn("notification dead-lettered: destination service URL cannot be decrypted", "outbox_id", urlErr.outboxID, "destination_id", urlErr.destinationID, "error", urlErr.err)
+	}
 	return items, nil
+}
+
+// unreadableDestinationError reports an outbox row whose destination service
+// URL cannot be decrypted with the current master key.
+type unreadableDestinationError struct {
+	outboxID      int64
+	destinationID int64
+	name          string
+	err           error
+}
+
+func (e *unreadableDestinationError) Error() string {
+	return fmt.Sprintf("decrypt service URL of destination %d: %v", e.destinationID, e.err)
+}
+
+func (e *unreadableDestinationError) Unwrap() error { return e.err }
+
+// reason is the dead-letter reason recorded on the outbox row.
+func (e *unreadableDestinationError) reason() string {
+	return fmt.Sprintf("service URL of destination %d (%s) cannot be decrypted with the current master key; save the destination with its URL again, or disable or remove it", e.destinationID, e.name)
 }
 
 func (s *Store) readOutboxItem(scanner outboxScanner) (OutboxItem, error) {
@@ -185,7 +228,7 @@ func (s *Store) readOutboxItem(scanner outboxScanner) (OutboxItem, error) {
 	if encrypted != "" {
 		item.Destination.ServiceURL, err = s.box.Open(destinationBinding(item.DestinationID), encrypted)
 		if err != nil {
-			return OutboxItem{}, err
+			return OutboxItem{}, &unreadableDestinationError{outboxID: item.ID, destinationID: item.DestinationID, name: name, err: err}
 		}
 	}
 	item.Destination.CreatedAt, err = time.Parse(time.RFC3339Nano, created)
@@ -354,6 +397,10 @@ type DestinationDelivery struct {
 	Processing    int
 	Dead          int
 	RetryableDead int
+	// ServiceURLUnreadable reports that the destination's service URL cannot
+	// be decrypted with the current master key, so its notifications are
+	// dead-lettered until it is saved with its URL again.
+	ServiceURLUnreadable bool
 }
 
 // retryableDeadOutbox selects dead letters that may be requeued. Rows
@@ -370,7 +417,7 @@ func retryableDeadOutbox(prefix string) string {
 // active destination, including destinations with an empty outbox, through
 // the read-only pool so the status page never waits behind a write.
 func (s *Store) DestinationDeliveries(ctx context.Context) ([]DestinationDelivery, error) {
-	rows, err := s.readDB().QueryContext(ctx, `SELECT d.id,d.name,d.enabled,
+	rows, err := s.readDB().QueryContext(ctx, `SELECT d.id,d.name,d.enabled,d.service_url_enc,
 		COALESCE(SUM(o.status='pending'),0),COALESCE(SUM(o.status='processing'),0),COALESCE(SUM(o.status='dead'),0),
 		COALESCE(SUM(CASE WHEN `+retryableDeadOutbox("o.")+` THEN 1 ELSE 0 END),0)
 		FROM notification_destinations d LEFT JOIN outbox o ON o.destination_id=d.id
@@ -383,10 +430,15 @@ func (s *Store) DestinationDeliveries(ctx context.Context) ([]DestinationDeliver
 	for rows.Next() {
 		var delivery DestinationDelivery
 		var enabled int
-		if err := rows.Scan(&delivery.ID, &delivery.Name, &enabled, &delivery.Pending, &delivery.Processing, &delivery.Dead, &delivery.RetryableDead); err != nil {
+		var encrypted string
+		if err := rows.Scan(&delivery.ID, &delivery.Name, &enabled, &encrypted, &delivery.Pending, &delivery.Processing, &delivery.Dead, &delivery.RetryableDead); err != nil {
 			return nil, err
 		}
 		delivery.Enabled = enabled == 1
+		if encrypted != "" {
+			_, openErr := s.box.Open(destinationBinding(delivery.ID), encrypted)
+			delivery.ServiceURLUnreadable = openErr != nil
+		}
 		out = append(out, delivery)
 	}
 	if err := rows.Err(); err != nil {

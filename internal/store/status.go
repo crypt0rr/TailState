@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -497,12 +498,49 @@ func (s *Store) reclaimAfterCleanup(ctx context.Context, stats *CleanupStats) {
 			stats.PagesReleased = before - after
 		}
 	}
-	var busy, logFrames, checkpointed int64
-	if err := s.db.QueryRowContext(ctx, "PRAGMA wal_checkpoint(TRUNCATE)").Scan(&busy, &logFrames, &checkpointed); err != nil {
+	checkpointed, err := s.checkpointWithoutWaiting(ctx)
+	if err != nil {
 		slog.Warn("WAL checkpoint after cleanup failed", "error", err)
 		return
 	}
-	stats.WALCheckpointed = busy == 0
+	stats.WALCheckpointed = checkpointed
+}
+
+// checkpointWithoutWaiting runs a TRUNCATE checkpoint on the writer
+// connection with busy_timeout=0. A TRUNCATE checkpoint holds the write lock
+// while it waits for readers, so with the normal timeout one open reader (a
+// long History read or admin backup, for example) would stall every writer
+// for the full timeout. Without a busy handler it gives up at once and the
+// next pass that does work tries again. The connection's previous timeout is
+// restored before it returns to the pool.
+func (s *Store) checkpointWithoutWaiting(ctx context.Context) (done bool, err error) {
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer conn.Close()
+	var timeout int64
+	if err := conn.QueryRowContext(ctx, "PRAGMA busy_timeout").Scan(&timeout); err != nil {
+		return false, err
+	}
+	if _, err := conn.ExecContext(ctx, "PRAGMA busy_timeout=0"); err != nil {
+		return false, err
+	}
+	defer func() {
+		if _, resetErr := conn.ExecContext(context.WithoutCancel(ctx), "PRAGMA busy_timeout="+strconv.FormatInt(timeout, 10)); resetErr != nil {
+			// A writer without a busy handler would fail instead of
+			// waiting, so the connection is discarded rather than reused.
+			_ = conn.Raw(func(any) error { return driver.ErrBadConn })
+			if err == nil {
+				err = resetErr
+			}
+		}
+	}()
+	var busy, logFrames, checkpointed int64
+	if err := conn.QueryRowContext(ctx, "PRAGMA wal_checkpoint(TRUNCATE)").Scan(&busy, &logFrames, &checkpointed); err != nil {
+		return false, err
+	}
+	return busy == 0, nil
 }
 
 // cleanupPhases returns the retention statements in execution order. Every
@@ -531,11 +569,20 @@ func cleanupPhases(stats *CleanupStats, now time.Time, retention time.Duration) 
 		// first_attempt across two status values would force a temporary sort.
 		{name: "outbox_dead_letter", query: `UPDATE outbox SET status='dead',next_attempt=?,lease_until=NULL,lease_token='',last_error=CASE WHEN TRIM(last_error)='' THEN 'delivery retry window expired' ELSE last_error END WHERE rowid IN (SELECT rowid FROM outbox WHERE status IN ('pending','processing') AND first_attempt<=? AND (status='pending' OR lease_until IS NULL OR lease_until<=?) LIMIT ?)`, args: []any{nowValue, retryCutoff, nowValue}, add: func(n int64) { stats.OutboxDeadLettered += n }},
 		{name: "webhook_dead_letter", query: `UPDATE webhook_triggers SET status='dead',next_attempt_at=?,lease_until=NULL,lease_token='',last_error=CASE WHEN TRIM(last_error)='' THEN 'reconciliation retry window expired' ELSE last_error END WHERE rowid IN (SELECT rowid FROM webhook_triggers WHERE status IN ('pending','processing') AND received_at<=? AND (status='pending' OR lease_until IS NULL OR lease_until<=?) LIMIT ?)`, args: []any{nowValue, webhookRetryCutoff, nowValue}, add: func(n int64) { stats.WebhookDeadLettered += n }},
-		{name: "events", query: `DELETE FROM events WHERE rowid IN (SELECT rowid FROM events WHERE observed_at<? ORDER BY observed_at,rowid LIMIT ?)`, args: []any{observedCutoff}, add: func(n int64) { stats.EventsDeleted += n }},
-		// A batch and its events share one observed_at, so only batches older
-		// than the retention cutoff can have lost their events. Bounding the
-		// candidates by that cutoff turns the orphan check into an index range.
-		{name: "event_batches", query: `DELETE FROM event_batches WHERE rowid IN (SELECT b.rowid FROM event_batches b WHERE b.observed_at<? AND NOT EXISTS (SELECT 1 FROM events WHERE events.batch_id=b.id) ORDER BY b.observed_at,b.rowid LIMIT ?)`, args: []any{observedCutoff}, add: func(n int64) { stats.EventBatchesDeleted += n }},
+		// An expired batch is removed together with its events in one
+		// transaction (see deleteExpiredBatches), so an evidence audit or
+		// export never sees a batch row that has lost some of its events and
+		// mistakes it for tampering. The query selects the candidate batches;
+		// a batch and its events share one observed_at.
+		{name: "event_batches", query: `SELECT b.id,(SELECT COUNT(*) FROM events WHERE events.batch_id=b.id) FROM event_batches b WHERE b.observed_at<? ORDER BY b.observed_at,b.rowid LIMIT ?`, args: []any{observedCutoff}, exec: func(ctx context.Context, db *sql.DB, query string, args []any) (int64, error) {
+			events, batches, err := deleteExpiredBatches(ctx, db, query, args)
+			stats.EventsDeleted += events
+			stats.EventBatchesDeleted += batches
+			return events + batches, err
+		}},
+		// Events without a batch row (legacy rows, or rows whose batch is
+		// already gone) expire on their own.
+		{name: "events", query: `DELETE FROM events WHERE rowid IN (SELECT rowid FROM events WHERE observed_at<? AND (batch_id IS NULL OR NOT EXISTS (SELECT 1 FROM event_batches b WHERE b.id=events.batch_id)) ORDER BY observed_at,rowid LIMIT ?)`, args: []any{observedCutoff}, add: func(n int64) { stats.EventsDeleted += n }},
 		// Trigger links are removed after their batch. Batch IDs are
 		// allocated in observation order, so links of expired batches sort
 		// below the first batch that is still inside the retention window;
@@ -565,6 +612,10 @@ type cleanupPhase struct {
 	query string
 	args  []any
 	add   func(int64)
+	// exec, when set, runs one bounded transaction of the phase in place of
+	// executing query as one statement. It records its own counts and
+	// returns the number of rows it changed.
+	exec func(ctx context.Context, db *sql.DB, query string, args []any) (int64, error)
 }
 
 type cleanupBudget struct {
@@ -583,8 +634,6 @@ func (s *Store) runCleanupPhase(ctx context.Context, stats *CleanupStats, phase 
 		if budget.expired() {
 			return false, nil
 		}
-		args := append([]any(nil), phase.args...)
-		args = append(args, budget.batchSize)
 		transactionBudget := budget.transaction
 		if remaining := time.Until(budget.deadline); remaining < transactionBudget {
 			transactionBudget = remaining
@@ -592,20 +641,99 @@ func (s *Store) runCleanupPhase(ctx context.Context, stats *CleanupStats, phase 
 		if transactionBudget <= 0 {
 			return false, nil
 		}
-		batchCtx, cancel := context.WithTimeout(ctx, transactionBudget)
-		result, err := s.db.ExecContext(batchCtx, phase.query, args...)
-		cancel()
-		stats.Transactions++
+		changed, err := s.cleanupTransaction(ctx, stats, phase, budget.batchSize, transactionBudget)
 		if err != nil {
-			return false, fmt.Errorf("cleanup %s: %w", phase.name, err)
-		}
-		changed, err := result.RowsAffected()
-		if err != nil {
-			return false, fmt.Errorf("cleanup %s rows affected: %w", phase.name, err)
+			return false, err
 		}
 		if changed == 0 {
 			return true, nil
 		}
+	}
+}
+
+// cleanupTransaction runs one bounded transaction of a cleanup phase and
+// returns the number of rows it changed.
+func (s *Store) cleanupTransaction(ctx context.Context, stats *CleanupStats, phase cleanupPhase, batchSize int, transactionBudget time.Duration) (int64, error) {
+	args := append([]any(nil), phase.args...)
+	args = append(args, batchSize)
+	batchCtx, cancel := context.WithTimeout(ctx, transactionBudget)
+	defer cancel()
+	stats.Transactions++
+	if phase.exec != nil {
+		changed, err := phase.exec(batchCtx, s.db, phase.query, args)
+		if err != nil {
+			return 0, fmt.Errorf("cleanup %s: %w", phase.name, err)
+		}
+		return changed, nil
+	}
+	result, err := s.db.ExecContext(batchCtx, phase.query, args...)
+	if err != nil {
+		return 0, fmt.Errorf("cleanup %s: %w", phase.name, err)
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("cleanup %s rows affected: %w", phase.name, err)
+	}
+	if changed > 0 {
 		phase.add(changed)
 	}
+	return changed, nil
+}
+
+// deleteExpiredBatches removes the oldest expired event batches together
+// with their events in one transaction, so a batch is always either complete
+// or absent. query lists candidate batches oldest first with their event
+// counts; its last argument is the batch size, which bounds the events one
+// transaction deletes. The oldest batch is always taken, even when it alone
+// holds more events, so a large batch cannot stall retention.
+func deleteExpiredBatches(ctx context.Context, db *sql.DB, query string, args []any) (events, batches int64, err error) {
+	limit := int64(args[len(args)-1].(int))
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer tx.Rollback()
+	rows, err := tx.QueryContext(ctx, query, args...)
+	if err != nil {
+		return 0, 0, err
+	}
+	var ids []int64
+	var selected int64
+	for rows.Next() {
+		var id, count int64
+		if err := rows.Scan(&id, &count); err != nil {
+			rows.Close()
+			return 0, 0, err
+		}
+		if len(ids) > 0 && selected+count > limit {
+			break
+		}
+		ids = append(ids, id)
+		selected += count
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return 0, 0, err
+	}
+	if err := rows.Close(); err != nil {
+		return 0, 0, err
+	}
+	for _, id := range ids {
+		result, err := tx.ExecContext(ctx, "DELETE FROM events WHERE batch_id=?", id)
+		if err != nil {
+			return 0, 0, err
+		}
+		deleted, err := result.RowsAffected()
+		if err != nil {
+			return 0, 0, err
+		}
+		if _, err := tx.ExecContext(ctx, "DELETE FROM event_batches WHERE id=?", id); err != nil {
+			return 0, 0, err
+		}
+		events += deleted
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, 0, err
+	}
+	return events, int64(len(ids)), nil
 }

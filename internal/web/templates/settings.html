@@ -107,10 +107,15 @@
       <div class="destination-top">
         <div class="destination-identity">
           <h3 id="destination-{{.ID}}">{{.Name}}</h3>
+          {{- if not .ServiceURLUnreadable}}
           <code class="destination-url">{{.DisplayURL}}</code>
+          {{- end}}
         </div>
         <span class="status-pill {{if .Enabled}}status-enabled{{else}}status-disabled{{end}}">{{if .Enabled}}Enabled{{else}}Disabled{{end}}</span>
       </div>
+      {{- if .ServiceURLUnreadable}}
+      <div class="error" role="alert">The service URL cannot be decrypted with the current master key, so notifications to this destination are dead-lettered. Edit the destination and enter its URL again, or disable or remove it.</div>
+      {{- end}}
       <p class="muted destination-routing">Routing: {{.RoutingSummary}} · Format: {{.EffectiveFormat}}{{if not .Format}} (automatic){{end}}</p>
       <div class="destination-actions">
         <form method="post" action="/settings/destinations/toggle">

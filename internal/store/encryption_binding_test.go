@@ -3,6 +3,7 @@ package store
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"path/filepath"
 	"testing"
 
@@ -65,22 +66,16 @@ func TestMovedCiphertextFailsAuthentication(t *testing.T) {
 		verify func(*Store) error
 	}{
 		{
-			name: "destination URL onto another destination",
-			move: "UPDATE notification_destinations SET service_url_enc=(SELECT service_url_enc FROM notification_destinations WHERE id=?) WHERE id=?",
-			args: func(first, second int64) []any { return []any{second, first} },
-			verify: func(st *Store) error {
-				_, err := st.ListDestinations(ctx)
-				return err
-			},
+			name:   "destination URL onto another destination",
+			move:   "UPDATE notification_destinations SET service_url_enc=(SELECT service_url_enc FROM notification_destinations WHERE id=?) WHERE id=?",
+			args:   func(first, second int64) []any { return []any{second, first} },
+			verify: func(st *Store) error { return destinationURLsReadable(ctx, st) },
 		},
 		{
-			name: "signing key into a destination URL",
-			move: "UPDATE notification_destinations SET service_url_enc=(SELECT value FROM meta WHERE key=?) WHERE id=?",
-			args: func(first, _ int64) []any { return []any{evidenceSigningPrivateKeyMeta, first} },
-			verify: func(st *Store) error {
-				_, err := st.ListDestinations(ctx)
-				return err
-			},
+			name:   "signing key into a destination URL",
+			move:   "UPDATE notification_destinations SET service_url_enc=(SELECT value FROM meta WHERE key=?) WHERE id=?",
+			args:   func(first, _ int64) []any { return []any{evidenceSigningPrivateKeyMeta, first} },
+			verify: func(st *Store) error { return destinationURLsReadable(ctx, st) },
 		},
 		{
 			name: "OAuth secret into the webhook secret",
@@ -105,6 +100,22 @@ func TestMovedCiphertextFailsAuthentication(t *testing.T) {
 			}
 		})
 	}
+}
+
+// destinationURLsReadable fails when any active destination's service URL
+// does not decrypt at its location. ListDestinations flags such a URL
+// instead of failing, so the destination can still be repaired.
+func destinationURLsReadable(ctx context.Context, st *Store) error {
+	destinations, err := st.ListDestinations(ctx)
+	if err != nil {
+		return err
+	}
+	for _, destination := range destinations {
+		if destination.ServiceURLUnreadable || destination.ServiceURL == "" {
+			return fmt.Errorf("destination %d service URL is unreadable", destination.ID)
+		}
+	}
+	return nil
 }
 
 // TestRekeyUpgradesLegacyEnvelopes downgrades every encrypted value to the

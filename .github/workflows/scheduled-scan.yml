@@ -1,12 +1,19 @@
 name: Scheduled vulnerability scan
 
-# New Go advisories and base-image CVEs appear between commits. This weekly
+# New Go advisories and base-image CVEs appear between commits. This daily
 # scan re-checks main with govulncheck and the published images with Grype,
-# and opens (or updates) one tracking issue when anything fails.
+# and opens (or updates) one tracking issue when anything fails. A manual run
+# reports to the tracking issue only when its `report` input is set.
 on:
   schedule:
-    - cron: "17 5 * * 1"
+    - cron: "17 5 * * *"
   workflow_dispatch:
+    inputs:
+      report:
+        description: Open or update the tracking issue if the scan fails
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -90,7 +97,7 @@ jobs:
 
   report:
     needs: scan
-    if: ${{ failure() && github.event_name == 'schedule' }}
+    if: ${{ failure() && (github.event_name == 'schedule' || inputs.report) }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -104,7 +111,7 @@ jobs:
         run: |
           set -euo pipefail
           title="Scheduled vulnerability scan failed"
-          body="$(printf 'The weekly vulnerability scan failed for: %s\n\nRun: %s\n' "${FAILURES:-unknown}" "$RUN_URL")"
+          body="$(printf 'The scheduled vulnerability scan failed for: %s\n\nRun: %s\n' "${FAILURES:-unknown}" "$RUN_URL")"
           existing="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "\"$title\" in:title" --json number --jq '.[0].number // empty')"
           if [[ -n "$existing" ]]; then
             gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" --body "$body"

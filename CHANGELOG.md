@@ -13,11 +13,13 @@ rollback requires restoring the backup taken before the upgrade. See
 
 ## [Unreleased]
 
-### Fixed
-- `tailstate admin reset` and the other one-shot administration commands wait up to 30 seconds for the database write lock instead of 5, so a busy service no longer makes them fail with "database is locked (SQLITE_BUSY)" (#269).
-
 ### Changed
 - Renovate proposes each Go release as one "Go toolchain" PR that updates the Dockerfile builder image, the `go` directive in `go.mod`, and the Dockerfile `GO_VERSION` argument together, so the toolchain alignment check passes and security releases of Go can land without manual work (#270).
+- CI runs `govulncheck` in its own `vulncheck` job instead of at the end of the `go` job, so a new Go advisory is reported by name about a minute into the run rather than as a generic `go` failure after the test suite. The scheduled vulnerability scan now runs daily instead of weekly, and a manual run can open or update the tracking issue through its `report` input (#286).
+- The release SBOM is generated from the built binaries only, so it no longer lists development tools from `go.mod` or the CI workflow actions. `SHA256SUMS` now covers every release asset including the SBOM, so the build-provenance attestation covers the SBOM as well (#287).
+
+### Fixed
+- `tailstate admin reset` and the other one-shot administration commands wait up to 30 seconds for the database write lock instead of 5, so a busy service no longer makes them fail with "database is locked (SQLITE_BUSY)" (#269).
 
 ## [0.18.1] - 2026-10-09
 

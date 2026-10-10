@@ -134,7 +134,7 @@ Storage limits and their enforcement are described in
 
 ## Local development
 
-TailState uses Go 1.27.2. CI reads this version from `go.mod`, and the
+TailState uses the Go version declared in `go.mod`. CI reads it from there, and the
 release container is built with the same digest-pinned Go builder. Run
 `bash scripts/check-go-toolchain.sh` to verify that the tested and published
 toolchains remain aligned before changing either declaration.

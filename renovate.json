@@ -28,6 +28,21 @@
       ],
       "datasourceTemplate": "docker",
       "versioningTemplate": "docker"
+    },
+    {
+      "customType": "regex",
+      "description": "The go.mod go directive and the Dockerfile GO_VERSION argument follow the golang builder image tag, so a Go release updates all three together (scripts/check-go-toolchain.sh rejects a partial update)",
+      "managerFilePatterns": [
+        "/(^|\\/)go\\.mod$/",
+        "/(^|\\/)Dockerfile$/"
+      ],
+      "matchStrings": [
+        "\\ngo (?<currentValue>\\d+\\.\\d+\\.\\d+)\\n",
+        "\\nARG GO_VERSION=(?<currentValue>\\d+\\.\\d+\\.\\d+)\\n"
+      ],
+      "depNameTemplate": "golang",
+      "datasourceTemplate": "docker",
+      "versioningTemplate": "docker"
     }
   ],
   "osvVulnerabilityAlerts": true,
@@ -51,6 +66,28 @@
         "gomod"
       ],
       "minimumReleaseAge": "3 days"
+    },
+    {
+      "description": "The regex manager above owns the go directive, so the gomod manager does not propose it separately.",
+      "matchManagers": [
+        "gomod"
+      ],
+      "matchDepTypes": [
+        "golang"
+      ],
+      "enabled": false
+    },
+    {
+      "description": "One PR per Go release: the builder image, the go directive, and GO_VERSION must change together.",
+      "matchDepNames": [
+        "golang"
+      ],
+      "matchUpdateTypes": [
+        "major",
+        "minor",
+        "patch"
+      ],
+      "groupName": "Go toolchain"
     }
   ]
 }

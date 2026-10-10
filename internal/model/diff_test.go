@@ -103,6 +103,41 @@ func TestKeyedDiffReportsListElementFieldPaths(t *testing.T) {
 	}
 }
 
+// TestKeyedDiffComparesAppearingListWithEmptyList is R-069: an identified
+// list that appears from null or absence, or disappears into it, is diffed
+// against an empty list, so each element is one added or removed element
+// instead of one whole-list value that is truncated past 240 bytes.
+func TestKeyedDiffComparesAppearingListWithEmptyList(t *testing.T) {
+	invite := deviceInvite("5861427050514914", false)
+	invite["multiUse"] = true
+	withInvite := detailsJSON(t, invite)
+	for name, before := range map[string][]byte{"null": []byte(`{"deviceInvites":null}`), "absent": []byte(`{}`)} {
+		diff := DiffDetailedFor("device_details", before, withInvite)
+		if len(diff.Fields) != 1 || diff.Fields[0].Field != "deviceInvites[5861427050514914]" || diff.Fields[0].OldPresent || !diff.Fields[0].NewPresent {
+			t.Fatalf("%s to list = %#v", name, diff.Fields)
+		}
+		diff = DiffDetailedFor("device_details", withInvite, before)
+		if len(diff.Fields) != 1 || diff.Fields[0].Field != "deviceInvites[5861427050514914]" || !diff.Fields[0].OldPresent || diff.Fields[0].NewPresent {
+			t.Fatalf("list to %s = %#v", name, diff.Fields)
+		}
+	}
+	// Without an element there is nothing to key: null to [] stays one value,
+	// as does a list replacing a value that is neither null nor a list.
+	for name, values := range map[string][2]string{
+		"null to empty":       {`{"deviceInvites":null}`, `{"deviceInvites":[]}`},
+		"unsupported to list": {`{"deviceInvites":{"unsupported":true}}`, `{"deviceInvites":[{"id":"1"}]}`},
+		"unidentified list":   {`{"deviceInvites":null}`, `{"deviceInvites":[{"name":"x"}]}`},
+	} {
+		diff := DiffDetailedFor("device_details", []byte(values[0]), []byte(values[1]))
+		if len(diff.Fields) != 1 || diff.Fields[0].Field != "deviceInvites" {
+			t.Fatalf("%s = %#v", name, diff.Fields)
+		}
+	}
+	if diff := DiffDetailed([]byte(`null`), []byte(`[{"id":"1"}]`)); len(diff.Fields) != 1 || diff.Fields[0].Field != "value" {
+		t.Fatalf("top-level list from null = %#v", diff.Fields)
+	}
+}
+
 func TestKeyedDiffFallsBackToWholeValueWithoutUsableIdentity(t *testing.T) {
 	cases := map[string][2]string{
 		"scalars":              {`{"tags":["tag:a"]}`, `{"tags":["tag:a","tag:b"]}`},

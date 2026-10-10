@@ -233,7 +233,7 @@ func (m muteSet) evaluate(change model.Change, before, after []byte) (bool, mode
 	if _, muted := m.resources[strings.ToLower(change.Name)]; muted && change.Name != "" {
 		return true, change
 	}
-	if len(m.tags) > 0 && (m.hasMutedTag(before) || m.hasMutedTag(after)) {
+	if len(m.tags) > 0 && m.tagMuted(change, before, after) {
 		return true, change
 	}
 	if change.Kind != "changed" || len(change.Fields) == 0 || len(m.fields[change.Collector]) == 0 {
@@ -259,21 +259,64 @@ func (m muteSet) evaluate(change model.Change, before, after []byte) (bool, mode
 	return false, stripped
 }
 
-func (m muteSet) hasMutedTag(raw []byte) bool {
-	if len(raw) == 0 {
+// tagMuted applies the tag rules. A resource created or removed while
+// carrying a muted tag is muted. A changed resource is muted only when it
+// carries a muted tag both before and after the change and its tags did not
+// change: a tag mute silences noise on tagged devices, never the act of
+// tagging or re-tagging one.
+func (m muteSet) tagMuted(change model.Change, before, after []byte) bool {
+	if change.Kind != "changed" {
+		return m.hasMutedTag(before) || m.hasMutedTag(after)
+	}
+	if !m.hasMutedTag(before) || !m.hasMutedTag(after) {
 		return false
+	}
+	for _, field := range change.Fields {
+		if strings.EqualFold(model.FieldRoot(field.Field), "tags") {
+			return false
+		}
+	}
+	// The field list can be truncated; the snapshots' tag sets decide.
+	return sameTags(snapshotTags(before), snapshotTags(after))
+}
+
+// snapshotTags returns the lower-cased string tags of a snapshot's
+// top-level tags list.
+func snapshotTags(raw []byte) map[string]struct{} {
+	if len(raw) == 0 {
+		return nil
 	}
 	var resource struct {
 		Tags []any `json:"tags"`
 	}
 	if json.Unmarshal(raw, &resource) != nil {
-		return false
+		return nil
 	}
+	tags := make(map[string]struct{}, len(resource.Tags))
 	for _, tag := range resource.Tags {
 		if text, ok := tag.(string); ok {
-			if _, muted := m.tags[strings.ToLower(text)]; muted {
-				return true
-			}
+			tags[strings.ToLower(text)] = struct{}{}
+		}
+	}
+	return tags
+}
+
+func sameTags(left, right map[string]struct{}) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for tag := range left {
+		if _, ok := right[tag]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func (m muteSet) hasMutedTag(raw []byte) bool {
+	for tag := range snapshotTags(raw) {
+		if _, muted := m.tags[tag]; muted {
+			return true
 		}
 	}
 	return false

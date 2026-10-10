@@ -83,6 +83,132 @@ func TestAttributionCorrelatesAuditTargets(t *testing.T) {
 	}
 }
 
+// TestTailnetFieldChangesMatchOnlyTheirProperty is R-068: a settings or
+// DNS field change is credited only to an entry for a property that can
+// change that field, not to a later entry for another setting; a field
+// without a known property, or a truncated field list, still accepts any of
+// the collector's properties.
+func TestTailnetFieldChangesMatchOnlyTheirProperty(t *testing.T) {
+	base := time.Date(2026, 10, 6, 12, 0, 0, 0, time.UTC)
+	entries := []AuditEntry{
+		auditEntry("alice", "TAILNET", "T1", "ENABLE", "HTTPS", base.Add(-time.Minute)),
+		auditEntry("bob", "TAILNET", "T1", "DISABLE", "FILE_SHARING", base.Add(-10*time.Second)),
+		auditEntry("carol", "TAILNET", "T1", "UPDATE", "DNS_CONFIG", base.Add(-time.Minute)),
+		auditEntry("dave", "TAILNET", "T1", "ENABLE", "MAGIC_DNS", base.Add(-10*time.Second)),
+	}
+	settings := func(fields ...string) Change {
+		change := Change{Kind: "changed", Collector: "settings", ResourceID: "settings"}
+		for _, field := range fields {
+			change.Fields = append(change.Fields, FieldChange{Field: field})
+		}
+		return change
+	}
+	dns := settings("nameservers")
+	dns.Collector = "dns"
+	magic := settings("preferences.magicDNS")
+	magic.Collector = "dns"
+	override := settings("preferences.overrideLocalDNS")
+	override.Collector = "dns"
+	truncated := settings("httpsEnabled")
+	truncated.FieldsTruncated = true
+	for name, tc := range map[string]struct {
+		change Change
+		want   string
+	}{
+		"https setting":         {settings("httpsEnabled"), "alice"},
+		"unmatched setting":     {settings("usersApprovalOn"), ""},
+		"unmapped setting":      {settings("regionalRoutingOn"), "bob"},
+		"mapped and unmapped":   {settings("httpsEnabled", "regionalRoutingOn"), "bob"},
+		"truncated settings":    {truncated, "bob"},
+		"nameservers":           {dns, "carol"},
+		"magicDNS":              {magic, "dave"},
+		"unmapped dns field":    {override, "dave"},
+		"created settings":      {Change{Kind: "created", Collector: "settings", ResourceID: "settings"}, "bob"},
+		"settings without list": {settings(), "bob"},
+	} {
+		attribution, ok := Attribute(tc.change, nil, nil, entries, base)
+		if attribution.ActorLogin != tc.want || ok != (tc.want != "") {
+			t.Fatalf("%s: attributed to %q (ok=%v), want %q", name, attribution.ActorLogin, ok, tc.want)
+		}
+	}
+}
+
+// TestDeviceSharesMatchInviteAndShareEntries is R-069's attribution part:
+// a change to a device's share invites is credited to an Invite or Share
+// audit entry (type strings matched loosely) that names the changed invite
+// by ID, or the device by name, legacy id, or node ID, and never to a NODE
+// entry or an entry for another invite.
+func TestDeviceSharesMatchInviteAndShareEntries(t *testing.T) {
+	base := time.Date(2026, 10, 6, 12, 0, 0, 0, time.UTC)
+	device := []byte(`{"id":"654495373136127","nodeId":"nLUDUS","name":"ludus.tail1234.ts.net"}`)
+	share := func(fields ...string) Change {
+		change := Change{Kind: "changed", Collector: "device_details", ResourceID: "654495373136127", Name: "ludus.tail1234.ts.net"}
+		for _, field := range fields {
+			change.Fields = append(change.Fields, FieldChange{Field: field})
+		}
+		return change
+	}
+	invite := func(login, targetType, id, name, action string, at time.Time) AuditEntry {
+		entry := auditEntry(login, targetType, id, action, "", at)
+		entry.TargetName = name
+		return entry
+	}
+	for name, tc := range map[string]struct {
+		change  Change
+		entries []AuditEntry
+		related [][]byte
+		want    string
+	}{
+		"invite by invite id": {share("deviceInvites[5861427050514914]"), []AuditEntry{
+			invite("alice", "INVITE", "5861427050514914", "", "CREATE", base.Add(-time.Minute)),
+		}, nil, "alice"},
+		"accepted share by invite id": {share("deviceInvites[5861427050514914].accepted", "deviceInvites[5861427050514914].acceptedBy.loginName"), []AuditEntry{
+			invite("bob", "NODE_SHARE_INVITE", "5861427050514914", "", "ACCEPT", base.Add(-time.Minute)),
+		}, nil, "bob"},
+		"share by device name": {share("deviceInvites[5861427050514914].allowExitNode"), []AuditEntry{
+			invite("carol", "Share", "s-1", "LUDUS.tail1234.ts.net", "UPDATE", base.Add(-time.Minute)),
+		}, nil, "carol"},
+		"share by legacy id": {share("deviceInvites[5861427050514914]"), []AuditEntry{
+			invite("dave", "SHARE", "654495373136127", "", "DELETE", base.Add(-time.Minute)),
+		}, nil, "dave"},
+		"share by node id from the device snapshot": {share("deviceInvites[5861427050514914]"), []AuditEntry{
+			invite("erin", "SHARE", "nLUDUS", "", "CREATE", base.Add(-time.Minute)),
+		}, [][]byte{device}, "erin"},
+		"node id without the device snapshot": {share("deviceInvites[5861427050514914]"), []AuditEntry{
+			invite("erin", "SHARE", "nLUDUS", "", "CREATE", base.Add(-time.Minute)),
+		}, nil, ""},
+		"other invite": {share("deviceInvites[5861427050514914]"), []AuditEntry{
+			invite("mallory", "INVITE", "7000000000000001", "", "CREATE", base.Add(-time.Minute)),
+		}, nil, ""},
+		"other device": {share("deviceInvites[5861427050514914]"), []AuditEntry{
+			invite("mallory", "SHARE", "s-2", "web-01.tail1234.ts.net", "CREATE", base.Add(-time.Minute)),
+		}, [][]byte{device}, ""},
+		"node entry for the device": {share("deviceInvites[5861427050514914]"), []AuditEntry{
+			auditEntry("mallory", "NODE", "nLUDUS", "UPDATE", "ATTRIBUTES", base.Add(-time.Minute)),
+			auditEntry("mallory", "NODE", "654495373136127", "UPDATE", "ACL_TAGS", base.Add(-time.Minute)),
+		}, [][]byte{device}, ""},
+		"node entry for a truncated share change": {Change{Kind: "changed", Collector: "device_details", ResourceID: "654495373136127", Fields: []FieldChange{{Field: "deviceInvites[5861427050514914].accepted"}}, FieldsTruncated: true}, []AuditEntry{
+			auditEntry("mallory", "NODE", "654495373136127", "UPDATE", "ATTRIBUTES", base.Add(-time.Minute)),
+		}, nil, ""},
+		"share entry for a posture change": {share("postureAttributes.custom:tier"), []AuditEntry{
+			invite("mallory", "SHARE", "654495373136127", "", "UPDATE", base.Add(-time.Minute)),
+		}, nil, ""},
+		"posture change by node id": {share("postureAttributes.custom:tier"), []AuditEntry{
+			auditEntry("frank", "NODE", "nLUDUS", "UPDATE", "ATTRIBUTES", base.Add(-time.Minute)),
+		}, [][]byte{device}, "frank"},
+		"latest share entry": {share("deviceInvites[5861427050514914]"), []AuditEntry{
+			invite("early", "INVITE", "5861427050514914", "", "CREATE", base.Add(-2*time.Minute)),
+			invite("late", "SHARE", "654495373136127", "", "CREATE", base.Add(-time.Minute)),
+			invite("after", "SHARE", "654495373136127", "", "UPDATE", base.Add(time.Minute)),
+		}, nil, "late"},
+	} {
+		attribution, ok := Attribute(tc.change, nil, nil, tc.entries, base, tc.related...)
+		if attribution.ActorLogin != tc.want || ok != (tc.want != "") {
+			t.Fatalf("%s: attributed to %q (ok=%v), want %q", name, attribution.ActorLogin, ok, tc.want)
+		}
+	}
+}
+
 // TestAttributionRecordIsBoundedAndRedacted keeps only bounded identifying
 // fields: control characters are removed, long names are cut, identifiers
 // keep only identifier characters, and the record round-trips through its

@@ -60,6 +60,11 @@ type Change struct {
 	// notifications can name the recipient of an invite whose recorded
 	// fields do not. It is never persisted or exported.
 	Invites map[string]DeviceInvite `json:"-"`
+	// Created is the severity-relevant initial state of a created users,
+	// user_invites, or devices resource (see CreatedStateOf), so a
+	// privileged creation is classified like the equivalent later edit. It
+	// is never persisted or exported.
+	Created *CreatedState `json:"-"`
 }
 
 var ignored = map[string]struct{}{
@@ -452,10 +457,23 @@ func (d *differ) diff(path string, oldValue any, oldPresent bool, newValue any, 
 	}
 	oldList, oldIsList := oldValue.([]any)
 	newList, newIsList := newValue.([]any)
-	if oldPresent && newPresent && oldIsList && newIsList && !orderedArray(d.collector, path) {
-		if key, ok := arrayIdentity(oldList, newList); ok {
-			d.diffKeyed(path, key, oldList, newList)
-			return
+	if !orderedArray(d.collector, path) {
+		// A non-empty identified list that appears from null or absence (or
+		// disappears into it) is compared with an empty list, so each of
+		// its elements is one added or removed element rather than one
+		// opaque, possibly truncated, list value.
+		switch {
+		case path == "" || (oldIsList && newIsList):
+		case oldValue == nil && newIsList && len(newList) > 0:
+			oldList, oldIsList = []any{}, true
+		case newValue == nil && oldIsList && len(oldList) > 0:
+			newList, newIsList = []any{}, true
+		}
+		if oldIsList && newIsList {
+			if key, ok := arrayIdentity(oldList, newList); ok {
+				d.diffKeyed(path, key, oldList, newList)
+				return
+			}
 		}
 	}
 	oldJSON := diffJSON(oldValue, oldPresent)

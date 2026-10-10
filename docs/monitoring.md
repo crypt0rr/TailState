@@ -39,11 +39,12 @@ Because the last group has an open schema, a field that Tailscale adds to its AP
 - The first complete supported inventory is a silent baseline.
 - Stable additions and modifications alert on the next successful poll.
 - Removals require absence from two complete successful polls.
+- When a complete response suddenly omits most of a collector's stored resources (at least 3, and more than it returned), the mass-removal guard treats it as possibly degraded data: the snapshots are kept, the collector shows as degraded, and one health notification ("possible mass removal") is queued on the first guarded poll. After two consecutive guarded responses the new population is accepted and the normal two-poll removal confirmation follows, so a real mass removal is reported about three polls later than an ordinary one. Those removals are attributed from the last successful poll before the guard engaged.
 - One device change is reported once. A device's appearance and removal are `devices` events only (its `device_details` snapshot is created and deleted silently); routes and client/OS versions are reported by `devices`, so `device_details` does not fetch the routes endpoint and ignores the `node:os`, `node:osVersion`, and `node:tsVersion` posture attributes. Snapshots stored by older releases are re-normalized before diffing, so upgrading does not report drift. A DNS snapshot stored from the legacy endpoints is compared with the `dns/configuration` response only on the fields both express (nameservers, MagicDNS, search paths, split DNS), so the upgrade, and any later fallback between the two endpoints, is silent unless one of those fields actually changed. New collectors (`services`, `oauth_apps`) take a silent baseline on their first successful poll.
-- Changes are recorded per field, with dotted paths for nested objects (`postureAttributes.custom:tier`). A list of objects that each carry a unique `id` (or, failing that, a unique `nodeId` or `address`), such as a device's `deviceInvites`, is compared element by element: a change inside one element is recorded at that element's path (`deviceInvites[5861427050514914].tailnetId`), and an added or removed element is one change at `deviceInvites[5861427050514914]`. Reordering such a list is not a change. Lists of plain values, lists without such an identity, and the ordered DNS nameserver and search-path lists are compared as one value. Events recorded by earlier releases keep their whole-list fields. A change records at most 24 fields; the rest are counted.
+- Changes are recorded per field, with dotted paths for nested objects (`postureAttributes.custom:tier`). A list of objects that each carry a unique `id` (or, failing that, a unique `nodeId` or `address`), such as a device's `deviceInvites`, is compared element by element: a change inside one element is recorded at that element's path (`deviceInvites[5861427050514914].tailnetId`), and an added or removed element is one change at `deviceInvites[5861427050514914]`. A non-empty list that appears where the field was `null` or absent (or disappears into `null` or absence) is compared with an empty list, so each of its elements is one added (or removed) element. Reordering such a list is not a change. Lists of plain values, lists without such an identity, and the ordered DNS nameserver and search-path lists are compared as one value. Events recorded by earlier releases keep their whole-list fields. A change records at most 24 fields; the rest are counted.
 - Failed or partial polls never delete snapshots.
 - Single-object endpoints (tailnet settings, contacts, policy, the DNS configuration and each legacy DNS sub-endpoint, and log-streaming configuration and status) must return a JSON object. A `null`, empty, array, or scalar body is treated as an invalid upstream response: the collector fails, no events are recorded, and the last snapshot is kept.
-- Tailscale API requests retry network errors, `429`, and the transient gateway statuses `502`, `503`, and `504` with exponential backoff; a transient OAuth token-endpoint failure (network error, `429`, or `5xx`) is retried the same way instead of failing every request that needs a token. Retries honor `Retry-After` while capping a provider delay at five minutes and the complete retry window for one request at 30 seconds; a gateway retry that would not fit in that window reports the upstream status immediately. Cursor pagination keeps the original query parameters (for example `fields=all`) on every page. Collectors also have a two-minute poll deadline, so a throttled endpoint cannot stall the scheduler indefinitely.
+- Tailscale API requests retry network errors, `429`, and the transient gateway statuses `502`, `503`, and `504` with exponential backoff; a transient OAuth token-endpoint failure (network error, `429`, or `5xx`) is retried the same way instead of failing every request that needs a token. Retries honor `Retry-After` while capping a provider delay at five minutes and the complete retry window for one request at 30 seconds; a `429` or gateway retry that would not fit in that window reports the upstream status immediately (so a long `Retry-After` is reported as `rate limited`, not as a timeout). Cursor pagination keeps the original query parameters (for example `fields=all`) on every page. Collectors also have a two-minute poll deadline, so a throttled endpoint cannot stall the scheduler indefinitely.
 - Each paginated collection is bounded to 10,000 items and 64 MiB of response data across all pages, in addition to the 16 MiB per-response cap. If an aggregate limit is exceeded, the collector fails without applying partial inventory or deleting the last known snapshots. Device-detail requests share a bounded eight-worker queue so a large device list cannot create one job and result buffer per device. If the two-minute device-detail deadline expires, the poll is reported as partial with the number of devices left unrefreshed, their previous snapshots are kept, and the next poll starts with the stalest devices so every device is eventually refreshed.
 - A failed or partial collector is retried after 30 seconds, and each further consecutive failure doubles the delay up to that collector's configured polling interval; a successful poll resets the backoff. A permanently broken endpoint or device therefore settles back to the normal cadence instead of repeating its requests every 30 seconds. Webhook triggers that are processed together poll the union of their collectors once, while each trigger still succeeds or retries only on the collectors it requested.
 - Per-collector retry deadlines (failure retries, unsupported confirmation) are persisted and honored after a restart or a settings save, so a short retry is never replaced by the full polling interval.
@@ -51,11 +52,15 @@ Because the last group has an open schema, a field that Tailscale adds to its AP
   unsupported response. Collectors that have never produced a baseline are
   retried every six hours. For an established baseline, the first response is
   recorded as pending confirmation and retried after five minutes; only a
-  second consecutive response opens the six-hour unsupported window. Baselines
-  and snapshots remain intact across that interval, so recovery reports drift
-  instead of silently rebasing. A later non-403/404 failure is recorded as a
-  transient supported collector failure rather than retaining the unsupported
-  label.
+  second consecutive response opens the six-hour unsupported window. Because
+  changes to an established baseline are no longer detected, that second
+  response queues one collector health notification with reason
+  `unsupported`, and the collector's recovery queues one "recovered"
+  notification; a collector that never had a baseline is marked unsupported
+  silently. Baselines and snapshots remain intact across that interval, so
+  recovery reports drift instead of silently rebasing. A later non-403/404
+  failure is recorded as a transient supported collector failure rather than
+  retaining the unsupported label.
 - Log streaming is the exception to the 404 rule: Tailscale returns `404` from
   `/logging/{kind}/stream` when no stream is configured, so TailState records
   that kind as `{"configured": false}` and diffs it like any other state.
@@ -110,6 +115,8 @@ unsupported collector due for an immediate re-check; a collector that becomes
 readable baselines silently. Narrowing scopes can hide resources or fields
 (for example other credential types under `keys`), which are then reported as
 removed or changed, so settle on the scopes before the first baseline.
+Removing the scope of a collector that already has a baseline is reported
+once as an unsupported collector (see [Change detection](#change-detection)).
 
 Without `logs:configuration:read` changes are still detected and notified;
 they are only not attributed, and the status page shows **Change
@@ -170,9 +177,11 @@ when a poll can produce a change.
 
 - **When.** Before a poll's changes are recorded, TailState reads the audit
   log for the window since the previous successful poll of the affected
-  collectors, widened by two minutes on both sides for clock skew (and by the
-  polling interval when a removal is confirmed, because removals are reported
-  one poll after the resource disappeared). The window is at most 24 hours,
+  collectors (the time that poll fetched them), widened by two minutes on
+  both sides for clock skew (and by the polling interval when a removal is
+  confirmed, because removals are reported one poll after the resource
+  disappeared; a removal held back by the mass-removal guard is searched from
+  the last successful poll before the guard engaged). The window is at most 24 hours,
   at most 5,000 entries are read, and the lookup has a strict 10-second
   budget: a slow or failing audit log delays a batch by at most that budget
   and never fails it.
@@ -184,8 +193,23 @@ when a poll can produce a change.
   needs a create/approve/login entry, a removed one a delete, and a device
   field change an entry for that property (a tag change matches `ACL_TAGS`;
   client version, OS, or address changes reported by the node itself never
-  match an administrator's edit). The latest matching entry wins; failed
-  attempts are ignored.
+  match an administrator's edit). Tailnet settings and DNS fields with a
+  known property match only that property (`httpsEnabled` matches `HTTPS`,
+  `devicesApprovalOn` matches `MACHINE_APPROVAL_NEEDED`, MagicDNS matches
+  `MAGIC_DNS`, nameservers, search paths, and split DNS match `DNS_CONFIG`),
+  so toggling one setting is never credited to an edit of another; other
+  fields accept any of the collector's properties. The latest matching entry
+  at or before the time the change's collector was fetched wins, so an edit
+  made while the rest of the poll was still running is not credited with it;
+  an entry up to two minutes after the fetch (clock skew) is used only when
+  none before it matches. Failed attempts are ignored. Device share
+  (`deviceInvites`) changes are matched to the audit log's Invite and Share
+  entries (creating, accepting, updating, or deleting a node share or its
+  invite), never to a NODE entry: an entry fits when it names one of the
+  changed invites by ID, or the device by name, ID, or node ID. Tailscale
+  does not document the machine-readable target types of these entries, so
+  any target type containing `INVITE` or `SHARE` is accepted. Invite events
+  are logged only in the sharing tailnet.
 - **What is stored.** Only the actor's login and display name, the actor
   type, the origin (admin console, API, ...), the audit action (for example
   `NODE.UPDATE.ACL_TAGS`), the target, and the audit timestamp, each bounded

@@ -238,17 +238,12 @@ func (c *Client) getBody(ctx context.Context, endpoint string) ([]byte, error) {
 			c.mu.Unlock()
 			continue
 		}
-		if resp.StatusCode == 429 && attempt < 3 {
-			delay := retryAfter(resp.Header.Get("Retry-After"), time.Duration(1<<attempt)*time.Second)
-			if !waitForRetry(retryCtx, delay) {
-				return body, retryCtx.Err()
-			}
-			continue
-		}
-		if transientGatewayStatus(resp.StatusCode) && attempt < 3 {
-			// Tailscale documents 502/503/504 as "try again later". Retry with
-			// backoff (or the provider's Retry-After) while the request budget
-			// allows; otherwise report the upstream status unchanged.
+		if (resp.StatusCode == http.StatusTooManyRequests || transientGatewayStatus(resp.StatusCode)) && attempt < 3 {
+			// A 429 and Tailscale's documented "try again later" statuses
+			// (502/503/504) are retried with backoff (or the provider's
+			// Retry-After) while the request budget allows; otherwise the
+			// upstream status is reported unchanged, so a long Retry-After
+			// is "rate limited" rather than a timeout after a futile wait.
 			delay := retryAfter(resp.Header.Get("Retry-After"), time.Duration(1<<attempt)*time.Second)
 			if waitWithinBudget(retryCtx, delay) {
 				continue

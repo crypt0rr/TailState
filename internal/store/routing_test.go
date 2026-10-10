@@ -220,3 +220,145 @@ func TestRoutingRulesNormalizationAndErrors(t *testing.T) {
 		t.Fatal("invalid routing was saved")
 	}
 }
+
+// TestPrivilegedCreationsAreHighEverywhere is E-040: a user or invite
+// created with a role other than member and a device that joins tagged or
+// with key expiry disabled are high in the stored event, the History
+// severity filter, and the digest (so a "high only" destination receives
+// them), while plain member, invite, and device creations stay medium.
+func TestPrivilegedCreationsAreHighEverywhere(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	generation, err := st.SaveSettings(ctx, settings())
+	if err != nil {
+		t.Fatal(err)
+	}
+	pagerID := addDestination(t, st, "pager", RoutingRules{MinSeverity: model.SeverityHigh})
+	digest := notify.Context{Tailnet: "example.com"}.Digest
+	resource := func(collector, id string, data map[string]any) model.Resource {
+		return model.Resource{ID: id, Type: collector, Name: id, Collector: collector, Data: data}
+	}
+	inventory := func(created bool) []model.Collected {
+		results := []model.Collected{
+			{Collector: "users", Resources: []model.Resource{resource("users", "existing-user", map[string]any{"loginName": "old@example.com", "role": "member"})}},
+			{Collector: "user_invites", Resources: []model.Resource{resource("user_invites", "existing-invite", map[string]any{"email": "old@example.com", "role": "member"})}},
+			{Collector: "devices", Resources: []model.Resource{resource("devices", "existing-device", map[string]any{"name": "old", "tags": []any{}})}},
+		}
+		if created {
+			results[0].Resources = append(results[0].Resources,
+				resource("users", "new-admin", map[string]any{"loginName": "admin@example.com", "role": "admin"}),
+				resource("users", "new-member", map[string]any{"loginName": "member@example.com", "role": "member"}))
+			results[1].Resources = append(results[1].Resources,
+				resource("user_invites", "invite-admin", map[string]any{"email": "admin2@example.com", "role": "it-admin"}),
+				resource("user_invites", "invite-member", map[string]any{"email": "member2@example.com", "role": "member"}))
+			results[2].Resources = append(results[2].Resources,
+				resource("devices", "device-tagged", map[string]any{"name": "db", "tags": []any{"tag:prod"}}),
+				resource("devices", "device-noexpiry", map[string]any{"name": "kiosk", "keyExpiryDisabled": true}),
+				resource("devices", "device-plain", map[string]any{"name": "laptop", "tags": []any{}, "keyExpiryDisabled": false}))
+		}
+		return results
+	}
+	if _, err := st.ApplyBatchWithBatch(ctx, generation, inventory(false), digest); err != nil {
+		t.Fatal(err)
+	}
+	batch, err := st.ApplyBatchWithBatch(ctx, generation, inventory(true), digest)
+	if err != nil || len(batch.Changes) != 7 {
+		t.Fatalf("creation batch=%+v err=%v", batch, err)
+	}
+	want := map[string]string{
+		"new-admin": "high", "invite-admin": "high", "device-tagged": "high", "device-noexpiry": "high",
+		"new-member": "medium", "invite-member": "medium", "device-plain": "medium",
+	}
+	page, err := st.ListHistory(ctx, HistoryFilter{BatchID: batch.ID})
+	if err != nil || len(page.Batches) != 1 {
+		t.Fatalf("history=%+v err=%v", page, err)
+	}
+	for _, event := range page.Batches[0].Events {
+		if event.Severity != want[event.ResourceID] {
+			t.Fatalf("%s stored severity=%s, want %s", event.ResourceID, event.Severity, want[event.ResourceID])
+		}
+	}
+	high, err := st.ListHistory(ctx, HistoryFilter{BatchID: batch.ID, Severity: "high"})
+	if err != nil || len(high.Batches) != 1 || len(high.Batches[0].Events) != 4 {
+		t.Fatalf("History high filter=%+v err=%v", high.Batches, err)
+	}
+	for _, event := range high.Batches[0].Events {
+		if want[event.ResourceID] != "high" {
+			t.Fatalf("History high filter returned %s", event.ResourceID)
+		}
+	}
+	pager := batchDeliveries(t, st, batch.ID)[pagerID]
+	for id, severity := range want {
+		line := ""
+		for _, candidate := range strings.Split(pager, "\n") {
+			if strings.Contains(candidate, "**"+id+"**") {
+				line = candidate
+			}
+		}
+		switch {
+		case severity == "high" && !strings.HasPrefix(strings.TrimLeft(line, "- "), "🔴"):
+			t.Fatalf("high-only digest line for %s=%q, want a high-severity line:\n%s", id, line, pager)
+		case severity == "medium" && line != "":
+			t.Fatalf("high-only digest included medium %s:\n%s", id, pager)
+		}
+	}
+}
+
+// TestTagMuteNeverHidesTagging is R-057: a tag rule mutes noise on devices
+// that keep a muted tag, and devices created or removed with it, but never
+// a change to a device's tags: re-tagging out of the muted tag or into it
+// is notified (and high).
+func TestTagMuteNeverHidesTagging(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	generation, err := st.SaveSettings(ctx, settings())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.AddMuteRule(ctx, MuteTag, "tag:ci"); err != nil {
+		t.Fatal(err)
+	}
+	digest := notify.Context{Tailnet: "example.com"}.Digest
+	device := func(id, version string, tags ...any) model.Resource {
+		return model.Resource{ID: id, Type: "device", Name: id, Data: map[string]any{"name": id, "clientVersion": version, "tags": tags}}
+	}
+	devices := func(resources ...model.Resource) []model.Collected {
+		return []model.Collected{{Collector: "devices", Resources: resources}}
+	}
+	if _, err := st.ApplyBatchWithBatch(ctx, generation, devices(device("retagged", "1", "tag:ci"), device("runner", "1", "tag:ci"), device("prod", "1", "tag:prod"), device("leaver", "1", "tag:ci")), digest); err != nil {
+		t.Fatal(err)
+	}
+	batch, err := st.ApplyBatchWithBatch(ctx, generation, devices(device("retagged", "1", "tag:prod"), device("runner", "2", "tag:ci"), device("prod", "1", "tag:ci"), device("leaver", "1", "tag:ci"), device("joiner", "1", "tag:ci")), digest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantMuted := map[string]bool{"retagged": false, "prod": false, "runner": true, "joiner": true}
+	page, err := st.ListHistory(ctx, HistoryFilter{BatchID: batch.ID})
+	if err != nil || len(page.Batches) != 1 || len(page.Batches[0].Events) != len(wantMuted) {
+		t.Fatalf("history=%+v err=%v", page.Batches, err)
+	}
+	for _, event := range page.Batches[0].Events {
+		if event.Muted != wantMuted[event.ResourceID] {
+			t.Fatalf("%s muted=%v, want %v", event.ResourceID, event.Muted, wantMuted[event.ResourceID])
+		}
+		if event.ResourceID != "runner" && event.Severity != "high" {
+			t.Fatalf("%s severity=%s, want high", event.ResourceID, event.Severity)
+		}
+	}
+	payloads := pendingPayloads(t, st, batch.ID)
+	if len(payloads) != 1 || !strings.Contains(payloads[0], "**retagged**") || !strings.Contains(payloads[0], "**prod**") || strings.Contains(payloads[0], "**runner**") || strings.Contains(payloads[0], "**joiner**") {
+		t.Fatalf("digest=%q", payloads)
+	}
+	// A device removed while carrying the muted tag stays muted.
+	remaining := devices(device("retagged", "1", "tag:prod"), device("runner", "2", "tag:ci"), device("prod", "1", "tag:ci"), device("joiner", "1", "tag:ci"))
+	if _, err := st.ApplyBatchWithBatch(ctx, generation, remaining, digest); err != nil {
+		t.Fatal(err)
+	}
+	removed, err := st.ApplyBatchWithBatch(ctx, generation, remaining, digest)
+	if err != nil || len(removed.Changes) != 1 || removed.Changes[0].Kind != "removed" {
+		t.Fatalf("removal batch=%+v err=%v", removed, err)
+	}
+	if payloads := pendingPayloads(t, st, removed.ID); len(payloads) != 0 {
+		t.Fatalf("removed muted device was notified: %q", payloads)
+	}
+}

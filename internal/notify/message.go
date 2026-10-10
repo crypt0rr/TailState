@@ -223,10 +223,15 @@ func (c Context) message(severity model.Severity, icon, title string, lines ...L
 type CollectorHealth struct {
 	Collector string
 	Reason    string
+	// Detail explains a transition other than three consecutive failures,
+	// such as a baselined collector confirmed unsupported or a guarded mass
+	// removal. It is TailState's own text, never upstream error text.
+	Detail string
 }
 
 // CollectorsUnhealthy groups every collector that crossed the failure
-// threshold in one poll into a single message.
+// threshold, or otherwise stopped reporting reliably, in one poll into a
+// single message.
 func (c Context) CollectorsUnhealthy(collectors []CollectorHealth, observedAt time.Time) Message {
 	title := "Tailscale API collector unhealthy"
 	summary := "1 collector failed three consecutive polls. TailState will keep retrying."
@@ -234,13 +239,27 @@ func (c Context) CollectorsUnhealthy(collectors []CollectorHealth, observedAt ti
 		title = "Tailscale API collectors unhealthy"
 		summary = fmt.Sprintf("%d collectors failed three consecutive polls. TailState will keep retrying.", len(collectors))
 	}
+	for _, collector := range collectors {
+		if strings.TrimSpace(collector.Detail) == "" {
+			continue
+		}
+		summary = "1 collector needs attention. TailState will keep checking."
+		if len(collectors) != 1 {
+			summary = fmt.Sprintf("%d collectors need attention. TailState will keep checking.", len(collectors))
+		}
+		break
+	}
 	lines := []Line{line(lit(summary))}
 	for _, collector := range collectors {
 		reason := strings.TrimSpace(collector.Reason)
 		if reason == "" {
 			reason = "request failed"
 		}
-		lines = append(lines, item(code(collector.Collector), lit(": "), txt(reason)))
+		spans := []Span{code(collector.Collector), lit(": "), txt(reason)}
+		if detail := strings.TrimSpace(collector.Detail); detail != "" {
+			spans = append(spans, lit(" ("), txt(detail), lit(")"))
+		}
+		lines = append(lines, item(spans...))
 	}
 	lines = append(lines, observedLine(observedAt))
 	if statusURL := c.StatusURL(); statusURL != "" {

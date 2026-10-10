@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/crypt0rr/tailstate/internal/model"
 	"github.com/crypt0rr/tailstate/internal/notify"
@@ -187,5 +188,92 @@ func TestFieldRulesCoverListElements(t *testing.T) {
 	whole := newMuteSet([]MuteRule{{Kind: MuteField, Value: "device_details.device_invites"}})
 	if !whole.fieldMuted("device_details", "deviceInvites[5861427050514914].acceptedBy.id") {
 		t.Fatal("a list rule did not cover its element fields")
+	}
+}
+
+// TestShareChangeIsAttributedToShareEntryByNodeID checks R-069's
+// attribution in the store: a share change on device_details is credited to
+// a share audit entry that names the device by the node ID kept in its
+// devices snapshot, and never to a NODE entry for the device.
+func TestShareChangeIsAttributedToShareEntryByNodeID(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	generation, err := st.SaveSettings(ctx, settings())
+	if err != nil {
+		t.Fatal(err)
+	}
+	lookup := &recordingLookup{status: AttributionComplete}
+	options := BatchOptions{Attribute: lookup.lookup}
+	digest := notify.Context{}.Digest
+	poll := func(invite map[string]any) ChangeBatchResult {
+		t.Helper()
+		results := append([]model.Collected{{Collector: "devices", Resources: []model.Resource{{ID: "654495373136127", Type: "device", Name: "ludus.tail1234.ts.net", Data: map[string]any{"id": "654495373136127", "nodeId": "nLUDUS", "name": "ludus.tail1234.ts.net"}}}}}, sharedDevice(invite)...)
+		batch, err := st.ApplyBatchWithOptions(ctx, generation, results, digest, options)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return batch
+	}
+	invite := shareInvite("5861427050514914", "T1000EXAMPLE")
+	invite["allowExitNode"] = false
+	poll(invite)
+	now := time.Now().UTC()
+	lookup.entries = []model.AuditEntry{
+		nodeEntry("mallory", "nLUDUS", "UPDATE", "ATTRIBUTES", now.Add(-10*time.Second)),
+		{EventTime: now.Add(-30 * time.Second), Origin: "ADMIN_CONSOLE", ActorType: "USER", ActorLogin: "alice", TargetType: "SHARE", TargetID: "nLUDUS", Action: "UPDATE"},
+	}
+	invite["allowExitNode"] = true
+	changed := poll(invite)
+	if got := eventChangedBy(t, st, changed.ID)["654495373136127"]; got != "alice via admin console" {
+		t.Fatalf("share change attributed to %q, want the share entry's actor", got)
+	}
+	lookup.entries = lookup.entries[:1]
+	invite["allowExitNode"] = false
+	changed = poll(invite)
+	if got := eventChangedBy(t, st, changed.ID)["654495373136127"]; got != model.ActorUnknown {
+		t.Fatalf("share change attributed to %q from a NODE entry", got)
+	}
+}
+
+// TestShareAppearingFromNullListIsClassifiedAsAShare is R-069: when a
+// device's deviceInvites goes from null to a list holding one realistic
+// (over 240 bytes) multi-use invite, the change is recorded at the
+// invite's element path, classified high, and shown as a share line
+// rather than as truncated list JSON.
+func TestShareAppearingFromNullListIsClassifiedAsAShare(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	generation, err := st.SaveSettings(ctx, settings())
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseline := sharedDevice()
+	baseline[0].Resources[0].Data.(map[string]any)["deviceInvites"] = nil
+	if _, err := testApplyBatch(st, ctx, generation, baseline, notify.TextDigest("baseline")); err != nil {
+		t.Fatal(err)
+	}
+	invite := shareInvite("5861427050514914", "T1000EXAMPLE")
+	invite["multiUse"], invite["accepted"], invite["email"] = true, false, "carol@example.com"
+	delete(invite, "acceptedBy")
+	if encoded, _ := json.Marshal(invite); len(encoded) < 300 {
+		t.Fatalf("invite fixture is %d bytes, want a realistic invite of about 350", len(encoded))
+	}
+	batch, err := st.ApplyBatchWithBatch(ctx, generation, sharedDevice(invite), notify.Context{}.Digest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(batch.Changes) != 1 || len(batch.Changes[0].Fields) != 1 || batch.Changes[0].Fields[0].Field != "deviceInvites[5861427050514914]" {
+		t.Fatalf("share from a null list = %#v", batch.Changes)
+	}
+	page, err := st.ListHistory(ctx, HistoryFilter{BatchID: batch.ID})
+	if err != nil || len(page.Batches) != 1 || len(page.Batches[0].Events) != 1 {
+		t.Fatalf("history: %+v %v", page.Batches, err)
+	}
+	if got := page.Batches[0].Events[0].Severity; got != "high" {
+		t.Fatalf("severity = %s, want high", got)
+	}
+	payloads := pendingPayloads(t, st, batch.ID)
+	if len(payloads) != 1 || !strings.Contains(payloads[0], "shared via a new invite to carol@example.com (multi-use)") || strings.Contains(payloads[0], "redacted_sha256") {
+		t.Fatalf("digest lacks the share line: %q", payloads)
 	}
 }

@@ -2,6 +2,7 @@ package tailscale
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -451,12 +452,13 @@ func TestClientBoundsRetryWindow(t *testing.T) {
 		return &http.Response{
 			StatusCode: http.StatusTooManyRequests,
 			Status:     "429",
-			Header:     http.Header{"Retry-After": []string{"86400"}},
+			Header:     http.Header{"Retry-After": []string{"1"}},
 			Body:       io.NopCloser(strings.NewReader("busy")),
 		}, nil
 	})}
-	if _, err := client.get(context.Background(), "https://api.example.test/api/v2/devices"); err == nil {
-		t.Fatal("retry exhaustion unexpectedly succeeded")
+	var httpErr *HTTPError
+	if _, err := client.get(context.Background(), "https://api.example.test/api/v2/devices"); !errors.As(err, &httpErr) || httpErr.Status != http.StatusTooManyRequests {
+		t.Fatalf("retry exhaustion error=%v, want the upstream 429", err)
 	}
 	remaining := time.Until(retryDeadline)
 	if retryDeadline.IsZero() || remaining <= 0 || remaining > maxRequestRetryDuration {

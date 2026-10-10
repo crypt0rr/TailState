@@ -215,8 +215,10 @@ func TestPollHandlesUnsupportedFailureAndRecovery(t *testing.T) {
 	if devices.FailureCount != 3 {
 		t.Fatalf("failure count=%d, want 3", devices.FailureCount)
 	}
-	if current.Pending != 1 {
-		t.Fatalf("unhealthy notification count=%d, want 1", current.Pending)
+	// One notice for the baselined users collector confirmed unsupported,
+	// one for devices crossing the failure threshold.
+	if current.Pending != 2 {
+		t.Fatalf("unhealthy notification count=%d, want 2", current.Pending)
 	}
 
 	status.Store(http.StatusOK)
@@ -227,7 +229,7 @@ func TestPollHandlesUnsupportedFailureAndRecovery(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if current.Pending != 2 {
+	if current.Pending != 3 {
 		t.Fatalf("recovery notification was not queued: pending=%d", current.Pending)
 	}
 	items, err := st.ClaimDueOutbox(ctx, 10, time.Minute)

@@ -129,23 +129,31 @@ func (e *Engine) pollWithOutcomes(ctx context.Context, client *tailscale.Client,
 	}
 	// Health transitions from one poll are grouped into one message per
 	// direction, so a revoked credential produces one alert instead of one per
-	// collector.
+	// collector. Unhealthy transitions decided while applying the batch (a
+	// baselined collector confirmed unsupported, an engaged mass-removal
+	// guard) join the poll's failures, so that message follows the batch.
 	messages := e.notificationContext(settings)
-	if len(unhealthy) > 0 {
-		if enqueueErr := e.store.EnqueueMessage(ctx, messages.CollectorsUnhealthy(unhealthy, time.Now())); enqueueErr != nil {
-			slog.Error("enqueue collector health notification", "collectors", len(unhealthy), "error", enqueueErr)
-		}
-	}
 	if len(recovered) > 0 {
 		if enqueueErr := e.store.EnqueueMessage(ctx, messages.CollectorsRecovered(recovered, time.Now())); enqueueErr != nil {
 			slog.Error("enqueue collector recovery notification", "collectors", len(recovered), "error", enqueueErr)
 		}
 	}
+	enqueueUnhealthy := func() {
+		if len(unhealthy) == 0 {
+			return
+		}
+		if enqueueErr := e.store.EnqueueMessage(ctx, messages.CollectorsUnhealthy(unhealthy, time.Now())); enqueueErr != nil {
+			slog.Error("enqueue collector health notification", "collectors", len(unhealthy), "error", enqueueErr)
+		}
+	}
 	if len(polled) == 0 {
+		enqueueUnhealthy()
 		outcome.success = success
 		return outcome
 	}
 	batch, err := e.store.ApplyBatchWithOptions(ctx, settings.Generation, results, messages.Digest, e.batchOptions(ctx, client, settings, polled), triggerIDs...)
+	unhealthy = append(unhealthy, batch.Unhealthy...)
+	enqueueUnhealthy()
 	if err != nil {
 		slog.Error("apply collected inventory", "error", err)
 		if retryErr := e.store.SetNextPollErr(ctx, settings.Generation, polled, time.Now().Add(collectorRetryInterval)); retryErr != nil {

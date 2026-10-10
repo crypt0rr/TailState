@@ -118,6 +118,17 @@ func TestCodeSpansRenderValuesWithoutMarkdownEscapes(t *testing.T) {
 	if got, want := sourceHealth("device_details", false), "### ⚠️ Tailscale API collector unhealthy · example.com\n1 collector failed three consecutive polls. TailState will keep retrying.\n  - `device_details`: auth rejected\nObserved at 5 Oct 2026 12:00 UTC"; got != want {
 		t.Fatalf("source health message=%q, want %q", got, want)
 	}
+	detailed := Markdown(Context{Tailnet: "example.com"}.CollectorsUnhealthy([]CollectorHealth{
+		{Collector: "policy", Reason: "unsupported", Detail: "insufficient OAuth scope or plan: HTTP 403 on two consecutive polls"},
+		{Collector: "keys", Reason: "possible mass removal", Detail: "5 of 8 resources missing"},
+		{Collector: "dns", Reason: "timeout"},
+	}, testObservedAt))
+	if want := "### ⚠️ Tailscale API collectors unhealthy · example.com\n3 collectors need attention. TailState will keep checking.\n  - `policy`: unsupported (insufficient OAuth scope or plan: HTTP 403 on two consecutive polls)\n  - `keys`: possible mass removal (5 of 8 resources missing)\n  - `dns`: timeout\nObserved at 5 Oct 2026 12:00 UTC"; detailed != want {
+		t.Fatalf("detailed health message=%q, want %q", detailed, want)
+	}
+	if single := Markdown(Context{}.CollectorsUnhealthy([]CollectorHealth{{Collector: "policy", Reason: "unsupported", Detail: "x"}}, testObservedAt)); !strings.Contains(single, "\n1 collector needs attention. TailState will keep checking.\n") {
+		t.Fatalf("single detailed health message=%q", single)
+	}
 	if got, want := sourceHealth("device_details", true), "### ✅ Tailscale API collector recovered · example.com\n1 collector is responding successfully again.\n  - `device_details`\nObserved at 5 Oct 2026 12:00 UTC"; got != want {
 		t.Fatalf("source recovery message=%q, want %q", got, want)
 	}

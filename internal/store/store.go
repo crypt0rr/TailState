@@ -478,8 +478,11 @@ func OpenExisting(path string, box *secret.Box) (*Store, error) {
 		return nil, fmt.Errorf("inspect database path: %w", err)
 	}
 	// mode=rw refuses to create a missing file. journal_mode is omitted: the
-	// serving process already configured WAL, which is persistent.
-	db, err := sql.Open("sqlite", "file:"+path+"?mode=rw&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)&_txlock=immediate")
+	// serving process already configured WAL, which is persistent. A one-shot
+	// command waits longer for the write lock than the service does: SQLite's
+	// busy handler is not fair, so a busy service can hold the lock past the
+	// service's 5 s budget, and an operator command must not fail on that.
+	db, err := sql.Open("sqlite", "file:"+path+"?mode=rw&_pragma=busy_timeout(30000)&_pragma=foreign_keys(1)&_txlock=immediate")
 	if err != nil {
 		return nil, fmt.Errorf("open database: %w", err)
 	}

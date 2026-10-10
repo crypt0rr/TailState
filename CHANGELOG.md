@@ -13,6 +13,12 @@ rollback requires restoring the backup taken before the upgrade. See
 
 ## [Unreleased]
 
+### Fixed
+- `tailstate admin reset` and the other one-shot administration commands wait up to 30 seconds for the database write lock instead of 5, so a busy service no longer makes them fail with "database is locked (SQLITE_BUSY)" (#269).
+
+### Changed
+- Renovate proposes each Go release as one "Go toolchain" PR that updates the Dockerfile builder image, the `go` directive in `go.mod`, and the Dockerfile `GO_VERSION` argument together, so the toolchain alignment check passes and security releases of Go can land without manual work (#270).
+
 ## [0.18.1] - 2026-10-09
 
 - **Schema:** 17 (unchanged)

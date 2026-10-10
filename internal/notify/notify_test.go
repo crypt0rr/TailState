@@ -47,6 +47,33 @@ func TestValidateAndRedact(t *testing.T) {
 	}
 }
 
+// TestRedactURLHidesCredentialHosts is R-062's acceptance criterion: a
+// service whose URL host is its credential is shown as scheme://<redacted>,
+// in the Settings list and in validation errors, while a server host is kept.
+func TestRedactURLHidesCredentialHosts(t *testing.T) {
+	const secret = "k3yS3cr3tV4lue"
+	for raw, want := range map[string]string{
+		"pushbullet://o." + secret + "/device":       "pushbullet://<redacted>",
+		"ifttt://" + secret + "/?events=tailstate":   "ifttt://<redacted>",
+		"wecom://" + secret:                          "wecom://<redacted>",
+		"notifiarr://" + secret + "?channel=1":       "notifiarr://<redacted>",
+		"IFTTT://" + secret + "/?events=tailstate":   "ifttt://<redacted>",
+		"mattermost://host.example:8443/" + secret:   "mattermost://host.example:8443",
+		"pushover://shoutrrr:" + secret + "@userkey": "pushover://userkey",
+	} {
+		if got := RedactURL(raw); got != want {
+			t.Errorf("RedactURL(%q)=%q, want %q", raw, got, want)
+		}
+	}
+	err := Validate("ifttt://" + secret + "/")
+	if err == nil {
+		t.Fatal("IFTTT URL without events was accepted")
+	}
+	if strings.Contains(err.Error(), secret) || strings.Contains(err.Error(), secret[:6]) || !strings.Contains(err.Error(), "ifttt://<redacted>") {
+		t.Fatalf("validation error leaks the webhook key: %v", err)
+	}
+}
+
 func TestDestinationURLRedactsEncodedComponents(t *testing.T) {
 	encodedQueryMessage := sanitize("provider rejected SUPER%2FSECRET%2B123", "generic://hooks.example.com/post?token=SUPER%2FSECRET%2B123&template=json")
 	if strings.Contains(encodedQueryMessage, "SUPER%2FSECRET%2B123") || strings.Contains(encodedQueryMessage, "SUPER/SECRET+123") {

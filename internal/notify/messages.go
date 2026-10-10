@@ -3,6 +3,7 @@ package notify
 import (
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -435,7 +436,30 @@ var markdownInline = strings.NewReplacer(
 // escapes there, so every escape would be shown literally. Use escapeCode
 // instead.
 func escape(value string) string {
-	return markdownInline.Replace(truncate(stripControl(value), 256))
+	return markdownInline.Replace(neutralize(truncate(stripControl(value), 256)))
+}
+
+// wordJoiner (U+2060) is invisible and joins the characters around it, so a
+// client no longer sees a URL or a mention there.
+const wordJoiner = "\u2060"
+
+var (
+	bareWebPattern = regexp.MustCompile(`(?i)\bwww\.`)
+	// A mention stands on its own: no address local part before the "@"
+	// (bob@allcorp.example is an e-mail address, not @all) and a word
+	// boundary after it.
+	broadcastPattern = regexp.MustCompile(`(?i)(^|[^\w.+\-])@(channel|all|here|room|everyone)\b`)
+)
+
+// neutralize inserts a word joiner inside "://" and "www." and after the "@"
+// of a broadcast mention (@channel, @all, @here, @room, @everyone), so a
+// tenant value cannot become a link that a client autolinks or notify a
+// whole channel. Renderers apply it to values only: TailState's own links to
+// the public URL are never passed through it.
+func neutralize(value string) string {
+	value = strings.ReplaceAll(value, "://", ":"+wordJoiner+"//")
+	value = bareWebPattern.ReplaceAllStringFunc(value, func(match string) string { return match[:3] + wordJoiner + "." })
+	return broadcastPattern.ReplaceAllString(value, "${1}@"+wordJoiner+"${2}")
 }
 
 // escapeCode makes value safe inside a single-backtick code span. Code span
@@ -445,7 +469,7 @@ func escape(value string) string {
 // become spaces. Everything else is kept verbatim so timestamps, tags, and
 // collector names stay readable and copyable.
 func escapeCode(value string) string {
-	return truncate(strings.ReplaceAll(stripControl(value), "`", "'"), 256)
+	return neutralize(truncate(strings.ReplaceAll(stripControl(value), "`", "'"), 256))
 }
 
 // stripControl replaces control characters and Unicode line/paragraph

@@ -93,7 +93,10 @@ func summarize(in DigestInput) ([]shareLine, []schemaChange, []fleetTransition, 
 	var schema []schemaChange
 	for key, group := range schemaGroups {
 		population := in.ResourceCounts[group.collector]
-		if population >= schemaChangeMinimum && group.count == population {
+		// A high-severity field (such as tags on every device of a small
+		// tailnet) is never summarised as upstream noise: its values are
+		// listed per resource or in a fleet line.
+		if population >= schemaChangeMinimum && group.count == population && group.severity() != model.SeverityHigh {
 			group.changes = resources(schemaRefs[key])
 			schema = append(schema, *group)
 			for _, ref := range schemaRefs[key] {

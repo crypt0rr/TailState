@@ -70,9 +70,10 @@ func teamsLine(l Line) string {
 // one inside a word such as tag:prod_db is kept; and a closing bracket
 // followed by "(" becomes a fullwidth bracket (］), so the value cannot form
 // a link (teamsLine does the same when the "(" follows the value). Control
-// characters become spaces.
+// characters become spaces, and the value cannot form a bare URL or a
+// broadcast mention (see neutralize).
 func escapeTeams(value string) string {
-	value = truncate(stripControl(value), 256)
+	value = neutralize(truncate(stripControl(value), 256))
 	var b strings.Builder
 	for index, r := range value {
 		switch r {

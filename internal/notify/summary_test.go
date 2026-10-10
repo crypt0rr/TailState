@@ -74,6 +74,42 @@ func TestUpstreamFieldAdditionProducesOneSchemaChangeLine(t *testing.T) {
 	}
 }
 
+// TestSecurityFieldsAreNeverSchemaChanges is R-071's acceptance criterion:
+// tags newly present on every device of a small tailnet are listed with
+// their value at high severity, per device or as a fleet line, never as an
+// upstream schema change.
+func TestSecurityFieldsAreNeverSchemaChanges(t *testing.T) {
+	tagged := func(count int) []model.Change {
+		out := make([]model.Change, 0, count)
+		for i := 0; i < count; i++ {
+			out = append(out, model.Change{Kind: "changed", Collector: "devices", ResourceID: fmt.Sprintf("d%d", i), Name: fmt.Sprintf("host-%d", i), Fields: []model.FieldChange{
+				{Field: "tags", New: []any{"tag:attacker"}, NewPresent: true},
+			}})
+		}
+		return out
+	}
+	small := Markdown(Context{}.Digest(DigestInput{ObservedAt: testObservedAt, Changes: tagged(3), ResourceCounts: map[string]int{"devices": 3}}))
+	if strings.Contains(small, "schema") || strings.Contains(small, "📦") || strings.Count(small, "tag:attacker") != 3 {
+		t.Fatalf("tagging every device was not listed per device:\n%s", small)
+	}
+	for i := 0; i < 3; i++ {
+		if !strings.Contains(small, fmt.Sprintf("🔴 ✏️ **host-%d** (device) changed", i)) {
+			t.Fatalf("host-%d is not listed at high severity:\n%s", i, small)
+		}
+	}
+	fleet := Markdown(Context{}.Digest(DigestInput{ObservedAt: testObservedAt, Changes: tagged(6), ResourceCounts: map[string]int{"devices": 6}}))
+	if strings.Contains(fleet, "schema") || !strings.Contains(fleet, "🔴 📦 6 devices: `tags`") || !strings.Contains(fleet, "tag:attacker") {
+		t.Fatalf("tagging every device was not one fleet line with the tag:\n%s", fleet)
+	}
+	removed := tagged(2)
+	for index := range removed {
+		removed[index].Fields[0] = model.FieldChange{Field: "tags", Old: []any{"tag:prod"}, OldPresent: true}
+	}
+	if got := Markdown(Context{}.Digest(DigestInput{ObservedAt: testObservedAt, Changes: removed, ResourceCounts: map[string]int{"devices": 2}})); strings.Contains(got, "schema") || strings.Count(got, "tag:prod") != 2 {
+		t.Fatalf("removing every device's tags was summarised:\n%s", got)
+	}
+}
+
 func TestDigestReportsMutedCount(t *testing.T) {
 	got := Markdown(Context{}.Digest(DigestInput{ObservedAt: testObservedAt, Changes: rollout(1), MutedCount: 4}))
 	if !strings.Contains(got, "4 muted changes not shown · 5 Oct 2026 12:00 UTC") {

@@ -34,7 +34,7 @@ func slackLine(l Line) string {
 		case SpanStrong:
 			b.WriteString("*" + escapeSlack(span.Text, false) + "*")
 		case SpanCode:
-			b.WriteString("`" + escapeSlack(strings.ReplaceAll(truncate(span.Text, 256), "`", "'"), false) + "`")
+			b.WriteString("`" + escapeSlack(neutralize(strings.ReplaceAll(truncate(span.Text, 256), "`", "'")), false) + "`")
 		case SpanEmph:
 			b.WriteString("_" + escapeSlack(span.Text, false) + "_")
 		case SpanLink:
@@ -52,18 +52,21 @@ func slackLine(l Line) string {
 
 // escapeSlack applies Slack's required entity escaping. Untrusted values
 // additionally lose the characters that open or close bold, strike, and code
-// formatting, so they cannot restyle the rest of the line. A value is bounded
-// before it is escaped, so an entity is never cut in half.
+// formatting, so they cannot restyle the rest of the line, and cannot form a
+// bare URL or a broadcast mention (see neutralize). A value is bounded before
+// it is escaped, so an entity is never cut in half.
 func escapeSlack(value string, untrusted bool) string {
 	value = stripControl(value)
 	if untrusted {
-		value = strings.NewReplacer("*", "∗", "~", "∼", "`", "'").Replace(truncate(value, 256))
+		value = neutralize(strings.NewReplacer("*", "∗", "~", "∼", "`", "'").Replace(truncate(value, 256)))
 	}
 	return strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;").Replace(value)
 }
 
 // Plain renders a message as plain text without any markup, for services
-// that show text verbatim (email, SMS, push, Matrix).
+// that show text verbatim (email, SMS, push, Matrix). Values are shown as
+// they are, except that they cannot form a bare URL or a broadcast mention
+// (see neutralize).
 func Plain(m Message) string { return plainFlavour.render(m) }
 
 var plainFlavour = flavour{title: plainTitleLine, line: plainLine}
@@ -71,7 +74,7 @@ var plainFlavour = flavour{title: plainTitleLine, line: plainLine}
 func plainTitleLine(m Message) string {
 	title := stripControl(titleText(m))
 	if scope := strings.TrimSpace(m.Scope); scope != "" {
-		title += " · " + truncate(stripControl(scope), 256)
+		title += " · " + neutralize(truncate(stripControl(scope), 256))
 	}
 	return title
 }
@@ -93,10 +96,10 @@ func plainLine(l Line) string {
 			if safeLinkURL(span.URL) {
 				b.WriteString(text + ": " + span.URL)
 			} else {
-				b.WriteString(truncate(text, 256))
+				b.WriteString(neutralize(truncate(text, 256)))
 			}
 		default:
-			b.WriteString(truncate(text, 256))
+			b.WriteString(neutralize(truncate(text, 256)))
 		}
 	}
 	return b.String()

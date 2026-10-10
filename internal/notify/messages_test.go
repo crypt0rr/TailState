@@ -143,7 +143,7 @@ func TestCodeSpansCannotBeClosedOrBrokenByValues(t *testing.T) {
 			t.Fatalf("value broke out of its code span with %q: %q", unwanted, got)
 		}
 	}
-	if !strings.Contains(got, "`x' [click](https://evil.example) <img src=x>` → `line break return`") {
+	if !strings.Contains(got, "`x' [click](https:"+wordJoiner+"//evil.example) <img src=x>` → `line break return`") {
 		t.Fatalf("code span did not keep inert link text verbatim: %s", got)
 	}
 	if long := escapeCode(strings.Repeat("a", 400)); len(long) > 256 {

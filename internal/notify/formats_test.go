@@ -1,8 +1,10 @@
 package notify
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -130,12 +132,14 @@ func TestFormatSelectionByServiceAndOverride(t *testing.T) {
 		"generic+https://example.com/hook":                     FormatMarkdown,
 		"telegram://token@telegram?chats=1":                    FormatHTML,
 		"telegram://token@telegram?chats=1&parsemode=HTML":     FormatHTML,
-		"telegram://token@telegram?chats=1&parsemode=Markdown": FormatPlain,
-		"telegram://token@telegram?chats=1&parsemode=None":     FormatPlain,
+		"telegram://token@telegram?chats=1&parsemode=Markdown": FormatHTML,
+		"telegram://token@telegram?chats=1&parsemode=None":     FormatHTML,
 		"smtp://user:pass@host:25/?to=a@b":                     FormatPlain,
 		"pushover://shoutrrr:token@user":                       FormatPlain,
 		"matrix://:token@matrix.example/":                      FormatPlain,
 		"ntfy://ntfy.sh/topic":                                 FormatPlain,
+		"ntfy://ntfy.sh/topic?markdown=yes":                    FormatMarkdown,
+		"smtp://user:pass@host:25/?to=a@b&usehtml=yes":         FormatPlain,
 		"unknownservice://x":                                   FormatMarkdown,
 		"not a url":                                            FormatMarkdown,
 	}
@@ -199,6 +203,78 @@ func TestPrepareDeliversLegacyRowsUnchanged(t *testing.T) {
 	}
 	if got := Slack(Message{Title: "t", Lines: []Line{note("n"), line(Span{Style: "other", Text: "*x*"})}}); !strings.Contains(got, "    _n_") || !strings.Contains(got, "∗x∗") {
 		t.Fatalf("slack note or unknown span: %s", got)
+	}
+}
+
+// TestHTMLEmailAndMarkdownNtfyKeepValuesInert is R-059's acceptance
+// criterion: an SMTP URL with usehtml=yes receives an HTML-escaped body with
+// <br> line breaks, also with a Markdown or plain override, and an ntfy URL
+// with markdown=yes receives the Markdown rendering, whose values are
+// escaped. Without these options both render as before.
+func TestHTMLEmailAndMarkdownNtfyKeepValuesInert(t *testing.T) {
+	hostile := `<a href="https://evil.example/reauth">Re-authenticate now</a> <img src="https://evil.example/b.png"> [click](https://evil.example)`
+	message := Context{Label: hostile, Tailnet: "example.com"}.Digest(DigestInput{ObservedAt: testObservedAt, Changes: []model.Change{
+		{Kind: "created", Collector: "keys", Name: hostile},
+		{Kind: "changed", Collector: "users", Name: "bob", Fields: []model.FieldChange{set("role", "member", hostile)}},
+	}})
+	// Markdown escapes a value's < and ] with a backslash; an unescaped one
+	// outside a code span (whose content is literal) would be live markup.
+	codeSpan := regexp.MustCompile("`[^`]*`")
+	rawMarkup := regexp.MustCompile(`(^|[^\\])(<a|<img|\]\()`)
+	live := func(text string) bool { return rawMarkup.MatchString(codeSpan.ReplaceAllString(text, "")) }
+	server := newSMTPServer(t)
+	smtpURL := "smtp://" + server.listener.Addr().String() + "/?from=tailstate@example.com&to=ops@example.com&encryption=None&usestarttls=No&auth=None"
+	for _, override := range []string{"", FormatPlain, FormatMarkdown, FormatHTML} {
+		prepared := PrepareMessage(message, smtpURL+"&usehtml=yes", override)
+		if prepared.Title == "" || prepared.Format != FormatHTML {
+			t.Fatalf("%q: prepared=%+v", override, prepared)
+		}
+		for _, text := range []string{prepared.Text, prepared.Body} {
+			// In an HTML part, Markdown link syntax is plain text.
+			if strings.Contains(text, "<a") || strings.Contains(text, "<img") {
+				t.Fatalf("%q: HTML e-mail keeps markup from a value:\n%s", override, text)
+			}
+			lines := strings.Split(text, "\n")
+			for _, current := range lines[:len(lines)-1] {
+				if !strings.HasSuffix(current, "<br>") {
+					t.Fatalf("%q: HTML e-mail line without <br>: %q", override, current)
+				}
+			}
+		}
+		if err := New().SendPrepared(context.Background(), smtpURL+"&usehtml=yes", prepared); err != nil {
+			t.Fatalf("%q: send: %v", override, err)
+		}
+	}
+	// The subject is a plain-text header; the parts are checked.
+	for _, data := range server.messages() {
+		_, parts, found := strings.Cut(data, "Content-Type: text/plain")
+		if !found || !strings.Contains(parts, "Content-Type: text/html") || !strings.Contains(parts, "<br>") || strings.Contains(parts, "<a href") || strings.Contains(parts, "<img") {
+			t.Fatalf("HTML e-mail keeps markup from a value:\n%s", data)
+		}
+	}
+	for _, override := range []string{"", FormatPlain, FormatSlack, FormatHTML} {
+		prepared := PrepareMessage(message, ntfyURL+"?markdown=yes", override)
+		text := prepared.Message()
+		if prepared.Format != FormatMarkdown || live(text) || !strings.Contains(text, `\[click\](https:`) {
+			t.Fatalf("%q: Markdown ntfy message keeps markup from a value:\n%s", override, text)
+		}
+		if lines := strings.Split(text, "\n"); len(lines) < 4 || !strings.HasSuffix(lines[0], "  ") {
+			t.Fatalf("%q: Markdown ntfy message lost its line breaks:\n%s", override, text)
+		}
+	}
+	mock := &mockProviders{}
+	if err := senderWithTransport(mock).SendPrepared(context.Background(), ntfyURL+"?markdown=yes", PrepareMessage(message, ntfyURL+"?markdown=yes", "")); err != nil {
+		t.Fatal(err)
+	}
+	if request := mock.all()[0]; request.header.Get("Content-Type") != "text/markdown" || live(request.body) {
+		t.Fatalf("ntfy request=%+v", request)
+	}
+	// Without the options, both keep their plain rendering.
+	_, plainBody, _ := strings.Cut(Plain(message), "\n")
+	for _, serviceURL := range []string{smtpURL, smtpURL + "&usehtml=no", ntfyURL, ntfyURL + "?markdown=no"} {
+		if prepared := PrepareMessage(message, serviceURL, ""); prepared.Format != FormatPlain || prepared.Body != plainBody {
+			t.Fatalf("%s: prepared=%+v", serviceURL, prepared)
+		}
 	}
 }
 

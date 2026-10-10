@@ -44,12 +44,12 @@ func TestOrdinaryNamesRenderWithoutBackslashes(t *testing.T) {
 // every inline position (titles, bold names, prose, and link labels).
 func TestMarkdownInjectionInValuesStaysInert(t *testing.T) {
 	cases := map[string]string{
-		"![x](https://evil.example/i.png)":  `!\[x\](https://evil.example/i.png)`,
-		"[x](https://evil.example)":         `\[x\](https://evil.example)`,
+		"![x](https://evil.example/i.png)":  `!\[x\](https:` + wordJoiner + `//evil.example/i.png)`,
+		"[x](https://evil.example)":         `\[x\](https:` + wordJoiner + `//evil.example)`,
 		"*bold* and **strong**":             `\*bold\* and \*\*strong\*\*`,
 		"_it_ and __under__":                `\_it\_ and \_\_under\_\_`,
 		"<script>alert(1)</script>":         `\<script>alert(1)\</script>`,
-		"<https://evil.example>":            `\<https://evil.example>`,
+		"<https://evil.example>":            `\<https:` + wordJoiner + `//evil.example>`,
 		"`code` and ~~strike~~ ||spoiler||": "\\`code\\` and \\~\\~strike\\~\\~ \\|\\|spoiler\\|\\|",
 		"trailing backslash \\":             `trailing backslash \\`,
 	}

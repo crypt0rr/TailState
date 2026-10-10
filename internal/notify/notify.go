@@ -285,7 +285,15 @@ func (s *SenderImpl) SendPrepared(ctx context.Context, serviceURL string, messag
 			// observed. Provider error text is never parsed for a status: it
 			// contains port numbers, SMTP codes, and other unrelated digits.
 			status, retryAfter := record.failure()
-			return &DeliveryError{Status: status, Message: sanitize(sendErr.Error(), serviceURL), RetryAfter: retryAfter, Permanent: permanentDeliveryFailure(sendErr.Error(), status)}
+			delivery := &DeliveryError{Status: status, Message: sanitize(sendErr.Error(), serviceURL), RetryAfter: retryAfter, Permanent: permanentDeliveryFailure(sendErr.Error(), status)}
+			// A failure the sender classified itself (a Slack API error in a
+			// 200 response) keeps its classification and reason.
+			var classified *DeliveryError
+			if errors.As(sendErr, &classified) && classified != nil {
+				delivery.Permanent = delivery.Permanent || classified.Permanent
+				delivery.Reason = classified.Reason
+			}
+			return delivery
 		}
 	}
 	// A cancellation that arrives after Shoutrrr has returned successfully
@@ -312,6 +320,10 @@ type DeliveryError struct {
 	Message    string
 	RetryAfter time.Duration
 	Permanent  bool
+	// Reason is a fixed reason TailState chose for the failure (see
+	// slackError); SafeDeliveryError persists it only when it is on the
+	// allowlist.
+	Reason string
 }
 
 // messageTooLargeReason is the persisted reason for a payload a provider
@@ -320,12 +332,13 @@ const messageTooLargeReason = "notification rejected by provider: message too la
 
 // permanentStatusReasons are the persisted reasons for HTTP statuses that no
 // retry can fix: a malformed request, revoked or missing credentials, or a
-// deleted webhook. 413 uses messageTooLargeReason.
+// deleted webhook or archived channel. 413 uses messageTooLargeReason.
 var permanentStatusReasons = map[int]string{
 	http.StatusBadRequest:   "notification rejected by provider (HTTP 400)",
 	http.StatusUnauthorized: "notification rejected by provider (HTTP 401)",
 	http.StatusForbidden:    "notification rejected by provider (HTTP 403)",
 	http.StatusNotFound:     "notification rejected by provider (HTTP 404)",
+	http.StatusGone:         "notification rejected by provider (HTTP 410)",
 }
 
 // permanentDeliveryFailure reports provider responses that no retry of the
@@ -367,6 +380,9 @@ func SafeDeliveryError(err error) string {
 			if reason, ok := permanentStatusReasons[delivery.Status]; ok {
 				return reason
 			}
+			if slackReason(delivery.Reason) {
+				return delivery.Reason
+			}
 			if delivery.Status == http.StatusRequestEntityTooLarge || messageTooLarge(delivery.Message) {
 				return messageTooLargeReason
 			}
@@ -391,8 +407,15 @@ func SafeDeliveryError(err error) string {
 func SafeDeliveryMessage(message string) string {
 	message = strings.TrimSpace(message)
 	switch message {
-	case "destination disabled", "destination removed", "delivery retry window expired", "no notification destination configured", "monitoring identity changed", "collector reconciliation failed", "reconciliation retry window expired", "notification delivery failed", "notification delivery timed out", "notification delivery canceled", messageTooLargeReason,
-		permanentStatusReasons[http.StatusBadRequest], permanentStatusReasons[http.StatusUnauthorized], permanentStatusReasons[http.StatusForbidden], permanentStatusReasons[http.StatusNotFound]:
+	case "destination disabled", "destination removed", "delivery retry window expired", "no notification destination configured", "monitoring identity changed", "collector reconciliation failed", "reconciliation retry window expired", "notification delivery failed", "notification delivery timed out", "notification delivery canceled", messageTooLargeReason:
+		return message
+	}
+	for _, reason := range permanentStatusReasons {
+		if message == reason {
+			return message
+		}
+	}
+	if slackReason(message) {
 		return message
 	}
 	// Only the exact reason SafeDeliveryError writes for an HTTP status is
@@ -449,15 +472,23 @@ func isValidationError(err error) bool {
 	return message == "notification URL is required" || strings.HasPrefix(message, "invalid notification URL") || strings.HasPrefix(message, "create notification sender")
 }
 
+// credentialHostSchemes are the pinned Shoutrrr services whose URL host is
+// the credential itself, not a server name: a Pushbullet API token, an IFTTT
+// webhook key, a WeCom bot key, and a Notifiarr API key. (A Pushover host is
+// the user key, which names the account but is not the application token.)
+var credentialHostSchemes = map[string]bool{"pushbullet": true, "ifttt": true, "wecom": true, "notifiarr": true}
+
 // RedactURL returns scheme and host information while hiding credentials,
-// paths, queries, fragments, and tokens.
+// paths, queries, fragments, and tokens. A host that is a credential (see
+// credentialHostSchemes) is hidden too.
 func RedactURL(raw string) string {
 	u, err := url.Parse(strings.TrimSpace(raw))
 	if err != nil || u.Scheme == "" {
 		return "<redacted>"
 	}
 	host := u.Hostname()
-	if host == "" {
+	scheme, _, _ := strings.Cut(strings.ToLower(u.Scheme), "+")
+	if host == "" || credentialHostSchemes[scheme] {
 		return u.Scheme + "://<redacted>"
 	}
 	if port := u.Port(); port != "" {

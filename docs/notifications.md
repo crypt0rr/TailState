@@ -217,6 +217,23 @@ every message type and format.
   entity; the only tags are TailState's own `<b>`, `<i>`, `<code>`, and
   `<a href>` to the configured public URL.
 - **Plain text:** values are shown as they are.
+- **HTML e-mail and Markdown ntfy:** an `smtp` URL with `usehtml=yes` puts
+  the body into the e-mail's HTML part, so that rendering is HTML-escaped
+  (whatever the destination's format) and its lines end in `<br>`. Shoutrrr
+  writes the same body into the plain-text alternative, which therefore
+  shows the escaped HTML in a mail client that cannot display HTML. An
+  `ntfy` URL with `markdown=yes` always receives the Markdown rendering
+  (ignoring a format override), with every line ending in a Markdown hard
+  line break.
+
+In every format, a value also cannot form a bare link or a broadcast
+mention: an invisible word joiner (U+2060) is inserted inside `://` and
+`www.`, and after the `@` of `@channel`, `@all`, `@here`, `@room`, and
+`@everyone`, so a client does not autolink a URL from a resource name or an
+actor's display name, and Mattermost, Rocket.Chat, or Matrix does not
+notify a whole channel. Only values change: TailState's own links to the
+configured public URL keep working. A value copied out of a notification
+contains the invisible character; History shows the raw value.
 
 ## Titles
 
@@ -244,9 +261,10 @@ pinned Shoutrrr release; a test fails when a Shoutrrr update drops or renames
 one of them. A parameter set in the destination URL always wins: with
 `?title=` (for email `?subject=` or `?title=`) in the URL, TailState keeps the
 operator's title and leaves its own as the first line of the body. Telegram
-receives a separate title unless the URL sets a Markdown `parsemode` (Shoutrrr
-shows a title only in its HTML mode; see [Telegram](#telegram)), and a Discord URL with
-`json=yes` receives the body unchanged.
+always receives a separate title, because every Telegram message is sent in
+HTML mode, the only one in which Shoutrrr shows a title (see
+[Telegram](#telegram)), and a Discord URL with `json=yes` receives the body
+unchanged.
 
 ## Discord
 
@@ -271,7 +289,9 @@ Block Kit `section` blocks of whole lines (at most 3,000 characters each and 50
 blocks per message). TailState builds this payload itself, parses the URL with
 Shoutrrr's Slack parser, and sends it through the same bounded,
 redirect-rejecting HTTP client as every other delivery, so failures are
-classified the same way (permanent 4xx, `Retry-After`). The URL options
+classified the same way (permanent 4xx, `Retry-After`); a Slack error code in an
+HTTP 200 response is classified by code (see [Delivery
+semantics](#delivery-semantics)). The URL options
 `botname`/`username`, `icon`, `thread_ts`, `color` (which replaces the
 severity colour, see [Priority and colour](#priority-and-colour); the blocks
 are wrapped in one attachment with the colour bar), and `title` keep their
@@ -328,14 +348,20 @@ on the first line:
 
 The 4,096-byte budget is counted on the rendered HTML, tags and entities
 included, after reserving the title; a longer digest is shortened at line
-boundaries, so every tag stays closed. A URL that sets `parsemode` keeps it:
-with `parsemode=HTML` the destination still receives the HTML rendering,
-and with `Markdown`, `MarkdownV2`, or `None` it receives plain text (with
-`None`, Shoutrrr escapes it in its own HTML mode). Plain text also stays
-available as the destination's format override; Telegram HTML can likewise
-be chosen as an override. When a URL forces `parsemode=HTML` and the
-destination's override is another format, that rendering is HTML-escaped, so
-it is shown as written.
+boundaries, so every tag stays closed, and a single line that is too long
+for the budget is replaced by the "Shortened for this destination" note
+instead of being cut. A `parsemode` set in the URL is replaced with
+`parsemode=HTML`: Telegram's `Markdown` and `MarkdownV2` modes reject a
+message with an unescaped `_`, `*`, `[`, or `` ` `` (and, for
+`MarkdownV2`, `.`, `-`, `(`, and other punctuation), which collector names
+such as `device_details` and many tenant values contain, and HTTP 400 would
+dead-letter the alert. The first message to such a destination logs a
+one-time notice that its parse mode is overridden; remove `parsemode` from
+the URL to silence it. Plain text also stays available as the destination's
+format override; Telegram HTML can likewise be chosen as an override. When
+the URL sets a parse mode and the destination's override is another format,
+that rendering is HTML-escaped, so it is shown as written; without a parse
+mode in the URL, Shoutrrr escapes it in its own HTML mode.
 
 ## Severity and routing
 
@@ -427,7 +453,10 @@ Predictable noise is reduced in the digest without losing the audit trail:
 - **Schema-change detection:** when a field becomes newly present (or absent)
   on every resource a collector returned in one batch (at least 2 resources),
   the digest shows one "upstream schema change" line instead of one diff per
-  resource.
+  resource. A field whose change is high severity (for example `tags` on
+  devices, which the API omits for an untagged device) is never treated as a
+  schema change: tagging every device of a small tailnet lists each device
+  with its tag, or one fleet line with the tag from 5 devices.
 - Both summaries treat the same field of different list elements as one
   field, shown with `[]` in place of the element: `backends[].weight`. An
   element added or removed is listed with its resource.
@@ -436,7 +465,7 @@ Predictable noise is reduced in the digest without losing the audit trail:
 
 - Each destination receives its notifications in the order they were created, also after an outage: while a destination's oldest undelivered item is backing off after a failure (or still in flight), its younger items wait behind it instead of overtaking it when their own shorter retry delay expires, so a "collector recovered" message cannot arrive before the matching "unhealthy" one. Destinations are independent: one that fails or hangs holds back only its own queue. After a destination's first failed send in a delivery pass, its remaining items in that pass are returned unsent (without counting an attempt), so a blackholed destination delays the others by at most one send timeout (15 seconds) per pass.
 - Shoutrrr deliveries retry for up to 24 hours from when each item was queued (including time spent waiting behind an older item), across restarts, then remain visible as dead letters until the 30-day operational retention window expires. Delivery is at-least-once: each outbox row is leased while a sender is in flight, and if the process stops after a provider accepts a message but before the durable bookkeeping update commits, that message may be sent again after the lease expires. Per-lease fencing prevents a stale worker from changing a newer retry attempt. Disabling or removing a destination dead-letters its pending or in-flight items; newly added destinations receive only future notifications. Removing a destination also erases its encrypted URL (and overwrites the freed database space), so a leaked webhook credential is not carried into later backups; History keeps the destination name for past deliveries.
-- Delivery failures are classified from the HTTP response TailState's transport actually received, never from provider error text (so a port such as `:443` or an SMTP code is not mistaken for an HTTP status). Connection failures are recorded as "failed" or "timed out". HTTP 400, 401, 403, and 404 dead-letter on the first attempt as "notification rejected by provider (HTTP *n*)", because a malformed request, revoked token, or deleted webhook cannot succeed on retry. Other statuses (for example 429 and 5xx) are retried; a provider's `Retry-After` header (seconds or HTTP date) sets the next attempt, capped at one hour.
+- Delivery failures are classified from the HTTP response TailState's transport actually received, never from provider error text (so a port such as `:443` or an SMTP code is not mistaken for an HTTP status). Connection failures are recorded as "failed" or "timed out". HTTP 400, 401, 403, 404, and 410 dead-letter on the first attempt as "notification rejected by provider (HTTP *n*)", because a malformed request, revoked token, deleted webhook, or archived channel cannot succeed on retry. Slack reports most Web API errors as HTTP 200 with an error code; every code except temporary ones (`ratelimited`, `internal_error`, `fatal_error`, `service_unavailable`, `request_timeout`) dead-letters on the first attempt as "notification rejected by Slack (*code*)" for known codes such as `invalid_auth`, `token_revoked`, `channel_not_found`, `not_in_channel`, and `invalid_blocks` (`msg_too_long` as "message too large"), and the Settings test shows the same reason. Other statuses (for example 429 and 5xx) are retried; a provider's `Retry-After` header (seconds or HTTP date) sets the next attempt, capped at one hour.
 - If every destination is disabled, or the last destination is removed, monitoring continues and notifications are reported as paused.
 
 ## Collector health alerts

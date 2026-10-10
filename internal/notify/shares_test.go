@@ -271,10 +271,10 @@ func TestShareRecipientsAreEscaped(t *testing.T) {
 	}
 	message := Context{}.Digest(DigestInput{ObservedAt: testObservedAt, Changes: changes})
 	want := map[string]string{
-		FormatMarkdown: `\[x\](https://evil.example) \<b>\*bold\*\</b> \<!channel>`,
-		FormatSlack:    "[x](https://evil.example) &lt;b&gt;∗bold∗&lt;/b&gt; &lt;!channel&gt;",
-		FormatHTML:     "[x](https://evil.example) &lt;b&gt;*bold*&lt;/b&gt; &lt;!channel&gt;",
-		FormatTeams:    "[x］(https://evil.example) <b>∗bold∗</b> <!channel>",
+		FormatMarkdown: `\[x\](https:` + wordJoiner + `//evil.example) \<b>\*bold\*\</b> \<!channel>`,
+		FormatSlack:    "[x](https:" + wordJoiner + "//evil.example) &lt;b&gt;∗bold∗&lt;/b&gt; &lt;!channel&gt;",
+		FormatHTML:     "[x](https:" + wordJoiner + "//evil.example) &lt;b&gt;*bold*&lt;/b&gt; &lt;!channel&gt;",
+		FormatTeams:    "[x］(https:" + wordJoiner + "//evil.example) <b>∗bold∗</b> <!channel>",
 	}
 	for format, escaped := range want {
 		got := Render(message, format)

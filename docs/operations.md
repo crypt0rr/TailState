@@ -329,11 +329,14 @@ budget for the ledger's growth and monitor `tailstate_storage_used_bytes`.
 
 Each GitHub Release also ships reproducible `tailstate_<version>_<os>_<arch>.tar.gz`
 archives for Linux (amd64, arm64), macOS (amd64, arm64), and FreeBSD (amd64),
-plus `SHA256SUMS`, an SPDX SBOM, and a signed build-provenance attestation:
+plus an SPDX SBOM (`tailstate_<version>.spdx.json`) catalogued from the
+release binaries, `SHA256SUMS`, and a signed build-provenance attestation.
+`SHA256SUMS` and the attestation cover the archives and the SBOM:
 
 ```console
 sha256sum -c SHA256SUMS --ignore-missing
 gh attestation verify tailstate_<version>_linux_amd64.tar.gz --owner crypt0rr
+gh attestation verify tailstate_<version>.spdx.json --owner crypt0rr
 ```
 
 The archive contains a hardened systemd unit in

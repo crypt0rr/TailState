@@ -364,8 +364,8 @@ func (s *Server) apiHistory(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(body.Bytes())
 }
 
-// apiEvidence returns the signed evidence pack for the History filters,
-// exactly as the History page's download does.
+// apiEvidence returns the signed evidence pack for the History filters and
+// "limit", exactly as the History page's download does.
 func (s *Server) apiEvidence(w http.ResponseWriter, r *http.Request) {
 	if !s.apiAuthorize(w, r, store.ScopeEvidenceRead) {
 		return
@@ -374,7 +374,7 @@ func (s *Server) apiEvidence(w http.ResponseWriter, r *http.Request) {
 		apiError(w, http.StatusBadRequest, "invalid_request", "Dates must use the YYYY-MM-DD format.")
 		return
 	}
-	pack, err := s.store.ExportEvidencePack(r.Context(), historyFilter(r))
+	pack, err := s.store.ExportEvidencePack(r.Context(), evidenceExportFilter(r))
 	if err != nil {
 		if errors.Is(err, store.ErrEvidencePackTooLarge) {
 			apiError(w, http.StatusRequestEntityTooLarge, "too_large", "The evidence pack is too large; narrow the filters.")

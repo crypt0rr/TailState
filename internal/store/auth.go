@@ -157,49 +157,61 @@ func (s *Store) ResetPassword(ctx context.Context, password string) error {
 func (s *Store) NewResetToken(ctx context.Context) (string, error) {
 	return s.issueAuthToken(ctx, "reset", "reset_token_hash", resetTokenLifetime)
 }
-func (s *Store) ResetWithToken(ctx context.Context, token, password string) error {
+
+// ResetWithToken replaces the administrator password with a one-time reset
+// token. In the same transaction it signs out every session, invalidates the
+// reset token, and revokes every active API token; it returns the number of
+// API tokens revoked.
+func (s *Store) ResetWithToken(ctx context.Context, token, password string) (int64, error) {
 	if err := s.validateAuthToken(ctx, "reset", token, "reset token"); err != nil {
-		return err
+		return 0, err
 	}
 	hash, err := secret.PasswordHash(password)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer tx.Rollback()
 	var want, expires string
 	if err := tx.QueryRowContext(ctx, "SELECT token_hash,expires_at FROM auth_tokens WHERE kind='reset' ORDER BY created_at DESC LIMIT 1").Scan(&want, &expires); err != nil {
-		return errors.New("reset token is unavailable")
+		return 0, errors.New("reset token is unavailable")
 	}
 	if subtle.ConstantTimeCompare([]byte(secret.HashToken(token)), []byte(want)) != 1 {
-		return errors.New("invalid reset token")
+		return 0, errors.New("invalid reset token")
 	}
 	if expiry, err := time.Parse(time.RFC3339Nano, expires); err != nil || !expiry.After(time.Now().UTC()) {
-		return errors.New("reset token has expired")
+		return 0, errors.New("reset token has expired")
 	}
 	now := formatTimestamp(time.Now())
 	result, err := tx.ExecContext(ctx, "UPDATE admin SET password_hash=?,updated_at=? WHERE id=1", hash, now)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	rows, err := result.RowsAffected()
 	if err != nil {
-		return err
+		return 0, err
 	}
 	if rows == 0 {
-		return errors.New("administrator is not configured")
+		return 0, errors.New("administrator is not configured")
 	}
 	if _, err := tx.ExecContext(ctx, "DELETE FROM sessions"); err != nil {
-		return err
+		return 0, err
 	}
 	if _, err := tx.ExecContext(ctx, "DELETE FROM auth_tokens WHERE token_hash=? AND kind='reset'", want); err != nil {
-		return err
+		return 0, err
 	}
 	if _, err := tx.ExecContext(ctx, "DELETE FROM meta WHERE key='reset_token_hash'"); err != nil {
-		return err
+		return 0, err
 	}
-	return tx.Commit()
+	revoked, err := revokeActiveAPITokens(ctx, tx)
+	if err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return revoked, nil
 }

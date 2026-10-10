@@ -28,6 +28,7 @@ const (
 	AuditSetupClaim          = "setup_claim"
 	AuditPasswordReset       = "password_reset"
 	AuditPasswordChanged     = "password_changed"
+	AuditPasswordChangeFail  = "password_change_failed"
 	AuditSessionsRevoked     = "sessions_revoked"
 	AuditSettingsChanged     = "settings_changed"
 	AuditDestinationAdded    = "destination_added"
@@ -56,6 +57,7 @@ var adminAuditLabels = map[string]string{
 	AuditSetupClaim:          "Installation claimed",
 	AuditPasswordReset:       "Password reset with a reset token",
 	AuditPasswordChanged:     "Password changed",
+	AuditPasswordChangeFail:  "Password change refused: wrong current password",
 	AuditSessionsRevoked:     "Other sessions signed out",
 	AuditSettingsChanged:     "Monitoring settings changed",
 	AuditDestinationAdded:    "Notification destination added",

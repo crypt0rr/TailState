@@ -198,44 +198,50 @@ func (s *Store) RevokeOtherSessions(ctx context.Context, keepToken string) (int6
 var ErrCurrentPasswordMismatch = errors.New("current password is incorrect")
 
 // ChangePassword replaces the administrator password after verifying the
-// current one, and in the same transaction signs out every other session and
-// invalidates any outstanding reset token. The new password must satisfy
-// secret.CheckPasswordPolicy; the session identified by keepToken stays
-// signed in.
-func (s *Store) ChangePassword(ctx context.Context, keepToken, current, password string) error {
+// current one, and in the same transaction signs out every session,
+// invalidates any outstanding reset token, and revokes every active API
+// token. The new password must satisfy secret.CheckPasswordPolicy. The caller
+// issues a fresh session for the administrator who made the change, so the
+// cookie value used to submit it stops working. It returns the number of API
+// tokens revoked.
+func (s *Store) ChangePassword(ctx context.Context, current, password string) (int64, error) {
 	hash, err := secret.PasswordHash(password)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	if !s.Authenticate(ctx, current) {
-		return ErrCurrentPasswordMismatch
+		return 0, ErrCurrentPasswordMismatch
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer tx.Rollback()
 	now := formatTimestamp(time.Now())
 	result, err := tx.ExecContext(ctx, "UPDATE admin SET password_hash=?,updated_at=? WHERE id=1", hash, now)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	if n, err := result.RowsAffected(); err != nil {
-		return err
+		return 0, err
 	} else if n == 0 {
-		return errors.New("administrator is not configured")
+		return 0, errors.New("administrator is not configured")
 	}
-	for _, statement := range []struct {
-		query string
-		args  []any
-	}{
-		{"DELETE FROM sessions WHERE token_hash<>?", []any{secret.HashToken(keepToken)}},
-		{"DELETE FROM auth_tokens WHERE kind='reset'", nil},
-		{"DELETE FROM meta WHERE key='reset_token_hash'", nil},
+	for _, query := range []string{
+		"DELETE FROM sessions",
+		"DELETE FROM auth_tokens WHERE kind='reset'",
+		"DELETE FROM meta WHERE key='reset_token_hash'",
 	} {
-		if _, err := tx.ExecContext(ctx, statement.query, statement.args...); err != nil {
-			return err
+		if _, err := tx.ExecContext(ctx, query); err != nil {
+			return 0, err
 		}
 	}
-	return tx.Commit()
+	revoked, err := revokeActiveAPITokens(ctx, tx)
+	if err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return revoked, nil
 }

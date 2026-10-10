@@ -56,7 +56,7 @@ func (s *Server) claim(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "installation already claimed", http.StatusConflict)
 		return
 	}
-	flow := credentialFlow{server: s, page: "setup", action: credentialActionSetup, throttledMessage: "Too many setup attempts. Try again later."}
+	flow := credentialFlow{server: s, page: "setup", action: credentialActionSetup, throttledMessage: "Too many setup attempts. Try again later.", setsPassword: true}
 	release, ok := flow.begin(w, r)
 	if !ok {
 		return
@@ -159,7 +159,7 @@ func (s *Server) reset(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) resetPost(w http.ResponseWriter, r *http.Request) {
-	flow := credentialFlow{server: s, page: "reset", action: credentialActionReset, throttledMessage: "Too many reset attempts. Try again later."}
+	flow := credentialFlow{server: s, page: "reset", action: credentialActionReset, throttledMessage: "Too many reset attempts. Try again later.", setsPassword: true}
 	release, ok := flow.begin(w, r)
 	if !ok {
 		return
@@ -169,7 +169,8 @@ func (s *Server) resetPost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	before := s.enabledDestinations(r.Context())
-	if err := s.store.ResetWithToken(r.Context(), r.FormValue("token"), r.FormValue("password")); err != nil {
+	revoked, err := s.store.ResetWithToken(r.Context(), r.FormValue("token"), r.FormValue("password"))
+	if err != nil {
 		// Do not disclose whether a reset token is missing, invalid, expired,
 		// or temporarily unreadable. The token is deliberately a single
 		// generic oracle to unauthenticated callers.
@@ -178,9 +179,18 @@ func (s *Server) resetPost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	flow.succeed(w)
-	s.recordAdmin(r, "", adminChange{event: store.AuditPasswordReset, highRisk: true}, before, 0)
+	s.recordAdmin(r, "", adminChange{event: store.AuditPasswordReset, fields: apiTokensRevokedFields(revoked), highRisk: true}, before, 0)
 	s.clearCookies(w)
 	http.Redirect(w, r, "/login", http.StatusSeeOther)
+}
+
+// apiTokensRevokedFields names the API token revocation of a password reset
+// or change in its audit record, when any token was revoked.
+func apiTokensRevokedFields(revoked int64) []string {
+	if revoked == 0 {
+		return nil
+	}
+	return []string{"api_tokens_revoked"}
 }
 
 func (s *Server) startSession(w http.ResponseWriter, r *http.Request) (string, bool) {

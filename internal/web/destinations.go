@@ -128,9 +128,14 @@ func (s *Server) destinationPost(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	switch action {
 	case "save":
+		all, ok := s.destinationsBeforeChange(w, r)
+		if !ok {
+			return
+		}
 		serviceURL := strings.TrimSpace(r.FormValue("service_url"))
 		if serviceURL == "" && id > 0 {
-			serviceURL = s.storedDestinationURL(ctx, id)
+			stored, _ := findDestination(all, id)
+			serviceURL = stored.ServiceURL
 		}
 		enabled := r.FormValue("enabled") == "on" || r.FormValue("enabled") == "true"
 		// Forms that carry routing fields mark themselves with routing=1, so a
@@ -148,8 +153,8 @@ func (s *Server) destinationPost(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
-		before := s.enabledDestinations(ctx)
-		change, notified := s.prepareDestinationSave(ctx, r, id, serviceURL, enabled, withRouting, rules, format)
+		before := onlyEnabled(all)
+		change, notified := s.prepareDestinationSave(ctx, r, all, id, serviceURL, enabled, withRouting, rules, format)
 		savedID, err := s.store.SaveDestination(ctx, store.NotificationDestination{ID: id, Name: r.FormValue("name"), ServiceURL: serviceURL, Enabled: enabled})
 		if err == nil && withRouting {
 			err = s.store.SetDestinationRouting(ctx, savedID, rules)
@@ -198,13 +203,24 @@ func (s *Server) destinationPost(w http.ResponseWriter, r *http.Request) {
 		} else if r.URL.Path == "/settings/destinations/disable" {
 			enabled = false
 		}
-		before := s.enabledDestinations(ctx)
-		old, found := findDestination(before, id)
+		all, ok := s.destinationsBeforeChange(w, r)
+		if !ok {
+			return
+		}
+		before := onlyEnabled(all)
+		old, found := findDestination(all, id)
 		var change adminChange
 		var notified int64
-		if enabled {
-			change = adminChange{event: store.AuditDestinationEnabled, target: destinationTarget(id), fields: []string{"enabled"}}
-		} else if found {
+		switch {
+		case !found || old.Enabled == enabled:
+			// Re-enabling an enabled destination, or disabling a disabled
+			// one, changes nothing and is not recorded; an unknown
+			// destination is refused below.
+		case enabled:
+			// Re-enabling resumes deliveries to the destination, so the
+			// destinations already enabled are told.
+			change = adminChange{event: store.AuditDestinationEnabled, target: destinationTarget(id), fields: []string{"enabled"}, highRisk: true}
+		default:
 			// Disabling an enabled destination: tell it first, because a
 			// disabled destination receives nothing afterwards.
 			change = adminChange{event: store.AuditDestinationDisabled, target: destinationTarget(id), fields: []string{"enabled"}, highRisk: true}
@@ -216,9 +232,7 @@ func (s *Server) destinationPost(w http.ResponseWriter, r *http.Request) {
 			s.redirectWithFlash(w, r, "/settings", flashKindError, destinationMutationMessage("update", err))
 			return
 		}
-		// Re-enabling an enabled destination, or disabling a disabled one,
-		// changes nothing and is not recorded.
-		if change.event != "" && (!enabled || !found) {
+		if change.event != "" {
 			s.recordAdmin(r, auth.ref, change, before, notified)
 		}
 		s.engine.Wake()
@@ -234,8 +248,12 @@ func (s *Server) destinationPost(w http.ResponseWriter, r *http.Request) {
 			s.redirectWithFlash(w, r, "/settings", flashKindError, "The destination was not removed. Open \"Remove\" and confirm the removal.")
 			return
 		}
+		all, ok := s.destinationsBeforeChange(w, r)
+		if !ok {
+			return
+		}
 		name, pending := s.destinationPending(ctx, id)
-		before := s.enabledDestinations(ctx)
+		before := onlyEnabled(all)
 		change := adminChange{event: store.AuditDestinationDeleted, target: destinationTarget(id), highRisk: true}
 		var notified int64
 		if old, found := findDestination(before, id); found {
@@ -271,11 +289,18 @@ func (s *Server) notificationContext(ctx context.Context) notify.Context {
 	return messages
 }
 
-// storedDestinationURL returns the saved URL of an active destination, or
-// "" when it cannot be read.
-func (s *Server) storedDestinationURL(ctx context.Context, id int64) string {
-	destination, _ := s.storedDestination(ctx, id)
-	return destination.ServiceURL
+// destinationsBeforeChange reads every destination before a mutation. The
+// read decides what the change is, which destinations are told about it, and
+// whether the destination itself is notified first, so when it fails the
+// mutation is refused rather than applied unaudited or unannounced.
+func (s *Server) destinationsBeforeChange(w http.ResponseWriter, r *http.Request) ([]store.NotificationDestination, bool) {
+	destinations, err := s.store.ListDestinations(r.Context())
+	if err != nil {
+		slog.Error("load notification destinations before a change", "error", err)
+		s.redirectWithFlash(w, r, "/settings", flashKindError, "Notification destinations could not be read, so nothing was changed. Try again.")
+		return nil, false
+	}
+	return destinations, true
 }
 
 // storedDestination returns a saved, active destination. found is false

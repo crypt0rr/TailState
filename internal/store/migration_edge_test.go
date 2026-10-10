@@ -317,7 +317,7 @@ func TestVersionSixMigrationThroughOpenMigratesLegacyAuthenticationTokens(t *tes
 	if err := st.Claim(ctx, setupToken, "a secure password"); err != nil {
 		t.Fatalf("migrated setup token was not usable: %v", err)
 	}
-	if err := st.ResetWithToken(ctx, resetToken, "another secure password"); err != nil {
+	if _, err := st.ResetWithToken(ctx, resetToken, "another secure password"); err != nil {
 		t.Fatalf("migrated reset token was not usable: %v", err)
 	}
 	var remaining int

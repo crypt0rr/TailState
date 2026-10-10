@@ -589,3 +589,75 @@ func TestRevealStoreExpiresAndBoundsPendingSecrets(t *testing.T) {
 		t.Fatalf("expired reveals were not pruned: %v", err)
 	}
 }
+
+// TestAPIEvidenceHonorsLimitLikeHistoryExport guards R-066: the API evidence
+// pack uses the History download's pack size by default and honors a
+// positive limit, with truncated and next_cursor set when more batches match.
+func TestAPIEvidenceHonorsLimitLikeHistoryExport(t *testing.T) {
+	f := newAPIFixture(t, 25)
+	token := f.createToken(t, store.ScopeEvidenceRead)
+	type pack struct {
+		Batches    []json.RawMessage `json:"batches"`
+		Truncated  bool              `json:"truncated"`
+		NextCursor int64             `json:"next_cursor"`
+	}
+	decode := func(response *httptest.ResponseRecorder) pack {
+		t.Helper()
+		if response.Code != http.StatusOK {
+			t.Fatalf("evidence status %d: %s", response.Code, response.Body.String())
+		}
+		var out pack
+		if err := json.Unmarshal(response.Body.Bytes(), &out); err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+	api := decode(apiGet(f.server, "/api/v1/evidence?collector=devices", token))
+	download := decode(authGet(t, f.server, "/history/export?collector=devices", f.cookies))
+	if len(api.Batches) != f.batches || len(api.Batches) != len(download.Batches) || api.Truncated != download.Truncated {
+		t.Fatalf("API pack has %d batches (truncated=%v), History download %d (truncated=%v), want %d", len(api.Batches), api.Truncated, len(download.Batches), download.Truncated, f.batches)
+	}
+	limited := decode(apiGet(f.server, "/api/v1/evidence?collector=devices&limit=5", token))
+	if len(limited.Batches) != 5 || !limited.Truncated || limited.NextCursor <= 0 {
+		t.Fatalf("limit=5 returned %d batches, truncated=%v next_cursor=%d", len(limited.Batches), limited.Truncated, limited.NextCursor)
+	}
+}
+
+// TestPasswordRecoveryRevokesAPITokens guards R-052: a password change and a
+// token reset both revoke every active API token, so a token created with a
+// stolen session does not outlive the recovery, and the audit record names
+// the revocation.
+func TestPasswordRecoveryRevokesAPITokens(t *testing.T) {
+	f := newAPIFixture(t, 1)
+	token := f.createToken(t, store.ScopeStatusRead)
+	const changed = "violet harbor lantern"
+	response := coveragePost(t, f.server, "/settings/password", url.Values{"_csrf": {csrfFrom(t, f.cookies)}, "current_password": {testAdminPassword}, "password": {changed}, "confirm": {changed}}, f.cookies)
+	f.cookies = sessionOnly(response.Result().Cookies())
+	if body := followFlash(t, f.server, f.cookies, response); !strings.Contains(body, "every active API token was revoked") {
+		t.Fatalf("password change does not report the token revocation: %s", body)
+	}
+	if response := apiGet(f.server, "/api/v1/status", token); response.Code != http.StatusUnauthorized {
+		t.Fatalf("API token survived a password change: %d", response.Code)
+	}
+	entries, err := f.st.RecentAdminAudit(context.Background(), 1)
+	if err != nil || len(entries) != 1 || entries[0].Event != store.AuditPasswordChanged || strings.Join(entries[0].Fields, ",") != "api_tokens_revoked" {
+		t.Fatalf("password change audit %+v err=%v", entries, err)
+	}
+
+	token = f.createToken(t, store.ScopeHistoryRead, store.ScopeEvidenceRead)
+	reset, err := f.st.NewResetToken(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	const recovered = "amber meadow compass"
+	if response := coveragePost(t, f.server, "/reset", url.Values{"token": {reset}, "password": {recovered}, "confirm": {recovered}}, nil); response.Code != http.StatusSeeOther {
+		t.Fatalf("reset %d: %s", response.Code, response.Body.String())
+	}
+	if response := apiGet(f.server, "/api/v1/evidence", token); response.Code != http.StatusUnauthorized {
+		t.Fatalf("API token survived a password reset: %d", response.Code)
+	}
+	entries, err = f.st.RecentAdminAudit(context.Background(), 1)
+	if err != nil || len(entries) != 1 || entries[0].Event != store.AuditPasswordReset || strings.Join(entries[0].Fields, ",") != "api_tokens_revoked" {
+		t.Fatalf("password reset audit %+v err=%v", entries, err)
+	}
+}

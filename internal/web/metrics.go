@@ -244,7 +244,8 @@ func (s *Server) metricsAuthorized(r *http.Request) bool {
 	if err != nil || !addr.IsLoopback() || s.isTrustedProxy(remote) {
 		return false
 	}
-	return strings.TrimSpace(r.Header.Get("X-Forwarded-For")) == "" && strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")) == ""
+	// Any forwarded header line, even an empty one, is proxy provenance.
+	return len(r.Header.Values("X-Forwarded-For")) == 0 && len(r.Header.Values("X-Forwarded-Proto")) == 0
 }
 
 func boolMetric(value bool) int {

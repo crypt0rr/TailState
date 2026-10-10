@@ -237,6 +237,18 @@ func (s *Store) RevokeAPIToken(ctx context.Context, id int64) error {
 	return nil
 }
 
+// revokeActiveAPITokens revokes every active token inside tx and returns how
+// many it revoked. A password reset or change calls it, so a token created
+// with a stolen session does not outlive the credential recovery.
+func revokeActiveAPITokens(ctx context.Context, tx *sql.Tx) (int64, error) {
+	now := formatTimestamp(time.Now())
+	result, err := tx.ExecContext(ctx, "UPDATE api_tokens SET revoked_at=? WHERE revoked_at IS NULL AND expires_at>?", now, now)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
 // AuthenticateAPIToken resolves a presented token. Unknown, revoked, and
 // expired tokens all return ErrAPITokenInvalid. The last-used time is
 // updated at most once a minute.

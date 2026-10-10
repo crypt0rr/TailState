@@ -56,7 +56,12 @@ func (s *Server) enabledDestinations(ctx context.Context) []store.NotificationDe
 		slog.Error("load notification destinations for administrative notice", "error", err)
 		return nil
 	}
-	enabled := destinations[:0]
+	return onlyEnabled(destinations)
+}
+
+// onlyEnabled returns the enabled destinations in a new slice.
+func onlyEnabled(destinations []store.NotificationDestination) []store.NotificationDestination {
+	var enabled []store.NotificationDestination
 	for _, destination := range destinations {
 		if destination.Enabled {
 			enabled = append(enabled, destination)
@@ -195,18 +200,17 @@ func findDestination(destinations []store.NotificationDestination, id int64) (st
 	return store.NotificationDestination{}, false
 }
 
-// prepareDestinationSave works out the audit record for a destination save.
-// When the save would stop an enabled destination from receiving notices at
-// its current URL (disabling it or replacing the URL), the notice is sent
-// there first and the destination ID is returned so the durable notice skips
-// it. A save that changes nothing returns an empty change.
-func (s *Server) prepareDestinationSave(ctx context.Context, r *http.Request, id int64, serviceURL string, enabled, withRouting bool, rules store.RoutingRules, format string) (adminChange, int64) {
+// prepareDestinationSave works out the audit record for a destination save
+// from destinations, every destination as read before the save. Adding a
+// destination, or turning a disabled one back on, starts deliveries to it and
+// is high-risk. When the save would stop an enabled destination from
+// receiving notices at its current URL (disabling it or replacing the URL),
+// the notice is sent there first and the destination ID is returned so the
+// durable notice skips it. A save that changes nothing returns an empty
+// change.
+func (s *Server) prepareDestinationSave(ctx context.Context, r *http.Request, destinations []store.NotificationDestination, id int64, serviceURL string, enabled, withRouting bool, rules store.RoutingRules, format string) (adminChange, int64) {
 	if id <= 0 {
-		return adminChange{event: store.AuditDestinationAdded, fields: []string{"enabled", "name", "service_url"}}, 0
-	}
-	destinations, err := s.store.ListDestinations(ctx)
-	if err != nil {
-		return adminChange{}, 0
+		return adminChange{event: store.AuditDestinationAdded, fields: []string{"enabled", "name", "service_url"}, highRisk: true}, 0
 	}
 	old, found := findDestination(destinations, id)
 	if !found {
@@ -218,8 +222,9 @@ func (s *Server) prepareDestinationSave(ctx context.Context, r *http.Request, id
 		return adminChange{}, 0
 	}
 	disabling := old.Enabled && !enabled
+	reenabling := !old.Enabled && enabled
 	redirecting := containsField(fields, "service_url")
-	change := adminChange{event: store.AuditDestinationEdited, target: destinationTarget(id), fields: fields, highRisk: disabling || redirecting || containsField(fields, "routing")}
+	change := adminChange{event: store.AuditDestinationEdited, target: destinationTarget(id), fields: fields, highRisk: disabling || reenabling || redirecting || containsField(fields, "routing")}
 	if old.Enabled && (disabling || redirecting) && name != "" && notify.Validate(serviceURL) == nil {
 		s.noticeBeforeChange(ctx, old, s.adminMessage(ctx, r, change))
 		return change, id

@@ -21,6 +21,11 @@ const (
 	paramColor      = "color"
 	paramParseMode  = "parsemode"
 
+	// Shoutrrr URL options TailState reads but never passes: an SMTP URL's
+	// HTML body and an ntfy URL's Markdown display.
+	paramUseHTML  = "usehtml"
+	paramMarkdown = "markdown"
+
 	// parseModeHTML is the Telegram parse mode of the HTML rendering.
 	parseModeHTML = "HTML"
 )
@@ -154,15 +159,11 @@ func (d destination) sendsTitleSeparately() bool {
 	if d.paramKey(paramTitle) == "" {
 		return false
 	}
-	switch d.scheme {
-	case "telegram":
-		// Shoutrrr shows a Telegram title only in its HTML parse mode: the one
-		// TailState passes with its HTML rendering, the one an operator set,
-		// or the one Shoutrrr selects (escaping a plain body) when no parse
-		// mode is set. With a Markdown parse mode the title would be dropped.
-		mode := strings.ToLower(d.query[paramParseMode])
-		return mode == "" || mode == "none" || mode == "html"
-	case "discord":
+	// Shoutrrr shows a Telegram title only in its HTML parse mode, which
+	// every Telegram message uses: TailState passes it with its HTML
+	// rendering and in place of any parse mode the URL sets, and Shoutrrr
+	// selects it (escaping a plain body) when no parse mode is set.
+	if d.scheme == "discord" {
 		// In JSON mode Discord sends the body as a raw payload and ignores
 		// every parameter.
 		return !truthy(d.query["json"])
@@ -187,12 +188,11 @@ func (d destination) params(message Prepared) *types.Params {
 			params[key] = encodeTitle(d.scheme, message.Title)
 		}
 	}
-	if message.Format == FormatHTML {
+	if message.Format == FormatHTML && d.scheme == "telegram" {
 		// The HTML rendering is only shown as such in Telegram's HTML parse
-		// mode; Shoutrrr's own HTML mode would escape it.
-		if key := d.paramKey(paramParseMode); key != "" {
-			params[key] = parseModeHTML
-		}
+		// mode; Shoutrrr's own HTML mode would escape it. It replaces a parse
+		// mode set in the URL, whose Markdown modes would reject the text.
+		params[paramParseMode] = parseModeHTML
 	}
 	for param := range severityParams[d.scheme] {
 		if value := d.severityParam(param, message.Severity); value != "" {
@@ -212,11 +212,12 @@ func (d destination) params(message Prepared) *types.Params {
 
 // plainTitle is the title a destination receives as a parameter: the icon,
 // title, and scope as one line of plain text without control characters,
-// bounded to maxTitleBytes.
+// bounded to maxTitleBytes. The scope cannot form a bare URL or a broadcast
+// mention (see neutralize).
 func plainTitle(m Message) string {
 	title := stripControl(titleText(m))
 	if scope := strings.TrimSpace(m.Scope); scope != "" {
-		title += " · " + stripControl(scope)
+		title += " · " + neutralize(stripControl(scope))
 	}
 	return truncate(strings.TrimSpace(title), maxTitleBytes)
 }

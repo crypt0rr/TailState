@@ -1,9 +1,11 @@
 package notify
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"regexp"
 	"strings"
 	"testing"
@@ -169,10 +171,11 @@ func TestTelegramReceivesFittedHTML(t *testing.T) {
 	validTelegramHTML(t, body)
 
 	small := Context{Tailnet: "example.com"}.Test(testObservedAt)
-	// An operator parse mode wins: Markdown gets plain text with the title
-	// line, and an operator HTML mode gets the HTML rendering.
+	// An operator parse mode is replaced with HTML (R-058): Markdown also
+	// gets the HTML rendering with the title in bold, as does an operator
+	// HTML mode.
 	payload = send(telegramURL+"&parsemode=Markdown", "", small)
-	if text, _ := payload["text"].(string); payload["parse_mode"] != "Markdown" || !strings.HasPrefix(text, "🧪 TailState test · example.com\nTailState test:") {
+	if text, _ := payload["text"].(string); payload["parse_mode"] != "HTML" || !strings.HasPrefix(text, "<b>🧪 TailState test · example.com</b>\n<b>TailState test:</b> notifications") {
 		t.Fatalf("operator Markdown mode: %v", payload)
 	}
 	payload = send(telegramURL+"&parsemode=HTML", "", small)
@@ -195,5 +198,51 @@ func TestTelegramReceivesFittedHTML(t *testing.T) {
 	}
 	if params := parseDestination(telegramURL).params(Prepared{Title: "t", Format: FormatPlain}); params == nil || (*params)["parsemode"] != "" {
 		t.Fatalf("plain override passes a parse mode: %v", params)
+	}
+}
+
+// TestTelegramParseModesAreReplacedWithHTML is R-058's acceptance criterion:
+// messages full of Markdown-reserved characters reach every Telegram parse
+// mode as valid HTML sent with parse_mode=HTML, also with a format override,
+// and the override is logged once per destination.
+func TestTelegramParseModesAreReplacedWithHTML(t *testing.T) {
+	var logs bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+	defer slog.SetDefault(previous)
+	parseModeNotices.Clear()
+
+	tenant := Context{Label: "lab_1", Tailnet: "example.com", PublicURL: "https://tailstate.example", Version: "v0.18.1"}
+	messages := []Message{
+		tenant.CollectorsUnhealthy([]CollectorHealth{{Collector: "device_details", Reason: "HTTP 500 (*retrying*) [x](y) `z`"}}, testObservedAt),
+		tenant.AdminChange("destination updated", []string{"service_url", "api_token:5"}, "first_last@corp.example", "10.0.0.1", testObservedAt),
+	}
+	for _, mode := range []string{"", "&parsemode=Markdown", "&parsemode=MarkdownV2", "&parsemode=HTML", "&parsemode=None"} {
+		serviceURL := telegramURL + mode
+		for _, override := range []string{"", FormatPlain, FormatMarkdown} {
+			for _, message := range messages {
+				mock := &mockProviders{}
+				if err := senderWithTransport(mock).SendPrepared(context.Background(), serviceURL, PrepareMessage(message, serviceURL, override)); err != nil {
+					t.Fatalf("%s %q: %v", mode, override, err)
+				}
+				var payload map[string]any
+				if err := json.Unmarshal([]byte(mock.all()[0].body), &payload); err != nil {
+					t.Fatal(err)
+				}
+				text, _ := payload["text"].(string)
+				if payload["parse_mode"] != "HTML" || !strings.HasPrefix(text, "<b>") {
+					t.Fatalf("%s %q: parse_mode=%v text=%q", mode, override, payload["parse_mode"], text)
+				}
+				validTelegramHTML(t, text)
+			}
+		}
+	}
+	for _, mode := range []string{"Markdown", "MarkdownV2", "None"} {
+		if count := strings.Count(logs.String(), "parse_mode="+mode+"\n"); count != 1 {
+			t.Fatalf("parse mode %s notice logged %d times:\n%s", mode, count, logs.String())
+		}
+	}
+	if strings.Contains(logs.String(), "parse_mode=HTML") || strings.Contains(logs.String(), "ABCdef") {
+		t.Fatalf("unexpected notice:\n%s", logs.String())
 	}
 }

@@ -1,10 +1,13 @@
 package notify
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
+	"sync"
 )
 
 // Message formats a destination can receive.
@@ -78,8 +81,13 @@ func ValidateFormat(format string) (string, error) {
 }
 
 // FormatFor returns the format used for a destination: the override when
-// one is set, otherwise the format of the URL's service.
+// one is set, otherwise the format of the URL's service. An ntfy URL with
+// markdown=yes always receives Markdown, the only rendering that escapes
+// values for a Markdown display.
 func FormatFor(serviceURL, override string) string {
+	if destination := parseDestination(serviceURL); destination.scheme == "ntfy" && truthy(destination.query[paramMarkdown]) {
+		return FormatMarkdown
+	}
 	if format, err := ValidateFormat(override); err == nil && format != FormatAuto {
 		return format
 	}
@@ -90,13 +98,6 @@ func FormatFor(serviceURL, override string) string {
 	scheme = strings.ToLower(scheme)
 	if base, _, ok := strings.Cut(scheme, "+"); ok {
 		scheme = base
-	}
-	if scheme == "telegram" {
-		// Telegram renders HTML when TailState passes parsemode=HTML. A URL
-		// that chooses another parse mode keeps it and receives plain text.
-		if mode := parseDestination(serviceURL).query[paramParseMode]; mode != "" && !strings.EqualFold(mode, "html") {
-			return FormatPlain
-		}
 	}
 	if format, ok := schemeFormats[scheme]; ok {
 		return format
@@ -208,11 +209,30 @@ func PrepareMessage(message Message, serviceURL, override string) Prepared {
 	format := FormatFor(serviceURL, override)
 	limit := MessageLimit(serviceURL)
 	render := flavourFor(format)
-	if destination := parseDestination(serviceURL); format != FormatHTML && destination.scheme == "telegram" && strings.EqualFold(destination.query[paramParseMode], "html") {
-		// The URL selects Telegram's HTML mode, but the destination's
-		// format override is not HTML: escape the rendering so its text
-		// is shown as written and a value cannot add markup.
+	destination := parseDestination(serviceURL)
+	htmlBody, lineBreaks := false, false
+	switch {
+	case destination.scheme == "telegram" && destination.operatorSet([]string{paramParseMode}):
+		// Telegram's Markdown modes reject unescaped reserved characters,
+		// which every value may contain, so a parse mode set in the URL is
+		// replaced with HTML (see params).
+		noteParseModeOverride(serviceURL, destination.query[paramParseMode])
+		htmlBody = true
+	case destination.scheme == "smtp" && truthy(destination.query[paramUseHTML]):
+		// Shoutrrr writes the body into the e-mail's HTML part as it is.
+		htmlBody, lineBreaks = true, true
+	case destination.scheme == "ntfy" && truthy(destination.query[paramMarkdown]):
+		// FormatFor selected Markdown. ntfy's Markdown display joins
+		// consecutive lines into one paragraph unless each ends in a hard
+		// line break.
+		render = render.hardBreaks()
+	}
+	if htmlBody && format != FormatHTML {
+		// The destination displays HTML, but its format is another one:
+		// escape the rendering so its text is shown as written and a value
+		// cannot add markup.
 		render = render.htmlEscaped()
+		format = FormatHTML
 	}
 	head, context := splitContext(message)
 	rendered := render.render(head)
@@ -220,7 +240,7 @@ func PrepareMessage(message Message, serviceURL, override string) Prepared {
 	if len(context) > 0 {
 		footer = render.lines(context)
 	}
-	fit := func(text string, limit int) string {
+	shorten := func(text string, limit int) string {
 		if footer == "" {
 			return FitMessageFor(text, limit, format)
 		}
@@ -232,8 +252,17 @@ func PrepareMessage(message Message, serviceURL, override string) Prepared {
 		}
 		return FitMessageFor(text+"\n"+footer, limit, format)
 	}
+	fit := func(text string, limit int) string {
+		text = shorten(text, limit)
+		if lineBreaks {
+			// An HTML e-mail collapses line breaks. E-mail has no provider
+			// size limit, so the bytes added after fitting are harmless.
+			text = strings.ReplaceAll(text, "\n", "<br>\n")
+		}
+		return text
+	}
 	prepared := Prepared{Text: fit(rendered, limit), Format: format, Severity: message.Severity}
-	if message.IsText() || !parseDestination(serviceURL).sendsTitleSeparately() {
+	if message.IsText() || !destination.sendsTitleSeparately() {
 		return prepared
 	}
 	title := plainTitle(message)
@@ -250,4 +279,28 @@ func PrepareMessage(message Message, serviceURL, override string) Prepared {
 	prepared.Title = title
 	prepared.Body = fit(body, limit-len(title)-1)
 	return prepared
+}
+
+// parseModeNotices holds a hash of every Telegram destination URL whose
+// parse mode was reported as overridden, so the notice is logged once per
+// destination and process instead of on every send.
+var parseModeNotices sync.Map
+
+// noteParseModeOverride logs, once per destination, that a parse mode set in
+// a Telegram URL is replaced with HTML. HTML is TailState's own mode and needs
+// no notice. Only a known mode name is logged, never other URL text.
+func noteParseModeOverride(serviceURL, mode string) {
+	if strings.EqualFold(mode, parseModeHTML) {
+		return
+	}
+	if _, seen := parseModeNotices.LoadOrStore(sha256.Sum256([]byte(strings.TrimSpace(serviceURL))), struct{}{}); seen {
+		return
+	}
+	logged := "other"
+	for _, known := range []string{"None", "Markdown", "MarkdownV2"} {
+		if strings.EqualFold(mode, known) {
+			logged = known
+		}
+	}
+	slog.Info("Telegram destination URL sets a parse mode; TailState overrides it with HTML and sends its escaped HTML rendering", "destination", RedactURL(serviceURL), "parse_mode", logged)
 }

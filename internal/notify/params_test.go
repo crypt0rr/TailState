@@ -393,7 +393,7 @@ func TestTitleParameterRules(t *testing.T) {
 	for serviceURL, want := range map[string]bool{
 		telegramURL:                                                   true,
 		telegramURL + "&parsemode=None":                               true,
-		telegramURL + "&parsemode=Markdown":                           false,
+		telegramURL + "&parsemode=Markdown":                           true,
 		telegramURL + "&ParseMode=HTML":                               true,
 		discordURL + "?json=yes":                                      false,
 		discordURL + "?json=no":                                       true,

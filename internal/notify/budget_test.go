@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -128,6 +129,78 @@ func TestSendFitsMessageToDestinationBudget(t *testing.T) {
 	// ntfy sends JSON; the message field must have been fitted to 4096 bytes.
 	if len(bodies[0]) > 4096+512 || !strings.Contains(bodies[0], "omitted") {
 		t.Fatalf("ntfy body was not fitted (%d bytes)", len(bodies[0]))
+	}
+}
+
+// longLineDigest is R-063's scenario: one fleet line for five devices that
+// share four transitions, each to 250 characters that grow under escaping.
+func longLineDigest(value string) Message {
+	changes := make([]model.Change, 0, 5)
+	for i := 0; i < 5; i++ {
+		changes = append(changes, model.Change{Kind: "changed", Collector: "devices", ResourceID: fmt.Sprint(i), Name: fmt.Sprintf("host-%d", i), Fields: []model.FieldChange{
+			set("tags", []any{}, []any{value}),
+			set("name", "a", value),
+			set("os", "b", value),
+			set("hostname", "c", value),
+		}})
+	}
+	return Context{Tailnet: "example.com", PublicURL: "https://tailstate.example"}.Digest(DigestInput{BatchID: 9, ObservedAt: testObservedAt, Changes: changes})
+}
+
+// TestTooLongFirstLineIsNeverCut is R-063's acceptance criterion: a line too
+// long for the destination is replaced by the omission note, so Telegram
+// receives valid HTML within its budget with the high-severity count, and
+// Markdown keeps its code spans balanced.
+func TestTooLongFirstLineIsNeverCut(t *testing.T) {
+	message := longLineDigest(strings.Repeat("&", 250))
+	prepared := PrepareMessage(message, telegramURL, "")
+	if prepared.Title == "" || len(prepared.Body) > 4096-len(prepared.Title)-1 {
+		t.Fatalf("telegram body is %d bytes", len(prepared.Body))
+	}
+	validTelegramHTML(t, prepared.Body)
+	if !strings.Contains(prepared.Body, "<i>Shortened for this destination: ") || !strings.Contains(prepared.Body, "high-severity change") || !strings.HasSuffix(prepared.Body, `Batch 9 in History</a>`) {
+		t.Fatalf("telegram body lost the note or its high-severity count:\n%s", prepared.Body)
+	}
+	markdown := Render(message, FormatMarkdown)
+	_, body, _ := strings.Cut(markdown, "\n")
+	fitted := FitMessageFor(body, 900, FormatMarkdown)
+	if len(fitted) > 900 || strings.Count(fitted, "`")%2 != 0 || !strings.Contains(fitted, "high-severity change") {
+		t.Fatalf("markdown fit (%d bytes):\n%s", len(fitted), fitted)
+	}
+}
+
+// TestFitNeverCutsMarkup checks every format and a range of budgets: each
+// fitted line is a complete rendered line or the omission note, so no
+// destination receives a cut tag, entity, escape, or code span.
+func TestFitNeverCutsMarkup(t *testing.T) {
+	note := regexp.MustCompile(`^(_|<i>)?Shortened for this destination: [^<>&*` + "`" + `]* See TailState History for the full batch\.(_|</i>)?$`)
+	for _, value := range []string{strings.Repeat("&", 250), strings.Repeat("<b>", 90), strings.Repeat("`*_\\", 70), strings.Repeat("é&", 120)} {
+		message := longLineDigest(value)
+		for _, format := range Formats {
+			rendered := Render(message, format)
+			whole := map[string]bool{}
+			for _, current := range strings.Split(rendered, "\n") {
+				whole[current] = true
+			}
+			for limit := 1; limit <= len(rendered)+1; limit += 13 {
+				got := FitMessageFor(rendered, limit, format)
+				if len(got) > limit || !utf8.ValidString(got) {
+					t.Fatalf("%s limit %d: %d bytes", format, limit, len(got))
+				}
+				if format == FormatHTML {
+					validTelegramHTML(t, got)
+				}
+				for _, current := range strings.Split(got, "\n") {
+					// A budget too small for the note gets a cut of the plain
+					// note, which has no markup.
+					cutNote := strings.HasPrefix(current, "Shortened for this destination: ") || strings.HasPrefix("Shortened for this destination: ", current)
+					shortenedNote := note.MatchString(current) || (cutNote && !strings.ContainsAny(current, "<>&*`_\\"))
+					if !whole[current] && !shortenedNote {
+						t.Fatalf("%s limit %d: cut line %q", format, limit, current)
+					}
+				}
+			}
+		}
 	}
 }
 

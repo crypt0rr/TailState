@@ -241,6 +241,53 @@ func TestPresentedValuesStayInert(t *testing.T) {
 			t.Fatalf("%s value broke a line:\n%s", format, got)
 		}
 	}
+
+	// R-064: bare URLs and broadcast mentions in values, in every span a
+	// value reaches, are broken up by a word joiner in every renderer, while
+	// TailState's own links still render.
+	inert := []string{"https://evil.example", "www.evil.example", "WWW.evil.example", "@channel", "@all", "@here", "@room", "@everyone", "@Channel"}
+	value := strings.Join(inert, " ")
+	tenant := Context{Label: value, Tailnet: "example.com", PublicURL: "https://tailstate.example"}
+	messages := []Message{
+		tenant.Digest(DigestInput{BatchID: 7, ObservedAt: testObservedAt, Attributed: true, Changes: []model.Change{
+			{Kind: "changed", Collector: "devices", Name: value, Attribution: &model.Attribution{ActorLogin: value, ActorName: value}, Fields: []model.FieldChange{
+				set("tags", []any{"tag:a"}, []any{"tag:a", value}),
+				set("name", "plain", value),
+			}},
+			{Kind: "created", Collector: "keys", Name: value},
+		}}),
+		tenant.CollectorsUnhealthy([]CollectorHealth{{Collector: value, Reason: value}}, testObservedAt),
+		tenant.ExpiryWarning(3, []ExpiryLine{{Kind: value, Name: value, Tags: []string{value}, Expires: testObservedAt}}, testObservedAt),
+		tenant.Test(testObservedAt),
+		{Title: "t", Lines: []Line{line(link(value, "javascript:x"))}},
+	}
+	links := map[string]string{
+		FormatMarkdown: "](https://tailstate.example/history?batch=7)",
+		FormatSlack:    "<https://tailstate.example/history?batch=7|",
+		FormatPlain:    ": https://tailstate.example/history?batch=7",
+		FormatTeams:    "](https://tailstate.example/history?batch=7)",
+		FormatHTML:     `<a href="https://tailstate.example/history?batch=7">`,
+	}
+	for _, format := range Formats {
+		for index, message := range messages {
+			got := Render(message, format)
+			for _, active := range inert {
+				if strings.Contains(strings.ToLower(got), strings.ToLower(active)) {
+					t.Fatalf("%s message %d keeps %q contiguous:\n%s", format, index, active, got)
+				}
+			}
+			if !strings.Contains(got, wordJoiner) {
+				t.Fatalf("%s message %d has no neutralised value:\n%s", format, index, got)
+			}
+		}
+		if got := Render(messages[0], format); !strings.Contains(got, links[format]) {
+			t.Fatalf("%s lost the History link:\n%s", format, got)
+		}
+		title := plainTitle(messages[3])
+		if strings.Contains(title, "@here") || strings.Contains(title, "https://") {
+			t.Fatalf("title parameter keeps a value active: %q", title)
+		}
+	}
 }
 
 // TestPresenterEdgeCases covers the fallbacks and bounds of the presenter.

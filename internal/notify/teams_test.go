@@ -51,8 +51,8 @@ func TestTeamsFlavourHasNoUnsupportedMarkup(t *testing.T) {
 // backslashes, including a bracket that meets a following parenthesis.
 func TestTeamsValuesCannotFormLinksOrEmphasis(t *testing.T) {
 	for value, want := range map[string]string{
-		"[click](https://evil.example)":    "[click］(https://evil.example)",
-		"![x](https://evil.example/i.png)": "![x］(https://evil.example/i.png)",
+		"[click](https://evil.example)":    "[click］(https:" + wordJoiner + "//evil.example)",
+		"![x](https://evil.example/i.png)": "![x］(https:" + wordJoiner + "//evil.example/i.png)",
 		"*bold* **strong**":                "∗bold∗ ∗∗strong∗∗",
 		"_it_ __u__ snake_case":            "＿it＿ ＿＿u＿＿ snake_case",
 		"a]":                               "a]",
@@ -64,7 +64,7 @@ func TestTeamsValuesCannotFormLinksOrEmphasis(t *testing.T) {
 	// A value ending in "]" followed by a value or literal starting with "("
 	// cannot form a link either.
 	got := teamsLine(line(txt("[click]"), txt("(https://evil.example)"), lit(" "), txt("[x]"), lit("(y)"), lit(" "), link("bad", "javascript:x")))
-	if strings.Contains(got, "](") || got != "[click］(https://evil.example) [x］(y) bad" {
+	if strings.Contains(got, "](") || got != "[click］(https:"+wordJoiner+"//evil.example) [x］(y) bad" {
 		t.Fatalf("teams line=%q", got)
 	}
 	message := Context{Tailnet: "[t](https://evil.example)"}.Digest(DigestInput{ObservedAt: testObservedAt, Changes: []model.Change{

@@ -68,11 +68,12 @@ func (f flavour) htmlEscaped() flavour {
 
 // escapeHTML replaces control characters with spaces and escapes &, <, >,
 // ", and '. An untrusted value is bounded first, so an entity is never cut
-// in half.
+// in half, and cannot form a bare URL or a broadcast mention (see
+// neutralize).
 func escapeHTML(value string, untrusted bool) string {
 	value = stripControl(value)
 	if untrusted {
-		value = truncate(value, 256)
+		value = neutralize(truncate(value, 256))
 	}
 	return html.EscapeString(value)
 }

@@ -52,8 +52,8 @@ const (
 
 // FitMessage shortens a Markdown message to at most limit bytes. It removes
 // whole lines from the end so Markdown spans are never cut in half, and
-// appends an explicit note saying how many lines were omitted. A single first
-// line that is longer than the limit is truncated at a UTF-8 boundary.
+// appends an explicit note saying how many lines were omitted. When not even
+// the first line fits with the note, the message is replaced by the note.
 func FitMessage(message string, limit int) string {
 	return FitMessageFor(message, limit, FormatMarkdown)
 }
@@ -83,7 +83,18 @@ func FitMessageFor(message string, limit int, format string) string {
 			return body + note
 		}
 	}
-	return truncateBytes(lines[0], limit)
+	// Not even the first line fits with the note. Rendered markup is never
+	// cut (a cut could leave a tag, entity, or code span open), so every
+	// line is replaced by the note, which keeps the high-severity count.
+	omitted := plural(countLines(lines), "line", "lines") + " omitted"
+	if high := countHighSeverity(lines); high > 0 {
+		omitted += ", including " + plural(high, "high-severity change", "high-severity changes")
+	}
+	if note := strings.TrimPrefix(fmt.Sprintf(noteFormat, omitted), "\n"); len(note) <= limit {
+		return note
+	}
+	// The plain note has no markup, so cutting it is safe in every format.
+	return truncateBytes(strings.TrimPrefix(fmt.Sprintf(shortenedPlainNoteFormat, omitted), "\n"), limit)
 }
 
 func countLines(lines []string) int {

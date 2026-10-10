@@ -148,11 +148,11 @@ func TestSlackTokenURLUsesTheWebAPI(t *testing.T) {
 	if payload := mock.payloads(t)[0]; payload.Channel != "C0123456" || payload.Text == "" {
 		t.Fatalf("payload=%+v", payload)
 	}
-	// An API rejection reported in a 200 response is a failure, retried
-	// like Shoutrrr's API errors.
+	// An API rejection reported in a 200 response is a permanent failure
+	// with a specific reason (R-061).
 	rejected := &slackMock{status: http.StatusOK, body: `{"ok":false,"error":"channel_not_found"}`}
 	err := senderWithTransport(rejected).Send(context.Background(), slackTokenURL, "hello")
-	if err == nil || IsPermanent(err) || strings.Contains(err.Error(), "abcdefghijklmnopqrstuvwx") {
+	if err == nil || !IsPermanent(err) || SafeDeliveryError(err) != "notification rejected by Slack (channel_not_found)" || strings.Contains(err.Error(), "abcdefghijklmnopqrstuvwx") {
 		t.Fatalf("API rejection err=%v", err)
 	}
 	for _, body := range []string{"not json", ""} {
@@ -259,7 +259,9 @@ func TestSlackDeliveryErrorsKeepTheirClassification(t *testing.T) {
 		{"too large", &slackMock{status: http.StatusRequestEntityTooLarge, body: "too large"}, true, messageTooLargeReason, 0},
 		{"rate limited", &slackMock{status: http.StatusTooManyRequests, body: "rate_limited", header: http.Header{"Retry-After": {"30"}}}, false, "notification delivery failed with HTTP 429", 30 * time.Second},
 		{"server error", &slackMock{status: http.StatusInternalServerError, body: "oops"}, false, "notification delivery failed with HTTP 500", 0},
-		{"archived channel", &slackMock{status: http.StatusOK, body: "channel_is_archived"}, false, "notification delivery failed", 0},
+		{"archived channel", &slackMock{status: http.StatusGone, body: "channel_is_archived"}, true, "notification rejected by provider (HTTP 410)", 0},
+		{"archived channel in a 200", &slackMock{status: http.StatusOK, body: "channel_is_archived"}, true, "notification rejected by Slack (channel_is_archived)", 0},
+		{"unknown 200 body", &slackMock{status: http.StatusOK, body: "<html>proxy</html>"}, false, "notification delivery failed", 0},
 		{"redirect", &slackMock{status: http.StatusFound, body: ""}, false, "notification delivery failed with HTTP 302", 0},
 	}
 	for _, tc := range cases {
@@ -268,7 +270,7 @@ func TestSlackDeliveryErrorsKeepTheirClassification(t *testing.T) {
 		if err == nil || !errors.As(err, &delivery) {
 			t.Fatalf("%s: err=%v", tc.name, err)
 		}
-		if IsPermanent(err) != tc.permanent || SafeDeliveryError(err) != tc.reason || delivery.RetryAfter != tc.retry {
+		if IsPermanent(err) != tc.permanent || SafeDeliveryError(err) != tc.reason || SafeDeliveryMessage(tc.reason) != tc.reason || delivery.RetryAfter != tc.retry {
 			t.Fatalf("%s: permanent=%t reason=%q retry=%s", tc.name, IsPermanent(err), SafeDeliveryError(err), delivery.RetryAfter)
 		}
 		if strings.Contains(err.Error(), "CCCCCCCCCCCCCCCCCCCCCCCC") {
@@ -283,6 +285,47 @@ func TestSlackDeliveryErrorsKeepTheirClassification(t *testing.T) {
 	failing := roundTripperFunc(func(*http.Request) (*http.Response, error) { return nil, fmt.Errorf("dial tcp: connection refused") })
 	if err := senderWithTransport(failing).Send(context.Background(), slackURL, "x"); err == nil || IsPermanent(err) {
 		t.Fatalf("connection failure err=%v", err)
+	}
+}
+
+// TestSlackAPIErrorsAreClassifiedByCode is R-061's acceptance criterion:
+// Slack API errors that no retry can fix dead-letter at once with a specific
+// reason that survives the persistence boundary, temporary ones are
+// retried, and the Settings test names a revoked token.
+func TestSlackAPIErrorsAreClassifiedByCode(t *testing.T) {
+	for code, reason := range map[string]string{
+		"invalid_auth":      "notification rejected by Slack (invalid_auth)",
+		"token_revoked":     "notification rejected by Slack (token_revoked)",
+		"channel_not_found": "notification rejected by Slack (channel_not_found)",
+		"not_in_channel":    "notification rejected by Slack (not_in_channel)",
+		"msg_too_long":      messageTooLargeReason,
+		"invalid_blocks":    "notification rejected by Slack (invalid_blocks)",
+		"some_new_error":    "notification rejected by Slack",
+		"":                  "notification rejected by Slack",
+	} {
+		mock := &slackMock{status: http.StatusOK, body: `{"ok":false,"error":"` + code + `"}`}
+		err := senderWithTransport(mock).SendPrepared(context.Background(), slackTokenURL, PrepareMessage(Context{}.Test(testObservedAt), slackTokenURL, ""))
+		if !IsPermanent(err) || SafeDeliveryError(err) != reason || SafeDeliveryMessage(reason) != reason {
+			t.Fatalf("%q: permanent=%t reason=%q", code, IsPermanent(err), SafeDeliveryError(err))
+		}
+	}
+	for _, code := range []string{"ratelimited", "internal_error", "service_unavailable", "fatal_error", "request_timeout"} {
+		mock := &slackMock{status: http.StatusOK, body: `{"ok":false,"error":"` + code + `"}`}
+		err := senderWithTransport(mock).Send(context.Background(), slackTokenURL, "hello")
+		if err == nil || IsPermanent(err) || strings.HasPrefix(SafeDeliveryError(err), "notification rejected") {
+			t.Fatalf("%q: err=%v permanent=%t", code, err, IsPermanent(err))
+		}
+	}
+	revoked := &slackMock{status: http.StatusOK, body: `{"ok":false,"error":"token_revoked"}`}
+	if got := SafeTestError(senderWithTransport(revoked).Test(context.Background(), slackTokenURL), slackTokenURL); got != "notification rejected by Slack (token_revoked)" {
+		t.Fatalf("Settings test reason=%q", got)
+	}
+	// A reason outside the allowlist is never persisted.
+	if got := SafeDeliveryError(&DeliveryError{Message: "x", Permanent: true, Reason: "secret response text"}); got != "notification delivery failed" {
+		t.Fatalf("unlisted reason persisted: %q", got)
+	}
+	if got := SafeDeliveryMessage("notification rejected by Slack (secret)"); got != "notification delivery failed" {
+		t.Fatalf("unlisted reason accepted: %q", got)
 	}
 }
 

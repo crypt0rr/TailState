@@ -35,6 +35,16 @@ func (f flavour) lines(lines []Line) string {
 	return strings.Join(rendered, "\n")
 }
 
+// hardBreaks returns the flavour with every title and line ending in a
+// Markdown hard line break (two spaces), for a display that otherwise joins
+// consecutive lines into one paragraph.
+func (f flavour) hardBreaks() flavour {
+	return flavour{
+		title: func(m Message) string { return f.title(m) + "  " },
+		line:  func(l Line) string { return f.line(l) + "  " },
+	}
+}
+
 var markdownFlavour = flavour{title: markdownTitle, line: markdownLine}
 
 // Markdown renders a message as CommonMark, the format TailState has always

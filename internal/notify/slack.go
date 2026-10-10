@@ -178,17 +178,81 @@ func (s *SenderImpl) sendSlack(ctx context.Context, parsed *url.URL, message Pre
 
 var errSlackRejected = errors.New("slack: message rejected")
 
+// slackRejectedReason is the persisted reason for a Slack error code that no
+// retry can fix; a code TailState knows is named in parentheses.
+const slackRejectedReason = "notification rejected by Slack"
+
+// slackRetryableErrors are the Slack error codes for temporary server-side
+// failures, which are retried. Every other code is permanent.
+var slackRetryableErrors = map[string]bool{"ratelimited": true, "rate_limited": true, "internal_error": true, "fatal_error": true, "service_unavailable": true, "request_timeout": true}
+
+// slackErrorReasons maps the permanent Slack error codes TailState names to
+// their persisted reasons. Reasons are built only from this list, never from
+// response text.
+var slackErrorReasons = func() map[string]string {
+	reasons := map[string]string{"msg_too_long": messageTooLargeReason}
+	for _, code := range []string{
+		"invalid_auth", "not_authed", "account_inactive", "token_revoked", "token_expired", "no_permission", "missing_scope",
+		"not_allowed_token_type", "team_access_not_granted", "ekm_access_denied", "invalid_token",
+		"channel_not_found", "not_in_channel", "is_archived", "channel_is_archived", "restricted_action", "action_prohibited",
+		"posting_to_general_channel_denied", "user_not_found", "no_service", "no_service_id", "no_team", "team_disabled",
+		"invalid_blocks", "invalid_blocks_format", "invalid_attachments", "too_many_attachments", "invalid_arguments", "invalid_payload", "no_text",
+	} {
+		reasons[code] = slackRejectedReason + " (" + code + ")"
+	}
+	return reasons
+}()
+
+// slackReason reports whether reason is one SafeDeliveryError may persist
+// for a Slack error.
+func slackReason(reason string) bool {
+	if reason == slackRejectedReason {
+		return true
+	}
+	for _, known := range slackErrorReasons {
+		if reason == known {
+			return true
+		}
+	}
+	return false
+}
+
+// slackError classifies a Slack error code. A temporary failure is a plain,
+// retryable error. Any other code is a permanent DeliveryError with a fixed
+// reason, except that an unknown code stays retryable unless
+// unknownPermanent is set: a Web API response is always Slack's own JSON,
+// but a webhook body may come from something in between.
+func slackError(code string, unknownPermanent bool) error {
+	code = strings.TrimSpace(code)
+	err := fmt.Errorf("%w: %s", errSlackRejected, truncate(stripControl(code), 100))
+	reason, known := slackErrorReasons[code]
+	if slackRetryableErrors[code] || (!known && !unknownPermanent) {
+		return err
+	}
+	if !known {
+		reason = slackRejectedReason
+	}
+	return &DeliveryError{Message: err.Error(), Permanent: true, Reason: reason}
+}
+
 // slackWebhookResult accepts "ok", or an empty 200 response, like Shoutrrr.
+// A known error code in a 200 response is classified like an API error;
+// other statuses are classified by SendPrepared (for example 410 for an
+// archived channel).
 func slackWebhookResult(status int, raw []byte) error {
 	body := string(raw)
 	if body == "ok" || (body == "" && status == http.StatusOK) {
 		return nil
 	}
+	if status == http.StatusOK {
+		return slackError(body, false)
+	}
 	return fmt.Errorf("%w: HTTP %d: %s", errSlackRejected, status, truncate(stripControl(body), 200))
 }
 
 // slackAPIResult requires a successful status and {"ok": true}, like
-// Shoutrrr's API client.
+// Shoutrrr's API client. An {"ok": false} error is classified by its code
+// (see slackError).
 func slackAPIResult(status int, raw []byte) error {
 	var result struct {
 		OK    bool   `json:"ok"`
@@ -201,7 +265,7 @@ func slackAPIResult(status int, raw []byte) error {
 		return fmt.Errorf("%w: invalid API response", errSlackRejected)
 	}
 	if !result.OK {
-		return fmt.Errorf("%w: %s", errSlackRejected, truncate(stripControl(result.Error), 100))
+		return slackError(result.Error, true)
 	}
 	return nil
 }

@@ -94,7 +94,7 @@ CREATE INDEX IF NOT EXISTS notification_destinations_enabled ON notification_des
 --     generation; changing the tailnet or OAuth identity replaces that
 --     generation in one transaction rather than cascading row deletes.
 --   * events belong to event_batches, and outbox rows may point at a batch;
---     retention deletes events before empty batches and keeps delivered/dead
+--     retention deletes a batch with its events in one transaction and keeps delivered/dead
 --     outbox history independently, so a cascading delete would erase audit
 --     evidence or make retention order-dependent.
 --   * event_batches.trigger_id and event_batch_triggers.trigger_id point at

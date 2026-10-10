@@ -157,7 +157,7 @@
       {{- range .DestinationDeliveries}}
       <tr>
         <th scope="row" data-label="Destination">{{.Name}}</th>
-        <td data-label="State">{{if .Enabled}}Enabled{{else}}Disabled{{end}}</td>
+        <td data-label="State">{{if .Enabled}}Enabled{{else}}Disabled{{end}}{{if .ServiceURLUnreadable}} · <strong>service URL cannot be decrypted</strong>; enter it again in <a href="/settings">Settings</a>{{end}}</td>
         <td data-label="Pending">{{.Pending}}</td>
         <td data-label="Processing">{{.Processing}}</td>
         <td data-label="Dead">{{.Dead}}</td>

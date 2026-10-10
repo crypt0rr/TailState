@@ -398,6 +398,18 @@ func adminRekey(args []string) error {
 	if strings.TrimSpace(*newKeyFile) == "" {
 		return usageError("admin rekey", errors.New("-new-key-file is required"))
 	}
+	// A running service keeps the old key in memory and would seal new
+	// values under it after the rotation commits, so rekey refuses to run
+	// while the service holds its lock, like admin compact.
+	config, err := boot.Load(version)
+	if err != nil {
+		return err
+	}
+	lock, err := store.LockService(config.DatabasePath())
+	if err != nil {
+		return err
+	}
+	defer lock.Release()
 	_, st, err := load()
 	if err != nil {
 		return err

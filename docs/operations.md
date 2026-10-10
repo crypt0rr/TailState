@@ -118,7 +118,7 @@ tailstate help admin backup    # one command; every command also accepts -h/--he
 | `healthcheck [-url URL]` | Probe `/healthz`; the URL defaults to `TAILSTATE_LISTEN_ADDR` (a wildcard host such as `0.0.0.0` or `[::]` is probed on loopback) |
 | `doctor [-json]` | Read-only deployment report |
 | `admin reset` | One-time password reset token (safe while serving) |
-| `admin rekey -new-key-file PATH` | Master-key rotation (service stopped) |
+| `admin rekey -new-key-file PATH` | Master-key rotation (service stopped; refused while the service lock is held) |
 | `admin backup -out FILE` | Consistent online database snapshot plus `FILE.sha256` (safe while serving) |
 | `admin compact [-incremental-vacuum]` | Release free pages (service stopped; see [Compaction](#compaction)) |
 | `evidence verify`, `evidence audit`, `evidence public-key` | Evidence verification and ledger audit |
@@ -270,7 +270,7 @@ for audit and is never silently deleted to make room.
 
 ### Retention cleanup
 
-Retention cleanup is resumable and writer-friendly. Each table is processed in keyset batches of at most 128 rows, each autocommit transaction has a 250 ms deadline, and one pass stops after two seconds; when work remains, the monitor schedules a continuation within one second instead of waiting for the hourly sweep. A failed pass is retried after one second, and consecutive failures double that delay up to the hourly sweep interval, so a persistent error (for example a full disk) does not retry every second; the next successful pass resets the backoff. Cleanup logs include per-table row counts, transaction count, duration, failures, and the remaining-work flag. The same information is available through `tailstate_cleanup_*` metrics. Active notification and webhook leases are never dead-lettered until their lease has expired, and evidence-ledger rows are never removed by retention. Administrative audit records use their own 365-day retention period.
+Retention cleanup is resumable and writer-friendly. Each table is processed in keyset batches of at most 128 rows, each autocommit transaction has a 250 ms deadline, and one pass stops after two seconds; when work remains, the monitor schedules a continuation within one second instead of waiting for the hourly sweep. A failed pass is retried after one second, and consecutive failures double that delay up to the hourly sweep interval, so a persistent error (for example a full disk) does not retry every second; the next successful pass resets the backoff. Cleanup logs include per-table row counts, transaction count, duration, failures, and the remaining-work flag. The same information is available through `tailstate_cleanup_*` metrics. Active notification and webhook leases are never dead-lettered until their lease has expired, and evidence-ledger rows are never removed by retention. An expired change batch is removed together with all of its events in one transaction (each transaction takes the oldest batches whose events fit in 128 rows, or a single larger batch), so `evidence audit` and evidence exports never see a partly deleted batch: a batch is either complete and verifies, or gone and its ledger entry counts as unverifiable. Administrative audit records use their own 365-day retention period.
 
 ### Compaction
 
@@ -303,7 +303,9 @@ platform without `flock(2)`, stop the service manually first.
 The writer connection sets `journal_size_limit` to 64 MiB, so after a burst
 the `-wal` file is truncated back to that cap the next time SQLite restarts
 the log, and every retention pass that changed rows ends with a
-`wal_checkpoint(TRUNCATE)`. `/healthz`, `/readyz`, `/metrics`, session checks,
+`wal_checkpoint(TRUNCATE)`. That checkpoint does not wait: while a reader is
+active (for example a long History read or `admin backup`), it gives up at once
+instead of blocking writers, and a later pass truncates the log. `/healthz`, `/readyz`, `/metrics`, session checks,
 History reads, the Status page (collector state, the **Expiring soon** card,
 and per-destination delivery counts), and the Settings page's webhook state
 and mute rules use a separate pool of four read-only (`mode=ro`,

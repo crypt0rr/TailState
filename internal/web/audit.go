@@ -81,6 +81,10 @@ func (s *Server) adminMessage(ctx context.Context, r *http.Request, change admin
 // unreachable destination must still be removable. The durable notice queued
 // by recordAdmin skips this destination.
 func (s *Server) noticeBeforeChange(ctx context.Context, destination store.NotificationDestination, message notify.Message) {
+	if destination.ServiceURLUnreadable {
+		slog.Warn("administrative notice skipped: destination service URL cannot be decrypted", "destination_id", destination.ID)
+		return
+	}
 	prepared := notify.PrepareMessage(message, destination.ServiceURL, destination.Format)
 	sendCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), s.noticeTimeout)
 	defer cancel()

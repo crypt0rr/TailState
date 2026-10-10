@@ -1326,8 +1326,8 @@ func TestDestinationDecryptionErrorBranches(t *testing.T) {
 	if _, err := st.db.ExecContext(ctx, "UPDATE notification_destinations SET service_url_enc='invalid-envelope'"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.ListDestinations(ctx); err == nil {
-		t.Fatal("ListDestinations accepted a corrupt encrypted URL")
+	if list, err := st.ListDestinations(ctx); err != nil || len(list) != 1 || !list[0].ServiceURLUnreadable || list[0].ServiceURL != "" {
+		t.Fatalf("ListDestinations did not flag a corrupt encrypted URL: %#v err=%v", list, err)
 	}
 	if _, err := testDueOutbox(st, ctx, 10); err == nil {
 		t.Fatal("DueOutbox accepted a corrupt encrypted URL")

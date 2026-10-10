@@ -43,6 +43,49 @@ func (s *Store) CollectorSnapshots(ctx context.Context, generation int64, collec
 	return out, rows.Err()
 }
 
+// expiryProjection rebuilds each snapshot as a small JSON object holding
+// only the fields the expiry check reads (see internal/expiry), so a status
+// render no longer copies every full snapshot into Go and decodes it into a
+// generic map. The column is a BLOB, which SQLite's JSON functions would read
+// as JSONB, so it is cast to text first. The -> operator keeps each value's
+// JSON type. json_patch onto an empty object drops the fields that are
+// missing or null, which the expiry check treats alike. A snapshot that is
+// not valid JSON yields NULL, and one that is not an object has no expiry,
+// so both are skipped as before.
+const expiryProjection = `CASE WHEN json_valid(j) THEN json_patch('{}',json_object(
+	'expires',j->'$.expires','tags',j->'$.tags','name',j->'$.name','hostname',j->'$.hostname',
+	'keyExpiryDisabled',j->'$.keyExpiryDisabled','isEphemeral',j->'$.isEphemeral',
+	'keyType',j->'$.keyType','invalid',j->'$.invalid','revoked',j->'$.revoked','description',j->'$.description',
+	'capabilities',CASE WHEN j->'$.capabilities.devices.create.tags' IS NOT NULL
+		THEN json_object('devices',json_object('create',json_object('tags',j->'$.capabilities.devices.create.tags'))) END))
+	END`
+
+// ExpirySnapshots returns the current snapshots of one collector like
+// CollectorSnapshots, except that Raw holds only the fields the expiry check
+// reads. The status page's expiry card and the daily expiry check use it.
+func (s *Store) ExpirySnapshots(ctx context.Context, generation int64, collector string) ([]SnapshotRecord, error) {
+	rows, err := s.readDB().QueryContext(ctx, `SELECT resource_id,name,`+expiryProjection+`
+		FROM (SELECT resource_id,name,CAST(canonical_json AS TEXT) AS j FROM snapshots WHERE generation=? AND collector=? AND content_truncated=0)
+		ORDER BY resource_id`, generation, collector)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []SnapshotRecord
+	for rows.Next() {
+		var record SnapshotRecord
+		var raw sql.NullString
+		if err := rows.Scan(&record.ResourceID, &record.Name, &raw); err != nil {
+			return nil, err
+		}
+		if raw.Valid {
+			record.Raw = []byte(raw.String)
+		}
+		out = append(out, record)
+	}
+	return out, rows.Err()
+}
+
 // ExpiryOptions is the active monitoring generation with the expiry warning
 // windows and tag filter, read without decrypting any credential.
 type ExpiryOptions struct {

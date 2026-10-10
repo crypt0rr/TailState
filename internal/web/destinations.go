@@ -33,6 +33,9 @@ type destinationPage struct {
 	// Pending counts the pending and in-flight notifications that removing
 	// the destination would dead-letter.
 	Pending int
+	// ServiceURLUnreadable flags a URL that cannot be decrypted with the
+	// current master key; DisplayURL is then empty.
+	ServiceURLUnreadable bool
 }
 
 // routingSummary describes a destination's rules in one line.

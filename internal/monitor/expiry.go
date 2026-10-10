@@ -37,11 +37,11 @@ func (e *Engine) CheckExpiry(ctx context.Context, now time.Time) (ExpiryReport, 
 	if err != nil {
 		return ExpiryReport{}, err
 	}
-	devices, err := e.store.CollectorSnapshots(ctx, settings.Generation, "devices")
+	devices, err := e.store.ExpirySnapshots(ctx, settings.Generation, "devices")
 	if err != nil {
 		return ExpiryReport{}, err
 	}
-	keys, err := e.store.CollectorSnapshots(ctx, settings.Generation, "keys")
+	keys, err := e.store.ExpirySnapshots(ctx, settings.Generation, "keys")
 	if err != nil {
 		return ExpiryReport{}, err
 	}

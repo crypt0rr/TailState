@@ -83,6 +83,56 @@ func TestAttributionCorrelatesAuditTargets(t *testing.T) {
 	}
 }
 
+// TestTailnetFieldChangesMatchOnlyTheirProperty is R-068: a settings or
+// DNS field change is credited only to an entry for a property that can
+// change that field, not to a later entry for another setting; a field
+// without a known property, or a truncated field list, still accepts any of
+// the collector's properties.
+func TestTailnetFieldChangesMatchOnlyTheirProperty(t *testing.T) {
+	base := time.Date(2026, 10, 6, 12, 0, 0, 0, time.UTC)
+	entries := []AuditEntry{
+		auditEntry("alice", "TAILNET", "T1", "ENABLE", "HTTPS", base.Add(-time.Minute)),
+		auditEntry("bob", "TAILNET", "T1", "DISABLE", "FILE_SHARING", base.Add(-10*time.Second)),
+		auditEntry("carol", "TAILNET", "T1", "UPDATE", "DNS_CONFIG", base.Add(-time.Minute)),
+		auditEntry("dave", "TAILNET", "T1", "ENABLE", "MAGIC_DNS", base.Add(-10*time.Second)),
+	}
+	settings := func(fields ...string) Change {
+		change := Change{Kind: "changed", Collector: "settings", ResourceID: "settings"}
+		for _, field := range fields {
+			change.Fields = append(change.Fields, FieldChange{Field: field})
+		}
+		return change
+	}
+	dns := settings("nameservers")
+	dns.Collector = "dns"
+	magic := settings("preferences.magicDNS")
+	magic.Collector = "dns"
+	override := settings("preferences.overrideLocalDNS")
+	override.Collector = "dns"
+	truncated := settings("httpsEnabled")
+	truncated.FieldsTruncated = true
+	for name, tc := range map[string]struct {
+		change Change
+		want   string
+	}{
+		"https setting":         {settings("httpsEnabled"), "alice"},
+		"unmatched setting":     {settings("usersApprovalOn"), ""},
+		"unmapped setting":      {settings("regionalRoutingOn"), "bob"},
+		"mapped and unmapped":   {settings("httpsEnabled", "regionalRoutingOn"), "bob"},
+		"truncated settings":    {truncated, "bob"},
+		"nameservers":           {dns, "carol"},
+		"magicDNS":              {magic, "dave"},
+		"unmapped dns field":    {override, "dave"},
+		"created settings":      {Change{Kind: "created", Collector: "settings", ResourceID: "settings"}, "bob"},
+		"settings without list": {settings(), "bob"},
+	} {
+		attribution, ok := Attribute(tc.change, nil, nil, entries, base)
+		if attribution.ActorLogin != tc.want || ok != (tc.want != "") {
+			t.Fatalf("%s: attributed to %q (ok=%v), want %q", name, attribution.ActorLogin, ok, tc.want)
+		}
+	}
+}
+
 // TestAttributionRecordIsBoundedAndRedacted keeps only bounded identifying
 // fields: control characters are removed, long names are cut, identifiers
 // keep only identifier characters, and the record round-trips through its

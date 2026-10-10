@@ -332,6 +332,15 @@ func TestMuteSetPartialFieldsAndTruncation(t *testing.T) {
 	if muted, _ := set.evaluate(model.Change{Kind: "created", Collector: "devices"}, nil, []byte(`{"tags":"tag:ci"}`)); muted {
 		t.Fatal("malformed tags were treated as muted")
 	}
+	// With a truncated field list the snapshots decide whether the tags
+	// changed.
+	unseen := model.Change{Kind: "changed", Collector: "devices", Fields: []model.FieldChange{{Field: "os"}}, FieldsTruncated: true, TotalFields: 30}
+	if muted, _ := set.evaluate(unseen, []byte(`{"tags":["tag:ci"]}`), []byte(`{"tags":["tag:ci","tag:prod"]}`)); muted {
+		t.Fatal("a tag added outside a truncated field list was muted")
+	}
+	if muted, _ := set.evaluate(unseen, []byte(`{"tags":["tag:ci","tag:prod"]}`), []byte(`{"tags":["TAG:PROD","tag:ci"]}`)); !muted {
+		t.Fatal("a device keeping its muted tag was not muted")
+	}
 	if muted, _ := newMuteSet(nil).evaluate(change, nil, nil); muted {
 		t.Fatal("empty rule set muted a change")
 	}

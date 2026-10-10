@@ -111,6 +111,69 @@ func TestGatewayRetryAfterBeyondBudgetFailsWithoutWaiting(t *testing.T) {
 	}
 }
 
+// TestRateLimitRetryAfterBeyondBudgetReportsRateLimited is R-067: a 429
+// whose Retry-After does not fit the 30 second request budget is returned
+// at once as the upstream 429 (health reason "rate limited"), instead of
+// sleeping out the budget and reporting a timeout.
+func TestRateLimitRetryAfterBeyondBudgetReportsRateLimited(t *testing.T) {
+	delays := recordRetryWaits(t)
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/oauth/token" {
+			_, _ = w.Write([]byte(`{"access_token":"access","expires_in":3600}`))
+			return
+		}
+		calls.Add(1)
+		w.Header().Set("Retry-After", "120")
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer server.Close()
+	client := New(server.URL+"/api/v2", server.URL+"/oauth/token", "test", Credentials{ClientID: "id", ClientSecret: "secret"})
+	started := time.Now()
+	_, err := client.Collect(context.Background(), "devices")
+	var httpErr *HTTPError
+	if !errors.As(err, &httpErr) || httpErr.Status != http.StatusTooManyRequests {
+		t.Fatalf("over-budget 429 error=%v, want the upstream 429", err)
+	}
+	if got := FailureCategory(err); got != FailureRateLimited {
+		t.Fatalf("failure category=%q, want %q", got, FailureRateLimited)
+	}
+	if len(*delays) != 0 || calls.Load() != 1 {
+		t.Fatalf("calls=%d delays=%v, want one attempt without waiting", calls.Load(), *delays)
+	}
+	if elapsed := time.Since(started); elapsed > 5*time.Second {
+		t.Fatalf("over-budget 429 took %s", elapsed)
+	}
+}
+
+func TestRateLimitWithShortRetryAfterIsRetried(t *testing.T) {
+	delays := recordRetryWaits(t)
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/oauth/token":
+			_, _ = w.Write([]byte(`{"access_token":"access","expires_in":3600}`))
+		case "/api/v2/tailnet/-/devices":
+			if calls.Add(1) == 1 {
+				w.Header().Set("Retry-After", "2")
+				w.WriteHeader(http.StatusTooManyRequests)
+				return
+			}
+			_, _ = w.Write([]byte(`{"devices":[{"id":"1"}]}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	client := New(server.URL+"/api/v2", server.URL+"/oauth/token", "test", Credentials{ClientID: "id", ClientSecret: "secret"})
+	if resources, err := client.Collect(context.Background(), "devices"); err != nil || len(resources) != 1 {
+		t.Fatalf("429 then success failed: resources=%#v err=%v", resources, err)
+	}
+	if calls.Load() != 2 || len(*delays) != 1 || (*delays)[0] != 2*time.Second {
+		t.Fatalf("calls=%d delays=%v, want one retry honoring Retry-After", calls.Load(), *delays)
+	}
+}
+
 func TestTransientTokenFailureIsRetried(t *testing.T) {
 	recordRetryWaits(t)
 	var tokenCalls atomic.Int32

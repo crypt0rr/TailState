@@ -28,8 +28,17 @@ func TestSeverityTable(t *testing.T) {
 		{"device authorized first seen", Change{Kind: "changed", Collector: "devices", Fields: []FieldChange{fieldChange("authorized", nil, true)}}, SeverityHigh},
 		{"key expiry disabled", Change{Kind: "changed", Collector: "devices", Fields: []FieldChange{fieldChange("keyExpiryDisabled", false, true)}}, SeverityHigh},
 		{"device tags", Change{Kind: "changed", Collector: "devices", Fields: []FieldChange{fieldChange("clientVersion", "1", "2"), fieldChange("tags", nil, []any{"tag:prod"})}}, SeverityHigh},
+		{"admin user created", Change{Kind: "created", Collector: "users", Created: CreatedStateOf("users", []byte(`{"loginName":"a@example.com","role":"admin"}`))}, SeverityHigh},
+		{"admin invite created", Change{Kind: "created", Collector: "user_invites", Created: CreatedStateOf("user_invites", []byte(`{"email":"a@example.com","role":"admin"}`))}, SeverityHigh},
+		{"tagged device created", Change{Kind: "created", Collector: "devices", Created: CreatedStateOf("devices", []byte(`{"name":"db","tags":["tag:prod"]}`))}, SeverityHigh},
+		{"device created with key expiry disabled", Change{Kind: "created", Collector: "devices", Created: CreatedStateOf("devices", []byte(`{"name":"db","keyExpiryDisabled":true}`))}, SeverityHigh},
 		// Medium.
 		{"device created", Change{Kind: "created", Collector: "devices"}, SeverityMedium},
+		{"untagged device created", Change{Kind: "created", Collector: "devices", Created: CreatedStateOf("devices", []byte(`{"name":"db","tags":[],"keyExpiryDisabled":false}`))}, SeverityMedium},
+		{"member user created", Change{Kind: "created", Collector: "users", Created: CreatedStateOf("users", []byte(`{"loginName":"a@example.com","role":"Member"}`))}, SeverityMedium},
+		{"member invite created", Change{Kind: "created", Collector: "user_invites", Created: CreatedStateOf("user_invites", []byte(`{"email":"a@example.com","role":"member"}`))}, SeverityMedium},
+		{"user created without a role", Change{Kind: "created", Collector: "users", Created: CreatedStateOf("users", []byte(`{"loginName":"a@example.com"}`))}, SeverityMedium},
+		{"admin user removed", Change{Kind: "removed", Collector: "users", Created: &CreatedState{Role: "admin"}}, SeverityMedium},
 		{"device removed", Change{Kind: "removed", Collector: "devices"}, SeverityMedium},
 		{"routes enabled", Change{Kind: "changed", Collector: "devices", Fields: []FieldChange{fieldChange("enabledRoutes", []any{}, []any{"10.0.0.0/8"})}}, SeverityMedium},
 		{"user invite", Change{Kind: "created", Collector: "user_invites"}, SeverityMedium},
@@ -50,6 +59,28 @@ func TestSeverityTable(t *testing.T) {
 		if got := Classify(test.change); got != test.want {
 			t.Fatalf("%s: Classify=%q, want %q", test.name, got, test.want)
 		}
+	}
+}
+
+func TestCreatedStateOfReadsOnlyClassifiedCollectors(t *testing.T) {
+	if state := CreatedStateOf("keys", []byte(`{"role":"admin"}`)); state != nil {
+		t.Fatalf("keys state=%+v, want none", state)
+	}
+	if state := CreatedStateOf("users", []byte(`not json`)); state != nil {
+		t.Fatalf("undecodable state=%+v, want none", state)
+	}
+	if state := CreatedStateOf("devices", []byte(`null`)); state != nil {
+		t.Fatalf("null state=%+v, want none", state)
+	}
+	state := CreatedStateOf("devices", []byte(`{"tags":"tag:prod","keyExpiryDisabled":"true","role":7}`))
+	if state == nil || state.Tagged || state.KeyExpiryDisabled || state.Role != "" {
+		t.Fatalf("malformed values state=%+v, want an unprivileged state", state)
+	}
+	if Classify(Change{Kind: "created", Collector: "user_invites", Created: &CreatedState{Tagged: true}}) != SeverityMedium {
+		t.Fatal("a device-only flag raised an invite's severity")
+	}
+	if Classify(Change{Kind: "created", Collector: "posture", Created: &CreatedState{Role: "admin"}}) != SeverityMedium {
+		t.Fatal("an initial state raised the severity of a collector classified on kind alone")
 	}
 }
 

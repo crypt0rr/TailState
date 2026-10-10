@@ -1588,6 +1588,91 @@ func TestMassRemovalGuardPreservesSnapshots(t *testing.T) {
 	}
 }
 
+// TestBatchReportsHealthTransitionsOnce covers the store side of R-056 and
+// R-070: ApplyBatch reports a baselined collector confirmed unsupported and
+// an engaged mass-removal guard once per episode, never a never-baselined
+// unsupported collector, and keeps the guard's attribution start only for
+// its own generation until the removals are recorded.
+func TestBatchReportsHealthTransitionsOnce(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	generation, err := st.SaveSettings(ctx, settings())
+	if err != nil {
+		t.Fatal(err)
+	}
+	apply := func(results ...model.Collected) []notify.CollectorHealth {
+		t.Helper()
+		batch, err := st.ApplyBatchWithBatch(ctx, generation, results, notify.TextDigest("batch"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return batch.Unhealthy
+	}
+	unsupported := func(collector, reason string) model.Collected {
+		return model.Collected{Collector: collector, Unsupported: true, UnsupportedReason: reason}
+	}
+	devices := func(count int) model.Collected {
+		resources := make([]model.Resource, count)
+		for i := range resources {
+			id := fmt.Sprintf("device-%d", i)
+			resources[i] = model.Resource{ID: id, Type: "device", Name: id, Data: map[string]any{"hostname": id}}
+		}
+		return model.Collected{Collector: "devices", Resources: resources}
+	}
+	policy := model.Collected{Collector: "policy", Resources: []model.Resource{{ID: "policy", Type: "policy", Name: "policy", Data: map[string]any{"acls": []any{}}}}}
+	if got := apply(devices(5), policy, unsupported("webhooks", "unsupported (insufficient OAuth scope or plan: HTTP 403)")); len(got) != 0 {
+		t.Fatalf("baseline with a never-baselined unsupported collector reported %+v", got)
+	}
+	if got := apply(unsupported("policy", "")); len(got) != 0 {
+		t.Fatalf("first unsupported response reported %+v", got)
+	}
+	got := apply(unsupported("policy", ""))
+	if len(got) != 1 || got[0].Collector != "policy" || got[0].Reason != "unsupported" || !strings.HasPrefix(got[0].Detail, "HTTP 403/404 on two consecutive polls") {
+		t.Fatalf("confirmed unsupported collector reported %+v", got)
+	}
+	if got := apply(unsupported("policy", "")); len(got) != 0 {
+		t.Fatalf("a demoted collector was reported again: %+v", got)
+	}
+	if detail := demotionDetail("unsupported (not available for this tailnet: HTTP 404)"); !strings.HasPrefix(detail, "not available for this tailnet: HTTP 404 on") {
+		t.Fatalf("demotion detail=%q", detail)
+	}
+
+	got = apply(devices(1))
+	if len(got) != 1 || got[0].Collector != "devices" || got[0].Reason != "possible mass removal" || !strings.HasPrefix(got[0].Detail, "4 of 5 resources missing") {
+		t.Fatalf("engaged guard reported %+v", got)
+	}
+	since, err := removalGuardSince(ctx, st.db, generation, "devices")
+	if err != nil || since.IsZero() {
+		t.Fatalf("guard attribution start=%v err=%v", since, err)
+	}
+	if other, err := removalGuardSince(ctx, st.db, generation+1, "devices"); err != nil || !other.IsZero() {
+		t.Fatalf("another generation read the guard start %v (%v)", other, err)
+	}
+	if got := apply(devices(1)); len(got) != 0 {
+		t.Fatalf("the second guarded poll reported %+v", got)
+	}
+	apply(devices(1))
+	if since, _ := removalGuardSince(ctx, st.db, generation, "devices"); since.IsZero() {
+		t.Fatal("the guard start was dropped while removals were pending")
+	}
+	apply(devices(1))
+	if since, _ := removalGuardSince(ctx, st.db, generation, "devices"); !since.IsZero() {
+		t.Fatalf("the guard start %v outlived the recorded removals", since)
+	}
+	if _, err := st.db.ExecContext(ctx, "INSERT INTO meta(key,value) VALUES('removal_guard_since:keys','not-a-marker')"); err != nil {
+		t.Fatal(err)
+	}
+	if since, err := removalGuardSince(ctx, st.db, generation, "keys"); err != nil || !since.IsZero() {
+		t.Fatalf("a malformed guard start was read as %v (%v)", since, err)
+	}
+	if _, err := st.db.ExecContext(ctx, "UPDATE meta SET value=? WHERE key='removal_guard_since:keys'", fmt.Sprintf("%d not-a-time", generation)); err != nil {
+		t.Fatal(err)
+	}
+	if since, err := removalGuardSince(ctx, st.db, generation, "keys"); err != nil || !since.IsZero() {
+		t.Fatalf("an unparsable guard start was read as %v (%v)", since, err)
+	}
+}
+
 func TestMassRemovalGuardDoesNotLoadSnapshotValuesBeforeGuardDecision(t *testing.T) {
 	ctx := context.Background()
 	st := testStore(t)

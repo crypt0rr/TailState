@@ -267,6 +267,31 @@ var tailnetProperties = map[string]map[string]bool{
 	},
 }
 
+// tailnetFieldProperties maps the changed fields of tailnet-wide collectors,
+// by compact path (see CompactField) or, failing that, by compact top-level
+// field, to the TAILNET properties an administrator changes them with, so an
+// entry for one setting is never credited with a change to another. A field
+// without an entry may be changed by any of the collector's properties.
+var tailnetFieldProperties = map[string]map[string][]string{
+	"settings": {
+		"devicesapprovalon":           {"MACHINE_APPROVAL_NEEDED", "MACHINE_AUTH_NEEDED"},
+		"usersapprovalon":             {"USER_APPROVAL_REQUIRED"},
+		"deviceskeydurationdays":      {"MAX_KEY_DURATION"},
+		"networkflowloggingon":        {"NETWORK_FLOW_LOGGING", "LOG_EXIT_FLOWS"},
+		"postureidentitycollectionon": {"COLLECT_POSTURE_IDENTITY"},
+		"httpsenabled":                {"HTTPS"},
+	},
+	"dns": {
+		// magicDNS is the field of a change between the legacy and
+		// configuration shapes (see ShapeTransition).
+		"preferences.magicdns": {"MAGIC_DNS"},
+		"magicdns":             {"MAGIC_DNS"},
+		"nameservers":          {"DNS_CONFIG"},
+		"searchpaths":          {"DNS_CONFIG"},
+		"splitdns":             {"DNS_CONFIG"},
+	},
+}
+
 // deviceFieldProperties maps changed device fields to the NODE properties an
 // administrator changes them with. Fields reported by the node itself (client
 // version, OS, addresses) have no entry: a concurrent administrative edit
@@ -358,7 +383,7 @@ func entryTargetsChange(change Change, ids map[string]bool, entry AuditEntry) bo
 func entryFitsKind(change Change, entry AuditEntry) bool {
 	action := strings.ToUpper(strings.TrimSpace(entry.Action))
 	if _, tailnetWide := tailnetProperties[change.Collector]; tailnetWide && strings.EqualFold(entry.TargetType, auditTargetTailnet) {
-		return action != "LOGIN" && action != "LOGOUT"
+		return action != "LOGIN" && action != "LOGOUT" && tailnetEntryFitsFields(change, entry)
 	}
 	switch change.Kind {
 	case "created":
@@ -385,6 +410,33 @@ func entryFitsKind(change Change, entry AuditEntry) bool {
 			return true
 		}
 		for _, candidate := range deviceFieldProperties[top] {
+			if property == candidate {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// tailnetEntryFitsFields reports whether a TAILNET entry's property can
+// explain a changed field of a tailnet-wide collector (see
+// tailnetFieldProperties). A change whose field list is unknown or truncated
+// accepts any of the collector's properties.
+func tailnetEntryFitsFields(change Change, entry AuditEntry) bool {
+	fields, mapped := tailnetFieldProperties[change.Collector]
+	if !mapped || change.Kind != "changed" || change.FieldsTruncated || len(change.Fields) == 0 {
+		return true
+	}
+	property := strings.ToUpper(strings.TrimSpace(entry.Property))
+	for _, field := range change.Fields {
+		candidates, known := fields[CompactField(field.Field)]
+		if !known {
+			candidates, known = fields[CompactField(FieldRoot(field.Field))]
+		}
+		if !known {
+			return true
+		}
+		for _, candidate := range candidates {
 			if property == candidate {
 				return true
 			}

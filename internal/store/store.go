@@ -15,6 +15,7 @@ import (
 	_ "modernc.org/sqlite"
 
 	"github.com/crypt0rr/tailstate/internal/model"
+	"github.com/crypt0rr/tailstate/internal/notify"
 	"github.com/crypt0rr/tailstate/internal/secret"
 )
 
@@ -148,6 +149,11 @@ type ChangeBatchResult struct {
 	// it explained.
 	AttributionStatus string
 	Attributed        int
+	// Unhealthy are the collector health transitions decided while applying
+	// the batch: a baselined collector confirmed unsupported, or a
+	// mass-removal guard engaged. The caller reports them with the poll's
+	// other health transitions.
+	Unhealthy []notify.CollectorHealth
 }
 
 type HistoryFieldChange struct {

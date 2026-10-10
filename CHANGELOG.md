@@ -13,6 +13,17 @@ rollback requires restoring the backup taken before the upgrade. See
 
 ## [Unreleased]
 
+### Changed
+- A collector with an established baseline that answers `403` or `404` on two consecutive polls now queues one collector health notification with reason `unsupported` (naming the HTTP status), and one "recovered" notification when it answers again, because changes to it go undetected in between. Previously it was only shown as Unsupported on the status page. Further `403`/`404` answers during the six-hourly rechecks send nothing, and a collector that never had a baseline is still marked unsupported silently (#265).
+- Created resources are classified by their initial state: a user or user invite created with a role other than `member`, and a device that joins with tags or with key expiry disabled, are now high severity like the equivalent later edit, so "high only" destinations receive them. Member users, member invites, and untagged devices with key expiry enabled stay medium (#271).
+- A tag mute rule no longer hides changes to a device's tags. A changed device is muted only when it carries the muted tag both before and after the change and its tags did not change, so re-tagging a device out of a muted tag or into it is notified. Devices created or removed while carrying the muted tag stay muted, including tagged devices that are now high severity on creation. Existing rules need no change (#266).
+- When the mass-removal guard holds back a sudden disappearance of most of a collector's resources, the first guarded poll queues one collector health notification ("possible mass removal", with the number missing), once per guard episode. The removals recorded after the guard releases are attributed from the last successful poll before it engaged, so they name the actor of the delete instead of "actor unknown" (#281).
+
+### Fixed
+- A Tailscale API `429` whose `Retry-After` does not fit in the 30-second request budget is now reported at once as `rate limited`, like the gateway statuses, instead of holding the request for the rest of its budget and reporting a timeout (#278).
+- Change attribution credits the latest matching audit entry at or before the time the change's collector was fetched, using the two-minute clock-skew tolerance after it only when nothing earlier matches, so an edit made while the rest of the poll was running is no longer credited with an earlier change. A collector's last success is now its fetch time, and tailnet settings and DNS fields with a known audit property (for example `httpsEnabled` and `HTTPS`) are only credited to an entry for that property. Attributions already stored and signed are unchanged (#279).
+- A device's share list that appears where `deviceInvites` was `null` or absent (or disappears into it) is now compared with an empty list, so each invite is reported as a share line with its share severity instead of as truncated list JSON at medium severity (#280).
+
 ## [0.18.2] - 2026-10-10
 
 - **Schema:** 17 (unchanged)

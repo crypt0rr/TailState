@@ -48,6 +48,17 @@ const (
 	unsupportedConfirmationMessage = "unsupported response pending confirmation"
 	unsupportedRetryInterval       = 5 * time.Minute
 	unsupportedDemotionInterval    = 6 * time.Hour
+	// healthUnsupported and healthMassRemoval are the bounded health reasons
+	// of the transitions ApplyBatch decides: a baselined collector confirmed
+	// unsupported, and an engaged mass-removal guard.
+	healthUnsupported  = "unsupported"
+	healthMassRemoval  = "possible mass removal"
+	removalGuardPrefix = "possible mass removal guarded"
+	// removalGuardMetaPrefix prefixes the meta key that records, per
+	// collector, the last successful poll before a mass-removal guard
+	// engaged. The guard delays removals by up to two polls, so removals
+	// confirmed after it releases are attributed from that time.
+	removalGuardMetaPrefix = "removal_guard_since:"
 	// usersSharedScopeMeta records the generation whose users snapshot was
 	// collected with users?type=all. Older versions requested only members,
 	// so the first type=all poll of an existing users baseline would otherwise
@@ -95,11 +106,12 @@ func (s *Store) ApplyBatchWithOptions(ctx context.Context, generation int64, res
 		return ChangeBatchResult{}, nil
 	}
 	now := time.Now().UTC()
-	apply := &batchApply{ctx: ctx, tx: tx, generation: generation, now: now, observedAt: formatTimestamp(now), limits: s.StorageLimits()}
+	apply := &batchApply{ctx: ctx, tx: tx, generation: generation, now: now, observedAt: formatTimestamp(now), limits: s.StorageLimits(), fetched: make(map[string]time.Time, len(results))}
 	for resultIndex, result := range results {
 		if result.Error != nil {
 			continue
 		}
+		apply.fetched[result.Collector] = apply.fetchedAt(result)
 		if result.Unsupported {
 			if err := apply.unsupportedCollector(result); err != nil {
 				return ChangeBatchResult{}, err
@@ -121,6 +133,7 @@ func (s *Store) ApplyBatchWithOptions(ctx context.Context, generation int64, res
 		return ChangeBatchResult{}, err
 	}
 	s.publishTruncations(apply)
+	result.Unhealthy = apply.unhealthy
 	return result, nil
 }
 
@@ -153,12 +166,27 @@ type batchApply struct {
 	now        time.Time
 	observedAt string
 	limits     StorageLimits
+	// fetched is each applied collector's fetch time (see fetchedAt).
+	fetched map[string]time.Time
 
 	changes     []model.Change
 	recorded    []recordedChange
 	truncations []truncationLog
+	// unhealthy are the health transitions decided in the batch, reported
+	// to the caller for one grouped notification.
+	unhealthy []notify.CollectorHealth
 
 	snapshotTruncations, eventTruncations, oversizedWrites uint64
+}
+
+// fetchedAt is when a result was fetched. It bounds the attribution of the
+// result's changes and is recorded as the collector's last success; the
+// apply time stands in for a result without a usable fetch time.
+func (a *batchApply) fetchedAt(result model.Collected) time.Time {
+	if result.ObservedAt.IsZero() || result.ObservedAt.After(a.now) {
+		return a.now
+	}
+	return result.ObservedAt.UTC()
 }
 
 func (a *batchApply) record(change model.Change, before, after storedValue) {
@@ -182,12 +210,16 @@ func (a *batchApply) noteTruncation(collector, resource string, value storedValu
 }
 
 // unsupportedCollector records an unsupported response. A baselined
-// collector is demoted only on the second consecutive response.
+// collector is demoted only on the second consecutive response, and that
+// demotion is a health transition: change detection for an established
+// baseline has stopped, so it is notified once (and its later recovery
+// too). A collector that never had a baseline is a plan-capability state
+// and is demoted silently.
 func (a *batchApply) unsupportedCollector(result model.Collected) error {
 	ctx, tx := a.ctx, a.tx
-	var supported, baseline int
+	var supported, baseline, notified int
 	var lastError string
-	stateErr := tx.QueryRowContext(ctx, "SELECT supported,baseline,last_error FROM collector_state WHERE generation=? AND collector=?", a.generation, result.Collector).Scan(&supported, &baseline, &lastError)
+	stateErr := tx.QueryRowContext(ctx, "SELECT supported,baseline,last_error,unhealthy_notified FROM collector_state WHERE generation=? AND collector=?", a.generation, result.Collector).Scan(&supported, &baseline, &lastError, &notified)
 	if stateErr != nil && !errors.Is(stateErr, sql.ErrNoRows) {
 		return stateErr
 	}
@@ -203,8 +235,26 @@ func (a *batchApply) unsupportedCollector(result model.Collected) error {
 	if reason == "" {
 		reason = "unsupported"
 	}
-	_, err := tx.ExecContext(ctx, `INSERT INTO collector_state(generation,collector,supported,baseline,last_error,next_poll,partial) VALUES(?,?,0,0,?,?,0) ON CONFLICT(generation,collector) DO UPDATE SET supported=0,last_error=excluded.last_error,next_poll=excluded.next_poll,partial=0`, a.generation, result.Collector, reason, next)
+	// Reaching here with a supported baseline means this response confirmed
+	// the pending one. A collector already reported unhealthy keeps that
+	// notice and recovers once.
+	if stateErr == nil && supported == 1 && baseline == 1 && notified == 0 {
+		notified = 1
+		a.unhealthy = append(a.unhealthy, notify.CollectorHealth{Collector: result.Collector, Reason: healthUnsupported, Detail: demotionDetail(reason)})
+	}
+	_, err := tx.ExecContext(ctx, `INSERT INTO collector_state(generation,collector,supported,baseline,last_error,next_poll,partial,unhealthy_notified) VALUES(?,?,0,0,?,?,0,?) ON CONFLICT(generation,collector) DO UPDATE SET supported=0,last_error=excluded.last_error,next_poll=excluded.next_poll,partial=0,unhealthy_notified=excluded.unhealthy_notified`, a.generation, result.Collector, reason, next, boolInt(notified == 1))
 	return err
+}
+
+// demotionDetail explains a baselined collector confirmed unsupported, from
+// its bounded unsupported label such as "unsupported (insufficient OAuth
+// scope or plan: HTTP 403)".
+func demotionDetail(reason string) string {
+	cause := strings.TrimSuffix(strings.TrimPrefix(reason, "unsupported ("), ")")
+	if cause == reason || cause == "" {
+		cause = "HTTP 403/404"
+	}
+	return cause + " on two consecutive polls; changes are not detected until it answers again, rechecked every 6 hours"
 }
 
 // collector applies one supported result: it upserts the returned
@@ -236,18 +286,27 @@ func (a *batchApply) collector(result model.Collected, canonical []canonicalReso
 	if err != nil {
 		return err
 	}
+	fetched := formatTimestamp(a.fetched[result.Collector])
 	if !guarded {
+		pending := false
 		if !result.Partial && missingCount > 0 {
-			if err := a.reconcileMissing(result.Collector, seen, baseline == 1, silentLifecycle); err != nil {
+			if pending, err = a.reconcileMissing(result.Collector, seen, baseline == 1, silentLifecycle); err != nil {
 				return err
 			}
 		}
-		return a.recordCollectorSuccess(result.Collector)
+		if !result.Partial && !pending {
+			// Every resource a guard held back is now removed or back, so
+			// its attribution start is no longer needed.
+			if _, err := a.tx.ExecContext(a.ctx, "DELETE FROM meta WHERE key=?", removalGuardMetaPrefix+result.Collector); err != nil {
+				return err
+			}
+		}
+		return a.recordCollectorSuccess(result.Collector, fetched)
 	}
 	if result.Partial {
-		return a.recordCollectorPartial(result)
+		return a.recordCollectorPartial(result, fetched)
 	}
-	return a.recordRemovalGuard(result.Collector, baseline, missingCount, len(seen))
+	return a.recordRemovalGuard(result.Collector, baseline, missingCount, len(seen), fetched)
 }
 
 // sharedUsersAbsorption reports whether newly visible shared users are
@@ -303,7 +362,7 @@ func (a *batchApply) upsertResource(collector string, resource model.Resource, c
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
 		if baselined && !silentLifecycle && !(absorbSharedUsers && isSharedUser(resource)) {
-			a.record(model.Change{Kind: "created", Collector: collector, ResourceID: resource.ID, Type: resource.Type, Name: resource.Name}, storedValue{}, existingStoredValue(raw, hash, int64(len(raw)), false))
+			a.record(model.Change{Kind: "created", Collector: collector, ResourceID: resource.ID, Type: resource.Type, Name: resource.Name, Created: model.CreatedStateOf(collector, raw)}, storedValue{}, existingStoredValue(raw, hash, int64(len(raw)), false))
 		}
 		_, err = tx.ExecContext(ctx, `INSERT INTO snapshots(generation,collector,resource_id,resource_type,name,canonical_json,content_hash,content_bytes,content_truncated,missing_count,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)`, generation, collector, resource.ID, resource.Type, resource.Name, storedSnapshot.raw, hash, storedSnapshot.bytes, boolInt(storedSnapshot.truncated), 0, formatTimestamp(a.now))
 	case err != nil:
@@ -407,7 +466,7 @@ func (a *batchApply) massRemovalGuard(result model.Collected, seen map[string]st
 	if stateErr != nil && !errors.Is(stateErr, sql.ErrNoRows) {
 		return false, 0, stateErr
 	}
-	guarded = !strings.HasPrefix(previousError, "possible mass removal guarded") || previousFailures < 2
+	guarded = !strings.HasPrefix(previousError, removalGuardPrefix) || previousFailures < 2
 	return guarded, missingCount, nil
 }
 
@@ -425,12 +484,13 @@ type absentResource struct {
 // response omitted and removes those missing on two consecutive polls,
 // recording a removed event when the collector has a baseline. The full
 // rows are loaded only after the guard decision, so a guarded response
-// never retains raw values.
-func (a *batchApply) reconcileMissing(collector string, seen map[string]struct{}, baselined, silentLifecycle bool) error {
+// never retains raw values. pending reports whether an omitted resource is
+// still waiting for its confirming poll.
+func (a *batchApply) reconcileMissing(collector string, seen map[string]struct{}, baselined, silentLifecycle bool) (pending bool, err error) {
 	ctx, tx, generation := a.ctx, a.tx, a.generation
 	rows, err := tx.QueryContext(ctx, "SELECT resource_id,resource_type,name,canonical_json,content_hash,content_bytes,content_truncated,missing_count FROM snapshots WHERE generation=? AND collector=?", generation, collector)
 	if err != nil {
-		return err
+		return false, err
 	}
 	var missingRows []absentResource
 	for rows.Next() {
@@ -438,7 +498,7 @@ func (a *batchApply) reconcileMissing(collector string, seen map[string]struct{}
 		var truncated int
 		if scanErr := rows.Scan(&absent.id, &absent.typ, &absent.name, &absent.raw, &absent.hash, &absent.bytes, &truncated, &absent.missing); scanErr != nil {
 			rows.Close()
-			return scanErr
+			return false, scanErr
 		}
 		absent.truncated = truncated == 1
 		if _, ok := seen[absent.id]; !ok {
@@ -447,10 +507,10 @@ func (a *batchApply) reconcileMissing(collector string, seen map[string]struct{}
 	}
 	if rowsErr := rows.Err(); rowsErr != nil {
 		rows.Close()
-		return rowsErr
+		return false, rowsErr
 	}
 	if closeErr := rows.Close(); closeErr != nil {
-		return closeErr
+		return false, closeErr
 	}
 	for _, absent := range missingRows {
 		if absent.missing+1 >= 2 {
@@ -459,20 +519,21 @@ func (a *batchApply) reconcileMissing(collector string, seen map[string]struct{}
 			}
 			_, err = tx.ExecContext(ctx, "DELETE FROM snapshots WHERE generation=? AND collector=? AND resource_id=?", generation, collector, absent.id)
 		} else {
+			pending = true
 			_, err = tx.ExecContext(ctx, "UPDATE snapshots SET missing_count=missing_count+1 WHERE generation=? AND collector=? AND resource_id=?", generation, collector, absent.id)
 		}
 		if err != nil {
-			return err
+			return false, err
 		}
 	}
-	return nil
+	return pending, nil
 }
 
 // recordCollectorPartial keeps a partial response as a usable baseline for
 // the resources returned. Existing snapshots of omitted resources are
 // preserved, but one incomplete optional collector must not hold the whole
 // installation in an un-baselined state forever.
-func (a *batchApply) recordCollectorPartial(result model.Collected) error {
+func (a *batchApply) recordCollectorPartial(result model.Collected, fetched string) error {
 	partialMessage := strings.TrimSpace(result.PartialError)
 	if partialMessage == "" {
 		partialMessage = "collector response was partial"
@@ -481,23 +542,39 @@ func (a *batchApply) recordCollectorPartial(result model.Collected) error {
 	if partialErrorCount < 1 {
 		partialErrorCount = 1
 	}
-	_, err := a.tx.ExecContext(a.ctx, `INSERT INTO collector_state(generation,collector,supported,baseline,last_success,last_error,failure_count,unhealthy_notified,partial,partial_error_count) VALUES(?,?,1,1,?,?,1,0,1,?) ON CONFLICT(generation,collector) DO UPDATE SET supported=1,baseline=MAX(collector_state.baseline,1),last_success=excluded.last_success,last_error=excluded.last_error,partial=1,partial_error_count=excluded.partial_error_count`, a.generation, result.Collector, a.observedAt, partialMessage, partialErrorCount)
+	_, err := a.tx.ExecContext(a.ctx, `INSERT INTO collector_state(generation,collector,supported,baseline,last_success,last_error,failure_count,unhealthy_notified,partial,partial_error_count) VALUES(?,?,1,1,?,?,1,0,1,?) ON CONFLICT(generation,collector) DO UPDATE SET supported=1,baseline=MAX(collector_state.baseline,1),last_success=excluded.last_success,last_error=excluded.last_error,partial=1,partial_error_count=excluded.partial_error_count`, a.generation, result.Collector, fetched, partialMessage, partialErrorCount)
 	return err
 }
 
 // recordRemovalGuard surfaces a guarded mass removal in collector health. A
 // successful-looking empty or near-empty response is more likely an
 // upstream degradation than a real mass removal, so the snapshots stay
-// intact instead of producing a removal storm.
-func (a *batchApply) recordRemovalGuard(collector string, baseline, missingCount, present int) error {
-	_, err := a.tx.ExecContext(a.ctx, `INSERT INTO collector_state(generation,collector,supported,baseline,last_success,last_error,failure_count,unhealthy_notified,partial,partial_error_count) VALUES(?,?,1,?,?,?,1,0,0,0) ON CONFLICT(generation,collector) DO UPDATE SET supported=1,last_success=excluded.last_success,last_error=excluded.last_error,failure_count=collector_state.failure_count+1,unhealthy_notified=0,partial=0,partial_error_count=0`, a.generation, collector, baseline, a.observedAt, fmt.Sprintf("possible mass removal guarded (%d missing, %d present)", missingCount, present))
+// intact instead of producing a removal storm. The first guarded response
+// of an episode queues one health notice and records the previous
+// successful poll, from which the removals confirmed after the guard
+// releases are attributed.
+func (a *batchApply) recordRemovalGuard(collector string, baseline, missingCount, present int, fetched string) error {
+	var previousError, previousSuccess string
+	stateErr := a.tx.QueryRowContext(a.ctx, "SELECT last_error,COALESCE(last_success,'') FROM collector_state WHERE generation=? AND collector=?", a.generation, collector).Scan(&previousError, &previousSuccess)
+	if stateErr != nil && !errors.Is(stateErr, sql.ErrNoRows) {
+		return stateErr
+	}
+	if !strings.HasPrefix(previousError, removalGuardPrefix) {
+		a.unhealthy = append(a.unhealthy, notify.CollectorHealth{Collector: collector, Reason: healthMassRemoval, Detail: fmt.Sprintf("%d of %d resources missing from a complete response; removals are reported only if they stay missing", missingCount, missingCount+present)})
+		if previousSuccess != "" {
+			if _, err := a.tx.ExecContext(a.ctx, "INSERT INTO meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", removalGuardMetaPrefix+collector, fmt.Sprintf("%d %s", a.generation, previousSuccess)); err != nil {
+				return err
+			}
+		}
+	}
+	_, err := a.tx.ExecContext(a.ctx, `INSERT INTO collector_state(generation,collector,supported,baseline,last_success,last_error,failure_count,unhealthy_notified,partial,partial_error_count) VALUES(?,?,1,?,?,?,1,0,0,0) ON CONFLICT(generation,collector) DO UPDATE SET supported=1,last_success=excluded.last_success,last_error=excluded.last_error,failure_count=collector_state.failure_count+1,unhealthy_notified=0,partial=0,partial_error_count=0`, a.generation, collector, baseline, fetched, fmt.Sprintf("%s (%d missing, %d present)", removalGuardPrefix, missingCount, present))
 	return err
 }
 
 // recordCollectorSuccess marks a fully applied collector healthy and
-// baselined.
-func (a *batchApply) recordCollectorSuccess(collector string) error {
-	_, err := a.tx.ExecContext(a.ctx, `INSERT INTO collector_state(generation,collector,supported,baseline,last_success,last_error,failure_count,unhealthy_notified,partial,partial_error_count) VALUES(?,?,1,1,?,'',0,0,0,0) ON CONFLICT(generation,collector) DO UPDATE SET supported=1,baseline=1,last_success=excluded.last_success,last_error='',failure_count=0,unhealthy_notified=0,partial=0,partial_error_count=0`, a.generation, collector, a.observedAt)
+// baselined, with its fetch time as the last success.
+func (a *batchApply) recordCollectorSuccess(collector, fetched string) error {
+	_, err := a.tx.ExecContext(a.ctx, `INSERT INTO collector_state(generation,collector,supported,baseline,last_success,last_error,failure_count,unhealthy_notified,partial,partial_error_count) VALUES(?,?,1,1,?,'',0,0,0,0) ON CONFLICT(generation,collector) DO UPDATE SET supported=1,baseline=1,last_success=excluded.last_success,last_error='',failure_count=0,unhealthy_notified=0,partial=0,partial_error_count=0`, a.generation, collector, fetched)
 	return err
 }
 
@@ -554,7 +631,11 @@ func (s *Store) recordChangeBatch(a *batchApply, results []model.Collected, dige
 	severities := make([]model.Severity, 0, len(a.recorded))
 	mutedCount := 0
 	for index, entry := range a.recorded {
-		attribution := attributeChange(entry, lookup, window, a.now)
+		observed, fetched := a.fetched[entry.Change.Collector]
+		if !fetched {
+			observed = a.now
+		}
+		attribution := attributeChange(entry, lookup, window, observed)
 		if attribution != nil {
 			result.Attributed++
 			result.Changes[index].Attribution = attribution

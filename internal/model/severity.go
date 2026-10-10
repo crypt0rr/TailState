@@ -1,6 +1,9 @@
 package model
 
-import "strings"
+import (
+	"encoding/json"
+	"strings"
+)
 
 // Severity is the built-in importance of a Change. It drives per-destination
 // routing (a minimum severity), the digest prefix, and the History filter.
@@ -65,25 +68,81 @@ var lowImpactDeviceFields = map[string]struct{}{
 	"distro":          {},
 }
 
+// CreatedState is the part of a created resource's first snapshot that
+// decides its severity: the role of a user or user invite, and whether a
+// device joined tagged or with key expiry disabled.
+type CreatedState struct {
+	Role              string
+	Tagged            bool
+	KeyExpiryDisabled bool
+}
+
+// CreatedStateOf reads the CreatedState of a created resource from its
+// canonical snapshot. It returns nil for collectors whose creations are
+// classified on their kind alone and for a snapshot that is not an object.
+func CreatedStateOf(collector string, raw []byte) *CreatedState {
+	switch collector {
+	case "users", "user_invites", "devices":
+	default:
+		return nil
+	}
+	var snapshot map[string]any
+	if json.Unmarshal(raw, &snapshot) != nil || snapshot == nil {
+		return nil
+	}
+	state := &CreatedState{KeyExpiryDisabled: isTrue(snapshot["keyExpiryDisabled"])}
+	role, _ := snapshot["role"].(string)
+	state.Role = strings.TrimSpace(role)
+	tags, _ := snapshot["tags"].([]any)
+	state.Tagged = len(tags) > 0
+	return state
+}
+
+// privileged reports whether a created resource starts in a state whose
+// later edit would be high severity: a user or invite with a role other
+// than member, or a device that joined tagged or with key expiry disabled.
+func (s *CreatedState) privileged(collector string) bool {
+	if s == nil {
+		return false
+	}
+	switch collector {
+	case "users", "user_invites":
+		return s.Role != "" && !strings.EqualFold(s.Role, "member")
+	case "devices":
+		return s.Tagged || s.KeyExpiryDisabled
+	}
+	return false
+}
+
 // Classify returns the built-in severity of a change. The table is
 // documented in docs/notifications.md ("Severity and routing") and is evaluated as:
 //
 //   - high: any policy, log_streaming, settings, webhooks, or oauth_apps
-//     change; a keys resource created; a users change touching role; a devices change to
-//     tags, authorized false→true, or keyExpiryDisabled false→true; a
-//     device share created multi-use, with the exit node allowed, or
-//     already accepted, accepted, or newly allowed to use the exit node.
+//     change; a keys resource created; a users or user_invites resource
+//     created with a role other than member; a devices resource created
+//     with tags or with key expiry disabled; a users change touching role;
+//     a devices change to tags, authorized false→true, or keyExpiryDisabled
+//     false→true; a device share created multi-use, with the exit node
+//     allowed, or already accepted, accepted, or newly allowed to use the
+//     exit node.
 //   - low: a devices change whose fields are all clientVersion,
 //     updateAvailable, os, or distro; a device_details change whose fields
 //     are all share bookkeeping (see ShareTransition.Severity).
-//   - medium: everything else, including devices created or removed, route
-//     changes, and user invites.
+//   - medium: everything else, including member users, member invites, and
+//     untagged devices created, devices removed, route changes, and other
+//     user invite changes.
+//
+// A created resource is classified on its initial state (Change.Created);
+// without one it is classified on its kind alone.
 //
 // A changed resource takes the highest severity of its fields. A change
 // whose field list was truncated is at least medium, because the omitted
 // fields cannot be shown to be routine.
 func Classify(change Change) Severity {
 	if _, high := highImpactCollectors[change.Collector]; high {
+		return SeverityHigh
+	}
+	if change.Kind == "created" && change.Created.privileged(change.Collector) {
 		return SeverityHigh
 	}
 	switch change.Collector {

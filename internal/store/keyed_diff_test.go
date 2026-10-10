@@ -189,3 +189,46 @@ func TestFieldRulesCoverListElements(t *testing.T) {
 		t.Fatal("a list rule did not cover its element fields")
 	}
 }
+
+// TestShareAppearingFromNullListIsClassifiedAsAShare is R-069: when a
+// device's deviceInvites goes from null to a list holding one realistic
+// (over 240 bytes) multi-use invite, the change is recorded at the
+// invite's element path, classified high, and shown as a share line
+// rather than as truncated list JSON.
+func TestShareAppearingFromNullListIsClassifiedAsAShare(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	generation, err := st.SaveSettings(ctx, settings())
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseline := sharedDevice()
+	baseline[0].Resources[0].Data.(map[string]any)["deviceInvites"] = nil
+	if _, err := testApplyBatch(st, ctx, generation, baseline, notify.TextDigest("baseline")); err != nil {
+		t.Fatal(err)
+	}
+	invite := shareInvite("5861427050514914", "T1000EXAMPLE")
+	invite["multiUse"], invite["accepted"], invite["email"] = true, false, "carol@example.com"
+	delete(invite, "acceptedBy")
+	if encoded, _ := json.Marshal(invite); len(encoded) < 300 {
+		t.Fatalf("invite fixture is %d bytes, want a realistic invite of about 350", len(encoded))
+	}
+	batch, err := st.ApplyBatchWithBatch(ctx, generation, sharedDevice(invite), notify.Context{}.Digest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(batch.Changes) != 1 || len(batch.Changes[0].Fields) != 1 || batch.Changes[0].Fields[0].Field != "deviceInvites[5861427050514914]" {
+		t.Fatalf("share from a null list = %#v", batch.Changes)
+	}
+	page, err := st.ListHistory(ctx, HistoryFilter{BatchID: batch.ID})
+	if err != nil || len(page.Batches) != 1 || len(page.Batches[0].Events) != 1 {
+		t.Fatalf("history: %+v %v", page.Batches, err)
+	}
+	if got := page.Batches[0].Events[0].Severity; got != "high" {
+		t.Fatalf("severity = %s, want high", got)
+	}
+	payloads := pendingPayloads(t, st, batch.ID)
+	if len(payloads) != 1 || !strings.Contains(payloads[0], "shared via a new invite to carol@example.com (multi-use)") || strings.Contains(payloads[0], "redacted_sha256") {
+		t.Fatalf("digest lacks the share line: %q", payloads)
+	}
+}

@@ -383,13 +383,17 @@ high-severity changes. See TailState History for the full batch."
 
 | Severity | Changes |
 | --- | --- |
-| High | Any `policy`, `log_streaming`, `settings` (tailnet settings), `webhooks`, or `oauth_apps` change (OAuth applications grant API access, like keys); a `keys` resource created; a `users` change to `role`; a `devices` change to `tags`, `authorized` false→true, or `keyExpiryDisabled` false→true; a device share created multi-use, with the exit node allowed, or already accepted, accepted (or accepted by another user), or newly allowed to use the exit node (see [Device shares](#device-shares)) |
+| High | Any `policy`, `log_streaming`, `settings` (tailnet settings), `webhooks`, or `oauth_apps` change (OAuth applications grant API access, like keys); a `keys` resource created; a `users` or `user_invites` resource created with a role other than `member` (for example `admin`); a `devices` resource created with tags or with `keyExpiryDisabled` true; a `users` change to `role`; a `devices` change to `tags`, `authorized` false→true, or `keyExpiryDisabled` false→true; a device share created multi-use, with the exit node allowed, or already accepted, accepted (or accepted by another user), or newly allowed to use the exit node (see [Device shares](#device-shares)) |
 | Low | A `devices` change whose changed fields are all `clientVersion`, `updateAvailable`, `os`, or `distro`; a `device_details` change whose changed fields are all share bookkeeping (an invite e-mail resent, identifier changes) |
-| Medium | Everything else, for example devices created or removed, route changes (`enabledRoutes`, `advertisedRoutes`), user invites, users created or removed, keys removed, DNS, contacts, posture, posture attributes, new single-use device shares, device shares removed, and `services` changes |
+| Medium | Everything else, for example untagged devices created (with key expiry enabled), devices removed, route changes (`enabledRoutes`, `advertisedRoutes`), member users and member user invites created, other user invite changes, users removed, keys removed, DNS, contacts, posture, posture attributes, new single-use device shares, device shares removed, and `services` changes |
 
 A changed resource takes the highest severity of its changed fields; a change
 whose field list was truncated is at least medium, because the omitted fields
-cannot be shown to be routine.
+cannot be shown to be routine. A created resource is classified by its initial
+state, so a new administrator or a device that joins already tagged reaches a
+"high only" destination like the equivalent later edit would; a tag mute rule
+still silences devices that routinely join with a muted tag (see
+[Noise controls](#noise-controls)).
 
 ### Priority and colour
 
@@ -437,8 +441,12 @@ Predictable noise is reduced in the digest without losing the audit trail:
   (`devices.clientVersion`, which also covers nested paths below it, and
   `device_details.deviceInvites`, which covers every invite such as
   `deviceInvites[5861427050514914].tailnetId`), every
-  device carrying a tag (`tag:ci`, matched in the before or after snapshot), or
-  one resource by ID or exact name. Muted changes are still recorded in History
+  device carrying a tag (`tag:ci`), or one resource by ID or exact name. A tag
+  rule silences noise on tagged devices, never the act of tagging: a device
+  created or removed while carrying the tag is muted, but a changed device is
+  muted only when it carries the tag both before and after the change and its
+  tags did not change, so re-tagging a device out of `tag:ci` or into it is
+  always notified. Muted changes are still recorded in History
   and in the signed evidence ledger, flagged `muted` in the History page and in
   evidence exports, but are left out of digests; the digest states how many
   muted changes it omitted, and a batch of only muted changes sends nothing. A
@@ -471,6 +479,9 @@ Predictable noise is reduced in the digest without losing the audit trail:
 ## Collector health alerts
 
 - API collector failures alert after three consecutive failures and once on recovery. Transitions observed in one poll are grouped into one message per destination (one "unhealthy" and later one "recovered"), each collector listed with a bounded reason: `auth rejected`, `rate limited`, `timeout`, `upstream 5xx`, `invalid response`, `unsupported`, or `network error`. Provider error text is never included. A revoked OAuth credential therefore produces one grouped alert per poll schedule (device and inventory collectors are polled on separate schedules) instead of one alert per collector.
+- A collector with an established baseline that answers `403` or `404` on two consecutive polls (see [Change detection](monitoring.md#change-detection)) stops detecting changes, so it is reported once in the same grouped "unhealthy" message with reason `unsupported` and the HTTP status, for example "`policy`: unsupported (insufficient OAuth scope or plan: HTTP 403 on two consecutive polls; ...)", and once more as "recovered" when it answers again. Further `403`/`404` answers during the six-hourly rechecks send nothing. A collector that never had a baseline (an endpoint the plan or OAuth scopes never allowed) is still marked unsupported silently.
+- When a complete response suddenly omits most of a collector's resources (at least 3, and more than remain), the mass-removal guard holds the removals back for two polls; the first guarded poll reports it once with reason `possible mass removal`, for example "`keys`: possible mass removal (5 of 8 resources missing from a complete response; removals are reported only if they stay missing)". If the resources stay missing, they are reported as removed a few polls later, attributed to the audit-log entries made before the guard engaged.
+- A message that includes such a transition opens with "N collectors need attention" instead of "failed three consecutive polls".
 
 ## Release notifications
 

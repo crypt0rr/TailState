@@ -65,8 +65,9 @@ func eventChangedBy(t *testing.T, st *Store, batchID int64) map[string]string {
 // removal, which is confirmed one poll after the resource went missing),
 // ends at now plus the tolerance, and never exceeds 24 hours. Entries outside
 // the window, or later than the tolerance after the observation, are not
-// credited; an unchanged poll and an un-baselined collector never trigger a
-// lookup.
+// credited, and an entry within the tolerance after the fetch is credited
+// only when none at or before it matches; an unchanged poll and an
+// un-baselined collector never trigger a lookup.
 func TestAttributionWindowCoversPollIntervalWithClockSkew(t *testing.T) {
 	ctx := context.Background()
 	st := testStore(t)
@@ -116,10 +117,10 @@ func TestAttributionWindowCoversPollIntervalWithClockSkew(t *testing.T) {
 	if window.End.Before(now.Add(AttributionClockSkew)) || window.End.After(time.Now().Add(AttributionClockSkew)) {
 		t.Fatalf("window end=%s, want now plus the skew", window.End)
 	}
-	if got := eventChangedBy(t, st, changed.ID)["d1"]; got != "skewed-after via admin console" {
-		t.Fatalf("changed by=%q, want the latest entry within the skew tolerance", got)
+	if got := eventChangedBy(t, st, changed.ID)["d1"]; got != "skewed-before via admin console" {
+		t.Fatalf("changed by=%q, want the latest entry at or before the fetch", got)
 	}
-	lookup.entries = lookup.entries[:2]
+	lookup.entries = []model.AuditEntry{lookup.entries[0], lookup.entries[2], lookup.entries[3]}
 	if _, err := st.db.Exec("UPDATE collector_state SET last_success=? WHERE collector='devices'", previous.Format(time.RFC3339Nano)); err != nil {
 		t.Fatal(err)
 	}
@@ -127,8 +128,8 @@ func TestAttributionWindowCoversPollIntervalWithClockSkew(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := eventChangedBy(t, st, changed.ID)["d1"]; got != "skewed-before via admin console" {
-		t.Fatalf("changed by=%q; an entry before the window start was credited", got)
+	if got := eventChangedBy(t, st, changed.ID)["d1"]; got != "skewed-after via admin console" {
+		t.Fatalf("changed by=%q, want the entry within the skew tolerance as the fallback; entries before the window start or after the tolerance must not be credited", got)
 	}
 
 	// The first poll without d2 only counts it missing: no change, no lookup.
@@ -598,5 +599,62 @@ func TestAttributionSourceStateAndChangedBy(t *testing.T) {
 		if got := ChangedBy(tc.attribution, tc.status); got != tc.want {
 			t.Fatalf("ChangedBy(%v,%q)=%q, want %q", tc.attribution, tc.status, got, tc.want)
 		}
+	}
+}
+
+// TestAttributionIsBoundedByTheCollectorFetch is R-068: a change is
+// credited to the latest matching entry at or before its collector's fetch
+// time, not to a later edit made while the rest of the poll was running;
+// the clock-skew tolerance after the fetch is only the fallback; and the
+// collector's last success is its fetch time, not the apply time.
+func TestAttributionIsBoundedByTheCollectorFetch(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	generation, err := st.SaveSettings(ctx, settings())
+	if err != nil {
+		t.Fatal(err)
+	}
+	lookup := &recordingLookup{status: AttributionComplete}
+	options := BatchOptions{Attribute: lookup.lookup}
+	digest := notify.Context{}.Digest
+	poll := func(tags string, fetched time.Time) ChangeBatchResult {
+		t.Helper()
+		batch, err := st.ApplyBatchWithOptions(ctx, generation, []model.Collected{{Collector: "devices", ObservedAt: fetched, Resources: []model.Resource{attributedDevice("d1", "n1", "db-01", tags)}}}, digest, options)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return batch
+	}
+	baselineFetch := time.Now().UTC().Add(-5 * time.Minute)
+	poll("tag:dev", baselineFetch)
+	var lastSuccess string
+	if err := st.db.QueryRow("SELECT last_success FROM collector_state WHERE collector='devices'").Scan(&lastSuccess); err != nil {
+		t.Fatal(err)
+	}
+	if lastSuccess != formatTimestamp(baselineFetch) {
+		t.Fatalf("last_success=%s, want the fetch time %s", lastSuccess, formatTimestamp(baselineFetch))
+	}
+
+	fetched := time.Now().UTC().Add(-time.Minute)
+	lookup.entries = []model.AuditEntry{
+		nodeEntry("alice", "n1", "UPDATE", "ACL_TAGS", fetched.Add(-30*time.Second)),
+		nodeEntry("bob", "n1", "UPDATE", "ACL_TAGS", fetched.Add(5*time.Second)),
+	}
+	changed := poll("tag:prod", fetched)
+	if got := eventChangedBy(t, st, changed.ID)["d1"]; got != "alice via admin console" {
+		t.Fatalf("changed by=%q, want the entry before the fetch", got)
+	}
+	lookup.entries = lookup.entries[1:]
+	fetched = time.Now().UTC().Add(-time.Minute)
+	lookup.entries[0].EventTime = fetched.Add(5 * time.Second)
+	changed = poll("tag:dev", fetched)
+	if got := eventChangedBy(t, st, changed.ID)["d1"]; got != "bob via admin console" {
+		t.Fatalf("changed by=%q, want the entry within the skew tolerance", got)
+	}
+	if err := st.db.QueryRow("SELECT last_success FROM collector_state WHERE collector='devices'").Scan(&lastSuccess); err != nil {
+		t.Fatal(err)
+	}
+	if lastSuccess != formatTimestamp(fetched) {
+		t.Fatalf("last_success=%s, want the fetch time %s", lastSuccess, formatTimestamp(fetched))
 	}
 }

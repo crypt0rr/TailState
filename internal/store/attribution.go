@@ -143,6 +143,18 @@ func (s *Store) attributionWindow(ctx context.Context, generation int64, results
 		if parsed, parseErr := time.Parse(time.RFC3339Nano, lastSuccess); parseErr == nil {
 			since = parsed
 		}
+		if removal {
+			// A removal held back by the mass-removal guard is confirmed up
+			// to two polls later than usual; search from the last
+			// successful poll before the guard engaged.
+			guardedSince, guardErr := removalGuardSince(ctx, db, generation, result.Collector)
+			if guardErr != nil {
+				return AttributionWindow{}, false, guardErr
+			}
+			if !guardedSince.IsZero() && guardedSince.Before(since) {
+				since = guardedSince
+			}
+		}
 		since = since.Add(-AttributionClockSkew)
 		if removal {
 			since = since.Add(-max(removalLookback, 0))
@@ -159,6 +171,29 @@ func (s *Store) attributionWindow(ctx context.Context, generation int64, results
 		start = earliest
 	}
 	return AttributionWindow{Start: start.UTC(), End: end.UTC()}, true, nil
+}
+
+// removalGuardSince returns the last successful poll of a collector before
+// its mass-removal guard engaged, or the zero time when no guard of this
+// generation is awaiting its removals.
+func removalGuardSince(ctx context.Context, db *sql.DB, generation int64, collector string) (time.Time, error) {
+	var value string
+	err := db.QueryRowContext(ctx, "SELECT value FROM meta WHERE key=?", removalGuardMetaPrefix+collector).Scan(&value)
+	if errors.Is(err, sql.ErrNoRows) {
+		return time.Time{}, nil
+	}
+	if err != nil {
+		return time.Time{}, err
+	}
+	markedGeneration, since, ok := strings.Cut(value, " ")
+	if !ok || markedGeneration != fmt.Sprint(generation) {
+		return time.Time{}, nil
+	}
+	parsed, parseErr := time.Parse(time.RFC3339Nano, since)
+	if parseErr != nil {
+		return time.Time{}, nil
+	}
+	return parsed, nil
 }
 
 func probeSnapshots(ctx context.Context, db *sql.DB, generation int64, collector string) (map[string]snapshotProbe, error) {
@@ -218,7 +253,11 @@ func (s *Store) lookupAttribution(ctx context.Context, generation int64, results
 }
 
 // attributeChange correlates one recorded change with the looked-up entries
-// inside the window.
+// inside the window. observed is when the change's collector was fetched:
+// the latest matching entry at or before it explains the change, and an
+// entry within the clock-skew tolerance after it is used only when none
+// does, so an edit made after the fetch (while later collectors of the poll
+// were still being fetched) is not credited with the change.
 func attributeChange(entry recordedChange, lookup AttributionResult, window AttributionWindow, observed time.Time) *model.Attribution {
 	if lookup.Status != AttributionComplete || len(lookup.Entries) == 0 {
 		return nil
@@ -230,7 +269,10 @@ func attributeChange(entry recordedChange, lookup AttributionResult, window Attr
 		}
 		entries = append(entries, candidate)
 	}
-	attribution, ok := model.Attribute(entry.Change, entry.Before.raw, entry.After.raw, entries, observed.Add(AttributionClockSkew))
+	attribution, ok := model.Attribute(entry.Change, entry.Before.raw, entry.After.raw, entries, observed)
+	if !ok {
+		attribution, ok = model.Attribute(entry.Change, entry.Before.raw, entry.After.raw, entries, observed.Add(AttributionClockSkew))
+	}
 	if !ok {
 		return nil
 	}

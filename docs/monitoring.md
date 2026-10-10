@@ -203,8 +203,13 @@ when a poll can produce a change.
   made while the rest of the poll was still running is not credited with it;
   an entry up to two minutes after the fetch (clock skew) is used only when
   none before it matches. Failed attempts are ignored. Device share
-  (`deviceInvites`) changes are not attributed: the audit-log property for a
-  share has not been confirmed against a live response.
+  (`deviceInvites`) changes are matched to the audit log's Invite and Share
+  entries (creating, accepting, updating, or deleting a node share or its
+  invite), never to a NODE entry: an entry fits when it names one of the
+  changed invites by ID, or the device by name, ID, or node ID. Tailscale
+  does not document the machine-readable target types of these entries, so
+  any target type containing `INVITE` or `SHARE` is accepted. Invite events
+  are logged only in the sharing tailnet.
 - **What is stored.** Only the actor's login and display name, the actor
   type, the origin (admin console, API, ...), the audit action (for example
   `NODE.UPDATE.ACL_TAGS`), the target, and the audit timestamp, each bounded

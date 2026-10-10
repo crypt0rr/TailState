@@ -635,7 +635,11 @@ func (s *Store) recordChangeBatch(a *batchApply, results []model.Collected, dige
 		if !fetched {
 			observed = a.now
 		}
-		attribution := attributeChange(entry, lookup, window, observed)
+		related, err := a.deviceIdentity(entry.Change, lookup)
+		if err != nil {
+			return ChangeBatchResult{}, err
+		}
+		attribution := attributeChange(entry, lookup, window, observed, related...)
 		if attribution != nil {
 			result.Attributed++
 			result.Changes[index].Attribution = attribution
@@ -660,6 +664,25 @@ func (s *Store) recordChangeBatch(a *batchApply, results []model.Collected, dige
 		return ChangeBatchResult{}, err
 	}
 	return result, nil
+}
+
+// deviceIdentity returns the devices snapshot of a device_details change
+// when it can be attributed. Detail snapshots carry no id or nodeId of
+// their own, so the device's snapshot lets audit entries that name the
+// device by node ID match.
+func (a *batchApply) deviceIdentity(change model.Change, lookup AttributionResult) ([][]byte, error) {
+	if change.Collector != "device_details" || lookup.Status != AttributionComplete || len(lookup.Entries) == 0 {
+		return nil, nil
+	}
+	var raw []byte
+	err := a.tx.QueryRowContext(a.ctx, "SELECT canonical_json FROM snapshots WHERE generation=? AND collector='devices' AND resource_id=?", a.generation, change.ResourceID).Scan(&raw)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return [][]byte{raw}, nil
 }
 
 // insertEvent stores one recorded change of batchID with its bounded

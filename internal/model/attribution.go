@@ -318,16 +318,23 @@ var (
 // successful entry at or before notAfter whose target is the changed
 // resource and whose action fits the kind of change. before and after are the
 // normalized snapshots; their top-level id and nodeId identify a device by
-// its audit target ID. It reports false when no entry matches, which is
-// rendered as ActorUnknown.
-func Attribute(change Change, before, after []byte, entries []AuditEntry, notAfter time.Time) (Attribution, bool) {
-	ids := resourceIDs(change, before, after)
+// its audit target ID. related are further snapshots of the same resource
+// read only for those identifiers (the devices snapshot of a device_details
+// change, which carries no id of its own). It reports false when no entry
+// matches, which is rendered as ActorUnknown.
+func Attribute(change Change, before, after []byte, entries []AuditEntry, notAfter time.Time, related ...[]byte) (Attribution, bool) {
+	ids := resourceIDs(change, append([][]byte{before, after}, related...)...)
+	shares := shareInviteIDs(change)
 	candidates := make([]AuditEntry, 0, 4)
 	for _, entry := range entries {
 		if entry.Failed || (!notAfter.IsZero() && entry.EventTime.After(notAfter)) {
 			continue
 		}
-		if !entryTargetsChange(change, ids, entry) || !entryFitsKind(change, entry) {
+		if change.Collector == "device_details" && shareTarget(entry.TargetType) {
+			if !shareEntryFits(change, ids, shares, entry) {
+				continue
+			}
+		} else if !entryTargetsChange(change, ids, entry) || !entryFitsKind(change, entry) {
 			continue
 		}
 		candidates = append(candidates, entry)
@@ -345,12 +352,58 @@ func Attribute(change Change, before, after []byte, entries []AuditEntry, notAft
 	return NewAttribution(candidates[0]), true
 }
 
-func resourceIDs(change Change, before, after []byte) map[string]bool {
+// shareTarget reports whether an audit target is a device share or a share
+// invite. Tailscale documents the "Invite" and "Share" targets of node
+// sharing but not their machine-readable type strings, so they are matched
+// loosely.
+func shareTarget(targetType string) bool {
+	targetType = strings.ToUpper(targetType)
+	return strings.Contains(targetType, "INVITE") || strings.Contains(targetType, "SHARE")
+}
+
+// shareInviteIDs returns the invite IDs named by a device_details change's
+// element paths, such as 5861427050514914 for
+// "deviceInvites[5861427050514914].accepted".
+func shareInviteIDs(change Change) map[string]bool {
+	if change.Collector != "device_details" {
+		return nil
+	}
+	invites := map[string]bool{}
+	for _, field := range change.Fields {
+		root := FieldRoot(field.Field)
+		if CompactField(root) != "deviceinvites" {
+			continue
+		}
+		remainder := field.Field[len(root):]
+		if closing := strings.IndexByte(remainder, ']'); strings.HasPrefix(remainder, "[") && closing > 1 {
+			invites[remainder[1:closing]] = true
+		}
+	}
+	return invites
+}
+
+// shareEntryFits reports whether a share or invite audit entry explains a
+// device_details change to the device's share invites: the entry names one
+// of the changed invites by ID, or the device by name or ID. Share changes
+// are only ever credited to such entries, never to a NODE entry.
+func shareEntryFits(change Change, ids, invites map[string]bool, entry AuditEntry) bool {
+	if len(invites) == 0 {
+		return false
+	}
+	target := strings.TrimSpace(entry.TargetID)
+	if target != "" && (invites[target] || ids[target]) {
+		return true
+	}
+	name := strings.TrimSpace(entry.TargetName)
+	return name != "" && strings.EqualFold(name, strings.TrimSpace(change.Name))
+}
+
+func resourceIDs(change Change, snapshots ...[]byte) map[string]bool {
 	ids := map[string]bool{}
 	if id := strings.TrimSpace(change.ResourceID); id != "" {
 		ids[id] = true
 	}
-	for _, raw := range [][]byte{before, after} {
+	for _, raw := range snapshots {
 		var object map[string]any
 		if len(raw) == 0 || json.Unmarshal(raw, &object) != nil {
 			continue
@@ -398,7 +451,9 @@ func entryFitsKind(change Change, entry AuditEntry) bool {
 		return true
 	}
 	if change.FieldsTruncated {
-		return true
+		// A truncated change to a device's shares is left to share and
+		// invite entries; a NODE entry never explains a share.
+		return len(shareInviteIDs(change)) == 0
 	}
 	property := strings.ToUpper(strings.TrimSpace(entry.Property))
 	for _, field := range change.Fields {

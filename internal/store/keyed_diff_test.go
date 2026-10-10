@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/crypt0rr/tailstate/internal/model"
 	"github.com/crypt0rr/tailstate/internal/notify"
@@ -187,6 +188,50 @@ func TestFieldRulesCoverListElements(t *testing.T) {
 	whole := newMuteSet([]MuteRule{{Kind: MuteField, Value: "device_details.device_invites"}})
 	if !whole.fieldMuted("device_details", "deviceInvites[5861427050514914].acceptedBy.id") {
 		t.Fatal("a list rule did not cover its element fields")
+	}
+}
+
+// TestShareChangeIsAttributedToShareEntryByNodeID checks R-069's
+// attribution in the store: a share change on device_details is credited to
+// a share audit entry that names the device by the node ID kept in its
+// devices snapshot, and never to a NODE entry for the device.
+func TestShareChangeIsAttributedToShareEntryByNodeID(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	generation, err := st.SaveSettings(ctx, settings())
+	if err != nil {
+		t.Fatal(err)
+	}
+	lookup := &recordingLookup{status: AttributionComplete}
+	options := BatchOptions{Attribute: lookup.lookup}
+	digest := notify.Context{}.Digest
+	poll := func(invite map[string]any) ChangeBatchResult {
+		t.Helper()
+		results := append([]model.Collected{{Collector: "devices", Resources: []model.Resource{{ID: "654495373136127", Type: "device", Name: "ludus.tail1234.ts.net", Data: map[string]any{"id": "654495373136127", "nodeId": "nLUDUS", "name": "ludus.tail1234.ts.net"}}}}}, sharedDevice(invite)...)
+		batch, err := st.ApplyBatchWithOptions(ctx, generation, results, digest, options)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return batch
+	}
+	invite := shareInvite("5861427050514914", "T1000EXAMPLE")
+	invite["allowExitNode"] = false
+	poll(invite)
+	now := time.Now().UTC()
+	lookup.entries = []model.AuditEntry{
+		nodeEntry("mallory", "nLUDUS", "UPDATE", "ATTRIBUTES", now.Add(-10*time.Second)),
+		{EventTime: now.Add(-30 * time.Second), Origin: "ADMIN_CONSOLE", ActorType: "USER", ActorLogin: "alice", TargetType: "SHARE", TargetID: "nLUDUS", Action: "UPDATE"},
+	}
+	invite["allowExitNode"] = true
+	changed := poll(invite)
+	if got := eventChangedBy(t, st, changed.ID)["654495373136127"]; got != "alice via admin console" {
+		t.Fatalf("share change attributed to %q, want the share entry's actor", got)
+	}
+	lookup.entries = lookup.entries[:1]
+	invite["allowExitNode"] = false
+	changed = poll(invite)
+	if got := eventChangedBy(t, st, changed.ID)["654495373136127"]; got != model.ActorUnknown {
+		t.Fatalf("share change attributed to %q from a NODE entry", got)
 	}
 }
 

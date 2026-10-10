@@ -258,7 +258,10 @@ func (s *Store) lookupAttribution(ctx context.Context, generation int64, results
 // entry within the clock-skew tolerance after it is used only when none
 // does, so an edit made after the fetch (while later collectors of the poll
 // were still being fetched) is not credited with the change.
-func attributeChange(entry recordedChange, lookup AttributionResult, window AttributionWindow, observed time.Time) *model.Attribution {
+//
+// related are further snapshots of the changed resource that identify it
+// (see model.Attribute).
+func attributeChange(entry recordedChange, lookup AttributionResult, window AttributionWindow, observed time.Time, related ...[]byte) *model.Attribution {
 	if lookup.Status != AttributionComplete || len(lookup.Entries) == 0 {
 		return nil
 	}
@@ -269,9 +272,9 @@ func attributeChange(entry recordedChange, lookup AttributionResult, window Attr
 		}
 		entries = append(entries, candidate)
 	}
-	attribution, ok := model.Attribute(entry.Change, entry.Before.raw, entry.After.raw, entries, observed)
+	attribution, ok := model.Attribute(entry.Change, entry.Before.raw, entry.After.raw, entries, observed, related...)
 	if !ok {
-		attribution, ok = model.Attribute(entry.Change, entry.Before.raw, entry.After.raw, entries, observed.Add(AttributionClockSkew))
+		attribution, ok = model.Attribute(entry.Change, entry.Before.raw, entry.After.raw, entries, observed.Add(AttributionClockSkew), related...)
 	}
 	if !ok {
 		return nil

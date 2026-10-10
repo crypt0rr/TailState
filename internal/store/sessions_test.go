@@ -90,9 +90,10 @@ func TestSessionIdleTimeoutIgnoresNonActivityChecks(t *testing.T) {
 	}
 }
 
-// TestChangePasswordRevokesOtherSessions guards E-023: changing the password
-// needs the current password, applies the policy, and in one transaction
-// signs out every other session and invalidates the reset token.
+// TestChangePasswordRevokesOtherSessions guards E-023 and R-052: changing
+// the password needs the current password, applies the policy, and in one
+// transaction signs out every session (the web handler issues a fresh one),
+// invalidates the reset token, and revokes every active API token.
 func TestChangePasswordRevokesOtherSessions(t *testing.T) {
 	st := claimedStore(t)
 	ctx := context.Background()
@@ -101,21 +102,31 @@ func TestChangePasswordRevokesOtherSessions(t *testing.T) {
 	if _, err := st.NewResetToken(ctx); err != nil {
 		t.Fatal(err)
 	}
+	_, apiToken, err := st.CreateAPIToken(ctx, "SIEM", []string{ScopeHistoryRead}, 30*24*time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
 	const next = "violet harbor lantern"
-	if err := st.ChangePassword(ctx, keep, "wrong", next); !errors.Is(err, ErrCurrentPasswordMismatch) {
+	if _, err := st.ChangePassword(ctx, "wrong", next); !errors.Is(err, ErrCurrentPasswordMismatch) {
 		t.Fatalf("wrong current password: %v", err)
 	}
-	if err := st.ChangePassword(ctx, keep, "a secure password", "short"); !errors.Is(err, secret.ErrPasswordTooShort) {
+	if _, err := st.ChangePassword(ctx, "a secure password", "short"); !errors.Is(err, secret.ErrPasswordTooShort) {
 		t.Fatalf("policy not applied: %v", err)
 	}
 	if !st.ValidateSession(ctx, other, otherCSRF, true) {
 		t.Fatal("a rejected change revoked a session")
 	}
-	if err := st.ChangePassword(ctx, keep, "a secure password", next); err != nil {
-		t.Fatal(err)
+	if _, err := st.AuthenticateAPIToken(ctx, apiToken); err != nil {
+		t.Fatalf("a rejected change revoked an API token: %v", err)
 	}
-	if st.ValidateSession(ctx, other, otherCSRF, true) || !st.ValidateSession(ctx, keep, keepCSRF, true) {
-		t.Fatal("password change did not keep exactly the current session")
+	if revoked, err := st.ChangePassword(ctx, "a secure password", next); err != nil || revoked != 1 {
+		t.Fatalf("change revoked=%d err=%v", revoked, err)
+	}
+	if st.ValidateSession(ctx, other, otherCSRF, true) || st.ValidateSession(ctx, keep, keepCSRF, true) {
+		t.Fatal("password change left a session signed in")
+	}
+	if _, err := st.AuthenticateAPIToken(ctx, apiToken); !errors.Is(err, ErrAPITokenInvalid) {
+		t.Fatalf("API token survived a password change: %v", err)
 	}
 	if !st.Authenticate(ctx, next) || st.Authenticate(ctx, "a secure password") {
 		t.Fatal("password was not replaced")
@@ -127,7 +138,7 @@ func TestChangePasswordRevokesOtherSessions(t *testing.T) {
 	if _, err := st.db.Exec("DELETE FROM admin"); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.ChangePassword(ctx, keep, next, "another fine passphrase"); err == nil {
+	if _, err := st.ChangePassword(ctx, next, "another fine passphrase"); err == nil {
 		t.Fatal("password changed without an administrator")
 	}
 }
@@ -168,7 +179,7 @@ func TestListSessionsAndRevokeOthers(t *testing.T) {
 	if _, err := st.RevokeOtherSessions(ctx, current); err == nil {
 		t.Fatal("RevokeOtherSessions succeeded on a closed store")
 	}
-	if err := st.ChangePassword(ctx, current, "a secure password", "violet harbor lantern"); err == nil {
+	if _, err := st.ChangePassword(ctx, "a secure password", "violet harbor lantern"); err == nil {
 		t.Fatal("ChangePassword succeeded on a closed store")
 	}
 }

@@ -369,7 +369,7 @@ func TestDestinationActionsSurviveDeliveryStateErrors(t *testing.T) {
 	if name, pending := server.destinationPending(context.Background(), id); name != "the destination" || pending != 0 {
 		t.Fatalf("pending without outbox=%q/%d", name, pending)
 	}
-	if got := server.storedDestinationURL(context.Background(), id+100); got != "" {
-		t.Fatalf("unknown destination URL=%q", got)
+	if got, found := server.storedDestination(context.Background(), id+100); found || got.ServiceURL != "" {
+		t.Fatalf("unknown destination found=%v URL=%q", found, got.ServiceURL)
 	}
 }

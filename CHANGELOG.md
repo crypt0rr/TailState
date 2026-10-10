@@ -13,6 +13,13 @@ rollback requires restoring the backup taken before the upgrade. See
 
 ## [Unreleased]
 
+### Security
+- Setup and reset forms check the new password against the password policy before validating the form's challenge, so a weak password no longer spends a challenge. An unauthenticated client could previously fill the shared replay cache with unthrottled weak-password submissions and lock every login, setup, and reset out for about five minutes. A mismatched confirmation still spends its challenge and counts against the throttle (#260).
+- A password reset now revokes every active API token in the same transaction, and a password change does too, so a token created with a stolen session no longer outlives credential recovery; the audit record lists `api_tokens_revoked` when tokens were revoked. A password change also replaces the session that made it with a new one, so the old session cookie stops working (#261).
+- Adding a notification destination, and turning a disabled destination back on (with the enable action or by saving it as enabled), are now high-risk changes that send the "TailState configuration changed" notice to the destinations that were already enabled (#262).
+- Every `X-Forwarded-For` and `X-Forwarded-Proto` header line from a trusted proxy is now read as one list, so a proxy that appends its own line can no longer be bypassed by a client-supplied first line, and tokenless metrics are refused when any forwarded header line is present, even an empty one (#263).
+- A password change refused for a wrong current password is now recorded in the administrative audit trail and log as "Password change refused: wrong current password" with outcome `failure`. Destination saves, enables, disables, and removals are refused with an error when the destinations cannot be read first, instead of being applied without an audit record or notice (#276).
+
 ### Changed
 - Renovate proposes each Go release as one "Go toolchain" PR that updates the Dockerfile builder image, the `go` directive in `go.mod`, and the Dockerfile `GO_VERSION` argument together, so the toolchain alignment check passes and security releases of Go can land without manual work (#270).
 - CI runs `govulncheck` in its own `vulncheck` job instead of at the end of the `go` job, so a new Go advisory is reported by name about a minute into the run rather than as a generic `go` failure after the test suite. The scheduled vulnerability scan now runs daily instead of weekly, and a manual run can open or update the tracking issue through its `report` input (#286).
@@ -20,6 +27,7 @@ rollback requires restoring the backup taken before the upgrade. See
 
 ### Fixed
 - `tailstate admin reset` and the other one-shot administration commands wait up to 30 seconds for the database write lock instead of 5, so a busy service no longer makes them fail with "database is locked (SQLITE_BUSY)" (#269).
+- `/api/v1/evidence` now builds its pack exactly as the History download does: up to 100 batches by default instead of 20, and a positive `limit` requests a smaller pack, with `truncated` and `next_cursor` set when more batches match (#277).
 
 ## [0.18.1] - 2026-10-09
 

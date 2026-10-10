@@ -121,7 +121,7 @@ func (s *Server) requestIsHTTPS(r *http.Request) bool {
 	if !s.isTrustedProxy(remoteIP(r)) {
 		return false
 	}
-	values := strings.Split(r.Header.Get("X-Forwarded-Proto"), ",")
+	values := strings.Split(strings.Join(r.Header.Values("X-Forwarded-Proto"), ","), ",")
 	return strings.EqualFold(strings.TrimSpace(values[len(values)-1]), "https")
 }
 
@@ -130,8 +130,10 @@ func (s *Server) requestIsHTTPS(r *http.Request) bool {
 const accountSection = "/settings"
 
 // passwordPost changes the administrator password. It requires the current
-// password, applies the password policy before anything else, and signs out
-// every other session. Every outcome is reported with Post/Redirect/Get and
+// password, applies the password policy before anything else, signs out
+// every session, revokes every active API token, and signs the administrator
+// in again with a fresh session, so the cookie value that submitted the
+// change stops working. Every outcome is reported with Post/Redirect/Get and
 // a one-time flash message, so a reload never resubmits a password.
 func (s *Server) passwordPost(w http.ResponseWriter, r *http.Request) {
 	auth, ok := s.requireSession(w, r, true, true)
@@ -164,9 +166,11 @@ func (s *Server) passwordPost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	before := s.enabledDestinations(ctx)
-	if err := s.store.ChangePassword(ctx, auth.token, r.FormValue("current_password"), password); err != nil {
+	revoked, err := s.store.ChangePassword(ctx, r.FormValue("current_password"), password)
+	if err != nil {
 		if errors.Is(err, store.ErrCurrentPasswordMismatch) {
 			s.recordFailure(passwordChangeThrottle, key)
+			s.recordAdmin(r, auth.ref, adminChange{event: store.AuditPasswordChangeFail, outcome: store.AuditFailure}, nil, 0)
 			fail("Password was not changed: the current password is incorrect.")
 			return
 		}
@@ -175,8 +179,18 @@ func (s *Server) passwordPost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.clearFailures(key)
-	s.recordAdmin(r, auth.ref, adminChange{event: store.AuditPasswordChanged, highRisk: true}, before, 0)
-	s.redirectWithFlash(w, r, accountSection, flashKindSuccess, "Password changed. Every other session was signed out.")
+	s.recordAdmin(r, auth.ref, adminChange{event: store.AuditPasswordChanged, fields: apiTokensRevokedFields(revoked), highRisk: true}, before, 0)
+	// The change signed out every session, this one included; a fresh
+	// session keeps the administrator signed in while the cookie value that
+	// submitted the change stops working.
+	if _, ok := s.startSession(w, r); !ok {
+		return
+	}
+	message := "Password changed. Every other session was signed out."
+	if revoked > 0 {
+		message = "Password changed. Every other session was signed out and every active API token was revoked."
+	}
+	s.redirectWithFlash(w, r, accountSection, flashKindSuccess, message)
 }
 
 // sessionsPost signs out every session except the current one.

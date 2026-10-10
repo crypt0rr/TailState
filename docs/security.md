@@ -51,13 +51,17 @@ or short pattern, and not on a small embedded list of common passwords
 (compared case-insensitively, ignoring spaces, hyphens, underscores, and
 dots). The policy is checked first and a failure names the rule that was
 broken, so a short password is never reported as a setup or reset token
-problem. Existing passwords are not re-evaluated: an administrator whose
+problem; on the setup and reset forms it is checked before the form's
+challenge, so a rejected password does not spend it. Existing passwords are not re-evaluated: an administrator whose
 password predates the 15-character minimum can still sign in, and the policy
 applies the next time the password is changed.
 
 The **Account security** section of Settings changes the password (the
 current password is required, wrong current passwords are throttled like
-logins, and every other session is signed out in the same transaction),
+logins and audited, and in the same transaction every session is signed out
+and every active API token is revoked; the browser that made the change is
+signed in again with a new session, so the previous session cookie stops
+working, and automation must be given new tokens),
 lists active sessions with their sign-in, last-activity, and expiry times,
 and offers **Sign out all other sessions**. A session lasts at most 12 hours
 and ends after 60 minutes without activity. The status page's 30-second
@@ -89,7 +93,10 @@ docker compose exec tailstate /tailstate admin reset
 ```
 
 Then open `/reset`. Resetting the password invalidates existing sessions and any
-outstanding reset token. A signed-in administrator who knows the current
+outstanding reset token, and revokes every active API token in the same
+transaction, so a token created with a stolen session does not outlive the
+recovery; the audit record of the reset lists `api_tokens_revoked` when it
+revoked any. Create new tokens for automation afterwards. A signed-in administrator who knows the current
 password can instead use **Change password** under **Account security** in
 Settings, which needs no shell access. Reset tokens expire after 30 minutes; generate another
 token if one expires.
@@ -137,7 +144,11 @@ logged.
 If the proxy forwards the original client address or terminates TLS, configure
 only its actual source address as trusted, for example
 `TAILSTATE_TRUSTED_PROXIES=127.0.0.1/32`. TailState ignores
-`X-Forwarded-For` and `X-Forwarded-Proto` from every other peer.
+`X-Forwarded-For` and `X-Forwarded-Proto` from every other peer. When a
+trusted proxy appends its own header line instead of extending the incoming
+one, every line is read as one list in order, so the client address is the
+rightmost untrusted address across all lines and the scheme is the last
+`X-Forwarded-Proto` value.
 Enabling `TAILSTATE_COOKIE_SECURE=true` without a trusted proxy is rejected at
 startup because this binary serves plain HTTP and must receive the proxy's
 authenticated HTTPS indication.
@@ -147,7 +158,9 @@ authenticated HTTPS indication.
 TailState records its own security-relevant configuration changes in a
 durable `admin_audit` table, so a change made with a stolen session or by an
 insider is not silent. One record is written for each sign-in, failed
-sign-in, sign-out, setup claim, token password reset, password change, and
+sign-in, sign-out, setup claim, token password reset (listing
+`api_tokens_revoked` when it revoked API tokens), password change (likewise),
+password change refused for a wrong current password (outcome `failure`), and
 "sign out all other sessions"; for each monitoring settings save that changes
 something (tailnet, OAuth client ID, OAuth secret rotation, OAuth scopes,
 either polling interval, expiry warning windows or tag filter, webhook secret
@@ -184,9 +197,15 @@ notification (action, changed field names, object, client address, time) to
 every destination that was enabled **before** the change: monitoring
 settings changes (including an OAuth identity change, which notifies every
 enabled destination and is not dead-lettered by the identity switch),
-password resets and changes, mute rules added, API tokens created, and
-destination URL, routing, disable, and removal changes. The notice is queued in the same transaction as
-the audit record. A destination that the change itself disables, removes, or
+password resets and changes, mute rules added, API tokens created,
+destinations added, destinations turned back on (by the enable action or by
+an edit that enables a disabled destination), and destination URL, routing,
+disable, and removal changes. A new or re-enabled destination is not among
+the recipients, so adding the first destination sends nothing. The notice is
+queued in the same transaction as the audit record. A destination change
+reads the current destinations first, because that read decides the audit
+record and the recipients; if it fails, the change is refused with an error
+and nothing is saved. A destination that the change itself disables, removes, or
 points at a new URL is notified directly at its current URL before the
 change is applied (bounded to 10 seconds and best effort, so an unreachable
 destination can still be removed; the outcome is logged), which means
@@ -209,12 +228,13 @@ Revoking a token takes effect on the very next request. Expired and revoked
 tokens stay listed for 30 days after their expiry and are then removed by
 retention cleanup. Creating a token is recorded in the administrative audit
 trail and notified to every enabled destination; revoking one is recorded.
+A password reset or change revokes every active token (see above).
 
 | Endpoint | Scope | Response |
 | --- | --- | --- |
 | `GET /api/v1/status` | `status:read` | JSON status: setup and baseline state, notification state, destination counts, outbox and webhook queue counts, resource counts, and collectors with the bounded readiness reasons |
 | `GET /api/v1/history` | `history:read` | NDJSON History page (`application/x-ndjson`) |
-| `GET /api/v1/evidence` | `evidence:read` | Signed evidence pack, identical to the History download (format version 5) |
+| `GET /api/v1/evidence` | `evidence:read` | Signed evidence pack, identical to the History download (format version 5), up to 100 batches by default |
 
 ```console
 curl -fsS -H "Authorization: Bearer $TAILSTATE_API_TOKEN" https://tailstate.example/api/v1/status
@@ -228,7 +248,10 @@ with the same meaning (`collector`, `event_type`, `resource`, `severity`,
 `to` inclusive) and its paging (`cursor` for older batches; history also
 accepts `after` for newer batches). A malformed date is refused with `400`
 (`invalid_request`) instead of being ignored. History also accepts `limit`
-(1 to 100 batches, default 20). Each history
+(1 to 100 batches, default 20). Evidence accepts `limit` as the History
+download does: the default is the largest pack (100 batches), a smaller
+positive value requests smaller parts, and a pack cut short reports
+`truncated` and the `next_cursor` to pass as `cursor` for the next part. Each history
 line is either one `{"type":"batch",...}` object (batch metadata, the ledger
 sequence and hash, events with field diffs and redacted normalized
 snapshots, and per-destination delivery status by destination ID and name)

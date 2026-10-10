@@ -294,7 +294,7 @@
         <input id="confirm-password" type="password" name="confirm" minlength="{{.MinPasswordLength}}" autocomplete="new-password" required>
       </label>
     </div>
-    <p class="muted">Changing the password signs out every other session.</p>
+    <p class="muted">Changing the password signs out every other session and revokes every active API token.</p>
     <button type="submit">Change password</button>
   </form>
   <h3 id="sessions-heading">Active sessions</h3>

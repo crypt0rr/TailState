@@ -481,3 +481,53 @@ func credentialChallengeRequest(path, challenge, cookieName, cookieValue string)
 	request.AddCookie(&http.Cookie{Name: cookieName, Value: cookieValue})
 	return request
 }
+
+// TestRejectedNewPasswordsDoNotConsumeChallenges guards R-051: setup and
+// reset check the password policy before the challenge, so a flood of
+// policy-failing submissions cannot fill the shared replay cache, while a
+// mismatched confirmation still spends its challenge and counts as a failure.
+func TestRejectedNewPasswordsDoNotConsumeChallenges(t *testing.T) {
+	server, st, token := testServer(t)
+	consumed := func() int {
+		server.challengeMu.Lock()
+		defer server.challengeMu.Unlock()
+		return len(server.consumedChallenges)
+	}
+	weak := url.Values{"token": {"not-the-token"}, "password": {"short"}, "confirm": {"short"}}
+	for _, action := range []credentialAction{credentialActionSetup, credentialActionReset} {
+		if action == credentialActionReset {
+			claimCoverageAdmin(t, server, token)
+			if _, err := st.NewResetToken(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+		}
+		before := consumed()
+		for i := 0; i < 2*loginFailuresPerClient; i++ {
+			response := coverageCredentialPost(t, server, action.postPath(), weak, nil, "", "", nil)
+			if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "at least 15 characters") {
+				t.Fatalf("weak %s %d: status=%d body=%s", action, i, response.Code, response.Body.String())
+			}
+		}
+		if got := consumed(); got != before {
+			t.Fatalf("policy-failing %s submissions consumed %d challenges", action, got-before)
+		}
+	}
+	if got := server.credentialChallengeCount(credentialActionReset, challengeOutcomeAccepted); got != 0 {
+		t.Fatalf("policy-failing reset submissions validated %d challenges", got)
+	}
+
+	before := consumed()
+	mismatch := url.Values{"token": {"not-the-token"}, "password": {"another secure password"}, "confirm": {"a different passphrase"}}
+	for i := 0; i < loginFailuresPerClient; i++ {
+		response := coverageCredentialPost(t, server, "/reset", mismatch, nil, "", "", nil)
+		if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "Passwords do not match") {
+			t.Fatalf("mismatched reset %d: status=%d body=%s", i, response.Code, response.Body.String())
+		}
+	}
+	if got := consumed(); got != before+loginFailuresPerClient {
+		t.Fatalf("mismatched submissions consumed %d challenges, want %d", got-before, loginFailuresPerClient)
+	}
+	if response := coverageCredentialPost(t, server, "/reset", mismatch, nil, "", "", nil); response.Code != http.StatusTooManyRequests {
+		t.Fatalf("repeated mismatches were not throttled: status=%d", response.Code)
+	}
+}

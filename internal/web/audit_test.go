@@ -200,6 +200,17 @@ func TestEveryAdministrativeActionIsAuditedOnceWithoutSecrets(t *testing.T) {
 	if entry := expect("add destination", store.AuditDestinationAdded, "enabled", "name", "service_url"); entry.Target != destinationTarget(id) {
 		t.Fatalf("destination target %q", entry.Target)
 	}
+	// Adding the first destination has nobody to tell; adding another tells
+	// the destinations already enabled, not the new one.
+	if queued := f.adminNotices(t); len(queued) != 0 {
+		t.Fatalf("adding the first destination queued notices: %v", queued)
+	}
+	second := f.addDestination(t, "Backup", auditDestinationURL("b"))
+	expect("add second destination", store.AuditDestinationAdded, "enabled", "name", "service_url")
+	if queued := f.adminNotices(t); len(queued) != 1 || len(queued[id]) != 1 || len(queued[second]) != 0 {
+		t.Fatalf("adding a destination notified %v, want only the destination already enabled", queued)
+	}
+	f.clearNotices(t)
 	if response := f.post(t, "/settings", settingsForm("client", auditOAuthSecret, "", "60")); response.Code != http.StatusSeeOther {
 		t.Fatalf("initial settings %d: %s", response.Code, response.Body.String())
 	}
@@ -240,10 +251,30 @@ func TestEveryAdministrativeActionIsAuditedOnceWithoutSecrets(t *testing.T) {
 	expect("rename destination", store.AuditDestinationEdited, "name")
 	f.post(t, "/settings/destinations", url.Values{"action": {"save"}, "id": {idText}, "name": {"Renamed"}, "enabled": {"on"}, "routing": {"1"}, "min_severity": {"high"}, "message_format": {"plain"}})
 	expect("routing change", store.AuditDestinationEdited, "message_format", "routing")
-	f.post(t, "/settings/destinations/disable", url.Values{"id": {idText}})
-	expect("disable", store.AuditDestinationDisabled, "enabled")
+	// Re-enabling a disabled destination, by toggle or by save, tells the
+	// other enabled destinations.
+	for _, reenable := range []struct {
+		step  string
+		path  string
+		form  url.Values
+		event string
+	}{
+		{"enable", "/settings/destinations/enable", url.Values{"id": {idText}}, store.AuditDestinationEnabled},
+		{"re-enable by save", "/settings/destinations", url.Values{"action": {"save"}, "id": {idText}, "name": {"Renamed"}, "enabled": {"on"}}, store.AuditDestinationEdited},
+	} {
+		f.post(t, "/settings/destinations/disable", url.Values{"id": {idText}})
+		expect("disable", store.AuditDestinationDisabled, "enabled")
+		f.clearNotices(t)
+		f.post(t, reenable.path, reenable.form)
+		expect(reenable.step, reenable.event, "enabled")
+		if queued := f.adminNotices(t); len(queued) != 1 || len(queued[second]) != 1 {
+			t.Fatalf("%s notified %v, want only the other enabled destination", reenable.step, queued)
+		}
+	}
 	f.post(t, "/settings/destinations/enable", url.Values{"id": {idText}})
-	expect("enable", store.AuditDestinationEnabled, "enabled")
+	if len(f.audit(t)) != seen {
+		t.Fatal("enabling an enabled destination was audited")
+	}
 	f.post(t, "/settings/mutes", url.Values{"action": {"add"}, "kind": {"collector"}, "value": {"dns"}})
 	mute := expect("add mute", store.AuditMuteAdded, "kind", "value")
 	f.post(t, "/settings/mutes", url.Values{"action": {"delete"}, "id": {strings.TrimPrefix(mute.Target, "mute:")}})
@@ -282,8 +313,15 @@ func TestEveryAdministrativeActionIsAuditedOnceWithoutSecrets(t *testing.T) {
 	f.post(t, "/settings/sessions/revoke-others", url.Values{})
 	expect("revoke sessions", store.AuditSessionsRevoked)
 	const newPassword = "violet harbor lantern"
-	f.post(t, "/settings/password", url.Values{"current_password": {testAdminPassword}, "password": {newPassword}, "confirm": {newPassword}})
+	f.post(t, "/settings/password", url.Values{"current_password": {"not the password!"}, "password": {newPassword}, "confirm": {newPassword}})
+	if entry := expect("wrong current password", store.AuditPasswordChangeFail); entry.Outcome != store.AuditFailure || entry.SessionRef != store.SessionRef(sessionFrom(t, f.cookies)) {
+		t.Fatalf("wrong current password record %+v", entry)
+	}
+	changed := f.post(t, "/settings/password", url.Values{"current_password": {testAdminPassword}, "password": {newPassword}, "confirm": {newPassword}})
 	expect("change password", store.AuditPasswordChanged)
+	// The change replaced this session with a fresh one.
+	f.cookies = sessionOnly(changed.Result().Cookies())
+	f.csrf = csrfFrom(t, f.cookies)
 	f.post(t, "/settings/destinations/delete", url.Values{"id": {idText}})
 	if len(f.audit(t)) != seen {
 		t.Fatal("an unconfirmed removal was audited")
@@ -325,7 +363,7 @@ func TestEveryAdministrativeActionIsAuditedOnceWithoutSecrets(t *testing.T) {
 			t.Fatalf("log output contains %q", secret)
 		}
 	}
-	if !strings.Contains(logs.String(), `msg="administrative action" event=destination_disabled`) {
+	if !strings.Contains(logs.String(), `msg="administrative action" event=destination_disabled`) || !strings.Contains(logs.String(), `msg="administrative action" event=password_change_failed outcome=failure client_ip=192.0.2.1`) {
 		t.Fatal("audit records are not emitted as structured log lines")
 	}
 }
@@ -384,6 +422,7 @@ func TestHighRiskChangesNotifyDestinationsEnabledBeforeTheChange(t *testing.T) {
 	first := f.addDestination(t, "First", auditDestinationURL("1"))
 	second := f.addDestination(t, "Second", auditDestinationURL("2"))
 	disabled := f.addDestination(t, "Disabled", auditDestinationURL("3"))
+	f.clearNotices(t)
 	f.post(t, "/settings/destinations/disable", url.Values{"id": {strconv.FormatInt(disabled, 10)}})
 	queued := f.adminNotices(t)
 	if len(queued[first]) != 1 || len(queued[second]) != 1 || len(queued[disabled]) != 0 {
@@ -422,5 +461,61 @@ func TestHighRiskChangesNotifyDestinationsEnabledBeforeTheChange(t *testing.T) {
 	page := authenticatedGet(t, f.server, "/settings", f.cookies).Body.String()
 	if !strings.Contains(page, "Recent administrative activity") || !strings.Contains(page, "Notification destination edited") || strings.Contains(page, auditDestinationSecret) {
 		t.Fatal("settings does not show recent administrative activity safely")
+	}
+}
+
+// TestDestinationChangesAreRefusedWhenDestinationsCannotBeRead guards R-065:
+// the read taken before a destination change decides its audit record and
+// notices, so when it fails an edit, disable, or removal is refused instead
+// of being applied unaudited and unannounced.
+func TestDestinationChangesAreRefusedWhenDestinationsCannotBeRead(t *testing.T) {
+	f := newAuditFixture(t)
+	id := f.addDestination(t, "Primary", auditDestinationURL("a"))
+	other := f.addDestination(t, "Other", auditDestinationURL("b"))
+	f.clearNotices(t)
+	audited := len(f.audit(t))
+	// A malformed row elsewhere makes ListDestinations fail, while updates
+	// to the target row by ID would still succeed.
+	if _, err := f.db.Exec("UPDATE notification_destinations SET created_at='bad' WHERE id=?", other); err != nil {
+		t.Fatal(err)
+	}
+	idText := strconv.FormatInt(id, 10)
+	for _, attempt := range []struct {
+		step string
+		path string
+		form url.Values
+	}{
+		{"edit", "/settings/destinations", url.Values{"action": {"save"}, "id": {idText}, "name": {"Moved"}, "service_url": {auditDestinationURL("moved")}, "enabled": {"on"}}},
+		{"disable", "/settings/destinations/disable", url.Values{"id": {idText}}},
+		{"remove", "/settings/destinations/delete", url.Values{"id": {idText}, "confirm": {"remove"}}},
+		{"add", "/settings/destinations", url.Values{"action": {"save"}, "name": {"Added"}, "service_url": {auditDestinationURL("c")}, "enabled": {"on"}}},
+	} {
+		response := f.post(t, attempt.path, attempt.form)
+		// Settings itself cannot render without the destinations, so the
+		// flash is read from the redirect directly.
+		flashed := httptest.NewRequest(http.MethodGet, "/settings", nil)
+		for _, cookie := range response.Result().Cookies() {
+			flashed.AddCookie(cookie)
+		}
+		message, ok := f.server.takeFlash(httptest.NewRecorder(), flashed)
+		if response.Code != http.StatusSeeOther || !ok || message.Kind != flashKindError || !strings.Contains(message.Message, "could not be read, so nothing was changed") {
+			t.Fatalf("%s with a failed read was not refused: %d %+v", attempt.step, response.Code, message)
+		}
+	}
+	var name string
+	var enabled int
+	var deleted sql.NullString
+	if err := f.db.QueryRow("SELECT name,enabled,deleted_at FROM notification_destinations WHERE id=?", id).Scan(&name, &enabled, &deleted); err != nil {
+		t.Fatal(err)
+	}
+	var count int
+	if err := f.db.QueryRow("SELECT COUNT(*) FROM notification_destinations").Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if name != "Primary" || enabled != 1 || deleted.Valid || count != 2 {
+		t.Fatalf("a refused change was applied: name=%q enabled=%d deleted=%v destinations=%d", name, enabled, deleted.Valid, count)
+	}
+	if got := len(f.audit(t)); got != audited || len(f.sender.notices()) != 0 || len(f.adminNotices(t)) != 0 {
+		t.Fatalf("a refused change was audited or announced: %d audit records, %d direct notices", got-audited, len(f.sender.notices()))
 	}
 }

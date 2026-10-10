@@ -300,6 +300,47 @@ func TestLoginRejectsWhenAuthenticationCapacityIsExhausted(t *testing.T) {
 	}
 }
 
+// TestForwardedHeadersReadEveryFieldLine guards R-054: several field lines
+// of X-Forwarded-For or X-Forwarded-Proto form one list, so a line appended
+// by a trusted proxy is not hidden behind a client-supplied first line, and
+// tokenless metrics treat any forwarded line as proxy provenance.
+func TestForwardedHeadersReadEveryFieldLine(t *testing.T) {
+	server, _, _ := testServer(t)
+	server.config.TrustedProxies = []netip.Prefix{netip.MustParsePrefix("192.0.2.0/24")}
+	request := httptest.NewRequest(http.MethodPost, "/login", nil)
+	request.RemoteAddr = "192.0.2.10:1234"
+	request.Header.Add("X-Forwarded-For", "198.51.100.77")
+	request.Header.Add("X-Forwarded-For", "203.0.113.10, 192.0.2.9")
+	if got := server.clientIP(request); got != "203.0.113.10" {
+		t.Fatalf("clientIP across two lines=%q, want the proxy-appended 203.0.113.10", got)
+	}
+
+	for _, values := range [][]string{{"https", "http"}, {"http", "https"}} {
+		request := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+		request.RemoteAddr = "192.0.2.10:1234"
+		for _, value := range values {
+			request.Header.Add("X-Forwarded-Proto", value)
+		}
+		if got, want := server.requestIsHTTPS(request), values[len(values)-1] == "https"; got != want {
+			t.Fatalf("requestIsHTTPS with lines %q=%v, want %v", values, got, want)
+		}
+	}
+
+	server.config.TrustedProxies = nil
+	for _, header := range []string{"X-Forwarded-For", "X-Forwarded-Proto"} {
+		for _, values := range [][]string{{""}, {"", "198.51.100.8"}} {
+			request := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+			request.RemoteAddr = "127.0.0.1:1234"
+			for _, value := range values {
+				request.Header.Add(header, value)
+			}
+			if server.metricsAuthorized(request) {
+				t.Fatalf("tokenless metrics accepted %s lines %q", header, values)
+			}
+		}
+	}
+}
+
 func TestMetricsExposeCollectorHealthWithoutErrorDetails(t *testing.T) {
 	server, st, _ := testServer(t)
 	generation, err := st.SaveSettings(context.Background(), store.Settings{Tailnet: "-", OAuthClientID: "client", OAuthClientSecret: "secret", MattermostURL: "https://mattermost.example/hooks/x", DeviceInterval: time.Minute, InventoryInterval: 5 * time.Minute})

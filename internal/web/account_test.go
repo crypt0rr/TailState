@@ -172,9 +172,10 @@ func TestExistingShortPasswordStillSignsIn(t *testing.T) {
 }
 
 // TestPasswordChangeRequiresCurrentPasswordAndRevokesOtherSessions guards
-// E-023: the authenticated change form needs the current password, applies
-// the policy with a specific message, and signs out every other session
-// while keeping the one that made the change.
+// E-023 and R-052: the authenticated change form needs the current password,
+// applies the policy with a specific message, signs out every other session,
+// and replaces the session that made the change with a fresh one, so its old
+// cookie value stops working.
 func TestPasswordChangeRequiresCurrentPasswordAndRevokesOtherSessions(t *testing.T) {
 	server, _, _, token := accountServer(t, boot.Config{})
 	current := sessionOnly(claimCoverageAdmin(t, server, token))
@@ -204,17 +205,28 @@ func TestPasswordChangeRequiresCurrentPasswordAndRevokesOtherSessions(t *testing
 	if !signedIn(t, server, other) {
 		t.Fatal("a rejected change signed out another session")
 	}
-	if body := post(url.Values{"current_password": {testAdminPassword}, "password": {next}, "confirm": {next}}); !strings.Contains(body, "Password changed") {
+	changed := coveragePost(t, server, "/settings/password", url.Values{"_csrf": {csrfFrom(t, current)}, "current_password": {testAdminPassword}, "password": {next}, "confirm": {next}}, current)
+	if changed.Code != http.StatusSeeOther || changed.Header().Get("Location") != accountSection {
+		t.Fatalf("password change answered %d %q", changed.Code, changed.Header().Get("Location"))
+	}
+	fresh := sessionOnly(changed.Result().Cookies())
+	if len(fresh) != 2 || sessionFrom(t, fresh) == sessionFrom(t, current) {
+		t.Fatalf("password change did not issue a fresh session: %v", fresh)
+	}
+	if body := followFlash(t, server, fresh, changed); !strings.Contains(body, "Password changed") {
 		t.Fatalf("password change failed: %s", body)
 	}
-	if reload := authenticatedGet(t, server, "/settings", current).Body.String(); strings.Contains(reload, "Password changed. Every other session") {
+	if reload := authenticatedGet(t, server, "/settings", fresh).Body.String(); strings.Contains(reload, "Password changed. Every other session") {
 		t.Fatal("the password change message is shown again on reload")
 	}
 	if signedIn(t, server, other) {
 		t.Fatal("changing the password did not revoke the other session")
 	}
-	if !signedIn(t, server, current) {
-		t.Fatal("changing the password signed out the session that made the change")
+	if stale := authenticatedGet(t, server, "/settings", current); stale.Code != http.StatusSeeOther || !strings.HasPrefix(stale.Header().Get("Location"), "/login") {
+		t.Fatalf("the cookie that submitted the change still works: %d %q", stale.Code, stale.Header().Get("Location"))
+	}
+	if !signedIn(t, server, fresh) {
+		t.Fatal("the fresh session issued by the change does not work")
 	}
 	if failed := coveragePost(t, server, "/login", url.Values{"password": {testAdminPassword}}, nil); failed.Code == http.StatusSeeOther {
 		t.Fatal("the old password still signs in")

@@ -21,12 +21,17 @@ type credentialFlow struct {
 	// form, when set, returns the page data that a re-rendered form keeps
 	// (for example the login return path). It runs once, after parsing.
 	form func(*http.Request) pageData
+	// setsPassword marks a form that sets a new password (setup and reset).
+	// Its password policy is checked before the challenge, so a rejected
+	// password never consumes a nonce from the shared replay cache.
+	setsPassword bool
 
 	key  string
 	base pageData
 }
 
-// begin runs the throttle → parse → challenge → hash-slot sequence. When it
+// begin runs the throttle → parse → policy → challenge → hash-slot sequence
+// (the policy step only for forms that set a password). When it
 // returns ok, the caller holds a hashing slot and must call release once the
 // submission is handled; otherwise the response has been written.
 func (f *credentialFlow) begin(w http.ResponseWriter, r *http.Request) (release func(), ok bool) {
@@ -43,6 +48,12 @@ func (f *credentialFlow) begin(w http.ResponseWriter, r *http.Request) (release 
 	if f.form != nil {
 		f.base = f.form(r)
 	}
+	if f.setsPassword {
+		if err := secret.CheckPasswordPolicy(r.FormValue("password")); err != nil {
+			f.render(w, r, secret.PasswordPolicyMessage(err))
+			return nil, false
+		}
+	}
 	if !s.validateCredentialChallenge(r, f.action) {
 		f.render(w, r, credentialChallengeError)
 		return nil, false
@@ -56,18 +67,15 @@ func (f *credentialFlow) begin(w http.ResponseWriter, r *http.Request) (release 
 	}
 }
 
-// newPassword validates the password and confirmation fields of a form that
-// sets a password. A mismatch counts as a failed submission, so changing the
-// confirmation cannot bypass the throttle; a policy failure does not, and is
-// checked before any token so a weak password gets a specific explanation
-// that reveals nothing about the token.
+// newPassword checks the confirmation field of a form that sets a password.
+// A mismatch counts as a failed submission, so changing the confirmation
+// cannot bypass the throttle. A policy failure does not count: begin has
+// already rejected it, before the challenge and before any token, so a weak
+// password gets a specific explanation that reveals nothing about the token
+// and spends no challenge.
 func (f *credentialFlow) newPassword(w http.ResponseWriter, r *http.Request) bool {
 	if r.FormValue("password") != r.FormValue("confirm") {
 		f.reject(w, r, "Passwords do not match.")
-		return false
-	}
-	if err := secret.CheckPasswordPolicy(r.FormValue("password")); err != nil {
-		f.render(w, r, secret.PasswordPolicyMessage(err))
 		return false
 	}
 	return true

@@ -40,7 +40,10 @@ func (s *Server) clientIP(r *http.Request) string {
 	if !s.isTrustedProxy(remote) {
 		return remote
 	}
-	forwarded := strings.Split(r.Header.Get("X-Forwarded-For"), ",")
+	// Several X-Forwarded-For lines form one list in order (RFC 9110 section
+	// 5.3); a proxy that appends its own line must not hide it behind a
+	// client-supplied first line.
+	forwarded := strings.Split(strings.Join(r.Header.Values("X-Forwarded-For"), ","), ",")
 	for index := len(forwarded) - 1; index >= 0; index-- {
 		candidate, err := netip.ParseAddr(strings.TrimSpace(forwarded[index]))
 		if err != nil {

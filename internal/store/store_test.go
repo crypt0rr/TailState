@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -179,12 +180,19 @@ func TestResetTokenIsSingleUseAndInvalidatesSessions(t *testing.T) {
 	if !st.ValidateSession(ctx, session, csrf, true) {
 		t.Fatal("session should be valid before reset")
 	}
+	_, apiToken, err := st.CreateAPIToken(ctx, "SIEM", []string{ScopeHistoryRead, ScopeEvidenceRead}, 365*24*time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
 	reset, err := st.NewResetToken(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := st.ResetWithToken(ctx, reset, "new secure password"); err != nil {
-		t.Fatal(err)
+	if revoked, err := st.ResetWithToken(ctx, reset, "new secure password"); err != nil || revoked != 1 {
+		t.Fatalf("reset revoked=%d err=%v", revoked, err)
+	}
+	if _, err := st.AuthenticateAPIToken(ctx, apiToken); !errors.Is(err, ErrAPITokenInvalid) {
+		t.Fatalf("API token survived a password reset: %v", err)
 	}
 	if !st.Authenticate(ctx, "new secure password") || st.Authenticate(ctx, "old secure password") {
 		t.Fatal("password was not replaced correctly")
@@ -192,7 +200,7 @@ func TestResetTokenIsSingleUseAndInvalidatesSessions(t *testing.T) {
 	if st.ValidateSession(ctx, session, csrf, true) {
 		t.Fatal("reset did not invalidate the old session")
 	}
-	if err := st.ResetWithToken(ctx, reset, "another secure password"); err == nil {
+	if _, err := st.ResetWithToken(ctx, reset, "another secure password"); err == nil {
 		t.Fatal("reset token was reusable")
 	}
 }
@@ -241,7 +249,7 @@ func TestAuthTokensExpireAndPasswordResetRevokesOutstandingToken(t *testing.T) {
 	if err := st.ResetPassword(ctx, "another secure password"); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.ResetWithToken(ctx, reset, "third secure password"); err == nil || !strings.Contains(err.Error(), "unavailable") {
+	if _, err := st.ResetWithToken(ctx, reset, "third secure password"); err == nil || !strings.Contains(err.Error(), "unavailable") {
 		t.Fatalf("revoked reset token error=%v", err)
 	}
 	if err := st.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM meta WHERE key='reset_token_hash'").Scan(&count); err != nil {

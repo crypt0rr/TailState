@@ -513,7 +513,7 @@ func TestClosedStoreReturnsOperationalErrors(t *testing.T) {
 	}
 	expectErr("ResetPassword", func() error { return st.ResetPassword(ctx, "a secure password") })
 	expectErr("NewResetToken", func() error { _, err := st.NewResetToken(ctx); return err })
-	expectErr("ResetWithToken", func() error { return st.ResetWithToken(ctx, "token", "a secure password") })
+	expectErr("ResetWithToken", func() error { _, err := st.ResetWithToken(ctx, "token", "a secure password"); return err })
 	if _, _, err := st.CreateSession(ctx); err == nil {
 		t.Fatal("CreateSession unexpectedly succeeded on a closed store")
 	}
@@ -1169,7 +1169,7 @@ func TestAuthenticationTransactionErrorBranches(t *testing.T) {
 		if _, err := st.db.ExecContext(ctx, "DROP TABLE admin"); err != nil {
 			t.Fatal(err)
 		}
-		if err := st.ResetWithToken(ctx, token, "new secure password"); err == nil {
+		if _, err := st.ResetWithToken(ctx, token, "new secure password"); err == nil {
 			t.Fatal("ResetWithToken succeeded without admin")
 		}
 	})
@@ -1184,7 +1184,7 @@ func TestAuthenticationTransactionErrorBranches(t *testing.T) {
 		if _, err := st.db.ExecContext(ctx, "DROP TABLE sessions"); err != nil {
 			t.Fatal(err)
 		}
-		if err := st.ResetWithToken(ctx, token, "new secure password"); err == nil {
+		if _, err := st.ResetWithToken(ctx, token, "new secure password"); err == nil {
 			t.Fatal("ResetWithToken succeeded without sessions")
 		}
 	})
@@ -1199,7 +1199,7 @@ func TestAuthenticationTransactionErrorBranches(t *testing.T) {
 		if _, err := st.db.ExecContext(ctx, `CREATE TRIGGER fail_reset_token_delete BEFORE DELETE ON meta WHEN OLD.key='reset_token_hash' BEGIN SELECT RAISE(ABORT,'reset token delete failed'); END`); err != nil {
 			t.Fatal(err)
 		}
-		if err := st.ResetWithToken(ctx, token, "new secure password"); err == nil {
+		if _, err := st.ResetWithToken(ctx, token, "new secure password"); err == nil {
 			t.Fatal("ResetWithToken ignored the meta delete failure")
 		}
 	})
@@ -1581,7 +1581,7 @@ func TestAuthenticationAndOutboxBoundaryBranches(t *testing.T) {
 		if _, err := st.db.ExecContext(ctx, "DELETE FROM admin WHERE id=1"); err != nil {
 			t.Fatal(err)
 		}
-		if err := st.ResetWithToken(ctx, token, "new secure password"); err == nil || !strings.Contains(err.Error(), "not configured") {
+		if _, err := st.ResetWithToken(ctx, token, "new secure password"); err == nil || !strings.Contains(err.Error(), "not configured") {
 			t.Fatalf("ResetWithToken rows=0 error=%v", err)
 		}
 	})

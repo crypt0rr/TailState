@@ -29,7 +29,7 @@ A standalone binary listening on loopback can be scraped without a token
 (`curl -fsS http://127.0.0.1:8080/metrics`) as long as `127.0.0.1` is not listed
 in `TAILSTATE_TRUSTED_PROXIES`.
 
-When `TAILSTATE_METRICS_TOKEN` is empty, TailState answers only a loopback peer that is not listed in `TAILSTATE_TRUSTED_PROXIES` and sends no `X-Forwarded-For` or `X-Forwarded-Proto` header; everything else receives `401`. TailState cannot tell a loopback forwarder (for example an nginx `proxy_pass` that adds no forwarded headers, or an SSH tunnel) from a local client, so such a forwarder is treated as local: never expose `/metrics` through one without a token. Set that variable for Prometheus or any reverse proxy to require `Authorization: Bearer <token>` from any network location. Do not publish the endpoint without a token through a public reverse proxy.
+When `TAILSTATE_METRICS_TOKEN` is empty, TailState answers only a loopback peer that is not listed in `TAILSTATE_TRUSTED_PROXIES` and sends no `X-Forwarded-For` or `X-Forwarded-Proto` header (not even an empty one); everything else receives `401`. TailState cannot tell a loopback forwarder (for example an nginx `proxy_pass` that adds no forwarded headers, or an SSH tunnel) from a local client, so such a forwarder is treated as local: never expose `/metrics` through one without a token. Set that variable for Prometheus or any reverse proxy to require `Authorization: Bearer <token>` from any network location. Do not publish the endpoint without a token through a public reverse proxy.
 
 ## Metric reference
 

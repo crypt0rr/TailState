@@ -52,13 +52,7 @@ func (s *Server) historyExport(w http.ResponseWriter, r *http.Request) {
 	if _, ok := s.requireAuth(w, r, false); !ok {
 		return
 	}
-	filter := historyFilter(r)
-	// Exports default to the largest pack; a smaller "limit" is honored so a
-	// script can request smaller parts.
-	filter.Limit = 0
-	if limit, err := strconv.Atoi(strings.TrimSpace(r.URL.Query().Get("limit"))); err == nil && limit > 0 {
-		filter.Limit = limit
-	}
+	filter := evidenceExportFilter(r)
 	pack, err := s.store.ExportEvidencePack(r.Context(), filter)
 	if err != nil {
 		if errors.Is(err, store.ErrEvidencePackTooLarge) {
@@ -92,6 +86,18 @@ func (s *Server) historyExport(w http.ResponseWriter, r *http.Request) {
 // historyDateLayout is the format of the History page's from/to date
 // filters (an HTML date input). Dates are whole UTC days; "to" is inclusive.
 const historyDateLayout = "2006-01-02"
+
+// evidenceExportFilter is the History filter for an evidence pack, shared by
+// the History download and the API. Exports default to the largest pack; a
+// smaller positive "limit" is honored so a script can request smaller parts.
+func evidenceExportFilter(r *http.Request) store.HistoryFilter {
+	filter := historyFilter(r)
+	filter.Limit = 0
+	if limit, err := strconv.Atoi(strings.TrimSpace(r.URL.Query().Get("limit"))); err == nil && limit > 0 {
+		filter.Limit = limit
+	}
+	return filter
+}
 
 func historyFilter(r *http.Request) store.HistoryFilter {
 	query := r.URL.Query()

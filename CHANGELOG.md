@@ -13,6 +13,11 @@ rollback requires restoring the backup taken before the upgrade. See
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-10-10
+
+- **Schema:** 17 (unchanged)
+- **Rollback:** image-only rollback to 0.18.2 is safe. Events recorded on 0.19.0 keep the severity they were classified with, and the removal-guard start time kept in `meta` is ignored by 0.18.2.
+
 ### Changed
 - A collector with an established baseline that answers `403` or `404` on two consecutive polls now queues one collector health notification with reason `unsupported` (naming the HTTP status), and one "recovered" notification when it answers again, because changes to it go undetected in between. Previously it was only shown as Unsupported on the status page. Further `403`/`404` answers during the six-hourly rechecks send nothing, and a collector that never had a baseline is still marked unsupported silently (#265).
 - Created resources are classified by their initial state: a user or user invite created with a role other than `member`, and a device that joins with tags or with key expiry disabled, are now high severity like the equivalent later edit, so "high only" destinations receive them. Member users, member invites, and untagged devices with key expiry enabled stay medium (#271).
@@ -229,7 +234,8 @@ Releases before 0.11.16 are described in their
 [GitHub release notes](https://github.com/crypt0rr/TailState/releases); their
 schema versions are listed in [UPGRADING.md](UPGRADING.md#schema-history).
 
-[Unreleased]: https://github.com/crypt0rr/TailState/compare/v0.18.2...HEAD
+[Unreleased]: https://github.com/crypt0rr/TailState/compare/v0.19.0...HEAD
+[0.19.0]: https://github.com/crypt0rr/TailState/compare/v0.18.2...v0.19.0
 [0.18.2]: https://github.com/crypt0rr/TailState/compare/v0.18.1...v0.18.2
 [0.18.1]: https://github.com/crypt0rr/TailState/compare/v0.18.0...v0.18.1
 [0.18.0]: https://github.com/crypt0rr/TailState/compare/v0.17.1...v0.18.0

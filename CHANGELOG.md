@@ -19,10 +19,10 @@ rollback requires restoring the backup taken before the upgrade. See
 - **Rollback:** image-only rollback to 0.19.0 is safe.
 
 ### Changed
-- Update Shoutrrr to v0.22.0 and refresh the Go networking and cryptography dependencies; preserve notification titles for services without a separate title field (#297, #298, #302).
+- Update Shoutrrr to v0.22.0 and refresh the Go networking and cryptography dependencies; preserve notification titles for services without a separate title field and use the context-aware Discord and Matrix send APIs (#297, #298, #302).
 
 ### Maintenance
-- Update staticcheck, govulncheck, and the workflow security linter (#299, #300, #301).
+- Update the Go compiler and container builder to 1.27.3, plus staticcheck, govulncheck, and the workflow security linter (#299, #300, #301, #303).
 
 ## [0.19.0] - 2026-10-10
 

@@ -210,7 +210,7 @@ func (m matrixSender) Send(message string, params *types.Params) []error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), m.timeout)
 	defer cancel()
-	return []error{m.service.SendWithContext(ctx, message, params)}
+	return []error{m.service.SendContext(ctx, message, params)}
 }
 
 // Validate checks that a URL belongs to a service registered by the pinned

@@ -32,9 +32,8 @@ const (
 
 // serviceParams is the per-service allowlist of Shoutrrr config keys
 // TailState passes with a message, derived from the pinned Shoutrrr release
-// (v0.21.3-0.20261007063105-f3d2cba35d35). Shoutrrr fails a send when a
-// parameter is not a config key of the service, so nothing outside this list
-// is ever passed, and
+// (v0.22.0). Shoutrrr ignores undeclared reserved parameters and rejects
+// other unknown keys. Nothing outside this list is passed, and
 // TestServiceParamAllowlistMatchesShoutrrrKeys fails when a dependency update
 // drops or renames a listed key.
 //

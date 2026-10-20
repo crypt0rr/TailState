@@ -1,6 +1,6 @@
 module github.com/crypt0rr/tailstate
 
-go 1.27.2
+go 1.27.3
 
 require (
 	github.com/nicholas-fedor/shoutrrr v0.21.3-0.20261007063105-f3d2cba35d35

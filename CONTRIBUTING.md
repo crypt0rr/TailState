@@ -34,7 +34,7 @@ the CI `lint` job (versions are pinned in `.github/workflows/ci.yml`):
 shellcheck -S warning scripts/*.sh
 docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:1.7.12 -no-color
 docker run --rm -i hadolint/hadolint:v2.15.1 < Dockerfile
-docker run --rm -v "$PWD:/repo" -w /repo ghcr.io/zizmorcore/zizmor:1.30.1 \
+docker run --rm -v "$PWD:/repo" -w /repo ghcr.io/zizmorcore/zizmor:1.31.1 \
   --offline --min-severity low --config .github/zizmor.yml .github/workflows
 docker run --rm --entrypoint promtool -v "$PWD/docs/prometheus:/rules:ro" \
   prom/prometheus:v3.15.0 check rules /rules/alerts.yml

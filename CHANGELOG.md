@@ -13,6 +13,17 @@ rollback requires restoring the backup taken before the upgrade. See
 
 ## [Unreleased]
 
+## [0.19.1] - 2026-10-20
+
+- **Schema:** 17 (unchanged)
+- **Rollback:** image-only rollback to 0.19.0 is safe.
+
+### Changed
+- Update Shoutrrr to v0.22.0 and refresh the Go networking and cryptography dependencies; preserve notification titles for services without a separate title field and use the context-aware Discord and Matrix send APIs (#297, #298, #302).
+
+### Maintenance
+- Update the Go compiler and container builder to 1.27.3, plus staticcheck, govulncheck, and the workflow security linter (#299, #300, #301, #303).
+
 ## [0.19.0] - 2026-10-10
 
 - **Schema:** 17 (unchanged)
@@ -234,7 +245,8 @@ Releases before 0.11.16 are described in their
 [GitHub release notes](https://github.com/crypt0rr/TailState/releases); their
 schema versions are listed in [UPGRADING.md](UPGRADING.md#schema-history).
 
-[Unreleased]: https://github.com/crypt0rr/TailState/compare/v0.19.0...HEAD
+[Unreleased]: https://github.com/crypt0rr/TailState/compare/v0.19.1...HEAD
+[0.19.1]: https://github.com/crypt0rr/TailState/compare/v0.19.0...v0.19.1
 [0.19.0]: https://github.com/crypt0rr/TailState/compare/v0.18.2...v0.19.0
 [0.18.2]: https://github.com/crypt0rr/TailState/compare/v0.18.1...v0.18.2
 [0.18.1]: https://github.com/crypt0rr/TailState/compare/v0.18.0...v0.18.1

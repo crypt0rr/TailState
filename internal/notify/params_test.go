@@ -320,9 +320,8 @@ func TestShoutrrrDefaultTitlesAreReplaced(t *testing.T) {
 }
 
 // TestServicesWithoutTitleKeyReceiveNoParams is R-044's second acceptance
-// criterion. WeCom rejects any parameter it does not know, so passing a
-// title would fail the send; TailState passes none and keeps the title in
-// the body.
+// criterion. WeCom has no title field; TailState passes no parameters and
+// keeps the title in the body, even when Shoutrrr ignores a reserved title.
 func TestServicesWithoutTitleKeyReceiveNoParams(t *testing.T) {
 	message := Context{Tailnet: "example.com"}.Test(testObservedAt)
 	for _, serviceURL := range []string{wecomURL, googleChatURL, "rocketchat://rocketchat.example/token/token2", "mattermost://mattermost.example/hooktoken", "zulip://bot%40example.com:key@zulip.example/?stream=ops"} {
@@ -342,13 +341,18 @@ func TestServicesWithoutTitleKeyReceiveNoParams(t *testing.T) {
 			t.Fatalf("%s did not receive the title in the body: %v", serviceURL, requests)
 		}
 	}
-	// The control: Shoutrrr fails a WeCom send that carries a title.
-	sender, err := shoutrrr.CreateSenderWithOptions(types.SenderOptions{HTTPClient: &http.Client{Transport: &mockProviders{}}, Timeout: time.Second}, wecomURL)
+	// Shoutrrr v0.22.0 ignores reserved parameters absent from a service.
+	// Verify that passing a title still cannot deliver it for WeCom.
+	mock := &mockProviders{}
+	sender, err := shoutrrr.CreateSenderWithOptions(types.SenderOptions{HTTPClient: &http.Client{Transport: mock}, Timeout: time.Second}, wecomURL)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if errs := sender.Send("x", &types.Params{"title": "t"}); errs[0] == nil {
-		t.Fatal("Shoutrrr accepted an unknown WeCom parameter; the allowlist premise changed")
+	if errs := sender.Send("body only", &types.Params{"title": "separate title"}); errs[0] != nil {
+		t.Fatal(errs[0])
+	}
+	if requests := mock.all(); len(requests) != 1 || !strings.Contains(requests[0].body, "body only") || strings.Contains(requests[0].body, "separate title") {
+		t.Fatalf("WeCom reserved title behavior changed: %v", requests)
 	}
 }
 
@@ -391,12 +395,12 @@ func TestTitleParameterRules(t *testing.T) {
 		t.Fatalf("ascii ntfy title encoded: %q", got)
 	}
 	for serviceURL, want := range map[string]bool{
-		telegramURL:                                                   true,
-		telegramURL + "&parsemode=None":                               true,
-		telegramURL + "&parsemode=Markdown":                           true,
-		telegramURL + "&ParseMode=HTML":                               true,
-		discordURL + "?json=yes":                                      false,
-		discordURL + "?json=no":                                       true,
+		telegramURL:                         true,
+		telegramURL + "&parsemode=None":     true,
+		telegramURL + "&parsemode=Markdown": true,
+		telegramURL + "&ParseMode=HTML":     true,
+		discordURL + "?json=yes":            false,
+		discordURL + "?json=no":             true,
 		"smtp://mail.example:25/?from=a@example.com&to=b@example.com": true,
 		"generic+https://hooks.example/x":                             false,
 		"%%invalid":                                                   false,

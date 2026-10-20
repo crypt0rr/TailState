@@ -1,6 +1,7 @@
 package notify
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
@@ -46,13 +47,19 @@ func newDiscordSender(parsed *url.URL, client *http.Client, timeout time.Duratio
 }
 
 func (d discordSender) Send(message string, params *types.Params) []error {
+	ctx, cancel := context.WithTimeout(context.Background(), d.timeout)
+	defer cancel()
 	result := make(chan error, 1)
 	go func() {
 		if d.items {
-			result <- d.service.SendItems(discordItems(message), params)
+			var values types.Params
+			if params != nil {
+				values = *params
+			}
+			result <- d.service.SendItemsContext(ctx, discordItems(message), values)
 			return
 		}
-		result <- d.service.Send(message, params)
+		result <- d.service.SendContext(ctx, message, params)
 	}()
 	select {
 	case err := <-result:

@@ -479,6 +479,101 @@ func TestStorageLimitValidationAndMetricEdges(t *testing.T) {
 	}
 }
 
+// TestBoundedValueCapsEventLimitAtRejectCeiling is the write-ceiling acceptance
+// criterion at the unit level: an event value limit above the reject limit
+// must not store a value between the two limits in full.
+func TestBoundedValueCapsEventLimitAtRejectCeiling(t *testing.T) {
+	oversized := []byte(strings.Repeat("x", 9000))
+	hash := valueHash(oversized)
+	stored := boundedValue(oversized, hash, 1<<20, 8192)
+	if !stored.truncated || !stored.rejected || stored.reason != "hard write limit" || stored.bytes != int64(len(oversized)) {
+		t.Fatalf("value above the reject limit was stored: %+v", stored)
+	}
+	marker, ok := parseTruncationMarker(stored.raw)
+	if !ok || marker.TailState.SHA256 != hash || marker.TailState.Bytes != int64(len(oversized)) || marker.TailState.Limit != 8192 {
+		t.Fatalf("marker=%+v ok=%t", marker, ok)
+	}
+	atCeiling := []byte(strings.Repeat("y", 8192))
+	if stored := boundedValue(atCeiling, valueHash(atCeiling), 1<<20, 8192); stored.truncated || string(stored.raw) != string(atCeiling) {
+		t.Fatalf("value at the reject limit was not stored whole: truncated=%t", stored.truncated)
+	}
+	if stored := boundedValue(oversized, hash, 1<<20, 0); stored.truncated {
+		t.Fatal("a zero reject limit capped the event value limit")
+	}
+	if stored := boundedValue(oversized, hash, 4096, 1<<20); !stored.truncated || stored.rejected || stored.reason != "byte limit" {
+		t.Fatalf("byte limit below the reject limit changed: %+v", stored)
+	}
+}
+
+// TestHardWriteCeilingHoldsWhenEventLimitExceedsIt is the operator guarantee
+// behind the documented hard raw-value write ceiling. A database whose
+// persisted profile sets the event value limit above the reject limit still
+// opens, and a write above the reject limit is replaced by its marker.
+func TestHardWriteCeilingHoldsWhenEventLimitExceedsIt(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "tailstate.db")
+	box, err := secret.NewBox(make([]byte, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err := Open(path, box)
+	if err != nil {
+		t.Fatal(err)
+	}
+	generation, err := st.SaveSettings(ctx, settings())
+	if err != nil {
+		st.Close()
+		t.Fatal(err)
+	}
+	profile := StorageLimits{SnapshotBytes: 4096, EventValueBytes: 1 << 20, HistoryPageBytes: 4096, RejectBytes: 8192, DatabaseBytes: 1 << 30}
+	if err := st.SetStorageLimits(profile); err != nil {
+		st.Close()
+		t.Fatal(err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(path, box)
+	if err != nil {
+		t.Fatalf("database with an event limit above its reject limit did not open: %v", err)
+	}
+	defer reopened.Close()
+	if got := reopened.StorageLimits(); got != profile {
+		t.Fatalf("persisted profile=%#v, want %#v", got, profile)
+	}
+	baseline := []model.Collected{{Collector: "devices", Resources: []model.Resource{{
+		ID: "device-1", Type: "device", Name: "server", Data: map[string]any{"hostname": "small"},
+	}}}}
+	if _, err := testApplyBatch(reopened, ctx, generation, baseline, notify.TextDigest("baseline")); err != nil {
+		t.Fatal(err)
+	}
+	// Above the 8 KiB reject limit, far below the 1 MiB event limit.
+	large := strings.Repeat("secret-free-value-", 600)
+	changed := []model.Collected{{Collector: "devices", Resources: []model.Resource{{
+		ID: "device-1", Type: "device", Name: "server", Data: map[string]any{"hostname": large},
+	}}}}
+	if _, err := testApplyBatch(reopened, ctx, generation, changed, notify.TextDigest("changed")); err != nil {
+		t.Fatal(err)
+	}
+	var stored []byte
+	var bytes int64
+	var truncated int
+	if err := reopened.db.QueryRowContext(ctx, "SELECT after_json,after_bytes,after_truncated FROM events ORDER BY id DESC LIMIT 1").Scan(&stored, &bytes, &truncated); err != nil {
+		t.Fatal(err)
+	}
+	marker, ok := parseTruncationMarker(stored)
+	if truncated != 1 || !ok || marker.TailState.Reason != "hard write limit" || marker.TailState.Limit != profile.RejectBytes || bytes <= profile.RejectBytes {
+		t.Fatalf("event above the reject limit was stored whole: truncated=%d bytes=%d marker=%+v ok=%t", truncated, bytes, marker, ok)
+	}
+	metrics, err := reopened.StorageMetrics(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if metrics.OversizedWritesRejected == 0 {
+		t.Fatalf("oversized write was not counted: %#v", metrics)
+	}
+}
+
 func TestStorageMetricsExposePhysicalSQLiteUsage(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "tailstate.db")

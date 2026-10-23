@@ -219,7 +219,10 @@ every message type and format.
 - **Plain text:** values are shown as they are.
 - **HTML e-mail and Markdown ntfy:** an `smtp` URL with `usehtml=yes` puts
   the body into the e-mail's HTML part, so that rendering is HTML-escaped
-  (whatever the destination's format) and its lines end in `<br>`. Shoutrrr
+  (whatever the destination's format) and its lines end in `<br>`. The
+  `<br>` bytes are added after the digest is fitted to its budget, so such an
+  e-mail can be up to four bytes per line longer than the budget; e-mail has
+  no provider size limit, and the fitted digest is sent as it is. Shoutrrr
   writes the same body into the plain-text alternative, which therefore
   shows the escaped HTML in a mail client that cannot display HTML. An
   `ntfy` URL with `markdown=yes` always receives the Markdown rendering

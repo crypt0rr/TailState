@@ -140,8 +140,20 @@ type storedValue struct {
 	reason    string
 }
 
+// effectiveValueLimit is the byte limit that applies to one raw value. The
+// reject limit is a hard ceiling, so it caps an event value limit configured
+// above it. Normalization accepts that combination, so a database that already
+// persisted it still opens; the cap applies to every write.
+func effectiveValueLimit(limit, reject int64) int64 {
+	if reject > 0 && reject < limit {
+		return reject
+	}
+	return limit
+}
+
 func boundedValue(raw []byte, hash string, limit, reject int64) storedValue {
 	value := storedValue{raw: append([]byte(nil), raw...), hash: hash, bytes: int64(len(raw))}
+	limit = effectiveValueLimit(limit, reject)
 	if len(raw) == 0 || int64(len(raw)) <= limit {
 		return value
 	}

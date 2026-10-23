@@ -163,6 +163,10 @@ type Prepared struct {
 	// mapped to the destination's priority, tags, or colour (see
 	// severityParams). It is "" for a legacy row, which gets none.
 	Severity string
+	// fitted is set by PrepareMessage, which has fitted Text and Body to the
+	// destination's budget, so SendPrepared sends them unchanged. A legacy row
+	// and a raw Send are not fitted, and SendPrepared fits them.
+	fitted bool
 }
 
 // Message returns what is sent as the message body: Body when the title is
@@ -255,13 +259,15 @@ func PrepareMessage(message Message, serviceURL, override string) Prepared {
 	fit := func(text string, limit int) string {
 		text = shorten(text, limit)
 		if lineBreaks {
-			// An HTML e-mail collapses line breaks. E-mail has no provider
-			// size limit, so the bytes added after fitting are harmless.
+			// An HTML e-mail collapses line breaks. The bytes the <br> tags
+			// add come after fitting: e-mail has no provider size limit, and a
+			// prepared message is not fitted again (see Prepared.fitted),
+			// because that would drop its context line.
 			text = strings.ReplaceAll(text, "\n", "<br>\n")
 		}
 		return text
 	}
-	prepared := Prepared{Text: fit(rendered, limit), Format: format, Severity: message.Severity}
+	prepared := Prepared{Text: fit(rendered, limit), Format: format, Severity: message.Severity, fitted: true}
 	if message.IsText() || !destination.sendsTitleSeparately() {
 		return prepared
 	}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"regexp"
 	"strings"
 	"testing"
@@ -275,6 +276,39 @@ func TestHTMLEmailAndMarkdownNtfyKeepValuesInert(t *testing.T) {
 		if prepared := PrepareMessage(message, serviceURL, ""); prepared.Format != FormatPlain || prepared.Body != plainBody {
 			t.Fatalf("%s: prepared=%+v", serviceURL, prepared)
 		}
+	}
+}
+
+// TestSMTPHTMLDigestNearBudgetKeepsItsContextLine covers an HTML e-mail digest
+// shortened close to its budget, with values that grow when escaped. Its <br>
+// line breaks are added after fitting, so the context line must still end the
+// sent e-mail, and the e-mail must carry the HTML omission note rather than a
+// Markdown one.
+func TestSMTPHTMLDigestNearBudgetKeepsItsContextLine(t *testing.T) {
+	changes := make([]model.Change, 0, 240)
+	for i := 0; i < 240; i++ {
+		changes = append(changes, model.Change{
+			Kind: "changed", Collector: "devices", ResourceID: fmt.Sprint(i), Name: fmt.Sprintf("edge & <db> %03d's", i),
+			Fields: []model.FieldChange{set("tags", []any{}, []any{fmt.Sprintf(`tag:"%03d" & 'x'`, i)})},
+		})
+	}
+	message := Context{Tailnet: "example.com", PublicURL: "https://tailstate.example"}.Digest(DigestInput{BatchID: 42, ObservedAt: testObservedAt, Changes: changes})
+	server := newSMTPServer(t)
+	serviceURL := "smtp://" + server.listener.Addr().String() + "/?from=tailstate@example.com&to=ops@example.com&encryption=None&usestarttls=No&auth=None&usehtml=yes"
+	const contextLine = "Batch 42 in History: https://tailstate.example/history?batch=42"
+	prepared := PrepareMessage(message, serviceURL, "")
+	if !strings.HasSuffix(prepared.Body, contextLine) || !strings.Contains(prepared.Body, "<i>Shortened for this destination: ") {
+		t.Fatalf("prepared body lost its context line or its note:\n%s", prepared.Body)
+	}
+	if err := New().SendPrepared(context.Background(), serviceURL, prepared); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	sent := server.messages()
+	if len(sent) != 1 {
+		t.Fatalf("messages=%d", len(sent))
+	}
+	if data := sent[0]; !strings.Contains(data, contextLine) || strings.Contains(data, "_Shortened") || !strings.Contains(data, "<i>Shortened for this destination: ") {
+		t.Fatalf("sent e-mail lost its context line or carries a Markdown note:\n%s", data)
 	}
 }
 

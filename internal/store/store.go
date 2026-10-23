@@ -477,11 +477,8 @@ func OpenExisting(path string, box *secret.Box) (*Store, error) {
 	if strings.TrimSpace(path) == "" {
 		return nil, errors.New("database path is required")
 	}
-	if _, err := os.Stat(path); err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil, fmt.Errorf("%w: %s", ErrDatabaseNotFound, path)
-		}
-		return nil, fmt.Errorf("inspect database path: %w", err)
+	if err := requireDatabase(path); err != nil {
+		return nil, err
 	}
 	// mode=rw refuses to create a missing file. journal_mode is omitted: the
 	// serving process already configured WAL, which is persistent. A one-shot
@@ -528,6 +525,44 @@ func OpenExisting(path string, box *secret.Box) (*Store, error) {
 	st := &Store{db: db, databasePath: path, box: box}
 	st.limits.Store(DefaultStorageLimits())
 	return st, nil
+}
+
+// IssueResetToken issues a one-time administrator reset token for the existing
+// database at path and returns it. It is the entry point for admin reset: it
+// works while serve holds the service lock, never creates, migrates, or repairs
+// the database, and writes only the reset token row. It holds the maintenance
+// lock shared, so it fails with ErrMaintenanceBusy while Compact is replacing
+// the file; a token written then would be discarded by the rename, and the
+// printed token would never work.
+func IssueResetToken(ctx context.Context, path string, box *secret.Box) (string, error) {
+	// Check for the database before the lock: taking the lock creates its
+	// file, and a missing database must leave the data directory untouched.
+	if err := requireDatabase(path); err != nil {
+		return "", err
+	}
+	lock, err := LockMaintenanceShared(path)
+	if err != nil {
+		return "", err
+	}
+	defer lock.Release()
+	st, err := OpenExisting(path, box)
+	if err != nil {
+		return "", err
+	}
+	defer st.Close()
+	return st.NewResetToken(ctx)
+}
+
+// requireDatabase returns ErrDatabaseNotFound when no file exists at path. Any
+// other stat failure is reported as-is.
+func requireDatabase(path string) error {
+	if _, err := os.Stat(path); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("%w: %s", ErrDatabaseNotFound, path)
+		}
+		return fmt.Errorf("inspect database path: %w", err)
+	}
+	return nil
 }
 
 // ensurePrivateDatabaseFile creates the database file with owner-only

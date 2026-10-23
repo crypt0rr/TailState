@@ -16,6 +16,9 @@ rollback requires restoring the backup taken before the upgrade. See
 ### Fixed
 - The README build path tags a local build as `tailstate:local` instead of the pinned release image name, and its example image tag now names a released version (#322).
 - History filters that combine, such as event type with resource or resource with severity, list only batches with an event that matches every filter. Previously a page could come back empty with a next cursor of `0`, so "Load older changes" and API `next` links looped on the same page, and the evidence pack for that query failed verification (#310).
+- `admin rekey` now reads and checks the replacement key before it touches the database, and it refuses a missing or older-schema database with an error instead of creating or migrating one and reporting the rotation as successful (#313).
+- `admin reset` and `admin compact` no longer overlap: `admin reset` refuses (exit code `1`) while a compaction is replacing the database, and a compaction refuses while a reset is writing its token, so a printed reset token is never discarded by the replacement (#319).
+- A compaction run as root keeps the owner and group of the database it replaces, so a systemd install's service can still open the database afterwards. `doctor` and the operations guide now say to run admin commands on a systemd install as root with `sudo` (#321).
 
 ### Maintenance
 - Document a sidecar command that removes an online-backup snapshot from the data volume, since the scratch image has no `rm` (#323).

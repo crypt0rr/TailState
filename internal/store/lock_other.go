@@ -16,3 +16,16 @@ func LockService(string) (*ServiceLock, error) { return &ServiceLock{}, nil }
 
 // Release is a no-op.
 func (*ServiceLock) Release() error { return nil }
+
+// MaintenanceLock is a no-op on platforms without flock(2); stop the service
+// and avoid concurrent admin commands there.
+type MaintenanceLock struct{}
+
+// LockMaintenanceShared always succeeds on platforms without flock(2).
+func LockMaintenanceShared(string) (*MaintenanceLock, error) { return &MaintenanceLock{}, nil }
+
+// LockMaintenanceExclusive always succeeds on platforms without flock(2).
+func LockMaintenanceExclusive(string) (*MaintenanceLock, error) { return &MaintenanceLock{}, nil }
+
+// Release is a no-op.
+func (*MaintenanceLock) Release() error { return nil }

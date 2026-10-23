@@ -37,6 +37,13 @@ Like `admin compact`, `admin rekey` takes the service lock on
 because a running service keeps the old key in memory and would seal values it
 saves afterwards under that key.
 
+`admin rekey` never creates or migrates a database. It reads and checks the
+replacement key before it opens anything, then refuses a missing database and
+a database whose schema is older than the running release (exit code `1`), so
+a mistyped data directory cannot produce an empty database with a fresh key.
+For an older schema, start the current release once to migrate the database
+(after a verified backup), stop it, and rotate again.
+
 If a notification destination's URL still cannot be decrypted with the current
 key (for example a destination saved by a service that kept running through a
 rotation on a host without `flock(2)`), its notifications are dead-lettered

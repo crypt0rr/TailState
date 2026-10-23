@@ -375,15 +375,23 @@ func openExisting(command string) (*store.Store, error) {
 func adminReset() error {
 	// Reset must work while serve is running and must never create or
 	// migrate a database (a mistyped data directory or a newer image would
-	// otherwise do so silently); it writes only the reset token row.
-	st, err := openExisting("admin reset")
+	// otherwise do so silently). It writes only the reset token row, under the
+	// maintenance lock, so an admin compact cannot replace the file mid-write.
+	config, err := boot.Load(version)
 	if err != nil {
-		return err
+		return fmt.Errorf("admin reset configuration: %w", err)
 	}
-	defer st.Close()
-	token, err := st.NewResetToken(context.Background())
+	key, err := config.MasterKey()
 	if err != nil {
-		return err
+		return fmt.Errorf("admin reset master key: %w", err)
+	}
+	box, err := secret.NewBox(key)
+	if err != nil {
+		return fmt.Errorf("admin reset master key: %w", err)
+	}
+	token, err := store.IssueResetToken(context.Background(), config.DatabasePath(), box)
+	if err != nil {
+		return fmt.Errorf("admin reset: %w", err)
 	}
 	fmt.Printf("Password reset token: %s\nOpen /reset to choose a new administrator password.\n", token)
 	return nil
@@ -398,31 +406,41 @@ func adminRekey(args []string) error {
 	if strings.TrimSpace(*newKeyFile) == "" {
 		return usageError("admin rekey", errors.New("-new-key-file is required"))
 	}
+	// The replacement key is read and checked before the database is touched,
+	// so a mistyped path or malformed key cannot leave anything behind.
+	key, err := boot.ReadMasterKeyFile(*newKeyFile)
+	if err != nil {
+		return fmt.Errorf("admin rekey new key: %w", err)
+	}
+	newBox, err := secret.NewBox(key)
+	if err != nil {
+		return fmt.Errorf("admin rekey new key: %w", err)
+	}
+	config, err := boot.Load(version)
+	if err != nil {
+		return fmt.Errorf("admin rekey configuration: %w", err)
+	}
+	// Rekey only re-encrypts an existing database. Checking for it before the
+	// service lock keeps a missing database from also leaving a lock file.
+	if _, err := os.Stat(config.DatabasePath()); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			err = fmt.Errorf("%w: %s", store.ErrDatabaseNotFound, config.DatabasePath())
+		}
+		return fmt.Errorf("admin rekey database: %w", err)
+	}
 	// A running service keeps the old key in memory and would seal new
 	// values under it after the rotation commits, so rekey refuses to run
 	// while the service holds its lock, like admin compact.
-	config, err := boot.Load(version)
-	if err != nil {
-		return err
-	}
 	lock, err := store.LockService(config.DatabasePath())
 	if err != nil {
 		return err
 	}
 	defer lock.Release()
-	_, st, err := load()
+	st, err := openExisting("admin rekey")
 	if err != nil {
 		return err
 	}
 	defer st.Close()
-	key, err := boot.ReadMasterKeyFile(*newKeyFile)
-	if err != nil {
-		return err
-	}
-	newBox, err := secret.NewBox(key)
-	if err != nil {
-		return err
-	}
 	if err := st.Rekey(context.Background(), newBox); err != nil {
 		return err
 	}

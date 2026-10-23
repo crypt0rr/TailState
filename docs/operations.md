@@ -249,11 +249,23 @@ curl -fsS http://127.0.0.1:8080/healthz
 curl -fsS http://127.0.0.1:8080/readyz
 ```
 
-The service is restarted only after a successful restore. The replacement is
-staged inside the data volume and applied with same-filesystem renames; if a
-rename fails, the script rolls the previous entries back without copying the
-live database. If extraction or replacement still fails, the service remains
-stopped; inspect the pre-restore archive before starting it.
+The service is restarted only after a successful restore. The script then waits
+up to two minutes for the container's Docker health check to report `healthy`.
+The Compose health check first runs 30 seconds after start, so a healthy restore
+takes about that long to report. A service without a Docker health check cannot
+pass this wait. If the service exits, restarts, reports `unhealthy`, or is still
+not healthy at the deadline, the script stops it and exits non-zero with a
+`master key or database mismatch?` hint. The usual cause is an archive taken
+with a different master key, so check that the key file the service mounts is
+the one the archive was taken with. The data volume has already been replaced by
+then: after you fix the key, start the service with `docker compose up -d`, or
+restore the pre-restore archive instead.
+
+The replacement is staged inside the data volume and applied with
+same-filesystem renames; if a rename fails, the script rolls the previous
+entries back without copying the live database. If extraction or replacement
+still fails, the service remains stopped; inspect the pre-restore archive before
+starting it.
 
 After a restore, sign in and verify that the expected History, evidence,
 notification destinations, and monitoring settings are present. Keep the

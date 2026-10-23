@@ -133,6 +133,35 @@ fi
 timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
 pre_restore_name="${archive_name%.tar.gz}-pre-restore-$timestamp.tar.gz"
 pre_restore_path="$archive_dir/$pre_restore_name"
+# Docker's HEALTHCHECK decides whether the restored service is usable. A health
+# result from before the restart must not count, so the status is read only
+# after this run's first probe, which follows one 30-second interval (the image
+# and Compose default) plus its timeout. Until then only a container that stops
+# or restarts fails. A healthy restore therefore takes about 30 seconds.
+restore_health_timeout=120
+restore_health_grace=35
+wait_for_service_health() {
+    local started="$SECONDS" deadline=$((SECONDS + restore_health_timeout)) state health
+    echo "waiting up to ${restore_health_timeout}s for $service to report healthy" >&2
+    while (( SECONDS < deadline )); do
+        state="$(docker inspect --format '{{.State.Status}}' "$container" 2>/dev/null || true)"
+        if [[ "$state" != running ]]; then
+            return 1
+        fi
+        if (( SECONDS - started < restore_health_grace )); then
+            sleep 2
+            continue
+        fi
+        health="$(docker inspect --format '{{with .State.Health}}{{.Status}}{{end}}' "$container" 2>/dev/null || true)"
+        case "$health" in
+            healthy) return 0 ;;
+            starting) sleep 2 ;;
+            *) return 1 ;;
+        esac
+    done
+    return 1
+}
+
 restart() {
     local status=$?
     trap - EXIT
@@ -140,9 +169,20 @@ restart() {
         if ! docker compose start "$service" >/dev/null; then
             echo "restore failed, and $service could not be restarted" >&2
             status=1
+        elif ! wait_for_service_health; then
+            # Stop the instance so a crash-looping service does not keep
+            # restarting against the restored data.
+            docker compose stop "$service" >/dev/null 2>&1 || true
+            echo "restore replaced the data, but $service did not report healthy: master key or database mismatch? Check that the master key file for $service is the key the archive was taken with. Pre-restore backup: $pre_restore_path" >&2
+            status=1
         fi
     elif [[ "$status" -ne 0 ]]; then
         echo "restore failed; $service was left stopped so the data volume can be inspected or recovered from the pre-restore archive" >&2
+    fi
+    # Print the summary only after the restart and health verification, so a
+    # service that does not come up never follows a success line.
+    if [[ "$status" -eq 0 ]]; then
+        printf 'Restored %s into the %s data volume.\nPre-restore backup: %s\n' "$archive" "$service" "$pre_restore_path"
     fi
     exit "$status"
 }
@@ -217,5 +257,3 @@ docker run --rm \
         phase=3
         rm -rf "$restore_dir" "$previous_dir"
     ' -- "$archive_name"
-
-printf 'Restored %s into the %s data volume.\nPre-restore backup: %s\n' "$archive" "$service" "$pre_restore_path"

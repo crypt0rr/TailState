@@ -3,8 +3,9 @@
 # TailState's own notifications cannot report that notification delivery is
 # broken, so these rules use /metrics as the independent safety net. Load the
 # file through `rule_files` in prometheus.yml and adjust the thresholds, `for`
-# durations, and severity labels to your environment. Every expression uses
-# only metric names that TailState exposes; see docs/metrics.md.
+# durations, and severity labels to your environment. Every active expression
+# uses only metric names that TailState exposes; see docs/metrics.md. The
+# commented scrape-down rule at the end uses Prometheus's own `up` series.
 #
 # Validate after editing:
 #   promtool check rules docs/prometheus/alerts.yml
@@ -210,3 +211,23 @@ groups:
             are logged as warnings and are not counted here; a backlog that
             keeps overrunning shows as tailstate_cleanup_remaining at 1 instead.
           runbook_url: https://github.com/crypt0rr/TailState/blob/main/docs/operations.md#retention-cleanup
+
+# Uncomment to alert when Prometheus cannot scrape TailState at all; none of the
+# rules above can fire in that case. Keep the job name in step with the
+# scrape_configs job_name in prometheus.yml.
+#
+#   - name: tailstate-scrape
+#     rules:
+#       - alert: TailStateScrapeDown
+#         expr: 'up{job="tailstate"} == 0'
+#         for: 5m
+#         labels:
+#           severity: critical
+#         annotations:
+#           summary: "Prometheus cannot scrape TailState"
+#           description: >-
+#             Prometheus has failed to scrape TailState for five minutes, so no
+#             TailState alert can fire. Check that the container is running and
+#             that the bearer token in the scrape job matches
+#             TAILSTATE_METRICS_TOKEN.
+#           runbook_url: https://github.com/crypt0rr/TailState/blob/main/docs/metrics.md#alerting

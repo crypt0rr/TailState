@@ -101,5 +101,8 @@ scrape_configs:
       - targets: ["tailstate.example.com"]
 ```
 
-Also alert on the scrape itself (for example `up{job="tailstate"} == 0`),
-because none of these rules fire when Prometheus cannot reach TailState.
+Also alert on the scrape itself, because none of these rules fire when
+Prometheus cannot reach TailState. The rule for that, `up{job="tailstate"} == 0`,
+uses Prometheus's own `up` series rather than a TailState metric, so
+[`alerts.yml`](prometheus/alerts.yml) ships it commented out as
+`TailStateScrapeDown`; uncomment it to enable it.

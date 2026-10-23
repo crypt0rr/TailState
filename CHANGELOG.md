@@ -15,6 +15,7 @@ rollback requires restoring the backup taken before the upgrade. See
 
 ### Fixed
 - The README build path tags a local build as `tailstate:local` instead of the pinned release image name, and its example image tag now names a released version (#322).
+- History filters that combine, such as event type with resource or resource with severity, list only batches with an event that matches every filter. Previously a page could come back empty with a next cursor of `0`, so "Load older changes" and API `next` links looped on the same page, and the evidence pack for that query failed verification (#310).
 
 ### Maintenance
 - Document a sidecar command that removes an online-backup snapshot from the data volume, since the scratch image has no `rm` (#323).

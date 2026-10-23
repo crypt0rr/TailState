@@ -280,6 +280,86 @@ func TestAPIHistoryPagesAreBoundedAndResumable(t *testing.T) {
 	}
 }
 
+// TestAPIHistoryCombinedFiltersTerminateAndVerify guards #310 through the API.
+// With two filters combined, every non-empty "next" link carries a positive
+// cursor, following the links visits each matching batch once and ends, and
+// every evidence part for the same filters verifies. Batch B sits between the
+// two matches and matches only one of the filters.
+func TestAPIHistoryCombinedFiltersTerminateAndVerify(t *testing.T) {
+	f := newAPIFixture(t, 0)
+	token := f.createToken(t, store.ScopeHistoryRead, store.ScopeEvidenceRead)
+	ctx := context.Background()
+	generation, err := f.st.SettingsGeneration(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The fixture's device-1 stays unchanged in every poll, so only alpha and beta move.
+	stable := model.Resource{ID: "device-1", Type: "device", Name: "server", Data: map[string]any{"hostname": "server-0-" + strings.Repeat("x", 600)}}
+	device := func(id, hostname string) model.Resource {
+		return model.Resource{ID: id, Type: "device", Name: id, Data: map[string]any{"hostname": hostname}}
+	}
+	poll := func(resources ...model.Resource) int64 {
+		t.Helper()
+		batch, err := f.st.ApplyBatchWithBatch(ctx, generation, []model.Collected{{Collector: "devices", Resources: append([]model.Resource{stable}, resources...)}}, notify.TextDigest("poll"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return batch.ID
+	}
+	poll(device("alpha", "v1"), device("beta", "v1"))
+	older := poll(device("alpha", "v2"), device("beta", "v1"))
+	poll(device("beta", "v1"))
+	poll(device("beta", "v2"))
+	poll(device("alpha", "v3"), device("beta", "v2"))
+	newer := poll(device("alpha", "v4"), device("beta", "v2"))
+
+	const filters = "event_type=changed&resource=alpha&limit=1"
+	var visited []int64
+	target := "/api/v1/history?" + filters
+	for pages := 1; target != ""; pages++ {
+		if pages > 5 {
+			t.Fatal("combined-filter history did not terminate")
+		}
+		batches, page := parseNDJSON(t, apiGet(f.server, target, token).Body.String())
+		visited = append(visited, batchIDs(batches)...)
+		if page.Next != "" {
+			next, err := url.Parse(page.Next)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cursor, err := strconv.ParseInt(next.Query().Get("cursor"), 10, 64); err != nil || cursor <= 0 {
+				t.Fatalf("next link carries no positive cursor: %q", page.Next)
+			}
+		}
+		target = page.Next
+	}
+	if want := []int64{newer, older}; fmt.Sprint(visited) != fmt.Sprint(want) {
+		t.Fatalf("combined filter visited %v, want %v", visited, want)
+	}
+
+	evidenceTarget := "/api/v1/evidence?" + filters
+	for parts := 1; evidenceTarget != ""; parts++ {
+		if parts > 5 {
+			t.Fatal("combined-filter evidence chain did not terminate")
+		}
+		response := apiGet(f.server, evidenceTarget, token)
+		if response.Code != http.StatusOK {
+			t.Fatalf("evidence part %d: %d %s", parts, response.Code, response.Body.String())
+		}
+		if err := store.VerifyEvidencePack(response.Body.Bytes()); err != nil {
+			t.Fatalf("evidence part %d does not verify: %v", parts, err)
+		}
+		var pack store.EvidencePack
+		if err := json.Unmarshal(response.Body.Bytes(), &pack); err != nil {
+			t.Fatal(err)
+		}
+		evidenceTarget = ""
+		if pack.Truncated {
+			evidenceTarget = "/api/v1/evidence?" + filters + "&cursor=" + strconv.FormatInt(pack.NextCursor, 10)
+		}
+	}
+}
+
 // TestAPIResponsesNeverContainDestinationURLsOrSecrets guards E-030's
 // redaction requirement for every endpoint.
 func TestAPIResponsesNeverContainDestinationURLsOrSecrets(t *testing.T) {

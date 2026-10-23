@@ -106,6 +106,9 @@ func (s *Store) listHistory(ctx context.Context, filter HistoryFilter, byteLimit
 		} else if page.Truncated && len(candidates) > 0 {
 			// Mirror of the descending case: retry the oversized batch.
 			page.PrevCursor = candidates[0].ID - 1
+		} else if hasMoreByCount && len(candidates) > 0 {
+			// Mirror of the descending case: continue above the newest examined batch.
+			page.PrevCursor = candidates[len(candidates)-1].ID
 		}
 		for left, right := 0, len(page.Batches)-1; left < right; left, right = left+1, right-1 {
 			page.Batches[left], page.Batches[right] = page.Batches[right], page.Batches[left]
@@ -130,6 +133,11 @@ func (s *Store) listHistory(ctx context.Context, filter HistoryFilter, byteLimit
 			// filter or increasing the configured budget; the explicit reason makes
 			// that remediation visible instead of silently dropping the batch.
 			page.NextCursor = candidates[0].ID + 1
+		} else if hasMoreByCount && len(candidates) > 0 {
+			// Every examined batch was empty by the time it was loaded, because its
+			// events were removed after selection. Continue below the oldest examined
+			// batch so the next request still advances; a zero cursor would loop.
+			page.NextCursor = candidates[len(candidates)-1].ID
 		}
 		if filter.Cursor > 0 {
 			newest := filter.Cursor - 1
@@ -167,21 +175,39 @@ func historyBatchConditions(filter HistoryFilter) ([]string, []any) {
 		where = append(where, "b.observed_at < ?")
 		args = append(args, observationBound(filter.Until))
 	}
+	// The event terms share one EXISTS so that a batch qualifies only when a
+	// single event satisfies every filter, which is what loadHistoryBatch loads.
+	// Separate EXISTS clauses would let different events match different
+	// filters, listing a batch that has nothing to show.
+	if terms, termArgs := historyEventTerms(filter, "e."); len(terms) > 0 {
+		where = append(where, "EXISTS (SELECT 1 FROM events e WHERE e.batch_id=b.id AND "+strings.Join(terms, " AND ")+")")
+		args = append(args, termArgs...)
+	}
+	return where, args
+}
+
+// historyEventTerms returns the event-level filter terms. Batch selection, the
+// byte estimate, and the loaded events all use these terms so they agree on
+// which events a filter selects. prefix qualifies the columns: "e." inside the
+// batch EXISTS subquery and "" against the events table.
+func historyEventTerms(filter HistoryFilter, prefix string) ([]string, []any) {
+	var where []string
+	var args []any
 	if filter.Collector != "" {
-		where = append(where, "EXISTS (SELECT 1 FROM events e WHERE e.batch_id=b.id AND e.collector=?)")
+		where = append(where, prefix+"collector=?")
 		args = append(args, filter.Collector)
 	}
 	if filter.EventType != "" {
-		where = append(where, "EXISTS (SELECT 1 FROM events e WHERE e.batch_id=b.id AND e.event_type=?)")
+		where = append(where, prefix+"event_type=?")
 		args = append(args, filter.EventType)
 	}
 	if filter.ResourceID != "" {
-		where = append(where, "EXISTS (SELECT 1 FROM events e WHERE e.batch_id=b.id AND (e.resource_id LIKE ? ESCAPE '\\' OR e.name LIKE ? ESCAPE '\\'))")
+		where = append(where, "("+prefix+"resource_id LIKE ? ESCAPE '\\' OR "+prefix+"name LIKE ? ESCAPE '\\')")
 		term := "%" + escapeLike(filter.ResourceID) + "%"
 		args = append(args, term, term)
 	}
 	if filter.Severity != "" {
-		where = append(where, "EXISTS (SELECT 1 FROM events e WHERE e.batch_id=b.id AND e.severity=?)")
+		where = append(where, prefix+"severity=?")
 		args = append(args, filter.Severity)
 	}
 	return where, args
@@ -211,23 +237,9 @@ func (s *Store) historyHasBatch(ctx context.Context, filter HistoryFilter, newer
 func (s *Store) historyBatchByteEstimate(ctx context.Context, batchID int64, filter HistoryFilter, includeLedgerPayload bool) (int64, error) {
 	eventWhere := []string{"batch_id=?"}
 	eventArgs := []any{batchID}
-	if filter.Collector != "" {
-		eventWhere = append(eventWhere, "collector=?")
-		eventArgs = append(eventArgs, filter.Collector)
-	}
-	if filter.EventType != "" {
-		eventWhere = append(eventWhere, "event_type=?")
-		eventArgs = append(eventArgs, filter.EventType)
-	}
-	if filter.ResourceID != "" {
-		eventWhere = append(eventWhere, "(resource_id LIKE ? ESCAPE '\\' OR name LIKE ? ESCAPE '\\')")
-		term := "%" + escapeLike(filter.ResourceID) + "%"
-		eventArgs = append(eventArgs, term, term)
-	}
-	if filter.Severity != "" {
-		eventWhere = append(eventWhere, "severity=?")
-		eventArgs = append(eventArgs, filter.Severity)
-	}
+	terms, termArgs := historyEventTerms(filter, "")
+	eventWhere = append(eventWhere, terms...)
+	eventArgs = append(eventArgs, termArgs...)
 	var eventBytes int64
 	if err := s.readDB().QueryRowContext(ctx, `SELECT COALESCE(SUM(
 		length(COALESCE(changes_json,'')) + length(COALESCE(before_json,'')) + length(COALESCE(after_json,'')) +
@@ -299,23 +311,9 @@ func (s *Store) loadHistoryBatch(ctx context.Context, batch HistoryBatch, filter
 	}
 	eventWhere := []string{"batch_id=?"}
 	eventArgs := []any{batch.ID}
-	if filter.Collector != "" {
-		eventWhere = append(eventWhere, "collector=?")
-		eventArgs = append(eventArgs, filter.Collector)
-	}
-	if filter.EventType != "" {
-		eventWhere = append(eventWhere, "event_type=?")
-		eventArgs = append(eventArgs, filter.EventType)
-	}
-	if filter.ResourceID != "" {
-		eventWhere = append(eventWhere, "(resource_id LIKE ? ESCAPE '\\' OR name LIKE ? ESCAPE '\\')")
-		term := "%" + escapeLike(filter.ResourceID) + "%"
-		eventArgs = append(eventArgs, term, term)
-	}
-	if filter.Severity != "" {
-		eventWhere = append(eventWhere, "severity=?")
-		eventArgs = append(eventArgs, filter.Severity)
-	}
+	terms, termArgs := historyEventTerms(filter, "")
+	eventWhere = append(eventWhere, terms...)
+	eventArgs = append(eventArgs, termArgs...)
 	rows, err := s.readDB().QueryContext(ctx, `SELECT id,batch_id,generation,observed_at,collector,event_type,resource_id,name,changes_json,before_json,after_json,before_hash,after_hash,before_bytes,after_bytes,before_truncated,after_truncated,severity,muted,attribution
 		FROM events WHERE `+strings.Join(eventWhere, " AND ")+` ORDER BY id`, eventArgs...)
 	if err != nil {

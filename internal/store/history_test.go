@@ -345,6 +345,62 @@ func TestHistoryResourceFilterTreatsWildcardsLiterally(t *testing.T) {
 	}
 }
 
+// TestHistoryCombinedFiltersTerminateAndVerify guards #310. Batch B removes
+// alpha (matching the resource filter) and changes beta (matching the type
+// filter), but no single event in it is a change to alpha. A listed batch must
+// hold an event that satisfies every filter at once, so the page never comes
+// back empty with a next cursor of zero, and the evidence pack for the same
+// query verifies.
+func TestHistoryCombinedFiltersTerminateAndVerify(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	generation, err := st.SaveSettings(ctx, settings())
+	if err != nil {
+		t.Fatal(err)
+	}
+	device := func(id, hostname string) model.Resource {
+		return model.Resource{ID: id, Type: "device", Name: id, Data: map[string]any{"hostname": hostname}}
+	}
+	apply := func(digest string, resources ...model.Resource) ChangeBatchResult {
+		t.Helper()
+		batch, err := st.ApplyBatchWithBatch(ctx, generation, []model.Collected{{Collector: "devices", Resources: resources}}, notify.TextDigest(digest))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return batch
+	}
+	apply("baseline", device("alpha", "alpha"), device("beta", "beta"))
+	batchA := apply("alpha changed", device("alpha", "alpha-new"), device("beta", "beta"))
+	// A resource is removed only after two consecutive polls without it.
+	apply("alpha missing", device("beta", "beta"))
+	batchB := apply("alpha removed, beta changed", device("beta", "beta-new"))
+	if batchA.ID == 0 || batchB.ID == 0 || len(batchB.Changes) != 2 {
+		t.Fatalf("fixture did not record the two batches: A=%#v B=%#v", batchA, batchB)
+	}
+	filter := HistoryFilter{EventType: "changed", ResourceID: "alpha", Limit: 1}
+	page, err := st.ListHistory(ctx, filter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Batches) != 1 || page.Batches[0].ID != batchA.ID || len(page.Batches[0].Events) != 1 || page.HasNext || page.NextCursor != 0 {
+		t.Fatalf("combined filter page did not end at batch A: %#v", page)
+	}
+	encoded, err := st.ExportEvidencePack(ctx, filter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := VerifyEvidencePack(encoded); err != nil {
+		t.Fatalf("combined filter evidence pack did not verify: %v", err)
+	}
+	var pack EvidencePack
+	if err := json.Unmarshal(encoded, &pack); err != nil {
+		t.Fatal(err)
+	}
+	if pack.Truncated || len(pack.Batches) != 1 || pack.Batches[0].ID != batchA.ID {
+		t.Fatalf("combined filter pack should hold only batch A: %#v", pack)
+	}
+}
+
 func TestHistoryCorrelatesCoalescedWebhookTriggers(t *testing.T) {
 	ctx := context.Background()
 	st := testStore(t)

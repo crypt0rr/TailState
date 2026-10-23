@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/crypt0rr/tailstate/internal/diagnostics"
 	"github.com/crypt0rr/tailstate/internal/monitor"
@@ -62,6 +63,8 @@ func metricValue(b *bytes.Buffer, name, kind, help string, value any) {
 }
 
 func (s *Server) writeMetrics(b *bytes.Buffer, status store.Status, storage store.StorageMetrics, limits store.StorageLimits) {
+	// One reading time for every queue age, so the ages in a scrape agree.
+	now := time.Now()
 	metricValue(b, "tailstate_ready", "gauge", "Whether setup and baseline are complete.", boolMetric(status.Configured && status.BaselineReady))
 	metricValue(b, "tailstate_baseline_degraded", "gauge", "Whether the baseline is ready but one or more collectors are degraded.", boolMetric(status.BaselineDegraded))
 	dueErrors := uint64(0)
@@ -82,6 +85,10 @@ func (s *Server) writeMetrics(b *bytes.Buffer, status store.Status, storage stor
 	metricValue(b, "tailstate_outbox_pending", "gauge", "Notifications waiting for delivery.", status.Pending)
 	metricValue(b, "tailstate_outbox_processing", "gauge", "Notifications currently leased for delivery.", status.Processing)
 	metricValue(b, "tailstate_outbox_dead", "gauge", "Notifications that exhausted their delivery window.", status.Dead)
+	metricFamily(b, "tailstate_outbox_oldest_pending_age_seconds", "gauge", "Age of the oldest pending notification for each notification destination, labelled by its numeric ID; 0 when none is pending.")
+	for _, lag := range status.OutboxOldestPending {
+		fmt.Fprintf(b, "tailstate_outbox_oldest_pending_age_seconds{destination=\"%d\"} %.3f\n", lag.DestinationID, queueAgeSeconds(now, lag.Enqueued))
+	}
 	if s.engine != nil {
 		delivery := s.engine.DeliveryMetrics()
 		metricValue(b, "tailstate_outbox_delivery_attempts_total", "counter", "Notification delivery attempts.", delivery.Attempts)
@@ -101,6 +108,7 @@ func (s *Server) writeMetrics(b *bytes.Buffer, status store.Status, storage stor
 		metricValue(b, "tailstate_cleanup_remaining", "gauge", "Whether the last cleanup run left work for a further pass.", boolMetric(cleanup.Remaining))
 		metricValue(b, "tailstate_cleanup_remaining_passes_total", "counter", "Cleanup runs that left work for a further pass.", cleanup.RemainingPasses)
 		metricValue(b, "tailstate_cleanup_transactions_total", "counter", "Cleanup transactions committed.", cleanup.Transactions)
+		metricValue(b, "tailstate_cleanup_last_success_timestamp_seconds", "gauge", "Unix time of the last retention pass that finished without error in this process; 0 until one does.", unixSeconds(s.store.LastCleanupSuccess()))
 		metricFamily(b, "tailstate_cleanup_duration_seconds", "summary", "Retention cleanup run duration.")
 		fmt.Fprintf(b, "tailstate_cleanup_duration_seconds_sum %.6f\ntailstate_cleanup_duration_seconds_count %d\n", cleanup.DurationSeconds, cleanup.Runs)
 		metricFamily(b, "tailstate_cleanup_rows_total", "counter", "Rows removed or dead-lettered by retention cleanup, by table.")
@@ -162,6 +170,7 @@ func (s *Server) writeMetrics(b *bytes.Buffer, status store.Status, storage stor
 	metricValue(b, "tailstate_webhook_triggers_pending", "gauge", "Verified webhook deliveries waiting for reconciliation.", status.WebhookPending)
 	metricValue(b, "tailstate_webhook_triggers_processing", "gauge", "Verified webhook deliveries currently being reconciled.", status.WebhookProcessing)
 	metricValue(b, "tailstate_webhook_triggers_dead", "gauge", "Verified webhook deliveries that exhausted their retry window.", status.WebhookDead)
+	metricValue(b, "tailstate_webhook_trigger_oldest_pending_age_seconds", "gauge", "Age of the oldest verified webhook delivery still waiting for reconciliation; 0 when none is pending.", queueAgeSeconds(now, status.WebhookOldestPending))
 	metricFamily(b, "tailstate_webhook_requests_total", "counter", "Tailscale webhook requests by outcome; content_fallback is an authentic delivery outside TailState's bounds that requested a full reconciliation.")
 	for _, outcome := range webhookOutcomes {
 		fmt.Fprintf(b, "tailstate_webhook_requests_total{outcome=%q} %d\n", outcome, s.webhookOutcomeCount(outcome))
@@ -253,4 +262,22 @@ func boolMetric(value bool) int {
 		return 1
 	}
 	return 0
+}
+
+// queueAgeSeconds returns how long an item enqueued at since has waited, or 0
+// when nothing is pending (since is the zero time). A reading clock that is
+// behind the stored time reports 0 rather than a negative age.
+func queueAgeSeconds(now, since time.Time) float64 {
+	if since.IsZero() {
+		return 0
+	}
+	return max(now.Sub(since).Seconds(), 0)
+}
+
+// unixSeconds returns t as Unix seconds, or 0 for the zero time.
+func unixSeconds(t time.Time) int64 {
+	if t.IsZero() {
+		return 0
+	}
+	return t.Unix()
 }

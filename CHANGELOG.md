@@ -25,6 +25,7 @@ rollback requires restoring the backup taken before the upgrade. See
 - Device-detail refresh stops fanning out when Tailscale rate limits a request (`429`) or refuses it for an auth failure (such as `401`), instead of sending one request per remaining device into the same refusal. The devices that were refused or not reached keep their place at the front of the next poll rather than being recorded as refreshed (#316).
 - An event value limit above the reject limit no longer stores a value between the two limits in full. The reject limit is the hard raw-value write ceiling, so such a value is replaced by its truncation marker; a database that already persisted that profile still opens (#318).
 - An HTML e-mail digest (`smtp` with `usehtml=yes`) shortened near its budget keeps its context line and its HTML omission note. It was fitted a second time after the `<br>` line breaks were added, which dropped the context line for a Markdown note (#320).
+- Retention cleanup no longer stalls when one expired change batch takes longer than its 250 ms transaction budget. An overrun is logged as a warning and no longer fails the pass; an oversized batch gets one retry per pass with the pass budget, and the later retention tables still run in the same pass (#311).
 
 ### Maintenance
 - Document a sidecar command that removes an online-backup snapshot from the data volume, since the scratch image has no `rm` (#323).

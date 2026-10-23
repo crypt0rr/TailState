@@ -204,6 +204,9 @@ groups:
           summary: "TailState retention cleanup is failing"
           description: >-
             Retention passes failed repeatedly in the last hour, so expired
-            history is not being removed and storage keeps growing. Check the
-            cleanup log lines and free disk space.
+            history is not being removed and storage keeps growing. Find the
+            "retention cleanup failed" error lines, which name the failing
+            phase, and free disk space. Transactions that overrun their budget
+            are logged as warnings and are not counted here; a backlog that
+            keeps overrunning shows as tailstate_cleanup_remaining at 1 instead.
           runbook_url: https://github.com/crypt0rr/TailState/blob/main/docs/operations.md#retention-cleanup

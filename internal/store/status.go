@@ -385,7 +385,9 @@ const (
 
 // CleanupOptions controls one resumable retention pass. Zero values select
 // the production budgets; callers may use smaller values in tests or during
-// an operator-driven maintenance pass.
+// an operator-driven maintenance pass. A pass starts a transaction only while
+// a full TransactionBudget remains, so PassBudget should exceed
+// TransactionBudget.
 type CleanupOptions struct {
 	Retention         time.Duration
 	BatchSize         int
@@ -413,12 +415,25 @@ type CleanupStats struct {
 	Duration                  time.Duration
 	Remaining                 bool
 	FailedPhase               string
+	// Overruns lists, in order, each transaction that ran past its budget
+	// while the caller was still live. An overrun does not fail the pass; see
+	// CleanupWithOptions.
+	Overruns []CleanupOverrun
 	// PagesReleased counts free pages returned to the filesystem by
 	// incremental_vacuum (only on databases compacted with auto_vacuum=
 	// INCREMENTAL). WALCheckpointed reports a successful TRUNCATE
 	// checkpoint after a pass that changed rows.
 	PagesReleased   int64
 	WALCheckpointed bool
+}
+
+// CleanupOverrun records one transaction that ran past its budget while the
+// caller's context was still live. Escalated marks the retry of an oversized
+// batch, which runs with the pass budget.
+type CleanupOverrun struct {
+	Phase     string
+	Budget    time.Duration
+	Escalated bool
 }
 
 // TotalRowsChanged returns the total number of rows changed by the pass.
@@ -435,9 +450,14 @@ func (s *Store) Cleanup(ctx context.Context, retention time.Duration) error {
 }
 
 // CleanupWithOptions runs a bounded, resumable retention pass. Every batch is
-// an independent autocommit transaction capped by BatchSize and
-// TransactionBudget. If PassBudget is reached, Remaining is true and a later
-// pass can continue from the same keyset predicates without skipping rows.
+// an independent transaction capped by BatchSize and TransactionBudget. A
+// transaction that runs past its budget is recorded in Overruns and does not
+// fail the pass: its phase is left for a later pass, and the phases after it
+// still run. An oversized batch, one whose oldest candidate alone holds more
+// events than BatchSize, is retried once per pass with the pass budget (see
+// runCleanupPhase). When less than one TransactionBudget remains, the pass
+// ends with Remaining set, and a later pass continues from the same keyset
+// predicates without skipping rows.
 func (s *Store) CleanupWithOptions(ctx context.Context, options CleanupOptions) (stats CleanupStats, err error) {
 	started := time.Now()
 	defer func() { stats.Duration = time.Since(started) }()
@@ -457,16 +477,18 @@ func (s *Store) CleanupWithOptions(ctx context.Context, options CleanupOptions) 
 		options.PassBudget = defaultCleanupPassBudget
 	}
 	deadline := time.Now().Add(options.PassBudget)
-	budget := cleanupBudget{deadline: deadline, transaction: options.TransactionBudget, batchSize: options.BatchSize}
+	budget := cleanupBudget{deadline: deadline, transaction: options.TransactionBudget, escalation: options.PassBudget, batchSize: options.BatchSize}
 	phases := cleanupPhases(&stats, time.Now().UTC(), options.Retention)
 	for _, phase := range phases {
-		phaseDone, phaseErr := s.runCleanupPhase(ctx, &stats, phase, &budget)
+		outcome, phaseErr := s.runCleanupPhase(ctx, &stats, phase, &budget)
 		if phaseErr != nil {
 			stats.FailedPhase = phase.name
 			return stats, phaseErr
 		}
-		if !phaseDone {
+		if outcome != cleanupPhaseDone {
 			stats.Remaining = true
+		}
+		if outcome == cleanupPhaseOutOfBudget {
 			break
 		}
 	}
@@ -614,41 +636,123 @@ type cleanupPhase struct {
 	add   func(int64)
 	// exec, when set, runs one bounded transaction of the phase in place of
 	// executing query as one statement. It records its own counts and
-	// returns the number of rows it changed.
+	// returns the number of rows it changed. query lists candidate batches
+	// oldest first with their event counts, so running it with a limit of one
+	// reports whether the oldest batch is oversized (see escalationDue).
 	exec func(ctx context.Context, db *sql.DB, query string, args []any) (int64, error)
 }
 
+// cleanupBudget is the time one pass may spend. A transaction starts only when
+// a full transaction budget remains before deadline.
 type cleanupBudget struct {
 	deadline    time.Time
 	transaction time.Duration
-	batchSize   int
+	// escalation is the budget of the one escalated retry a pass may spend on
+	// an oversized batch: the pass budget itself.
+	escalation time.Duration
+	// escalated records that the pass has spent its escalated retry.
+	escalated bool
+	batchSize int
 }
 
-func (b cleanupBudget) expired() bool { return !time.Now().Before(b.deadline) }
+// cleanupPhaseOutcome is how far one phase got in a pass. It is meaningful
+// only when runCleanupPhase returns no error.
+type cleanupPhaseOutcome int
 
-func (s *Store) runCleanupPhase(ctx context.Context, stats *CleanupStats, phase cleanupPhase, budget *cleanupBudget) (bool, error) {
+const (
+	// cleanupPhaseDone means the phase found no candidate rows.
+	cleanupPhaseDone cleanupPhaseOutcome = iota
+	// cleanupPhaseDeferred means the phase still has rows because one of its
+	// transactions overran. The pass carries on with the phases after it.
+	cleanupPhaseDeferred
+	// cleanupPhaseOutOfBudget means less than one transaction budget is left
+	// in the pass, so the pass ends with Remaining set.
+	cleanupPhaseOutOfBudget
+)
+
+// runCleanupPhase runs one phase's transactions until the phase has no
+// candidate rows, a transaction overruns, or the pass has no budget left.
+//
+// A transaction that exceeds its budget while ctx is live is an overrun, not a
+// failure. An oversized batch gets one escalated retry per pass (see
+// escalationDue). If that retry also overruns, or the overrun was not an
+// oversized batch, the phase is deferred to a later pass.
+func (s *Store) runCleanupPhase(ctx context.Context, stats *CleanupStats, phase cleanupPhase, budget *cleanupBudget) (cleanupPhaseOutcome, error) {
 	for {
 		if err := ctx.Err(); err != nil {
-			return false, err
+			return cleanupPhaseOutOfBudget, err
 		}
-		if budget.expired() {
-			return false, nil
+		// A transaction is never shortened to the time left in the pass,
+		// because that would turn the pass boundary into a DeadlineExceeded
+		// failure. The pass ends with Remaining set instead.
+		if time.Until(budget.deadline) < budget.transaction {
+			return cleanupPhaseOutOfBudget, nil
 		}
-		transactionBudget := budget.transaction
-		if remaining := time.Until(budget.deadline); remaining < transactionBudget {
-			transactionBudget = remaining
+		changed, err := s.cleanupTransaction(ctx, stats, phase, budget.batchSize, budget.transaction)
+		if err == nil {
+			if changed == 0 {
+				return cleanupPhaseDone, nil
+			}
+			continue
 		}
-		if transactionBudget <= 0 {
-			return false, nil
+		if !isCleanupOverrun(ctx, err) {
+			return cleanupPhaseOutOfBudget, err
 		}
-		changed, err := s.cleanupTransaction(ctx, stats, phase, budget.batchSize, transactionBudget)
+		stats.Overruns = append(stats.Overruns, CleanupOverrun{Phase: phase.name, Budget: budget.transaction})
+		retry, err := s.escalationDue(ctx, phase, budget)
 		if err != nil {
-			return false, err
+			return cleanupPhaseOutOfBudget, err
 		}
-		if changed == 0 {
-			return true, nil
+		if !retry {
+			return cleanupPhaseDeferred, nil
 		}
+		budget.escalated = true
+		started := time.Now()
+		changed, err = s.cleanupTransaction(ctx, stats, phase, budget.batchSize, budget.escalation)
+		// The escalated attempt does not reduce the time left for the phases
+		// after this one, so one oversized batch cannot starve them.
+		budget.deadline = budget.deadline.Add(time.Since(started))
+		if err == nil {
+			if changed == 0 {
+				return cleanupPhaseDone, nil
+			}
+			continue
+		}
+		if !isCleanupOverrun(ctx, err) {
+			return cleanupPhaseOutOfBudget, err
+		}
+		stats.Overruns = append(stats.Overruns, CleanupOverrun{Phase: phase.name, Budget: budget.escalation, Escalated: true})
+		return cleanupPhaseDeferred, nil
 	}
+}
+
+// escalationDue reports whether an overrun may be retried with the pass
+// budget. Only an oversized batch qualifies: the oldest candidate of a batch
+// phase must alone hold more events than one batch may, because only such a
+// batch cannot be made smaller. A pass retries at most once, and only when the
+// pass budget exceeds the transaction budget. The probe reads through the
+// reader pool, so it neither waits for the writer nor counts against a
+// transaction budget.
+func (s *Store) escalationDue(ctx context.Context, phase cleanupPhase, budget *cleanupBudget) (bool, error) {
+	if phase.exec == nil || budget.escalated || budget.escalation <= budget.transaction {
+		return false, nil
+	}
+	args := append(append([]any(nil), phase.args...), 1)
+	var batch, events int64
+	err := s.readDB().QueryRowContext(ctx, phase.query, args...).Scan(&batch, &events)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("cleanup %s: %w", phase.name, err)
+	}
+	return events > int64(budget.batchSize), nil
+}
+
+// isCleanupOverrun reports whether err is a transaction exceeding its own
+// budget, as opposed to the caller being cancelled or a database failure.
+func isCleanupOverrun(ctx context.Context, err error) bool {
+	return ctx.Err() == nil && errors.Is(err, context.DeadlineExceeded)
 }
 
 // cleanupTransaction runs one bounded transaction of a cleanup phase and
@@ -685,7 +789,8 @@ func (s *Store) cleanupTransaction(ctx context.Context, stats *CleanupStats, pha
 // or absent. query lists candidate batches oldest first with their event
 // counts; its last argument is the batch size, which bounds the events one
 // transaction deletes. The oldest batch is always taken, even when it alone
-// holds more events, so a large batch cannot stall retention.
+// holds more events; runCleanupPhase retries such a transaction once per pass
+// with the pass budget, so a large batch cannot stall retention.
 func deleteExpiredBatches(ctx context.Context, db *sql.DB, query string, args []any) (events, batches int64, err error) {
 	limit := int64(args[len(args)-1].(int))
 	tx, err := db.BeginTx(ctx, nil)

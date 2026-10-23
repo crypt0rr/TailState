@@ -758,40 +758,100 @@ func nullableJSON(raw []byte) any {
 	return raw
 }
 
+// CollectorFailure is one collector whose poll failed. Reason is the bounded
+// category shown in its health notice, and Message is the safe error text kept
+// as its last error.
+type CollectorFailure struct {
+	Collector string
+	Reason    string
+	Message   string
+}
+
+// RecordCollectorHealth stores one poll's collector failures and, in the same
+// transaction, queues the grouped "unhealthy" notice for every collector that
+// crosses the failure threshold. A collector is marked notified only in that
+// transaction, as CommitExpiryWarnings commits its warning state with its
+// messages, so the flag and the outbox row commit together or not at all.
+// Nothing is written when the monitoring generation is no longer active.
+func (s *Store) RecordCollectorHealth(ctx context.Context, generation int64, failures []CollectorFailure, messages notify.Context) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	reported, active, err := recordCollectorFailuresTx(ctx, tx, generation, failures)
+	if err != nil || !active {
+		return err
+	}
+	if len(reported) > 0 {
+		now := time.Now()
+		payloadFormat, payload, err := notify.EncodePayload(messages.CollectorsUnhealthy(reported, now))
+		if err != nil {
+			return err
+		}
+		if err := enqueueOutboxTx(ctx, tx, payloadFormat, payload, formatTimestamp(now), 0); err != nil {
+			return err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return storageWriteError(err)
+	}
+	return nil
+}
+
+// recordCollectorFailuresTx stores each failure in tx and returns the
+// collectors that cross the failure threshold with it. It writes nothing and
+// reports false when the monitoring generation is no longer the active one.
+func recordCollectorFailuresTx(ctx context.Context, tx *sql.Tx, generation int64, failures []CollectorFailure) ([]notify.CollectorHealth, bool, error) {
+	var activeGeneration int64
+	if err := tx.QueryRowContext(ctx, "SELECT generation FROM settings WHERE id=1").Scan(&activeGeneration); err != nil {
+		return nil, false, err
+	}
+	if activeGeneration != generation {
+		return nil, false, nil
+	}
+	var reported []notify.CollectorHealth
+	for _, failure := range failures {
+		var count, notified int
+		stateErr := tx.QueryRowContext(ctx, "SELECT failure_count,unhealthy_notified FROM collector_state WHERE generation=? AND collector=?", generation, failure.Collector).Scan(&count, &notified)
+		if stateErr != nil && !errors.Is(stateErr, sql.ErrNoRows) {
+			return nil, false, stateErr
+		}
+		count++
+		if count >= 3 && notified == 0 {
+			notified = 1
+			reported = append(reported, notify.CollectorHealth{Collector: failure.Collector, Reason: failure.Reason})
+		}
+		// A non-unsupported error proves that the endpoint is reachable enough to
+		// classify the collector as supported, even if it is currently unhealthy.
+		// This also lets the UI distinguish a transient failure after an explicit
+		// unsupported response from a still-unsupported collector. Preserve the
+		// existing baseline: failures must not reset drift comparison state.
+		if _, err := tx.ExecContext(ctx, `INSERT INTO collector_state(generation,collector,supported,baseline,last_error,failure_count,unhealthy_notified,partial,partial_error_count) VALUES(?,?,1,0,?,?,?,0,0) ON CONFLICT(generation,collector) DO UPDATE SET supported=1,last_error=excluded.last_error,failure_count=excluded.failure_count,unhealthy_notified=excluded.unhealthy_notified,partial=0,partial_error_count=0`, generation, failure.Collector, failure.Message, count, notified); err != nil {
+			return nil, false, err
+		}
+	}
+	return reported, true, nil
+}
+
+// RecordCollectorFailure stores one failure of a collector and reports whether
+// it is the failure that crosses the threshold. It queues no notice, so the
+// poll does not use it: it records its failures with RecordCollectorHealth,
+// which commits each notice together with its notified flag.
 func (s *Store) RecordCollectorFailure(ctx context.Context, generation int64, collector, message string) (notify bool, recovered bool, err error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return false, false, err
 	}
 	defer tx.Rollback()
-	var activeGeneration int64
-	if err := tx.QueryRowContext(ctx, "SELECT generation FROM settings WHERE id=1").Scan(&activeGeneration); err != nil {
+	reported, active, err := recordCollectorFailuresTx(ctx, tx, generation, []CollectorFailure{{Collector: collector, Message: message}})
+	if err != nil || !active {
 		return false, false, err
 	}
-	if activeGeneration != generation {
-		return false, false, nil
-	}
-	var failures, notified int
-	stateErr := tx.QueryRowContext(ctx, "SELECT failure_count,unhealthy_notified FROM collector_state WHERE generation=? AND collector=?", generation, collector).Scan(&failures, &notified)
-	if stateErr != nil && !errors.Is(stateErr, sql.ErrNoRows) {
-		return false, false, stateErr
-	}
-	failures++
-	notify = failures >= 3 && notified == 0
-	if notify {
-		notified = 1
-	}
-	// A non-unsupported error proves that the endpoint is reachable enough to
-	// classify the collector as supported, even if it is currently unhealthy.
-	// This also lets the UI distinguish a transient failure after an explicit
-	// unsupported response from a still-unsupported collector. Preserve the
-	// existing baseline: failures must not reset drift comparison state.
-	_, err = tx.ExecContext(ctx, `INSERT INTO collector_state(generation,collector,supported,baseline,last_error,failure_count,unhealthy_notified,partial,partial_error_count) VALUES(?,?,1,0,?,?,?,0,0) ON CONFLICT(generation,collector) DO UPDATE SET supported=1,last_error=excluded.last_error,failure_count=excluded.failure_count,unhealthy_notified=excluded.unhealthy_notified,partial=0,partial_error_count=0`, generation, collector, message, failures, notified)
-	if err != nil {
+	if err := tx.Commit(); err != nil {
 		return false, false, err
 	}
-	err = tx.Commit()
-	return
+	return len(reported) > 0, false, nil
 }
 
 // CollectorWasUnhealthyWithError reports the persisted unhealthy notification

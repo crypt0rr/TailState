@@ -70,7 +70,7 @@ func (e *Engine) pollWithOutcomes(ctx context.Context, client *tailscale.Client,
 		partial   bool
 	}
 	measurements := make([]measurement, 0, len(collectors))
-	var unhealthy []notify.CollectorHealth
+	var failures []store.CollectorFailure
 	var recovered []string
 	for _, collector := range collectors {
 		if !force {
@@ -126,13 +126,7 @@ func (e *Engine) pollWithOutcomes(ctx context.Context, client *tailscale.Client,
 			success = false
 			collectorSuccess = false
 			safeError := tailscale.SafeError(err)
-			shouldNotify, _, storeErr := e.store.RecordCollectorFailure(ctx, settings.Generation, collector, safeError)
-			if storeErr != nil {
-				slog.Error("record collector failure", "collector", collector, "error", storeErr)
-			}
-			if shouldNotify {
-				unhealthy = append(unhealthy, notify.CollectorHealth{Collector: collector, Reason: tailscale.FailureCategory(err)})
-			}
+			failures = append(failures, store.CollectorFailure{Collector: collector, Reason: tailscale.FailureCategory(err), Message: safeError})
 			slog.Warn("collector failed", "collector", collector, "error", safeError)
 		} else if wasUnhealthy {
 			recovered = append(recovered, collector)
@@ -144,33 +138,31 @@ func (e *Engine) pollWithOutcomes(ctx context.Context, client *tailscale.Client,
 		results = append(results, result)
 		measurements = append(measurements, measurement{collector: collector, duration: duration, partial: result.Partial})
 	}
-	// Health transitions from one poll are grouped into one message per
-	// direction, so a revoked credential produces one alert instead of one per
-	// collector. Unhealthy transitions decided while applying the batch (a
-	// baselined collector confirmed unsupported, an engaged mass-removal
-	// guard) join the poll's failures, so that message follows the batch.
+	// Failures from one poll are grouped into one "unhealthy" message per
+	// destination, so a revoked credential produces one alert instead of one per
+	// collector. They are stored, and the notice of each collector that crosses
+	// the threshold queued, before the batch is applied: the notified flag and
+	// its notice commit together, and a shutdown during the batch cannot drop it.
 	messages := e.notificationContext(settings)
-	if len(recovered) > 0 {
-		if enqueueErr := e.store.EnqueueMessage(ctx, messages.CollectorsRecovered(recovered, time.Now())); enqueueErr != nil {
-			slog.Error("enqueue collector recovery notification", "collectors", len(recovered), "error", enqueueErr)
-		}
-	}
-	enqueueUnhealthy := func() {
-		if len(unhealthy) == 0 {
-			return
-		}
-		if enqueueErr := e.store.EnqueueMessage(ctx, messages.CollectorsUnhealthy(unhealthy, time.Now())); enqueueErr != nil {
-			slog.Error("enqueue collector health notification", "collectors", len(unhealthy), "error", enqueueErr)
-		}
+	if len(failures) > 0 {
+		e.recordCollectorFailures(ctx, settings.Generation, failures, messages)
 	}
 	if len(polled) == 0 {
-		enqueueUnhealthy()
 		outcome.success = success
 		return outcome
 	}
 	batch, err := e.store.ApplyBatchWithOptions(ctx, settings.Generation, results, messages.Digest, e.batchOptions(ctx, client, settings, polled), triggerIDs...)
-	unhealthy = append(unhealthy, batch.Unhealthy...)
-	enqueueUnhealthy()
+	// A recovery is announced only once its results are stored. A batch that was
+	// not stored, because the settings generation changed, announces nothing.
+	if err == nil && batch.Generation != 0 && len(recovered) > 0 {
+		e.queueHealthNotice(ctx, "recovered", messages.CollectorsRecovered(recovered, time.Now()))
+	}
+	// Unhealthy transitions decided while applying the batch (a baselined
+	// collector confirmed unsupported, an engaged mass-removal guard) are queued
+	// after the batch that committed them, as their own grouped message.
+	if len(batch.Unhealthy) > 0 {
+		e.queueHealthNotice(ctx, "unhealthy", messages.CollectorsUnhealthy(batch.Unhealthy, time.Now()))
+	}
 	if err != nil {
 		slog.Error("apply collected inventory", "error", err)
 		if retryErr := e.store.SetNextPollErr(ctx, settings.Generation, polled, time.Now().Add(collectorRetryInterval)); retryErr != nil {
@@ -228,4 +220,30 @@ func (e *Engine) pollWithOutcomes(ctx context.Context, client *tailscale.Client,
 	e.scheduleCollectorRetries(ctx, settings, retryCollectors)
 	outcome.success = success
 	return outcome
+}
+
+// healthBookkeepingTimeout bounds the health writes made around a poll. They
+// run on a context detached from the poll, so a shutdown that cancels the poll
+// cannot drop a notice whose notified flag is already committed.
+const healthBookkeepingTimeout = 5 * time.Second
+
+// recordCollectorFailures stores a poll's failed collectors and queues the
+// notices of those that cross the failure threshold, in one transaction. A
+// failed write is logged and the poll continues, as for its other writes.
+func (e *Engine) recordCollectorFailures(ctx context.Context, generation int64, failures []store.CollectorFailure, messages notify.Context) {
+	bookkeepingCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), healthBookkeepingTimeout)
+	defer cancel()
+	if err := e.store.RecordCollectorHealth(bookkeepingCtx, generation, failures, messages); err != nil {
+		slog.Error("record collector failures", "collectors", len(failures), "error", err)
+	}
+}
+
+// queueHealthNotice queues a health notice after the batch that decided it has
+// been committed, on a context detached from the poll like recordCollectorFailures.
+func (e *Engine) queueHealthNotice(ctx context.Context, kind string, message notify.Message) {
+	bookkeepingCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), healthBookkeepingTimeout)
+	defer cancel()
+	if err := e.store.EnqueueMessage(bookkeepingCtx, message); err != nil {
+		slog.Error("enqueue collector health notification", "notice", kind, "error", err)
+	}
 }

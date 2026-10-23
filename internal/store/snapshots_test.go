@@ -170,3 +170,90 @@ func TestRaisingSnapshotLimitRewritesTruncatedSnapshot(t *testing.T) {
 		t.Fatalf("snapshot still truncated=%d bytes=%d after raising the limit", truncated, len(stored))
 	}
 }
+
+// outboxRowCount returns the number of queued outbox rows.
+func outboxRowCount(t *testing.T, st *Store) int {
+	t.Helper()
+	var n int
+	if err := st.db.QueryRow("SELECT COUNT(*) FROM outbox").Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+// TestRecordCollectorHealthCommitsNoticeWithFlag checks that a collector is
+// marked notified only together with its unhealthy notice: the third failure
+// queues the notice and sets the flag, and the failures after it queue nothing.
+func TestRecordCollectorHealthCommitsNoticeWithFlag(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	generation, err := st.SaveSettings(ctx, settings())
+	if err != nil {
+		t.Fatal(err)
+	}
+	messages := notify.Context{Label: "lab", Tailnet: "-"}
+	failure := []CollectorFailure{{Collector: "devices", Reason: "upstream 5xx", Message: "temporary failure"}}
+	for attempt := 1; attempt <= 2; attempt++ {
+		if err := st.RecordCollectorHealth(ctx, generation, failure, messages); err != nil {
+			t.Fatal(err)
+		}
+	}
+	before := outboxRowCount(t, st)
+	if err := st.RecordCollectorHealth(ctx, generation, failure, messages); err != nil {
+		t.Fatal(err)
+	}
+	if unhealthy, err := st.CollectorWasUnhealthyWithError(ctx, generation, "devices"); err != nil || !unhealthy {
+		t.Fatalf("third failure did not mark the collector notified: unhealthy=%v err=%v", unhealthy, err)
+	}
+	queued := outboxRowCount(t, st) - before
+	if queued == 0 {
+		t.Fatal("third failure queued no unhealthy notice")
+	}
+	if err := st.RecordCollectorHealth(ctx, generation, failure, messages); err != nil {
+		t.Fatal(err)
+	}
+	if extra := outboxRowCount(t, st) - before - queued; extra != 0 {
+		t.Fatalf("fourth failure queued %d more notices, want none", extra)
+	}
+}
+
+// TestRecordCollectorHealthRollsBackWithNotice checks the other half of the
+// guarantee: when the notice cannot be queued, neither the notified flag nor
+// the failure count is committed, so the next failure crosses the threshold
+// again and queues the notice then.
+func TestRecordCollectorHealthRollsBackWithNotice(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	generation, err := st.SaveSettings(ctx, settings())
+	if err != nil {
+		t.Fatal(err)
+	}
+	messages := notify.Context{Label: "lab", Tailnet: "-"}
+	failure := []CollectorFailure{{Collector: "devices", Reason: "upstream 5xx", Message: "temporary failure"}}
+	for attempt := 1; attempt <= 2; attempt++ {
+		if err := st.RecordCollectorHealth(ctx, generation, failure, messages); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := st.db.Exec("CREATE TRIGGER refuse_outbox BEFORE INSERT ON outbox BEGIN SELECT RAISE(ABORT, 'refused'); END"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.RecordCollectorHealth(ctx, generation, failure, messages); err == nil {
+		t.Fatal("refused notice reported success")
+	}
+	if unhealthy, err := st.CollectorWasUnhealthyWithError(ctx, generation, "devices"); err != nil || unhealthy {
+		t.Fatalf("refused notice left the collector notified: unhealthy=%v err=%v", unhealthy, err)
+	}
+	if _, err := st.db.Exec("DROP TRIGGER refuse_outbox"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.RecordCollectorHealth(ctx, generation, failure, messages); err != nil {
+		t.Fatal(err)
+	}
+	if unhealthy, err := st.CollectorWasUnhealthyWithError(ctx, generation, "devices"); err != nil || !unhealthy {
+		t.Fatalf("retried failure did not mark the collector notified: unhealthy=%v err=%v", unhealthy, err)
+	}
+	if rows := outboxRowCount(t, st); rows == 0 {
+		t.Fatal("retried failure queued no unhealthy notice")
+	}
+}

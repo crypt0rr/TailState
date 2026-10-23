@@ -44,6 +44,12 @@ const EvidencePublicKeyLimitBytes = maxEvidencePublicKeyBytes
 // can be exported within the bounded pack size.
 var ErrEvidencePackTooLarge = errors.New("history evidence pack exceeds the size limit")
 
+// errEvidenceContinuation means a history page reported more batches but none
+// of them could be loaded, because they were removed after selection. The part
+// has no batch to name as its continuation cursor, so the export fails and can
+// be retried.
+var errEvidenceContinuation = errors.New("history evidence export could not name its continuation cursor; retry the export")
+
 // EvidencePack is a redacted, portable representation of explainable drift
 // history. Packs include an Ed25519 signature over the content hash, ledger
 // head, generation timestamp, and signing-key fingerprint. Version 4 adds the
@@ -209,7 +215,9 @@ type evidenceContent struct {
 // NextCursor set to its oldest batch ID. Exporting again with
 // filter.Cursor=NextCursor returns the next part, so the chain covers every
 // matching batch exactly once and each part verifies on its own.
-// ErrEvidencePackTooLarge is returned only when not even one batch fits.
+// ErrEvidencePackTooLarge is returned only when not even one batch fits. A part
+// whose batches were removed during the read is not signed; the export fails
+// and can be retried.
 func (s *Store) ExportEvidencePack(ctx context.Context, filter HistoryFilter) ([]byte, error) {
 	if filter.Limit <= 0 || filter.Limit > maxEvidenceBatches {
 		filter.Limit = maxEvidenceBatches
@@ -259,6 +267,11 @@ func (s *Store) ExportEvidencePack(ctx context.Context, filter HistoryFilter) ([
 		if count < len(batches) {
 			pack.Truncated = true
 			pack.NextCursor = batches[count-1].ID
+		}
+		// The verifier accepts a truncated part only when its last batch is the
+		// continuation cursor. Refuse to sign a part it would reject.
+		if pack.Truncated && (pack.NextCursor <= 0 || len(pack.Batches) == 0 || pack.Batches[len(pack.Batches)-1].ID != pack.NextCursor) {
+			return nil, errEvidenceContinuation
 		}
 		return s.signEvidencePack(pack)
 	}

@@ -262,7 +262,11 @@ func (s *SenderImpl) SendPrepared(ctx context.Context, serviceURL string, messag
 		}
 		return fmt.Errorf("invalid notification URL (%s): %s", RedactURL(serviceURL), sanitize(err.Error(), serviceURL))
 	}
-	body := FitMessage(message.Message(), MessageLimit(serviceURL))
+	// A message PrepareMessage has fitted is sent as it is (see Prepared.fitted).
+	body := message.Message()
+	if !message.fitted {
+		body = FitMessage(body, MessageLimit(serviceURL))
+	}
 	var errs []error
 	if parsed, parseErr := url.Parse(serviceURL); parseErr == nil && parsed.Scheme == slack.Scheme {
 		// Slack is sent natively (see sendSlack); Shoutrrr only validated

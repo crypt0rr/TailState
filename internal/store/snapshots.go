@@ -699,8 +699,9 @@ func (a *batchApply) insertEvent(batchID int64, entry recordedChange, attributio
 	}
 	before := boundedValue(entry.Before.raw, entry.Before.hash, a.limits.EventValueBytes, a.limits.RejectBytes)
 	after := boundedValue(entry.After.raw, entry.After.hash, a.limits.EventValueBytes, a.limits.RejectBytes)
-	a.noteTruncation(entry.Change.Collector, entry.Change.ResourceID, before, a.limits.EventValueBytes, false)
-	a.noteTruncation(entry.Change.Collector, entry.Change.ResourceID, after, a.limits.EventValueBytes, false)
+	limit := effectiveValueLimit(a.limits.EventValueBytes, a.limits.RejectBytes)
+	a.noteTruncation(entry.Change.Collector, entry.Change.ResourceID, before, limit, false)
+	a.noteTruncation(entry.Change.Collector, entry.Change.ResourceID, after, limit, false)
 	_, err = a.tx.ExecContext(a.ctx, `INSERT INTO events(batch_id,generation,observed_at,collector,event_type,resource_id,name,changes_json,before_json,after_json,before_hash,after_hash,before_bytes,after_bytes,before_truncated,after_truncated,severity,muted,attribution) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, batchID, a.generation, a.observedAt, entry.Change.Collector, entry.Change.Kind, entry.Change.ResourceID, entry.Change.Name, fields, nullableJSON(before.raw), nullableJSON(after.raw), before.hash, after.hash, before.bytes, after.bytes, boolInt(before.truncated), boolInt(after.truncated), string(severity), boolInt(muted), storedAttribution)
 	return err
 }

@@ -13,6 +13,11 @@ rollback requires restoring the backup taken before the upgrade. See
 
 ## [Unreleased]
 
+## [0.19.2] - 2026-10-23
+
+- **Schema:** 17 (unchanged)
+- **Rollback:** image-only rollback to 0.19.1 is safe.
+
 ### Fixed
 - Collector-health notifications are committed with their suppression state. The "unhealthy" notice for a collector that crosses the failure threshold is queued in the same transaction that marks it notified, before the poll's results are applied, so a restart or shutdown during that poll no longer drops it. "Recovered" is queued only after the poll's results are stored, so a failed apply no longer sends an early or duplicate "recovered" (#315).
 - The README build path tags a local build as `tailstate:local` instead of the pinned release image name, and its example image tag now names a released version (#322).

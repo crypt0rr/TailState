@@ -19,6 +19,7 @@ rollback requires restoring the backup taken before the upgrade. See
 ### Maintenance
 - Document a sidecar command that removes an online-backup snapshot from the data volume, since the scratch image has no `rm` (#323).
 - Correct the docs and comments on setup-token logging, `--signer-workflow` attestation checks, metrics header permissions, and Matrix login timing, and list setup and reset tokens as never-paste in the bug report template (#324).
+- Pin the BuildKit and binfmt images used by the release and CI image builds by digest, leave GitHub Actions and builder-image digest refreshes for manual merge, and hold Docker digest refreshes for seven days before Renovate proposes them (#307).
 
 ## [0.19.1] - 2026-10-20
 

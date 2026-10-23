@@ -31,6 +31,30 @@
     },
     {
       "customType": "regex",
+      "description": "BuildKit image used by the release and CI buildx builders (setup-buildx-action driver-opts), pinned by digest",
+      "managerFilePatterns": [
+        "/(^|\\/)\\.github\\/workflows\\/[^/]+\\.ya?ml$/"
+      ],
+      "matchStrings": [
+        "image=(?<depName>docker\\.io\\/moby\\/buildkit):(?<currentValue>v[0-9][^@\\s]*)@(?<currentDigest>sha256:[a-f0-9]+)"
+      ],
+      "datasourceTemplate": "docker",
+      "versioningTemplate": "docker"
+    },
+    {
+      "customType": "regex",
+      "description": "binfmt image that setup-qemu-action runs in the release job (its image input), pinned by digest. Only qemu-vX.Y.Z tags are versions, so the build-number aliases are ignored",
+      "managerFilePatterns": [
+        "/(^|\\/)\\.github\\/workflows\\/[^/]+\\.ya?ml$/"
+      ],
+      "matchStrings": [
+        "image: (?<depName>docker\\.io\\/tonistiigi\\/binfmt):(?<currentValue>qemu-v[0-9][^@\\s]*)@(?<currentDigest>sha256:[a-f0-9]+)"
+      ],
+      "datasourceTemplate": "docker",
+      "versioningTemplate": "regex:^qemu-v(?<major>\\d+)\\.(?<minor>\\d+)\\.(?<patch>\\d+)$"
+    },
+    {
+      "customType": "regex",
       "description": "The go.mod go directive and the Dockerfile GO_VERSION argument follow the golang builder image tag, so a Go release updates all three together (scripts/check-go-toolchain.sh rejects a partial update)",
       "managerFilePatterns": [
         "/(^|\\/)go\\.mod$/",
@@ -48,7 +72,7 @@
   "osvVulnerabilityAlerts": true,
   "packageRules": [
     {
-      "description": "Group digest-only refreshes of pinned images and actions into one weekly PR and merge it automatically once required CI checks pass.",
+      "description": "Group digest-only refreshes of pinned images and actions into one weekly PR and merge it automatically once required CI checks pass. A group that contains a GitHub Actions or release-builder digest is not automerged, because Renovate automerges a group only when every upgrade in it is automerge-eligible.",
       "matchUpdateTypes": [
         "digest",
         "pinDigest"
@@ -59,6 +83,41 @@
       ],
       "automerge": true,
       "automergeType": "pr"
+    },
+    {
+      "description": "A GitHub Actions digest refresh means an action tag was re-pointed, so it waits for a reviewer instead of automerging. pinDigest is included so that pinning an action to a SHA is reviewed too.",
+      "matchManagers": [
+        "github-actions"
+      ],
+      "matchUpdateTypes": [
+        "digest",
+        "pinDigest"
+      ],
+      "automerge": false
+    },
+    {
+      "description": "BuildKit and binfmt run in the release job, which holds packages: write and id-token: write, so their digest refreshes wait for a reviewer like the GitHub Actions digests above.",
+      "matchDepNames": [
+        "docker.io/moby/buildkit",
+        "docker.io/tonistiigi/binfmt"
+      ],
+      "matchUpdateTypes": [
+        "digest",
+        "pinDigest"
+      ],
+      "automerge": false
+    },
+    {
+      "description": "Hold Docker digest refreshes until seven days after the tag was last pushed. Renovate reads release timestamps only from Docker Hub; a registry without them (GHCR) stays pending under timestamp-required, so its digest refreshes are not proposed automatically.",
+      "matchDatasources": [
+        "docker"
+      ],
+      "matchUpdateTypes": [
+        "digest",
+        "pinDigest"
+      ],
+      "minimumReleaseAge": "7 days",
+      "minimumReleaseAgeBehaviour": "timestamp-required"
     },
     {
       "description": "Give new Go module releases time to be retracted before they are proposed.",

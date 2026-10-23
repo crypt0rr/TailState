@@ -184,4 +184,33 @@ if ! docker run --rm --network none --volume "$data_source:/data:ro" "$backup_im
     exit 1
 fi
 
+# A backup taken under one master key must not be reported as restored into a
+# service that runs with another key. Start a fresh instance with a different
+# key, restore the original archive, and require a non-zero exit, the mismatch
+# hint, and a stopped service.
+wrong_key_file="$backup_dir/wrong-master-key"
+openssl rand -base64 32 >"$wrong_key_file"
+docker run --rm --user 0 \
+    --volume "$wrong_key_file:/run/secrets/tailstate_master_key" \
+    "$backup_image" \
+    sh -ec 'chown 10001:10001 /run/secrets/tailstate_master_key && chmod 0400 /run/secrets/tailstate_master_key'
+docker compose -f "$compose_file" down -v >/dev/null
+TAILSTATE_MASTER_KEY_FILE="$wrong_key_file" docker compose -f "$compose_file" up -d --no-build >/dev/null
+wait_health "TailState health endpoint did not become ready with the replacement master key"
+mismatch_log="$backup_dir/key-mismatch-restore.log"
+if "$repo_dir/scripts/restore.sh" "$archive" --yes >"$mismatch_log" 2>&1; then
+    cat "$mismatch_log" >&2
+    echo "restore helper reported success for a backup made with a different master key" >&2
+    exit 1
+fi
+if ! grep -Fq 'master key or database mismatch?' "$mismatch_log"; then
+    cat "$mismatch_log" >&2
+    echo "restore helper did not print the master key mismatch hint" >&2
+    exit 1
+fi
+if [[ "$(docker inspect --format '{{.State.Running}}' "$container_name")" != "false" ]]; then
+    echo "failed restore left the service running with a mismatched master key" >&2
+    exit 1
+fi
+
 echo "TailState backup/restore smoke test passed"

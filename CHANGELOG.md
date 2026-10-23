@@ -13,6 +13,9 @@ rollback requires restoring the backup taken before the upgrade. See
 
 ## [Unreleased]
 
+### Added
+- `scripts/restore.sh` no longer reports success when the restored service fails to come up: after `docker compose start` it waits up to two minutes for the container's Docker health check to report `healthy`, and on failure it stops the service, prints a master key or database mismatch hint, and exits non-zero. The container smoke test asserts the same healthy status, and the backup and restore smoke test covers a restore with the wrong master key (#309).
+
 ## [0.19.2] - 2026-10-23
 
 - **Schema:** 17 (unchanged)

@@ -60,6 +60,24 @@ docker run -d \
     --volume "$volume_name:/data" \
     "$image" >/dev/null
 
+# The image HEALTHCHECK is the signal restore.sh waits for after a restore. Its
+# first probe runs one interval after start, so "starting" is expected for about
+# thirty seconds before the container reports healthy.
+wait_for_image_health() {
+    local status=""
+    for _ in $(seq 1 120); do
+        status="$(docker inspect --format '{{with .State.Health}}{{.Status}}{{end}}' "$container_name" 2>/dev/null || true)"
+        case "$status" in
+            healthy) return 0 ;;
+            starting) sleep 1 ;;
+            *) break ;;
+        esac
+    done
+    docker logs "$container_name" >&2 || true
+    echo "TailState container did not report healthy; last Docker health status: ${status:-none}" >&2
+    return 1
+}
+
 for _ in $(seq 1 30); do
     if curl --fail --silent --show-error --max-time 2 "http://127.0.0.1:${port}/healthz" >/dev/null; then
         metrics_status="$(curl --silent --show-error --max-time 2 --output /dev/null --write-out '%{http_code}' "http://127.0.0.1:${port}/metrics")"
@@ -68,6 +86,7 @@ for _ in $(seq 1 30); do
             echo "TailState metrics endpoint unexpectedly returned HTTP ${metrics_status} without a token" >&2
             exit 1
         fi
+        wait_for_image_health || exit 1
         exit 0
     fi
     sleep 1

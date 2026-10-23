@@ -13,6 +13,13 @@ rollback requires restoring the backup taken before the upgrade. See
 
 ## [Unreleased]
 
+### Fixed
+- The README build path tags a local build as `tailstate:local` instead of the pinned release image name, and its example image tag now names a released version (#322).
+
+### Maintenance
+- Document a sidecar command that removes an online-backup snapshot from the data volume, since the scratch image has no `rm` (#323).
+- Correct the docs and comments on setup-token logging, `--signer-workflow` attestation checks, metrics header permissions, and Matrix login timing, and list setup and reset tokens as never-paste in the bug report template (#324).
+
 ## [0.19.1] - 2026-10-20
 
 - **Schema:** 17 (unchanged)

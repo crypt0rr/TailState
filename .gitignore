@@ -8,3 +8,4 @@ backups/
 /tailstate
 coverage.out
 Caddyfile
+metrics.header

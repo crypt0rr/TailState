@@ -15,12 +15,15 @@ in `.env` and recreate the container so it takes effect:
 ```console
 openssl rand -hex 32   # put the output in TAILSTATE_METRICS_TOKEN= in .env
 docker compose up -d
-printf 'Authorization: Bearer %s\n' "$(sed -n 's/^TAILSTATE_METRICS_TOKEN=//p' .env)" > metrics.header
+rm -f metrics.header
+(umask 077 && printf 'Authorization: Bearer %s\n' "$(sed -n 's/^TAILSTATE_METRICS_TOKEN=//p' .env)" > metrics.header)
 curl -fsS -H @metrics.header http://127.0.0.1:8080/metrics
 ```
 
 Reading the header from a file keeps the token out of your shell history and
-the process list. Do not set the token with `export` in the shell that runs
+the process list. The file is created with mode `0600` and is git-ignored, but
+it still holds the token, so keep it out of shared directories and repositories.
+Do not set the token with `export` in the shell that runs
 `docker compose`: Compose prefers shell variables over `.env`. With the HTTPS
 override in `compose.remote.yaml` there is no host port, so scrape through the
 proxy instead, for example `https://tailstate.example.com/metrics`.

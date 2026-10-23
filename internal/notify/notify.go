@@ -175,14 +175,12 @@ type messageSender interface {
 	Send(message string, params *types.Params) []error
 }
 
-// newSender constructs the Shoutrrr sender for one destination. Construction
-// is not always local: Shoutrrr's Matrix service logs in to the homeserver
-// while it is initialised when the URL carries a user and password, and the
-// router only injects a custom HTTP client after initialisation. Matrix is
-// therefore built directly with client in place first, so its login uses
-// TailState's bounded, redirect-rejecting transport like every other request.
-// Discord is also built directly, so its body can be sent as embeds of whole
-// lines (see newDiscordSender).
+// newSender constructs the Shoutrrr sender for one destination. Matrix is
+// built directly with client in place first, so its login, which Shoutrrr's
+// Matrix service runs on the first send rather than while it is initialised,
+// uses TailState's bounded, redirect-rejecting transport like every other
+// request. Discord is also built directly, so its body can be sent as embeds
+// of whole lines (see newDiscordSender).
 func newSender(serviceURL string, client *http.Client, timeout time.Duration) (messageSender, error) {
 	if parsed, err := url.Parse(serviceURL); err == nil && parsed.Scheme == matrix.Scheme {
 		service := &matrix.Service{}
@@ -215,10 +213,8 @@ func (m matrixSender) Send(message string, params *types.Params) []error {
 
 // Validate checks that a URL belongs to a service registered by the pinned
 // Shoutrrr module by constructing its sender. For most services this is a
-// local parse, but a Matrix URL with a user and password logs in to the
-// homeserver during construction, so validating one makes network requests
-// through TailState's bounded transport. Access-token Matrix URLs do not log
-// in.
+// local parse, and so is Matrix's even with a user and password: that login
+// runs on the first send, so validating a Matrix URL makes no network requests.
 func Validate(serviceURL string) error {
 	serviceURL = strings.TrimSpace(serviceURL)
 	if serviceURL == "" {
@@ -239,8 +235,8 @@ func (s *SenderImpl) Send(ctx context.Context, serviceURL, message string) error
 // SendPrepared delivers message to exactly one destination. Shoutrrr's
 // sender is created per call so a failure in one destination cannot affect
 // another. The sender is constructed exactly once per call, and that
-// construction is also the URL validation, so a Matrix password URL logs in
-// once per delivery rather than once for validation and again for sending.
+// construction is also the URL validation. A Matrix password URL logs in once
+// per call, during that call's send.
 //
 // Only allowlisted Shoutrrr parameters are passed (see serviceParams): the
 // title when the destination receives it separately, never overriding a
@@ -257,9 +253,10 @@ func (s *SenderImpl) SendPrepared(ctx context.Context, serviceURL string, messag
 	client := s.clientFor(record)
 	sender, err := newSender(serviceURL, client, s.timeout)
 	if err != nil {
-		// A construction that reached the provider (a Matrix login) is a
-		// delivery outcome: classify it like any other HTTP response so a
-		// rejected password dead-letters and a rate limit honours Retry-After.
+		// A construction that reached the provider is a delivery outcome:
+		// classify it like any other HTTP response so a rejected password
+		// dead-letters and a rate limit honours Retry-After. A Matrix login
+		// happens during the send below and is classified the same way.
 		if status, retryAfter := record.failure(); status != 0 {
 			return &DeliveryError{Status: status, Message: sanitize(err.Error(), serviceURL), RetryAfter: retryAfter, Permanent: permanentDeliveryFailure(err.Error(), status)}
 		}

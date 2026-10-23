@@ -21,7 +21,9 @@ upgrade so you can return to the exact previous state.
    in `.env`) instead of following `latest`, and optionally verify it:
 
    ```console
-   gh attestation verify oci://ghcr.io/crypt0rr/tailstate:<version> --owner crypt0rr
+   gh attestation verify oci://ghcr.io/crypt0rr/tailstate:<version> \
+     --owner crypt0rr \
+     --signer-workflow crypt0rr/TailState/.github/workflows/release.yml
    ```
 
 ## Upgrading

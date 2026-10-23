@@ -6,7 +6,8 @@ body:
     attributes:
       value: |
         Thanks for the report. Please never paste OAuth secrets, master keys,
-        destination URLs, session cookies, or database files.
+        setup or reset tokens, destination URLs, session cookies, or database
+        files.
   - type: input
     id: version
     attributes:
@@ -46,5 +47,5 @@ body:
     id: logs
     attributes:
       label: Relevant log lines
-      description: TailState never logs credentials, but please review before pasting.
+      description: Remove credentials, tokens, and destination URLs first. An unclaimed installation logs its one-time setup token at startup.
       render: text

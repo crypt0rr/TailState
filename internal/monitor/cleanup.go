@@ -47,6 +47,18 @@ type cleanupBackoff struct {
 	failures int
 }
 
+// errCleanupOverrun marks a pass in which a transaction overran its budget.
+// It is scheduled like a failure but is not recorded as one.
+var errCleanupOverrun = errors.New("retention transaction exceeded its budget")
+
+// overran schedules the next pass after a pass that overran a transaction
+// budget. An escalated overrun means a batch needs more than the pass budget,
+// so retrying it every continuation interval would hold the writer for the
+// whole pass budget each second; the backoff spaces those attempts out.
+func (b *cleanupBackoff) overran() time.Duration {
+	return b.next(true, errCleanupOverrun)
+}
+
 func (b *cleanupBackoff) next(remaining bool, err error) time.Duration {
 	if err != nil {
 		b.failures++
@@ -63,35 +75,45 @@ func (b *cleanupBackoff) next(remaining bool, err error) time.Duration {
 	return cleanupPollInterval
 }
 
-func (e *Engine) cleanup(ctx context.Context) {
-	run := func(initial bool) (bool, error) {
-		stats, err := e.store.CleanupWithOptions(ctx, store.CleanupOptions{Retention: 30 * 24 * time.Hour})
-		e.recordCleanup(stats, err)
-		if err != nil {
-			if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
-				if initial {
-					slog.Error("initial retention cleanup failed", "phase", stats.FailedPhase, "error", err)
-				} else {
-					slog.Error("retention cleanup failed", "phase", stats.FailedPhase, "error", err)
-				}
-			}
-			// A transient lock or I/O error is retried soon, with backoff for
-			// consecutive failures (see cleanupBackoff).
-			return stats.Remaining, err
-		}
-		slog.Info("retention cleanup completed", "duration_ms", stats.Duration.Milliseconds(), "transactions", stats.Transactions, "sessions_deleted", stats.SessionsDeleted, "auth_tokens_deleted", stats.AuthTokensDeleted, "meta_deleted", stats.MetaDeleted, "outbox_dead_lettered", stats.OutboxDeadLettered, "webhook_dead_lettered", stats.WebhookDeadLettered, "events_deleted", stats.EventsDeleted, "event_batches_deleted", stats.EventBatchesDeleted, "event_batch_triggers_deleted", stats.EventBatchTriggersDeleted, "webhook_triggers_deleted", stats.WebhookTriggersDeleted, "delivered_outbox_deleted", stats.DeliveredOutboxDeleted, "dead_outbox_deleted", stats.DeadOutboxDeleted, "admin_audit_deleted", stats.AdminAuditDeleted, "api_tokens_deleted", stats.APITokensDeleted, "remaining", stats.Remaining, "pages_released", stats.PagesReleased, "wal_checkpointed", stats.WALCheckpointed)
-		return stats.Remaining, nil
+// cleanupPass runs one retention pass, logs what happened, and returns the
+// delay before the next pass. Each transaction that overran its budget is
+// logged as a warning, even when the pass itself succeeded.
+func (e *Engine) cleanupPass(ctx context.Context, options store.CleanupOptions, backoff *cleanupBackoff, initial bool) time.Duration {
+	stats, err := e.store.CleanupWithOptions(ctx, options)
+	e.recordCleanup(stats, err)
+	for _, overrun := range stats.Overruns {
+		slog.Warn("retention cleanup transaction exceeded its budget", "phase", overrun.Phase, "budget_ms", overrun.Budget.Milliseconds(), "escalated", overrun.Escalated)
 	}
+	if err != nil {
+		if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
+			if initial {
+				slog.Error("initial retention cleanup failed", "phase", stats.FailedPhase, "error", err)
+			} else {
+				slog.Error("retention cleanup failed", "phase", stats.FailedPhase, "error", err)
+			}
+		}
+		// A transient lock or I/O error is retried soon, with backoff for
+		// consecutive failures (see cleanupBackoff).
+		return backoff.next(stats.Remaining, err)
+	}
+	slog.Info("retention cleanup completed", "duration_ms", stats.Duration.Milliseconds(), "transactions", stats.Transactions, "sessions_deleted", stats.SessionsDeleted, "auth_tokens_deleted", stats.AuthTokensDeleted, "meta_deleted", stats.MetaDeleted, "outbox_dead_lettered", stats.OutboxDeadLettered, "webhook_dead_lettered", stats.WebhookDeadLettered, "events_deleted", stats.EventsDeleted, "event_batches_deleted", stats.EventBatchesDeleted, "event_batch_triggers_deleted", stats.EventBatchTriggersDeleted, "webhook_triggers_deleted", stats.WebhookTriggersDeleted, "delivered_outbox_deleted", stats.DeliveredOutboxDeleted, "dead_outbox_deleted", stats.DeadOutboxDeleted, "admin_audit_deleted", stats.AdminAuditDeleted, "api_tokens_deleted", stats.APITokensDeleted, "remaining", stats.Remaining, "pages_released", stats.PagesReleased, "wal_checkpointed", stats.WALCheckpointed)
+	if len(stats.Overruns) > 0 {
+		return backoff.overran()
+	}
+	return backoff.next(stats.Remaining, nil)
+}
 
+func (e *Engine) cleanup(ctx context.Context) {
 	var backoff cleanupBackoff
-	timer := time.NewTimer(backoff.next(run(true)))
+	options := store.CleanupOptions{Retention: 30 * 24 * time.Hour}
+	timer := time.NewTimer(e.cleanupPass(ctx, options, &backoff, true))
 	defer timer.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-timer.C:
-			timer.Reset(backoff.next(run(false)))
+			timer.Reset(e.cleanupPass(ctx, options, &backoff, false))
 		}
 	}
 }

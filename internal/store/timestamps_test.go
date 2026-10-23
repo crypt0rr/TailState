@@ -203,7 +203,10 @@ func TestSubSecondLeaseExpiryAndScheduleComparisons(t *testing.T) {
 		}
 	}
 	var stats CleanupStats
-	budget := cleanupBudget{deadline: time.Now().Add(time.Minute), transaction: time.Minute, batchSize: 64}
+	// The pass budget must exceed the transaction budget (see CleanupOptions):
+	// a transaction starts only while a full transaction budget remains, so a
+	// deadline exactly one transaction away would start no transaction at all.
+	budget := cleanupBudget{deadline: time.Now().Add(2 * time.Minute), transaction: time.Minute, batchSize: 64}
 	for _, phase := range cleanupPhases(&stats, now, 30*24*time.Hour)[:2] {
 		if _, err := st.runCleanupPhase(ctx, &stats, phase, &budget); err != nil {
 			t.Fatal(err)
@@ -466,7 +469,10 @@ func TestObservationRetentionHandlesLegacyAndCurrentForms(t *testing.T) {
 		}
 	}
 	var stats CleanupStats
-	budget := cleanupBudget{deadline: time.Now().Add(time.Minute), transaction: time.Minute, batchSize: 64}
+	// The pass budget must exceed the transaction budget (see CleanupOptions):
+	// a transaction starts only while a full transaction budget remains, so a
+	// deadline exactly one transaction away would start no transaction at all.
+	budget := cleanupBudget{deadline: time.Now().Add(2 * time.Minute), transaction: time.Minute, batchSize: 64}
 	for _, phase := range cleanupPhases(&stats, now, retention) {
 		if phase.name != "events" {
 			continue

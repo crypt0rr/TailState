@@ -18,7 +18,7 @@ func TestCleanupWithOptionsBatchesAndResumes(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	stats, err := st.CleanupWithOptions(ctx, CleanupOptions{Retention: 24 * time.Hour, BatchSize: 7, PassBudget: time.Second})
+	stats, err := st.CleanupWithOptions(ctx, CleanupOptions{Retention: 24 * time.Hour, BatchSize: 7, PassBudget: 2 * time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -64,10 +64,10 @@ func TestCleanupWithOptionsHonorsCancellation(t *testing.T) {
 func TestCleanupWithOptionsClampsBatchAndBoundsTransactions(t *testing.T) {
 	ctx := context.Background()
 	st := testStore(t)
-	if _, err := st.CleanupWithOptions(ctx, CleanupOptions{Retention: time.Hour, BatchSize: 2048, TransactionBudget: time.Hour, PassBudget: time.Second}); err != nil {
+	if _, err := st.CleanupWithOptions(ctx, CleanupOptions{Retention: time.Hour, BatchSize: 2048, TransactionBudget: 250 * time.Millisecond, PassBudget: time.Second}); err != nil {
 		t.Fatalf("clamped cleanup failed: %v", err)
 	}
-	if _, err := st.CleanupWithOptions(ctx, CleanupOptions{Retention: time.Hour, BatchSize: 1, TransactionBudget: time.Hour, PassBudget: time.Second}); err != nil {
+	if _, err := st.CleanupWithOptions(ctx, CleanupOptions{Retention: time.Hour, BatchSize: 1, TransactionBudget: 250 * time.Millisecond, PassBudget: time.Second}); err != nil {
 		t.Fatalf("bounded transaction cleanup failed: %v", err)
 	}
 }

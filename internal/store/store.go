@@ -410,6 +410,7 @@ var postMigrationIndexes = []struct{ ddl, description string }{
 	{ddl: "CREATE INDEX IF NOT EXISTS webhook_triggers_due ON webhook_triggers(status, next_attempt_at, id)", description: "webhook trigger index"},
 	{ddl: "CREATE INDEX IF NOT EXISTS events_batch_id ON events(batch_id, id)", description: "event history index"},
 	{ddl: "CREATE INDEX IF NOT EXISTS outbox_batch_id ON outbox(batch_id, id)", description: "outbox history index"},
+	{ddl: "CREATE INDEX IF NOT EXISTS outbox_destination_status ON outbox(destination_id, status, id)", description: "outbox destination index"},
 	{ddl: "CREATE INDEX IF NOT EXISTS events_retention ON events(observed_at, id)", description: "event retention index"},
 	{ddl: "CREATE INDEX IF NOT EXISTS outbox_retry_retention ON outbox(status, first_attempt, lease_until, id)", description: "outbox retry index"},
 	{ddl: "CREATE INDEX IF NOT EXISTS outbox_delivered_retention ON outbox(status, delivered_at, created_at, id)", description: "outbox retention index"},

@@ -413,15 +413,26 @@ func retryableDeadOutbox(prefix string) string {
 		SELECT 1 FROM event_batches eb WHERE eb.id=` + prefix + `batch_id AND eb.generation<>(SELECT generation FROM settings WHERE id=1)))`
 }
 
+// destinationDeliveriesSQL counts each active destination's pending, processing,
+// and dead rows, plus the dead rows RetryDeadOutbox would requeue. The status
+// filter sits in the join's ON clause, not WHERE, so a destination with no
+// matching rows still yields one row of zero counts. The filter cannot change
+// any count, because each count already requires one of those statuses. It lets
+// outbox_destination_status answer the join without visiting the delivered rows,
+// which are most of the outbox.
+func destinationDeliveriesSQL() string {
+	return `SELECT d.id,d.name,d.enabled,d.service_url_enc,
+		COALESCE(SUM(o.status='pending'),0),COALESCE(SUM(o.status='processing'),0),COALESCE(SUM(o.status='dead'),0),
+		COALESCE(SUM(CASE WHEN ` + retryableDeadOutbox("o.") + ` THEN 1 ELSE 0 END),0)
+		FROM notification_destinations d LEFT JOIN outbox o ON o.destination_id=d.id AND o.status IN ('pending','processing','dead')
+		WHERE d.deleted_at IS NULL GROUP BY d.id ORDER BY d.id`
+}
+
 // DestinationDeliveries returns per-destination delivery counts for every
 // active destination, including destinations with an empty outbox, through
 // the read-only pool so the status page never waits behind a write.
 func (s *Store) DestinationDeliveries(ctx context.Context) ([]DestinationDelivery, error) {
-	rows, err := s.readDB().QueryContext(ctx, `SELECT d.id,d.name,d.enabled,d.service_url_enc,
-		COALESCE(SUM(o.status='pending'),0),COALESCE(SUM(o.status='processing'),0),COALESCE(SUM(o.status='dead'),0),
-		COALESCE(SUM(CASE WHEN `+retryableDeadOutbox("o.")+` THEN 1 ELSE 0 END),0)
-		FROM notification_destinations d LEFT JOIN outbox o ON o.destination_id=d.id
-		WHERE d.deleted_at IS NULL GROUP BY d.id ORDER BY d.id`)
+	rows, err := s.readDB().QueryContext(ctx, destinationDeliveriesSQL())
 	if err != nil {
 		return nil, err
 	}

@@ -19,6 +19,7 @@ rollback requires restoring the backup taken before the upgrade. See
 - `admin rekey` now reads and checks the replacement key before it touches the database, and it refuses a missing or older-schema database with an error instead of creating or migrating one and reporting the rotation as successful (#313).
 - `admin reset` and `admin compact` no longer overlap: `admin reset` refuses (exit code `1`) while a compaction is replacing the database, and a compaction refuses while a reset is writing its token, so a printed reset token is never discarded by the replacement (#319).
 - A compaction run as root keeps the owner and group of the database it replaces, so a systemd install's service can still open the database afterwards. `doctor` and the operations guide now say to run admin commands on a systemd install as root with `sudo` (#321).
+- Per-destination delivery counts on the status page and in the notification settings no longer build a temporary index over the whole outbox on every render. A new index on the outbox destination column serves them, and the counts are unchanged (#317).
 
 ### Maintenance
 - Document a sidecar command that removes an online-backup snapshot from the data volume, since the scratch image has no `rm` (#323).

@@ -174,3 +174,58 @@ func TestOverlappingDurableTriggersPollEachCollectorOnce(t *testing.T) {
 		}
 	}
 }
+
+func TestAppliedPartialDeviceDetailsCompletesTrigger(t *testing.T) {
+	ctx := context.Background()
+	st, settings := monitorTestStore(t)
+	var fanouts atomic.Int32
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/oauth/token":
+			_, _ = w.Write([]byte(`{"access_token":"access","expires_in":3600}`))
+		case r.URL.Path == "/api/v2/tailnet/-/devices":
+			_, _ = w.Write([]byte(`{"devices":[{"id":"healthy","hostname":"healthy"},{"id":"broken","hostname":"broken"}]}`))
+		case r.URL.Path == "/api/v2/device/healthy/attributes":
+			fanouts.Add(1)
+			_, _ = w.Write([]byte(`{}`))
+		case strings.HasPrefix(r.URL.Path, "/api/v2/device/healthy/"):
+			_, _ = w.Write([]byte(`{}`))
+		default:
+			// The broken device's details answer 404. The collector keeps the
+			// healthy device, so the result is partial rather than unsupported.
+			http.NotFound(w, r)
+		}
+	}))
+	defer api.Close()
+	hash := strings.Repeat("e", 64)
+	if _, created, err := st.RecordWebhookTrigger(ctx, hash, nil, []string{"devices", "device_details"}); err != nil || !created {
+		t.Fatalf("record trigger: created=%v err=%v", created, err)
+	}
+	client := tailscale.New(api.URL+"/api/v2", api.URL+"/oauth/token", "test", tailscale.Credentials{Tailnet: "-", ClientID: "client", ClientSecret: "secret"})
+	engine := New(st, api.URL+"/api/v2", api.URL+"/oauth/token", "test", &scriptedSender{})
+	if !engine.processDurableTriggers(ctx, client, settings) {
+		t.Fatal("durable trigger was not processed")
+	}
+	// A trigger means "we looked again". The applied partial result completes
+	// it instead of being retried on the trigger's own schedule for 24 hours.
+	state, _, err := st.RecordWebhookTrigger(ctx, hash, nil, nil)
+	if err != nil || state.Status != "processed" || state.Attempts != 1 {
+		t.Fatalf("trigger state=%#v err=%v, want processed after one attempt", state, err)
+	}
+	// Collector health still tracks the partial, so the collector's backoff
+	// schedule (not the trigger) decides when device_details is tried again.
+	next, failures := collectorNextPoll(t, st, "device_details")
+	if failures < 1 || time.Until(next) < collectorRetryInterval-5*time.Second {
+		t.Fatalf("device_details failures=%d next poll in %s, want a recorded failure and a %s backoff", failures, time.Until(next), collectorRetryInterval)
+	}
+	if got := fanouts.Load(); got != 1 {
+		t.Fatalf("trigger fan-outs=%d, want 1", got)
+	}
+	engine.poll(ctx, client, settings, []string{"device_details"}, false)
+	if got := fanouts.Load(); got != 1 {
+		t.Fatalf("scheduled poll before the backoff deadline fanned out again: %d", got)
+	}
+	if engine.processDurableTriggers(ctx, client, settings) {
+		t.Fatal("completed trigger was still due")
+	}
+}

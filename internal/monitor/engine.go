@@ -159,10 +159,11 @@ func (e *Engine) Trigger(request ReconcileRequest) {
 		return
 	default:
 	}
-	// Keep overflow requests separate instead of broadening them into one
-	// reconciliation. A broad poll has one success value, so coalescing
-	// unrelated webhook scopes would retry/dead-letter healthy triggers along
-	// with a failed collector. The scheduler drains this queue in order.
+	// Overflow requests keep their own collector scopes. The scheduler drains
+	// this queue together with the channel and polls the union of their
+	// collectors once. Outcomes stay per collector (pollOutcome.succeeds), so a
+	// failing collector retries only the triggers that requested it, and healthy
+	// triggers in the same poll are still completed.
 	e.triggerOverflowMu.Lock()
 	if len(e.triggerOverflow) < maxTriggerOverflow {
 		e.triggerOverflow = append(e.triggerOverflow, request)

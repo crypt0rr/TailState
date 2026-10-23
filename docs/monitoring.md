@@ -46,7 +46,7 @@ Because the last group has an open schema, a field that Tailscale adds to its AP
 - Single-object endpoints (tailnet settings, contacts, policy, the DNS configuration and each legacy DNS sub-endpoint, and log-streaming configuration and status) must return a JSON object. A `null`, empty, array, or scalar body is treated as an invalid upstream response: the collector fails, no events are recorded, and the last snapshot is kept.
 - Tailscale API requests retry network errors, `429`, and the transient gateway statuses `502`, `503`, and `504` with exponential backoff; a transient OAuth token-endpoint failure (network error, `429`, or `5xx`) is retried the same way instead of failing every request that needs a token. Retries honor `Retry-After` while capping a provider delay at five minutes and the complete retry window for one request at 30 seconds; a `429` or gateway retry that would not fit in that window reports the upstream status immediately (so a long `Retry-After` is reported as `rate limited`, not as a timeout). Cursor pagination keeps the original query parameters (for example `fields=all`) on every page. Collectors also have a two-minute poll deadline, so a throttled endpoint cannot stall the scheduler indefinitely.
 - Each paginated collection is bounded to 10,000 items and 64 MiB of response data across all pages, in addition to the 16 MiB per-response cap. If an aggregate limit is exceeded, the collector fails without applying partial inventory or deleting the last known snapshots. Device-detail requests share a bounded eight-worker queue so a large device list cannot create one job and result buffer per device. If the two-minute device-detail deadline expires, the poll is reported as partial with the number of devices left unrefreshed, their previous snapshots are kept, and the next poll starts with the stalest devices so every device is eventually refreshed.
-- A failed or partial collector is retried after 30 seconds, and each further consecutive failure doubles the delay up to that collector's configured polling interval; a successful poll resets the backoff. A permanently broken endpoint or device therefore settles back to the normal cadence instead of repeating its requests every 30 seconds. Webhook triggers that are processed together poll the union of their collectors once, while each trigger still succeeds or retries only on the collectors it requested.
+- A failed or partial collector is retried after 30 seconds, and each further consecutive failure doubles the delay up to that collector's configured polling interval; a successful poll resets the backoff. A permanently broken endpoint or device therefore settles back to the normal cadence instead of repeating its requests every 30 seconds. Webhook triggers that are processed together, including events that arrive while a poll is running, poll the union of their collectors once, while each trigger still succeeds or retries only on the collectors it requested. An applied partial result counts as reconciled for those triggers, so one device that keeps failing does not hold a trigger for 24 hours; the collector's backoff schedules the missing devices instead.
 - Per-collector retry deadlines (failure retries, unsupported confirmation) are persisted and honored after a restart or a settings save, so a short retry is never replaced by the full polling interval.
 - A 403/404 from an optional plan-specific endpoint is treated as an
   unsupported response. Collectors that have never produced a baseline are
@@ -264,10 +264,15 @@ webhook documentation](https://tailscale.com/docs/features/webhooks). TailState
 verifies the HMAC signature and timestamp, rejects oversized or replayed
 requests, and stores only a body hash and event metadata before acknowledging
 the delivery. A durable worker leases queued triggers, polls the affected
-collectors, and retries failures for up to 24 hours across restarts. Unknown
-event types trigger a complete reconciliation. The normal TailState poll
-interval remains the fallback if the endpoint is unavailable; accepted webhook
-triggers are never lost between the HTTP response and reconciliation.
+collectors, and retries a trigger for up to 24 hours across restarts when one of
+its collectors fails outright. A trigger is complete once each collector it
+requested has answered, including with a partial result that was applied. It
+therefore means that TailState looked again, not that the data is complete;
+scheduled polling is the safety net that refreshes whatever a partial result
+left out. Unknown event types trigger a complete reconciliation. The normal
+TailState poll interval remains the fallback if the endpoint is unavailable;
+accepted webhook triggers are never lost between the HTTP response and
+reconciliation.
 
 Once the signature is valid the delivery is authentic, so content outside
 TailState's own bounds (more than 100 events, an empty batch, or an event type

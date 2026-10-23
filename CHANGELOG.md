@@ -20,6 +20,8 @@ rollback requires restoring the backup taken before the upgrade. See
 - `admin reset` and `admin compact` no longer overlap: `admin reset` refuses (exit code `1`) while a compaction is replacing the database, and a compaction refuses while a reset is writing its token, so a printed reset token is never discarded by the replacement (#319).
 - A compaction run as root keeps the owner and group of the database it replaces, so a systemd install's service can still open the database afterwards. `doctor` and the operations guide now say to run admin commands on a systemd install as root with `sudo` (#321).
 - Per-destination delivery counts on the status page and in the notification settings no longer build a temporary index over the whole outbox on every render. A new index on the outbox destination column serves them, and the counts are unchanged (#317).
+- A webhook trigger no longer retries for up to 24 hours when a collector answers with a partial result, such as one device whose details return `404`: the applied partial completes the trigger, while collector health and retry backoff keep tracking it. Scheduled inventory polls also keep running while triggers are due (#312).
+- Webhook events that arrive while a poll is running are reconciled together: the bounded queue and its overflow share one poll of their combined collectors, instead of one forced device fan-out per event (#308).
 
 ### Maintenance
 - Document a sidecar command that removes an online-backup snapshot from the data volume, since the scratch image has no `rm` (#323).

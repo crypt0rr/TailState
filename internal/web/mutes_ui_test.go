@@ -23,7 +23,7 @@ func TestMuteRulesAreManagedInSettingsWithCSRF(t *testing.T) {
 	csrf := coverageCSRF(t, cookies)
 	ctx := context.Background()
 
-	add := url.Values{"action": {"add"}, "kind": {"field"}, "value": {"devices.clientVersion"}}
+	add := url.Values{"action": {"add"}, "current_password": {testAdminPassword}, "kind": {"field"}, "value": {"devices.clientVersion"}}
 	if forged := coveragePost(t, server, "/settings/mutes", add, cookies); forged.Code != http.StatusForbidden {
 		t.Fatalf("mute rule without CSRF status=%d", forged.Code)
 	}
@@ -35,9 +35,9 @@ func TestMuteRulesAreManagedInSettingsWithCSRF(t *testing.T) {
 		t.Fatalf("duplicate rule response: %s", duplicate)
 	}
 	for _, invalid := range []url.Values{
-		{"_csrf": {csrf}, "action": {"add"}, "kind": {"collector"}, "value": {"nonsense"}},
-		{"_csrf": {csrf}, "action": {"add"}, "kind": {"field"}, "value": {"nonsense.field"}},
-		{"_csrf": {csrf}, "action": {"add"}, "kind": {"tag"}, "value": {"ci"}},
+		{"_csrf": {csrf}, "action": {"add"}, "current_password": {testAdminPassword}, "kind": {"collector"}, "value": {"nonsense"}},
+		{"_csrf": {csrf}, "action": {"add"}, "current_password": {testAdminPassword}, "kind": {"field"}, "value": {"nonsense.field"}},
+		{"_csrf": {csrf}, "action": {"add"}, "current_password": {testAdminPassword}, "kind": {"tag"}, "value": {"ci"}},
 	} {
 		response := coveragePost(t, server, "/settings/mutes", invalid, cookies)
 		if body := followFlash(t, server, cookies, response); response.Code != http.StatusSeeOther || !strings.Contains(body, "Mute rule was not saved") {

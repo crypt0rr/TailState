@@ -404,6 +404,12 @@ func (s *Server) apiTokenPost(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	switch r.FormValue("action") {
 	case "create":
+		// A new token opens a read path to history and evidence, so creating
+		// one needs the current password before anything is stored.
+		if msg := s.checkStepUp(r, auth.ref, adminChange{event: store.AuditAPITokenCreated, fields: []string{"expires_at", "name", "scopes"}}, "API token was not created"); msg != "" {
+			s.redirectWithFlash(w, r, "/settings", flashKindError, msg)
+			return
+		}
 		days, err := strconv.Atoi(r.FormValue("expires_days"))
 		if err != nil {
 			days = 0
@@ -416,7 +422,7 @@ func (s *Server) apiTokenPost(w http.ResponseWriter, r *http.Request) {
 		}
 		// A new token opens a read path to history and evidence, so it is
 		// a high-risk change.
-		s.recordAdmin(r, auth.ref, adminChange{event: store.AuditAPITokenCreated, target: "api_token:" + strconv.FormatInt(token.ID, 10), fields: []string{"expires_at", "name", "scopes"}, highRisk: true}, before, 0)
+		s.recordAdmin(r, auth.ref, adminChange{event: store.AuditAPITokenCreated, target: "api_token:" + strconv.FormatInt(token.ID, 10), fields: []string{"expires_at", "name", "scopes", stepUpField}, highRisk: true}, before, 0)
 		reveal, err := s.tokenReveals.put(secretValue, auth.ref, time.Now())
 		if err != nil {
 			slog.Error("hold new API token for display", "error", err)

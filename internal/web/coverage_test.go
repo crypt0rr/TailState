@@ -497,7 +497,7 @@ func TestSettingsAndDestinationMutationBranches(t *testing.T) {
 	}
 
 	serviceURL := "mattermost://TailState@example.invalid/token?disabletls=true"
-	saveDestination := url.Values{"_csrf": {csrf}, "action": {"save"}, "name": {"Primary"}, "service_url": {serviceURL}, "enabled": {"on"}}
+	saveDestination := url.Values{"_csrf": {csrf}, "action": {"save"}, "current_password": {testAdminPassword}, "name": {"Primary"}, "service_url": {serviceURL}, "enabled": {"on"}}
 	saved := coveragePost(t, server, "/settings/destinations", saveDestination, cookies)
 	if saved.Code != http.StatusSeeOther || saved.Header().Get("Location") != "/settings" {
 		t.Fatalf("save destination response %d location=%q body=%s", saved.Code, saved.Header().Get("Location"), saved.Body.String())
@@ -607,7 +607,7 @@ func TestDestinationTestAndUnknownMutationErrors(t *testing.T) {
 	}
 
 	invalid := coveragePost(t, server, "/settings/destinations", url.Values{
-		"_csrf": {csrf}, "action": {"save"}, "name": {"Invalid"}, "service_url": {"not-a-shoutrrr-url"}, "enabled": {"on"},
+		"_csrf": {csrf}, "action": {"save"}, "current_password": {testAdminPassword}, "name": {"Invalid"}, "service_url": {"not-a-shoutrrr-url"}, "enabled": {"on"},
 	}, cookies)
 	if invalid.Code != http.StatusSeeOther || !strings.Contains(followFlash(t, server, cookies, invalid), "Notification destination was not saved") {
 		t.Fatalf("invalid destination save status=%d body=%s", invalid.Code, invalid.Body.String())
@@ -633,7 +633,7 @@ func TestDestinationTestAndUnknownMutationErrors(t *testing.T) {
 	defer upstream.Close()
 	serviceURL := strings.Replace(upstream.URL, "http://", "generic://", 1) + "?disabletls=true&template=json&messagekey=text"
 	saved := coveragePost(t, server, "/settings/destinations", url.Values{
-		"_csrf": {csrf}, "action": {"save"}, "name": {"Webhook"}, "service_url": {serviceURL}, "enabled": {"on"},
+		"_csrf": {csrf}, "action": {"save"}, "current_password": {testAdminPassword}, "name": {"Webhook"}, "service_url": {serviceURL}, "enabled": {"on"},
 	}, cookies)
 	if saved.Code != http.StatusSeeOther {
 		t.Fatalf("valid destination save status=%d body=%s", saved.Code, saved.Body.String())
@@ -985,7 +985,7 @@ func TestWebCSRFAndFormBoundaryBranches(t *testing.T) {
 	if wrongCSRF.Code != http.StatusForbidden {
 		t.Fatalf("wrong csrf destination status=%d body=%s", wrongCSRF.Code, wrongCSRF.Body.String())
 	}
-	defaultSave := coveragePost(t, server, "/settings/destinations", url.Values{"_csrf": {coverageCSRF(t, cookies)}, "name": {"Default action"}, "service_url": {"generic://example.invalid/path"}, "enabled": {"on"}}, cookies)
+	defaultSave := coveragePost(t, server, "/settings/destinations", url.Values{"_csrf": {coverageCSRF(t, cookies)}, "current_password": {testAdminPassword}, "name": {"Default action"}, "service_url": {"generic://example.invalid/path"}, "enabled": {"on"}}, cookies)
 	if defaultSave.Code != http.StatusSeeOther {
 		t.Fatalf("default destination action status=%d body=%s", defaultSave.Code, defaultSave.Body.String())
 	}

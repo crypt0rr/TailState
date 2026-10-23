@@ -29,6 +29,11 @@ func (s *Server) mutePost(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
+		// Adding a mute rule needs the current password before it is stored.
+		if msg := s.checkStepUp(r, auth.ref, adminChange{event: store.AuditMuteAdded, fields: []string{"kind", "value"}}, "Mute rule was not saved"); msg != "" {
+			s.redirectWithFlash(w, r, "/settings", flashKindError, msg)
+			return
+		}
 		before := s.enabledDestinations(ctx)
 		ruleID, err := s.store.AddMuteRule(ctx, kind, value)
 		if err != nil {
@@ -36,7 +41,7 @@ func (s *Server) mutePost(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		// A mute rule can silence alerts, so it is a high-risk change.
-		s.recordAdmin(r, auth.ref, adminChange{event: store.AuditMuteAdded, target: "mute:" + strconv.FormatInt(ruleID, 10), fields: []string{"kind", "value"}, highRisk: true}, before, 0)
+		s.recordAdmin(r, auth.ref, adminChange{event: store.AuditMuteAdded, target: "mute:" + strconv.FormatInt(ruleID, 10), fields: []string{"kind", stepUpField, "value"}, highRisk: true}, before, 0)
 		s.redirectWithFlash(w, r, "/settings", flashKindSuccess, "Mute rule added.")
 	case "delete":
 		id, _ := strconv.ParseInt(r.FormValue("id"), 10, 64)

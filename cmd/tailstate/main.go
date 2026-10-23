@@ -547,8 +547,24 @@ func evidenceAudit(args []string) error {
 	flags := newFlagSet("evidence audit")
 	publicKeyPath := flags.String("public-key", "", "trusted Ed25519 public key path (base64, hexadecimal, or raw)")
 	batchSize := flags.Int("batch-size", 128, "maximum ledger entries read per page")
+	minSequence := flags.Int64("min-sequence", 0, "checkpoint ledger sequence the ledger must reach; 0 disables the check")
+	expectHead := flags.String("expect-head", "", "checkpoint ledger head: the entry hash at -min-sequence (64 hexadecimal characters)")
 	if done, err := parseFlags("evidence audit", flags, args); done {
 		return err
+	}
+	if *minSequence < 0 {
+		return usageError("evidence audit", errors.New("-min-sequence must not be negative"))
+	}
+	checkpointHead := ""
+	if strings.TrimSpace(*expectHead) != "" {
+		if *minSequence == 0 {
+			return usageError("evidence audit", errors.New("-expect-head requires -min-sequence"))
+		}
+		head, headErr := store.NormalizeLedgerHead(*expectHead)
+		if headErr != nil {
+			return usageError("evidence audit", headErr)
+		}
+		checkpointHead = head
 	}
 	config, err := boot.Load(version)
 	if err != nil {
@@ -582,7 +598,7 @@ func evidenceAudit(args []string) error {
 	var keyID string
 	trusted := len(trustedKey) > 0
 	for {
-		result, err := st.AuditEvidenceLedger(context.Background(), store.EvidenceAuditOptions{Cursor: cursor, Limit: *batchSize, TrustedPublicKey: trustedKey})
+		result, err := st.AuditEvidenceLedger(context.Background(), store.EvidenceAuditOptions{Cursor: cursor, Limit: *batchSize, TrustedPublicKey: trustedKey, MinSequence: *minSequence, ExpectHead: checkpointHead})
 		if err != nil {
 			var auditErr *store.EvidenceAuditError
 			if errors.As(err, &auditErr) {
@@ -597,7 +613,14 @@ func evidenceAudit(args []string) error {
 			keyID = result.SigningKeyID
 		}
 		if result.Complete {
-			fmt.Printf("evidence ledger audit verified: entries=%d verified=%d unverifiable_payloads=%d key=%s trusted_key=%t\n", entries, verified, unverifiable, keyID, trusted)
+			checkpoint := ""
+			if result.CheckpointVerified {
+				checkpoint = fmt.Sprintf(" checkpoint_sequence=%d", *minSequence)
+				if checkpointHead != "" {
+					checkpoint += " checkpoint_head=matched"
+				}
+			}
+			fmt.Printf("evidence ledger audit verified: entries=%d verified=%d unverifiable_payloads=%d key=%s trusted_key=%t%s\n", entries, verified, unverifiable, keyID, trusted, checkpoint)
 			return nil
 		}
 		if result.NextCursor <= cursor {
@@ -605,6 +628,109 @@ func evidenceAudit(args []string) error {
 		}
 		cursor = result.NextCursor
 	}
+}
+
+// evidenceCheckpoint shows, or chooses, the notification destination that
+// receives signed ledger checkpoints. A change writes only the checkpoint
+// settings, under the maintenance lock: it runs while the service does and
+// refuses while admin compact is replacing the database.
+func evidenceCheckpoint(args []string) error {
+	flags := newFlagSet("evidence checkpoint")
+	destinationID := flags.Int64("destination-id", 0, "notification destination ID that receives signed ledger checkpoints")
+	clearDestination := flags.Bool("clear", false, "turn ledger checkpoints off")
+	if done, err := parseFlags("evidence checkpoint", flags, args); done {
+		return err
+	}
+	if *destinationID < 0 {
+		return usageError("evidence checkpoint", errors.New("-destination-id must be positive"))
+	}
+	if *clearDestination && *destinationID != 0 {
+		return usageError("evidence checkpoint", errors.New("-clear cannot be combined with -destination-id"))
+	}
+	config, err := boot.Load(version)
+	if err != nil {
+		return fmt.Errorf("evidence checkpoint configuration: %w", err)
+	}
+	key, err := config.MasterKey()
+	if err != nil {
+		return fmt.Errorf("evidence checkpoint master key: %w", err)
+	}
+	box, err := secret.NewBox(key)
+	if err != nil {
+		return fmt.Errorf("evidence checkpoint master key: %w", err)
+	}
+	ctx := context.Background()
+	if *clearDestination {
+		err := store.ChangeEvidenceCheckpoints(config.DatabasePath(), box, func(st *store.Store) error {
+			return st.ClearEvidenceCheckpointDestination(ctx)
+		})
+		if err != nil {
+			return fmt.Errorf("evidence checkpoint: %w", err)
+		}
+		fmt.Println("ledger checkpoints are off")
+		return nil
+	}
+	if *destinationID > 0 {
+		err := store.ChangeEvidenceCheckpoints(config.DatabasePath(), box, func(st *store.Store) error {
+			return st.SetEvidenceCheckpointDestination(ctx, *destinationID)
+		})
+		if err != nil {
+			return fmt.Errorf("evidence checkpoint: %w", err)
+		}
+		fmt.Printf("ledger checkpoints will be sent to notification destination %d\n", *destinationID)
+		return nil
+	}
+	st, err := store.OpenExisting(config.DatabasePath(), box)
+	if err != nil {
+		return fmt.Errorf("evidence checkpoint database: %w", err)
+	}
+	defer st.Close()
+	status, err := st.EvidenceCheckpointStatus(ctx)
+	if err != nil {
+		return err
+	}
+	printEvidenceCheckpointStatus(os.Stdout, status)
+	return nil
+}
+
+// printEvidenceCheckpointStatus lists the checkpoint destination, the last
+// checkpoint, and the active destinations with their IDs. Service URLs are
+// never printed.
+func printEvidenceCheckpointStatus(w io.Writer, status store.EvidenceCheckpointStatus) {
+	chosen := "off"
+	if status.DestinationID > 0 {
+		chosen = fmt.Sprintf("destination %d (removed)", status.DestinationID)
+		for _, destination := range status.Destinations {
+			if destination.ID == status.DestinationID {
+				chosen = fmt.Sprintf("destination %d %q (%s)", destination.ID, destination.Name, enabledWord(destination.Enabled))
+			}
+		}
+	}
+	fmt.Fprintf(w, "Ledger checkpoints: %s\n", chosen)
+	if status.LastSequence > 0 {
+		fmt.Fprintf(w, "Last checkpoint: sequence %d, head %s, recorded %s\n", status.LastSequence, status.LastHead, status.LastSentAt.UTC().Format(time.RFC3339))
+	} else {
+		fmt.Fprintln(w, "Last checkpoint: none")
+	}
+	if len(status.Destinations) == 0 {
+		fmt.Fprintln(w, "Notification destinations: none")
+		return
+	}
+	fmt.Fprintln(w, "Notification destinations:")
+	for _, destination := range status.Destinations {
+		marker := ""
+		if destination.ID == status.DestinationID {
+			marker = " (receives checkpoints)"
+		}
+		fmt.Fprintf(w, "  %d %q %s%s\n", destination.ID, destination.Name, enabledWord(destination.Enabled), marker)
+	}
+}
+
+func enabledWord(enabled bool) string {
+	if enabled {
+		return "enabled"
+	}
+	return "disabled"
 }
 
 func readEvidenceFile(path string, limit int64, tooLarge error) ([]byte, error) {

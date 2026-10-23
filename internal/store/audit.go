@@ -22,10 +22,18 @@ var ErrEvidenceDatabaseNotFound = errors.New("evidence audit database not found"
 // verified sequence from a previous page; a zero cursor starts at genesis.
 // TrustedPublicKey, when supplied, is used instead of the instance's stored
 // public key so the result can be independently anchored.
+//
+// MinSequence and ExpectHead check a ledger checkpoint kept outside the
+// database. MinSequence is the sequence the ledger must reach, and ExpectHead,
+// when set, is the entry hash the ledger must hold at that sequence. Both are
+// evaluated once the whole chain has verified, so a truncated or rewritten
+// tail fails even when the database's stored head was rewritten to match.
 type EvidenceAuditOptions struct {
 	Cursor           int64
 	Limit            int
 	TrustedPublicKey []byte
+	MinSequence      int64
+	ExpectHead       string
 }
 
 // EvidenceAuditResult describes the work completed by one audit page. A
@@ -47,6 +55,9 @@ type EvidenceAuditResult struct {
 	ObservedHead        string
 	SigningKeyID        string
 	TrustedKey          bool
+	// CheckpointVerified reports that a complete audit reached the supplied
+	// MinSequence and, when ExpectHead was set, held that head at it.
+	CheckpointVerified bool
 }
 
 // EvidenceAuditError identifies the first ledger sequence that failed a
@@ -148,6 +159,18 @@ func (s *Store) AuditEvidenceLedger(ctx context.Context, options EvidenceAuditOp
 	}
 	if options.Cursor < 0 {
 		return result, errors.New("evidence audit cursor must not be negative")
+	}
+	if options.MinSequence < 0 {
+		return result, errors.New("evidence audit checkpoint sequence must not be negative")
+	}
+	expectHead := ""
+	if options.ExpectHead != "" {
+		if options.MinSequence == 0 {
+			return result, errors.New("evidence audit checkpoint head requires a checkpoint sequence")
+		}
+		if expectHead, err = NormalizeLedgerHead(options.ExpectHead); err != nil {
+			return result, err
+		}
 	}
 	limit := options.Limit
 	if limit <= 0 {
@@ -264,6 +287,12 @@ func (s *Store) AuditEvidenceLedger(ctx context.Context, options EvidenceAuditOp
 		if !result.HeadMatches {
 			return result, evidenceAuditFailure(result.LatestSequence, "stored ledger head", errors.New("metadata head does not match the latest ledger entry"))
 		}
+		if options.MinSequence > 0 {
+			if err := verifyAuditCheckpoint(ctx, s.db, options.MinSequence, expectHead, result.LatestSequence); err != nil {
+				return result, err
+			}
+			result.CheckpointVerified = true
+		}
 	} else {
 		result.Complete = false
 		result.NextCursor = result.LastSequence
@@ -307,6 +336,31 @@ func validateAuditEntry(entry evidenceAuditEntry, public []byte, genesis bool, l
 
 func evidenceAuditFailure(sequence int64, check string, err error) error {
 	return &EvidenceAuditError{Sequence: sequence, Check: check, Err: err}
+}
+
+// verifyAuditCheckpoint checks a supplied checkpoint against a ledger whose
+// chain has verified. The ledger must reach minSequence, and when expectHead is
+// set the entry at minSequence must carry that hash. A rewritten tail fails
+// here even when it verifies on its own.
+func verifyAuditCheckpoint(ctx context.Context, db auditRowQueryer, minSequence int64, expectHead string, latest int64) error {
+	if latest < minSequence {
+		return evidenceAuditFailure(latest, "checkpoint length", fmt.Errorf("ledger ends at sequence %d, below the checkpoint sequence %d", latest, minSequence))
+	}
+	if expectHead == "" {
+		return nil
+	}
+	var head string
+	err := db.QueryRowContext(ctx, "SELECT entry_hash FROM evidence_ledger WHERE sequence=?", minSequence).Scan(&head)
+	if errors.Is(err, sql.ErrNoRows) {
+		return evidenceAuditFailure(minSequence, "checkpoint head", errors.New("checkpoint sequence is missing from the ledger"))
+	}
+	if err != nil {
+		return err
+	}
+	if head != expectHead {
+		return evidenceAuditFailure(minSequence, "checkpoint head", errors.New("ledger entry at the checkpoint sequence has a different head"))
+	}
+	return nil
 }
 
 // evidenceAuditBetweenHeadReads is a test seam invoked after the stored head

@@ -78,7 +78,8 @@ tokens; `settings.go` owns encrypted application
 settings; `snapshots.go` owns collector application and baseline transitions;
 `outbox.go` owns notification delivery bookkeeping; `status.go` owns health,
 scheduling, and retention queries; `evidence.go` builds signed evidence
-packs and `evidence_verify.go` verifies them; and `history.go`,
+packs, `evidence_verify.go` verifies them, and `checkpoint.go` owns the signed
+ledger-head checkpoints; and `history.go`,
 `destinations.go`, and `webhooks.go` contain the corresponding audit,
 endpoint, and trigger seams. `migrations.go` holds the preflight checks and
 the `migrations` table that drives every schema upgrade; the steps live in

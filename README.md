@@ -43,7 +43,7 @@ start, set it in `.env` to the newest version listed in the
 for example:
 
 ```dotenv
-TAILSTATE_IMAGE=ghcr.io/crypt0rr/tailstate:1.0.0
+TAILSTATE_IMAGE=ghcr.io/crypt0rr/tailstate:0.19.1
 ```
 
 Then pull and start it:
@@ -58,11 +58,17 @@ Without `TAILSTATE_IMAGE`, Compose falls back to
 
 ### Build locally
 
-To build TailState from the source in this repository:
+To build TailState from the source in this repository, tag the build as
+`tailstate:local` so it cannot be mistaken for a released image:
 
 ```console
-docker compose up --build -d
+TAILSTATE_IMAGE=tailstate:local docker compose up --build -d
 ```
+
+Later `docker compose` commands read `TAILSTATE_IMAGE` from `.env` again, so
+repeat the variable (or set it in `.env`) to keep running the local build. If an
+earlier version of this section tagged a build with the release name, run
+`docker compose pull` with the release name in `.env` to replace that tag.
 
 After either installation method, inspect the startup log:
 

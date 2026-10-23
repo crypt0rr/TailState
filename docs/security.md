@@ -148,8 +148,11 @@ proxy in `TAILSTATE_TRUSTED_PROXIES` so clients are throttled individually;
 otherwise every user shares the proxy's bucket, and the Settings diagnostics
 report `untrusted_forwarded_headers`.
 Challenge and credential failures are exposed only through low-cardinality
-route/outcome metrics; secrets, tokens, cookies, and request headers are never
-logged.
+route/outcome metrics. Secrets, cookies, and request headers are never logged.
+The one token the service writes to its log is the one-time setup token: while
+the installation is unclaimed, each startup logs a new one, which replaces the
+previous one (see the [Quick start](../README.md#quick-start)). `admin reset`
+prints its reset token to the command's output, never to the service log.
 
 ## Trusted proxies
 

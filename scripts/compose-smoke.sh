@@ -106,7 +106,12 @@ unset TAILSTATE_METRICS_TOKEN
 metrics_token="$(openssl rand -hex 32)"
 sed -i "s/^TAILSTATE_METRICS_TOKEN=.*/TAILSTATE_METRICS_TOKEN=${metrics_token}/" .env
 docker compose up -d
-printf 'Authorization: Bearer %s\n' "$(sed -n 's/^TAILSTATE_METRICS_TOKEN=//p' .env)" > metrics.header
+rm -f metrics.header
+(umask 077 && printf 'Authorization: Bearer %s\n' "$(sed -n 's/^TAILSTATE_METRICS_TOKEN=//p' .env)" > metrics.header)
+if [[ "$(stat -c '%a' metrics.header)" != "600" ]]; then
+    echo "documented metrics.header permissions were not applied" >&2
+    exit 1
+fi
 for _ in $(seq 1 30); do
     if curl --fail --silent --show-error --max-time 2 -H @metrics.header "http://127.0.0.1:${port}/metrics" >/dev/null 2>&1; then
         wrong_status="$(curl --silent --max-time 2 --output /dev/null --write-out '%{http_code}' -H 'Authorization: Bearer wrong' "http://127.0.0.1:${port}/metrics")"

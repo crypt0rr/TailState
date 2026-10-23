@@ -201,13 +201,25 @@ docker compose cp tailstate:/data/tailstate-backup.db.sha256 ./backups/
 docker compose exec tailstate /tailstate admin backup -h   # options
 ```
 
+The scratch image has no shell or `rm`, so remove the copied snapshot from the
+data volume with the pinned BusyBox sidecar. Like the backup helper, it mounts
+only that volume, with no network:
+
+```console
+container="$(docker compose ps -aq tailstate)"
+volume="$(./scripts/data-volume.sh "$container")"
+docker run --rm --network none --user 10001:10001 --volume "$volume:/data" \
+  "$(./scripts/backup-image.sh)" rm -f /data/tailstate-backup.db /data/tailstate-backup.db.sha256
+```
+
+Until the snapshot is removed, `admin backup` refuses to overwrite it, and it
+counts against the volume, not against the database budget.
+
 The snapshot is a plain SQLite database protected by the same master key. To
 restore it, stop TailState, verify it with `sha256sum -c`, replace
 `tailstate.db` in the data directory with the snapshot (remove any
 `tailstate.db-wal` and `tailstate.db-shm` left beside the old file), keep the
-file owned by the service user with mode `0600`, and start the service. Remove
-the snapshot from the data volume after copying it out; it counts against the
-volume, not against the database budget.
+file owned by the service user with mode `0600`, and start the service.
 
 Back up `secrets/tailstate_master_key` separately and securely. A backup is
 only useful with the matching master key: TailState intentionally refuses to
@@ -337,8 +349,10 @@ release binaries, `SHA256SUMS`, and a signed build-provenance attestation.
 
 ```console
 sha256sum -c SHA256SUMS --ignore-missing
-gh attestation verify tailstate_<version>_linux_amd64.tar.gz --owner crypt0rr
-gh attestation verify tailstate_<version>.spdx.json --owner crypt0rr
+gh attestation verify tailstate_<version>_linux_amd64.tar.gz --owner crypt0rr \
+  --signer-workflow crypt0rr/TailState/.github/workflows/release.yml
+gh attestation verify tailstate_<version>.spdx.json --owner crypt0rr \
+  --signer-workflow crypt0rr/TailState/.github/workflows/release.yml
 ```
 
 The archive contains a hardened systemd unit in

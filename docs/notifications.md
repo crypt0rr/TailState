@@ -17,7 +17,7 @@ Shoutrrr supports Mattermost natively, for example:
 mattermost://TailState@mattermost.example/hooks-token?icon=satellite
 ```
 
-For Matrix, prefer an access-token URL such as `matrix://:<access-token>@matrix.example/?rooms=!roomid:matrix.example`. A `matrix://user:password@host/...` URL makes Shoutrrr log in to the homeserver every time its sender is constructed: once when the destination is saved or tested and once per delivery attempt. Those logins use TailState's bounded, redirect-rejecting transport, and a rejected or rate-limited login is classified like any other provider response, but frequent logins can still hit homeserver login rate limits (for example Synapse's `rc_login`) and each one issues a new access token. Token URLs authenticate without a login request.
+For Matrix, prefer an access-token URL such as `matrix://:<access-token>@matrix.example/?rooms=!roomid:matrix.example`. A `matrix://user:password@host/...` URL makes Shoutrrr log in to the homeserver on the first send through each sender, inside the same 15-second send timeout as the message. TailState creates a sender for every delivery attempt and every test send, so each one logs in once; saving a destination does not log in. Those logins use TailState's bounded, redirect-rejecting transport, and a rejected or rate-limited login is classified like any other provider response, but frequent logins can still hit homeserver login rate limits (for example Synapse's `rc_login`) and each one issues a new access token. Token URLs authenticate without a login request.
 
 Destinations are added, edited, tested, and removed on the Settings page; see
 [Web interface](operations.md#web-interface).

@@ -186,7 +186,8 @@ With no option, show the checkpoint destination, the last checkpoint, and the
 notification destinations with their IDs. -destination-id chooses the enabled
 destination that receives a signed checkpoint of the ledger head, at most one
 every six hours and only while the ledger advances; -clear turns checkpoints
-off. Safe while the service runs; never creates or migrates a database.
+off. Runs while the service does, refuses while admin compact replaces the
+database, and never creates or migrates a database.
 `,
 	"evidence public-key": `Usage: tailstate evidence public-key
 

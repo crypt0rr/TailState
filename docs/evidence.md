@@ -34,7 +34,7 @@ tailstate evidence checkpoint -destination-id 3
 tailstate evidence checkpoint -clear          # turn checkpoints off
 ```
 
-The command writes only the checkpoint settings, so it is safe while TailState runs. Destinations are chosen by ID because their names need not be unique; the status output lists the IDs and never prints service URLs.
+The command changes only the checkpoint settings, so it works while TailState runs. Like `admin reset`, a change takes the maintenance lock shared and refuses with an error while `admin compact` is replacing the database, so a change is never lost to the file replacement. Destinations are chosen by ID because their names need not be unique; the status output lists the IDs and never prints service URLs.
 
 While the ledger advances, TailState checks every 15 minutes and sends at most one checkpoint every six hours. A checkpoint is sent only when the ledger has moved past the last one, so an idle ledger sends nothing and the same sequence is never sent twice. It is a system notification for the chosen destination only: routing and mute rules do not apply, and delivery is at-least-once like every other notification. The message shows the sequence, the ledger head (the lowercase hexadecimal SHA-256 entry hash), the recorded time in whole seconds (UTC), the signing key ID, and the Ed25519 signature. The signature covers this text, one value per line with no trailing newline:
 

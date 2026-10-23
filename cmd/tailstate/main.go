@@ -631,8 +631,9 @@ func evidenceAudit(args []string) error {
 }
 
 // evidenceCheckpoint shows, or chooses, the notification destination that
-// receives signed ledger checkpoints. It writes only the checkpoint settings,
-// so it is safe while the service runs, like admin reset.
+// receives signed ledger checkpoints. A change writes only the checkpoint
+// settings, under the maintenance lock: it runs while the service does and
+// refuses while admin compact is replacing the database.
 func evidenceCheckpoint(args []string) error {
 	flags := newFlagSet("evidence checkpoint")
 	destinationID := flags.Int64("destination-id", 0, "notification destination ID that receives signed ledger checkpoints")
@@ -646,26 +647,44 @@ func evidenceCheckpoint(args []string) error {
 	if *clearDestination && *destinationID != 0 {
 		return usageError("evidence checkpoint", errors.New("-clear cannot be combined with -destination-id"))
 	}
-	st, err := openExisting("evidence checkpoint")
+	config, err := boot.Load(version)
 	if err != nil {
-		return err
+		return fmt.Errorf("evidence checkpoint configuration: %w", err)
 	}
-	defer st.Close()
+	key, err := config.MasterKey()
+	if err != nil {
+		return fmt.Errorf("evidence checkpoint master key: %w", err)
+	}
+	box, err := secret.NewBox(key)
+	if err != nil {
+		return fmt.Errorf("evidence checkpoint master key: %w", err)
+	}
 	ctx := context.Background()
 	if *clearDestination {
-		if err := st.ClearEvidenceCheckpointDestination(ctx); err != nil {
-			return err
+		err := store.ChangeEvidenceCheckpoints(config.DatabasePath(), box, func(st *store.Store) error {
+			return st.ClearEvidenceCheckpointDestination(ctx)
+		})
+		if err != nil {
+			return fmt.Errorf("evidence checkpoint: %w", err)
 		}
 		fmt.Println("ledger checkpoints are off")
 		return nil
 	}
 	if *destinationID > 0 {
-		if err := st.SetEvidenceCheckpointDestination(ctx, *destinationID); err != nil {
+		err := store.ChangeEvidenceCheckpoints(config.DatabasePath(), box, func(st *store.Store) error {
+			return st.SetEvidenceCheckpointDestination(ctx, *destinationID)
+		})
+		if err != nil {
 			return fmt.Errorf("evidence checkpoint: %w", err)
 		}
 		fmt.Printf("ledger checkpoints will be sent to notification destination %d\n", *destinationID)
 		return nil
 	}
+	st, err := store.OpenExisting(config.DatabasePath(), box)
+	if err != nil {
+		return fmt.Errorf("evidence checkpoint database: %w", err)
+	}
+	defer st.Close()
 	status, err := st.EvidenceCheckpointStatus(ctx)
 	if err != nil {
 		return err

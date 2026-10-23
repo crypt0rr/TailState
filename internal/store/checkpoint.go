@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/crypt0rr/tailstate/internal/notify"
+	"github.com/crypt0rr/tailstate/internal/secret"
 )
 
 // Ledger checkpoints anchor the evidence-ledger head outside the database. The
@@ -150,6 +151,31 @@ func (s *Store) ClearEvidenceCheckpointDestination(ctx context.Context) error {
 		return fmt.Errorf("clear evidence checkpoint destination: %w", err)
 	}
 	return nil
+}
+
+// ChangeEvidenceCheckpoints applies one change to the checkpoint settings of
+// the existing database at path. It takes the maintenance lock shared, as admin
+// reset does: a setting written while admin compact is replacing the file would
+// be discarded by the rename, so the change fails with ErrMaintenanceBusy
+// instead. Like OpenExisting, it never creates, migrates, or repairs the
+// database, and it works while the service holds its lock.
+func ChangeEvidenceCheckpoints(path string, box *secret.Box, change func(*Store) error) error {
+	// Check for the database before the lock: taking the lock creates its file,
+	// and a missing database must leave the data directory untouched.
+	if err := requireDatabase(path); err != nil {
+		return err
+	}
+	lock, err := LockMaintenanceShared(path)
+	if err != nil {
+		return err
+	}
+	defer lock.Release()
+	st, err := OpenExisting(path, box)
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+	return change(st)
 }
 
 // EvidenceCheckpointStatus reports the checkpoint configuration and the last

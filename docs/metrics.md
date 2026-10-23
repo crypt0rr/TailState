@@ -37,8 +37,9 @@ When `TAILSTATE_METRICS_TOKEN` is empty, TailState answers only a loopback peer 
 ## Metric reference
 
 `/metrics` exposes the following families. Labels are low-cardinality: a
-collector name, a fixed outcome or state vocabulary, or a table name; no
-destination, resource, or user appears in a label.
+collector name, a fixed outcome or state vocabulary, a table name, or the
+numeric ID of a notification destination; no destination name or URL,
+resource, or user appears in a label.
 
 | Area | Metrics | Meaning |
 | --- | --- | --- |
@@ -47,6 +48,7 @@ destination, resource, or user appears in a label.
 | | `tailstate_notifications_paused` | `1` when a configured installation has no destination or every destination is disabled |
 | | `tailstate_notification_destinations`, `tailstate_notification_destinations_enabled` | Notification destination totals and enabled counts |
 | Delivery queue | `tailstate_outbox_pending`, `tailstate_outbox_processing`, `tailstate_outbox_dead` | Pending, in-flight (leased), and dead-lettered notifications |
+| | `tailstate_outbox_oldest_pending_age_seconds{destination=...}` | Age of each notification destination's oldest pending notification, labelled by the destination's numeric ID; `0` when nothing is pending. Ages run from enqueue, so a dead letter requeued by **Retry dead letters** keeps its original age. Disabling a destination dead-letters its queue, so it reads `0`. |
 | Delivery telemetry | `tailstate_outbox_delivery_attempts_total`, `tailstate_outbox_delivery_success_total`, `tailstate_outbox_delivery_failure_total` | Delivery attempts, successes, and failures |
 | | `tailstate_outbox_lease_renewals_total`, `tailstate_outbox_lease_renewal_failures_total`, `tailstate_outbox_lease_losses_total` | Delivery lease renewals, renewal failures, and leases lost before completion |
 | | `tailstate_outbox_delivery_duration_seconds` | Histogram of delivery attempt duration |
@@ -54,6 +56,7 @@ destination, resource, or user appears in a label.
 | | `tailstate_collector_due_errors_total` | The scheduler's total database-error counter while selecting due collectors |
 | | `tailstate_resources{collector=...}` | Resources in the current baseline |
 | Webhooks | `tailstate_webhook_triggers_pending`, `tailstate_webhook_triggers_processing`, `tailstate_webhook_triggers_dead` | Verified webhook triggers waiting, being reconciled, or past their retry window |
+| | `tailstate_webhook_trigger_oldest_pending_age_seconds` | Age of the oldest verified webhook trigger still waiting for reconciliation; `0` when none is pending |
 | | `tailstate_webhook_requests_total{outcome=...}` | Webhook requests by outcome (see [webhooks](monitoring.md#faster-reconciliation-with-tailscale-webhooks)) |
 | Change attribution | `tailstate_attribution_lookups_total{outcome=...}`, `tailstate_attribution_changes_total{result=...}` | Audit log lookups and attributed changes (see [Change attribution](monitoring.md#change-attribution)) |
 | Storage size | `tailstate_storage_bytes`, `tailstate_storage_used_bytes`, `tailstate_storage_freelist_pages`, `tailstate_storage_free_bytes`, `tailstate_storage_pressure_ratio` | Allocated and used database size, free pages and their bytes, and the used-bytes pressure ratio (see [Storage limits](operations.md#storage-limits)) |
@@ -62,6 +65,7 @@ destination, resource, or user appears in a label.
 | Physical files | `tailstate_storage_database_file_bytes`, `tailstate_storage_wal_bytes`, `tailstate_storage_shm_bytes`, `tailstate_storage_physical_bytes` | Observed physical sizes (see [WAL and read concurrency](operations.md#wal-and-read-concurrency)) |
 | Truncation | `tailstate_snapshot_truncations_total`, `tailstate_event_value_truncations_total`, `tailstate_history_page_truncations_total`, `tailstate_oversized_writes_rejected_total` | Snapshot truncation, event-value truncation, history-page truncation, and oversized raw writes represented by a metadata marker |
 | Retention cleanup | `tailstate_cleanup_runs_total`, `tailstate_cleanup_failures_total`, `tailstate_cleanup_remaining`, `tailstate_cleanup_remaining_passes_total`, `tailstate_cleanup_transactions_total`, `tailstate_cleanup_duration_seconds`, `tailstate_cleanup_rows_total{table=...}` | Retention cleanup progress (see [Retention cleanup](operations.md#retention-cleanup)) |
+| | `tailstate_cleanup_last_success_timestamp_seconds` | Unix time of the last retention pass that finished without error in this process; `0` until one does. The value is process-local, so it returns to `0` after a restart until the startup pass succeeds. |
 | Sign-in forms | `tailstate_credential_challenge_total{action=...,outcome=...}`, `tailstate_credential_rejections_total{action=...}` | Credential form challenge outcomes and rejected submissions (see [Credential forms and throttling](security.md#credential-forms-and-throttling)) |
 
 These signals make storage pressure visible without exposing destination URLs, provider bodies, or message contents. Every metric family carries `# HELP` and `# TYPE` lines (the exposition passes `promtool check metrics`), and the response is rendered in full before it is sent: if a store query fails, the scrape receives a clean `500` rather than a partial `200` body.
@@ -77,15 +81,18 @@ validated in CI with `promtool check rules`:
 | --- | --- |
 | `TailStateNotificationsDeadLettered` | `tailstate_outbox_dead > 0`: a destination missed a notification |
 | `TailStateNotificationsStuck` | Notifications are pending but none was delivered for an hour |
+| `TailStateNotificationQueueLagging` | One destination's oldest pending notification has waited over an hour, while other destinations may still be delivering |
 | `TailStateNotificationsPaused`, `TailStateNoNotificationDestinations` | Every destination is disabled, or none exists |
 | `TailStateNotReady`, `TailStateBaselineDegraded` | Setup or the first baseline is incomplete, or readiness is degraded |
 | `TailStateCollectorFailing` | A supported collector has failed three or more consecutive polls |
 | `TailStateCollectorPollOverdue`, `TailStateSchedulerDatabaseErrors` | The scheduler is behind or cannot read due collectors |
 | `TailStateWebhookTriggersDead` | Webhook triggers exhausted their retry window |
+| `TailStateWebhookTriggersLagging` | The oldest pending webhook trigger has waited over an hour for reconciliation |
 | `TailStateAttributionLookupsFailing` | Audit log lookups keep failing, so changes show "actor unknown" in History and digests say "Attribution unavailable" |
 | `TailStateStoragePressureHigh`, `TailStateStoragePressureCritical` | Used database bytes exceed 80% or 95% of the budget |
 | `TailStateStorageLimitNotEnforced` | `tailstate_storage_limit_enforced == 0`: the database needs compaction |
 | `TailStateRetentionCleanupFailing` | Retention cleanup keeps failing |
+| `TailStateRetentionCleanupStale` | No retention pass has finished without error for two hours |
 
 Load the file with `rule_files` in `prometheus.yml`, scrape TailState with its
 bearer token, and tune thresholds and `for` durations to your polling

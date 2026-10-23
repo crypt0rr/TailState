@@ -42,6 +42,22 @@ groups:
             are dead-lettered once their 24-hour delivery window expires.
           runbook_url: https://github.com/crypt0rr/TailState/blob/main/docs/notifications.md#delivery-semantics
 
+      - alert: TailStateNotificationQueueLagging
+        expr: tailstate_outbox_oldest_pending_age_seconds > 3600
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "TailState destination {{ $labels.destination }} has a notification pending for {{ $value | humanizeDuration }}"
+          description: >-
+            The oldest notification waiting for this destination (the
+            destination label is its numeric ID) has not been delivered for an
+            hour. The destination is failing or unreachable, and younger
+            notifications for it wait behind that oldest one. Other destinations
+            are not held back. Items are dead-lettered once their 24-hour
+            delivery window expires.
+          runbook_url: https://github.com/crypt0rr/TailState/blob/main/docs/notifications.md#delivery-semantics
+
       - alert: TailStateNotificationsPaused
         expr: tailstate_notification_state{state="paused"} == 1
         for: 15m
@@ -145,6 +161,21 @@ groups:
             collectors are failing; check collector health.
           runbook_url: https://github.com/crypt0rr/TailState/blob/main/docs/monitoring.md#faster-reconciliation-with-tailscale-webhooks
 
+      - alert: TailStateWebhookTriggersLagging
+        expr: tailstate_webhook_trigger_oldest_pending_age_seconds > 3600
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "TailState webhook triggers have waited {{ $value | humanizeDuration }} for reconciliation"
+          description: >-
+            The oldest verified Tailscale webhook delivery has waited an hour to
+            be reconciled, so the changes it reports wait for the scheduled
+            polls. Check collector health and the logs for reconciliation
+            errors. The trigger is dead-lettered once its 24-hour retry window
+            expires.
+          runbook_url: https://github.com/crypt0rr/TailState/blob/main/docs/monitoring.md#faster-reconciliation-with-tailscale-webhooks
+
       - alert: TailStateAttributionLookupsFailing
         expr: increase(tailstate_attribution_lookups_total{outcome="failed"}[1h]) >= 3
         labels:
@@ -210,6 +241,22 @@ groups:
             phase, and free disk space. Transactions that overrun their budget
             are logged as warnings and are not counted here; a backlog that
             keeps overrunning shows as tailstate_cleanup_remaining at 1 instead.
+          runbook_url: https://github.com/crypt0rr/TailState/blob/main/docs/operations.md#retention-cleanup
+
+      - alert: TailStateRetentionCleanupStale
+        expr: time() - tailstate_cleanup_last_success_timestamp_seconds > 7200
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "TailState retention cleanup has not completed a pass for over two hours"
+          description: >-
+            Retention passes run at least hourly, and back off to hourly while
+            they fail, so no pass has finished without error for two hours.
+            Expired history is not being removed and storage keeps growing. The
+            timestamp restarts from zero after a restart, so the startup pass
+            must succeed before it recovers. Find the "retention cleanup failed"
+            log lines and free disk space.
           runbook_url: https://github.com/crypt0rr/TailState/blob/main/docs/operations.md#retention-cleanup
 
 # Uncomment to alert when Prometheus cannot scrape TailState at all; none of the

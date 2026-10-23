@@ -32,6 +32,9 @@ type Store struct {
 	evidenceKey  evidenceSigningKey
 	limits       atomic.Value // stores StorageLimits
 	counters     storageCounters
+	// cleanupSuccessNanos is the completion time, in Unix nanoseconds, of the
+	// last retention pass that returned no error; 0 before the first one.
+	cleanupSuccessNanos atomic.Int64
 }
 
 type Settings struct {
@@ -94,9 +97,23 @@ type Status struct {
 	WebhookPending      int
 	WebhookProcessing   int
 	WebhookDead         int
+	// WebhookOldestPending is when the oldest pending webhook trigger was
+	// received; the zero time means none is pending.
+	WebhookOldestPending time.Time
+	// OutboxOldestPending has one entry per active destination, in ID order.
+	// Each entry holds the enqueue time of that destination's oldest pending
+	// notification, or the zero time when none is pending.
+	OutboxOldestPending []DestinationOldestPending
 	// Attribution is the configuration audit log state for the current
 	// generation; its zero value means it has not been checked yet.
 	Attribution AttributionSource
+}
+
+// DestinationOldestPending reports when the oldest pending notification of one
+// active destination was enqueued.
+type DestinationOldestPending struct {
+	DestinationID int64
+	Enqueued      time.Time
 }
 
 type OutboxItem struct {

@@ -162,6 +162,71 @@ func (s *Store) Status(ctx context.Context) (Status, error) {
 	if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM webhook_triggers WHERE status='dead'").Scan(&out.WebhookDead); err != nil {
 		return out, err
 	}
+	if out.WebhookOldestPending, err = oldestPendingWebhookTrigger(ctx, db); err != nil {
+		return out, err
+	}
+	if out.OutboxOldestPending, err = oldestPendingOutbox(ctx, db); err != nil {
+		return out, err
+	}
+	return out, nil
+}
+
+// oldestPendingWebhookTrigger returns when the oldest pending webhook trigger
+// was received, or the zero time when none is pending. The status seek on
+// webhook_triggers_due reads only pending rows, so the cost follows the pending
+// backlog rather than the table.
+func oldestPendingWebhookTrigger(ctx context.Context, db *sql.DB) (time.Time, error) {
+	var received sql.NullString
+	if err := db.QueryRowContext(ctx, "SELECT MIN(received_at) FROM webhook_triggers WHERE status='pending'").Scan(&received); err != nil {
+		return time.Time{}, err
+	}
+	if !received.Valid {
+		return time.Time{}, nil
+	}
+	return parseWebhookTimestamp(received.String, "received_at")
+}
+
+// oldestPendingOutboxSQL selects each active destination's oldest pending
+// notification. Delivery claims a destination's rows in ID order and holds
+// younger rows behind an older live one, so the lowest pending ID is the head
+// of that destination's queue. MIN(id) over outbox_destination_status is one
+// index seek per destination, so the cost does not grow with the outbox.
+// Disabling a destination dead-letters its pending rows, so a disabled
+// destination reads zero.
+func oldestPendingOutboxSQL() string {
+	return `SELECT d.id,o.created_at
+		FROM notification_destinations d
+		LEFT JOIN outbox o ON o.id=(SELECT MIN(p.id) FROM outbox p WHERE p.destination_id=d.id AND p.status='pending')
+		WHERE d.deleted_at IS NULL ORDER BY d.id`
+}
+
+// oldestPendingOutbox returns one entry per active destination; a destination
+// with nothing pending has the zero Enqueued time.
+func oldestPendingOutbox(ctx context.Context, db *sql.DB) ([]DestinationOldestPending, error) {
+	rows, err := db.QueryContext(ctx, oldestPendingOutboxSQL())
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []DestinationOldestPending
+	for rows.Next() {
+		var item DestinationOldestPending
+		var created sql.NullString
+		if err := rows.Scan(&item.DestinationID, &created); err != nil {
+			return nil, err
+		}
+		if created.Valid {
+			enqueued, parseErr := time.Parse(time.RFC3339Nano, created.String)
+			if parseErr != nil {
+				return nil, fmt.Errorf("parse outbox created_at timestamp: %w", parseErr)
+			}
+			item.Enqueued = enqueued
+		}
+		out = append(out, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
 	return out, nil
 }
 
@@ -495,7 +560,20 @@ func (s *Store) CleanupWithOptions(ctx context.Context, options CleanupOptions) 
 	if stats.TotalRowsChanged() > 0 {
 		s.reclaimAfterCleanup(ctx, &stats)
 	}
+	s.cleanupSuccessNanos.Store(time.Now().UnixNano())
 	return stats, nil
+}
+
+// LastCleanupSuccess reports when a retention pass last finished without an
+// error, or the zero time before the first one. The value is process-local: it
+// starts at zero after a restart and is set again when the startup pass
+// succeeds. Failed and canceled passes never move it.
+func (s *Store) LastCleanupSuccess() time.Time {
+	nanos := s.cleanupSuccessNanos.Load()
+	if nanos == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, nanos)
 }
 
 // incrementalVacuumPages bounds the pages one cleanup pass returns to the

@@ -31,20 +31,81 @@ func (e *Engine) processDurableTriggers(ctx context.Context, client *tailscale.C
 	// of their collectors, so overlapping webhook scopes poll each collector at
 	// most once. Outcomes stay per collector: each claim is completed or
 	// retried only on the collectors it requested.
-	var collectors []string
+	scopes := make([][]string, 0, len(triggers))
 	for _, trigger := range triggers {
-		scope := normalizeCollectors(trigger.Collectors)
-		if len(scope) == 0 {
-			collectors = allCollectors()
-			break
-		}
-		collectors = append(collectors, scope...)
+		scopes = append(scopes, trigger.Collectors)
 	}
-	outcome := e.pollWithOutcomes(ctx, client, settings, normalizeCollectors(collectors), true, webhookTriggerIDs(triggers)...)
+	outcome := e.pollWithOutcomes(ctx, client, settings, unionScopes(scopes...), true, webhookTriggerIDs(triggers)...)
 	for _, claim := range triggers {
 		e.finishClaimedTriggers(ctx, []store.WebhookTrigger{claim}, outcome.succeeds(claim.Collectors), claim.Attempts)
 	}
 	return true
+}
+
+// processFastTriggers serves every queued in-memory request in one pass. The
+// bounded channel and the overflow queue are drained together, each request's
+// durable rows are claimed, and the union of the collectors they need is polled
+// once. Each claim is then finished against only the collectors it requested,
+// so a failing collector retries the triggers that need it and no others.
+// received holds a request the caller already took from the channel. It reports
+// whether any request was served.
+func (e *Engine) processFastTriggers(ctx context.Context, client *tailscale.Client, settings store.Settings, received ...ReconcileRequest) bool {
+	requests := append(received, e.takeFastTriggerRequests()...)
+	var claims []store.WebhookTrigger
+	var scopes [][]string
+	for _, request := range requests {
+		ids := requestTriggerIDs(request)
+		claimed := e.claimFastTriggerClaims(ctx, ids)
+		if len(ids) > 0 && len(claimed) == 0 {
+			// The durable worker, or a newer attempt, already owns these rows.
+			continue
+		}
+		claims = append(claims, claimed...)
+		if len(ids) == 0 {
+			// A broad wakeup without durable rows polls its own scope.
+			scopes = append(scopes, request.Collectors)
+		}
+	}
+	for _, claim := range claims {
+		scopes = append(scopes, claim.Collectors)
+	}
+	if len(scopes) == 0 {
+		return false
+	}
+	outcome := e.pollWithOutcomes(ctx, client, settings, unionScopes(scopes...), true, webhookTriggerIDs(claims)...)
+	for _, claim := range claims {
+		e.finishClaimedTriggers(ctx, []store.WebhookTrigger{claim}, outcome.succeeds(claim.Collectors), claim.Attempts)
+	}
+	return true
+}
+
+// takeFastTriggerRequests removes every queued in-memory request without
+// blocking: the bounded channel first, then the overflow queue.
+func (e *Engine) takeFastTriggerRequests() []ReconcileRequest {
+	var requests []ReconcileRequest
+	for {
+		select {
+		case request := <-e.trigger:
+			requests = append(requests, request)
+		default:
+			return append(requests, e.takeTriggerOverflow()...)
+		}
+	}
+}
+
+// unionScopes merges the collector scopes of several triggers into one poll. An
+// empty or unrecognized scope means every collector, so it widens the union to
+// all of them.
+func unionScopes(scopes ...[]string) []string {
+	var union []string
+	for _, scope := range scopes {
+		scope = normalizeCollectors(scope)
+		if len(scope) == 0 {
+			return allCollectors()
+		}
+		union = append(union, scope...)
+	}
+	return normalizeCollectors(union)
 }
 
 // finishClaimedTriggers persists the result against the exact lease returned

@@ -99,32 +99,22 @@ func (e *Engine) scheduler(ctx context.Context) {
 				inventoryTimer = time.NewTimer(e.pollTimerDelay(ctx, settings.Generation, tailscale.InventoryCollectors, settings.InventoryInterval, true))
 			}
 		}
-		if overflow := e.takeTriggerOverflow(); len(overflow) > 0 {
-			for _, request := range overflow {
-				collectors := request.Collectors
-				if len(collectors) == 0 {
-					collectors = allCollectors()
-				}
-				requestedIDs := requestTriggerIDs(request)
-				claims := e.claimFastTriggerClaims(ctx, requestedIDs)
-				triggerIDs := webhookTriggerIDs(claims)
-				if len(requestedIDs) > 0 && len(triggerIDs) == 0 {
-					continue
-				}
-				outcome := e.pollWithOutcomes(ctx, client, settings, collectors, true, triggerIDs...)
-				for _, claim := range claims {
-					e.finishClaimedTriggers(ctx, []store.WebhookTrigger{claim}, outcome.succeeds(claim.Collectors), claim.Attempts)
-				}
-			}
+		// Handle the low-latency in-memory requests first when any are queued.
+		// The bounded channel and the overflow queue are served together. The
+		// durable queue remains the source of truth and is replayed once the
+		// fast path has drained.
+		if e.processFastTriggers(ctx, client, settings) {
+			e.serveElapsedPolls(ctx, client, settings, deviceTimer, inventoryTimer)
 			continue
 		}
-		// Handle the low-latency in-memory request first when one is queued.
-		// The durable queue remains the source of truth and is replayed once
-		// the fast path has drained.
 		// A trigger already accepted into the durable ledger must continue to
 		// reconcile even if the webhook secret is later cleared. Disabling new
 		// ingress must not strand work that was acknowledged earlier.
 		if len(e.trigger) == 0 && e.processDurableTriggers(ctx, client, settings) {
+			// A backlog of due triggers keeps this branch busy on every pass, so
+			// the select below is not reached. Serve any elapsed scheduled poll
+			// first, or the device and inventory collectors would starve.
+			e.serveElapsedPolls(ctx, client, settings, deviceTimer, inventoryTimer)
 			continue
 		}
 		select {
@@ -133,31 +123,45 @@ func (e *Engine) scheduler(ctx context.Context) {
 		case <-e.wake:
 			continue
 		case request := <-e.trigger:
-			collectors := request.Collectors
-			if len(collectors) == 0 {
-				collectors = allCollectors()
-			}
-			requestedIDs := requestTriggerIDs(request)
-			claims := e.claimFastTriggerClaims(ctx, requestedIDs)
-			triggerIDs := webhookTriggerIDs(claims)
-			if len(requestedIDs) > 0 && len(triggerIDs) == 0 {
-				continue
-			}
-			outcome := e.pollWithOutcomes(ctx, client, settings, collectors, true, triggerIDs...)
-			for _, claim := range claims {
-				e.finishClaimedTriggers(ctx, []store.WebhookTrigger{claim}, outcome.succeeds(claim.Collectors), claim.Attempts)
-			}
+			e.processFastTriggers(ctx, client, settings, request)
 		case <-triggerTimer.C:
 			// The durable queue is checked at the top of the loop. This timer
 			// also wakes the scheduler when a retry becomes due after a crash.
 			continue
 		case <-deviceTimer.C:
-			pollSuccess := e.poll(ctx, client, settings, tailscale.CoreCollectors, false)
-			deviceTimer.Reset(e.pollTimerDelay(ctx, settings.Generation, tailscale.CoreCollectors, settings.DeviceInterval, pollSuccess))
+			e.runScheduledPoll(ctx, client, settings, deviceTimer, tailscale.CoreCollectors, settings.DeviceInterval)
 		case <-inventoryTimer.C:
-			pollSuccess := e.poll(ctx, client, settings, tailscale.InventoryCollectors, false)
-			inventoryTimer.Reset(e.pollTimerDelay(ctx, settings.Generation, tailscale.InventoryCollectors, settings.InventoryInterval, pollSuccess))
+			e.runScheduledPoll(ctx, client, settings, inventoryTimer, tailscale.InventoryCollectors, settings.InventoryInterval)
 		}
+	}
+}
+
+// runScheduledPoll polls the collectors of one interval timer and re-arms that
+// timer for its next deadline.
+func (e *Engine) runScheduledPoll(ctx context.Context, client *tailscale.Client, settings store.Settings, timer *time.Timer, collectors []string, interval time.Duration) {
+	success := e.poll(ctx, client, settings, collectors, false)
+	timer.Reset(e.pollTimerDelay(ctx, settings.Generation, collectors, interval, success))
+}
+
+// serveElapsedPolls runs each scheduled poll whose timer has already fired,
+// without waiting for it. Trigger batches return to the top of the loop instead
+// of reaching the select, so a continuous backlog would otherwise keep the
+// device and inventory timers from ever being served.
+func (e *Engine) serveElapsedPolls(ctx context.Context, client *tailscale.Client, settings store.Settings, deviceTimer, inventoryTimer *time.Timer) {
+	if ctx.Err() != nil {
+		// Shutdown has begun. Do not start a scheduled poll that would only
+		// record its own cancellation as a collector failure.
+		return
+	}
+	select {
+	case <-deviceTimer.C:
+		e.runScheduledPoll(ctx, client, settings, deviceTimer, tailscale.CoreCollectors, settings.DeviceInterval)
+	default:
+	}
+	select {
+	case <-inventoryTimer.C:
+		e.runScheduledPoll(ctx, client, settings, inventoryTimer, tailscale.InventoryCollectors, settings.InventoryInterval)
+	default:
 	}
 }
 

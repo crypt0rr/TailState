@@ -12,15 +12,28 @@ import (
 	"github.com/crypt0rr/tailstate/internal/tailscale"
 )
 
+// pollOutcome keeps two answers apart. success is the scheduler's aggregate and
+// is strict: a partial response is not a complete poll, so timers and backoff
+// keep treating it as a failure. collectors records, per polled collector,
+// whether its answer reconciles a webhook trigger: a complete or unsupported
+// response, or a partial response whose resources were applied.
 type pollOutcome struct {
 	success    bool
 	collectors map[string]bool
 }
 
+// succeeds reports whether a trigger that requested collectors is reconciled
+// by the poll. An empty scope means every collector, so it is judged over the
+// collectors this poll covered.
 func (p pollOutcome) succeeds(collectors []string) bool {
 	collectors = normalizeCollectors(collectors)
 	if len(collectors) == 0 {
-		return p.success
+		for _, ok := range p.collectors {
+			if !ok {
+				return false
+			}
+		}
+		return true
 	}
 	for _, collector := range collectors {
 		if ok, found := p.collectors[collector]; !found || !ok {
@@ -32,7 +45,8 @@ func (p pollOutcome) succeeds(collectors []string) bool {
 
 // poll preserves the scheduler's aggregate success contract. Trigger
 // reconciliation uses pollWithOutcomes so a failure in one collector does not
-// retry a durable trigger that only requested collectors which completed.
+// retry a durable trigger that only requested collectors which completed or
+// applied a partial result.
 func (e *Engine) poll(ctx context.Context, client *tailscale.Client, settings store.Settings, collectors []string, force bool, triggerIDs ...int64) bool {
 	return e.pollWithOutcomes(ctx, client, settings, collectors, force, triggerIDs...).success
 }
@@ -123,7 +137,10 @@ func (e *Engine) pollWithOutcomes(ctx context.Context, client *tailscale.Client,
 		} else if wasUnhealthy {
 			recovered = append(recovered, collector)
 		}
-		outcome.collectors[collector] = collectorSuccess
+		// A partial result with resources is applied by ApplyBatch below, so it
+		// reconciles the trigger. The aggregate success stays false for it, and
+		// collector health and backoff keep tracking it.
+		outcome.collectors[collector] = collectorSuccess || result.Partial
 		results = append(results, result)
 		measurements = append(measurements, measurement{collector: collector, duration: duration, partial: result.Partial})
 	}

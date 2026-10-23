@@ -292,8 +292,11 @@ lifetime, and `compact` refuses to run (exit code `1`) while that lock is held.
 It opens the database like `admin reset` (never creates or migrates it),
 writes a compacted copy beside it with `VACUUM INTO`, verifies the copy, and
 only then replaces the original, so an interrupted run leaves the original in
-place. It also refuses if another process still has the database open. Take a
-backup first:
+place. It also refuses if another process still has the database open.
+Compaction and `admin reset` exclude each other through
+`tailstate.db.maintenance.lock`: while a compaction runs, `reset` refuses (exit
+code `1`) rather than writing a token that the replacement would discard, and a
+compaction refuses while a reset is writing its token. Take a backup first:
 
 ```console
 docker compose exec tailstate /tailstate admin backup -out /data/pre-compact.db
@@ -361,3 +364,30 @@ master key passed as a systemd credential, `systemd-analyze security` score
 1.1). Its header lists the install steps; the standalone binary listens on
 `127.0.0.1:8080` and prints the one-time setup token to the journal
 (`journalctl -u tailstate`).
+
+Run admin commands on a systemd install as root with `sudo`, not as your login
+user. The service runs as a dynamic user named `tailstate`, which exists only
+while the unit runs; its data lives in `/var/lib/tailstate`, owned by that user;
+and its master key is `/etc/tailstate/master_key`, readable only by root. Set
+the paths the unit uses. The defaults (`/data` and
+`/run/secrets/tailstate_master_key`) are container paths, so a command that
+misses them fails: the database is reported as not found, or the master key
+cannot be read.
+
+```console
+sudo systemctl stop tailstate
+sudo env TAILSTATE_DATA_DIR=/var/lib/tailstate TAILSTATE_MASTER_KEY_FILE=/etc/tailstate/master_key tailstate admin compact
+sudo systemctl start tailstate
+```
+
+`admin reset` runs the same way while the service is up. Running `admin compact`
+as root keeps the owner and group of the database it replaces. Earlier releases
+left the rewritten database owned by root, and the service then could not open
+it (`permission denied` on `/var/lib/tailstate/tailstate.db`). If that happens,
+restore the owner from the state directory and start the service again:
+
+```console
+sudo chown --reference=/var/lib/tailstate /var/lib/tailstate/tailstate.db
+```
+
+Check `tailstate.db.lock` the same way if the journal reports it.

@@ -32,6 +32,13 @@ type CompactResult struct {
 
 func serviceLockPath(path string) string { return path + ".lock" }
 
+func maintenanceLockPath(path string) string { return path + ".maintenance.lock" }
+
+// ErrMaintenanceBusy reports that admin compact and admin reset are running
+// against the same database at once. Whichever command finds the maintenance
+// lock held refuses instead of waiting.
+var ErrMaintenanceBusy = errors.New("admin compact or admin reset is running against this database; retry when it finishes")
+
 // compactBeforeReplace is a test seam invoked after the compacted copy is
 // verified and the source is closed, before it replaces the database.
 var compactBeforeReplace func(tempPath string) error
@@ -43,6 +50,12 @@ var compactBeforeReplace func(tempPath string) error
 // it opens the database like OpenExisting, so a missing, older-schema, or
 // wrong-key database is never created, migrated, or rewritten.
 //
+// It also holds the maintenance lock exclusively from before the copy until
+// the replacement is in place, so an admin reset cannot write its token into
+// the file that the rename discards; such a reset fails with ErrMaintenanceBusy
+// instead. When the process runs as root, the replacement keeps the owner and
+// group of the original file.
+//
 // The copy is written next to the database with VACUUM INTO (no temporary
 // directory is needed, which matters on a read-only container root), checked
 // for integrity and the master key, and then renamed over the original after
@@ -51,17 +64,19 @@ var compactBeforeReplace func(tempPath string) error
 // leaves the database exactly as it was.
 func Compact(ctx context.Context, path string, box *secret.Box, options CompactOptions) (CompactResult, error) {
 	var result CompactResult
-	if _, err := os.Stat(path); err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return result, fmt.Errorf("%w: %s", ErrDatabaseNotFound, path)
-		}
-		return result, fmt.Errorf("inspect database path: %w", err)
+	if err := requireDatabase(path); err != nil {
+		return result, err
 	}
 	lock, err := LockService(path)
 	if err != nil {
 		return result, err
 	}
 	defer lock.Release()
+	maintenance, err := LockMaintenanceExclusive(path)
+	if err != nil {
+		return result, err
+	}
+	defer maintenance.Release()
 	st, err := OpenExisting(path, box)
 	if err != nil {
 		return result, err
@@ -123,6 +138,15 @@ func Compact(ctx context.Context, path string, box *secret.Box, options CompactO
 	if compactBeforeReplace != nil {
 		if err := compactBeforeReplace(tempPath); err != nil {
 			return result, err
+		}
+	}
+	// A root run creates the copy as root. Give it the original owner and
+	// group first, or the service account that owns the database (a systemd
+	// DynamicUser, for example) cannot open it after the rename. A failed chown
+	// stops here, before the original is replaced.
+	if os.Geteuid() == 0 {
+		if err := copyOwner(path, tempPath); err != nil {
+			return result, fmt.Errorf("keep database owner: %w", err)
 		}
 	}
 	if err := os.Rename(tempPath, path); err != nil {

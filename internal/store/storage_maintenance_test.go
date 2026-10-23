@@ -560,3 +560,97 @@ func TestCompactLeavesDatabaseIntactOnFailure(t *testing.T) {
 		t.Fatalf("setup-token hash after failed compaction and retry=%q, want original value (err=%v)", afterSetupTokenHash, err)
 	}
 }
+
+// TestCompactRefusesWhileResetHoldsMaintenanceLock proves that a compaction
+// does not start while an admin reset holds the maintenance lock shared. The
+// database and the data directory stay as they were, and the compaction runs
+// once the reset has released the lock.
+func TestCompactRefusesWhileResetHoldsMaintenanceLock(t *testing.T) {
+	path, box := backupTestStore(t)
+	ctx := context.Background()
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reset, err := LockMaintenanceShared(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, compactErr := Compact(ctx, path, box, CompactOptions{})
+	if err := reset.Release(); err != nil {
+		t.Fatal(err)
+	}
+	if !errors.Is(compactErr, ErrMaintenanceBusy) {
+		t.Fatalf("compact while a reset holds the maintenance lock err=%v", compactErr)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatal("refused compaction modified the database")
+	}
+	if leftovers, _ := filepath.Glob(filepath.Join(filepath.Dir(path), ".tailstate-compact-*")); len(leftovers) != 0 {
+		t.Fatalf("refused compaction left temporary files: %v", leftovers)
+	}
+	if _, err := Compact(ctx, path, box, CompactOptions{}); err != nil {
+		t.Fatalf("compact after the reset released the lock: %v", err)
+	}
+}
+
+// claimedDatabase returns a closed database that has an administrator, so an
+// admin reset has a token it is allowed to issue.
+func claimedDatabase(t *testing.T) (string, *secret.Box) {
+	t.Helper()
+	path, box := backupTestStore(t)
+	st, err := Open(path, box)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	setup, err := st.NewSetupToken(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Claim(ctx, setup, "a secure password"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return path, box
+}
+
+// TestAdminResetDuringCompactionCannotLoseItsToken reproduces the window that
+// used to lose reset tokens: the compacted copy is verified and the source is
+// closed, but the rename has not replaced the database yet. A reset issued
+// there must be refused. If it were allowed instead, the token it printed
+// would have to survive the replacement.
+func TestAdminResetDuringCompactionCannotLoseItsToken(t *testing.T) {
+	path, box := claimedDatabase(t)
+	ctx := context.Background()
+	var issued string
+	var issueErr error
+	compactBeforeReplace = func(string) error {
+		issued, issueErr = IssueResetToken(ctx, path, box)
+		return nil
+	}
+	t.Cleanup(func() { compactBeforeReplace = nil })
+	if _, err := Compact(ctx, path, box, CompactOptions{}); err != nil {
+		t.Fatalf("compact: %v", err)
+	}
+	if issueErr != nil {
+		if !errors.Is(issueErr, ErrMaintenanceBusy) {
+			t.Fatalf("reset during compaction err=%v, want ErrMaintenanceBusy", issueErr)
+		}
+		return
+	}
+	st, err := OpenExisting(path, box)
+	if err != nil {
+		t.Fatalf("compacted database unusable: %v", err)
+	}
+	defer st.Close()
+	if err := st.validateAuthToken(ctx, "reset", issued, "reset token"); err != nil {
+		t.Fatalf("reset token issued during compaction was lost: %v", err)
+	}
+}

@@ -251,7 +251,7 @@ func Build(config boot.Config, runtime Runtime, request *http.Request) Report {
 			Code:        "storage_compaction_needed",
 			Severity:    SeverityWarning,
 			Summary:     "The database file is larger than the configured budget because it holds free pages; the budget is enforced at the current file size until the database is compacted.",
-			Remediation: "Stop TailState, run `tailstate admin compact`, and start it again.",
+			Remediation: "Stop TailState, run `tailstate admin compact`, and start it again. On a systemd install, run the command as root with `sudo`; docs/operations.md gives the exact invocation.",
 		})
 	} else if runtime.Storage.LimitNotEnforced {
 		add(Finding{
@@ -265,7 +265,7 @@ func Build(config boot.Config, runtime Runtime, request *http.Request) Report {
 			Code:        "storage_reclaimable",
 			Severity:    SeverityInfo,
 			Summary:     "At least a quarter of the database file is free pages left by retention.",
-			Remediation: "SQLite reuses free pages before growing the file. To return them to the filesystem, stop TailState and run `tailstate admin compact`.",
+			Remediation: "SQLite reuses free pages before growing the file. To return them to the filesystem, stop TailState, run `tailstate admin compact` (on a systemd install, as root with `sudo`; see docs/operations.md), and start it again.",
 		})
 	}
 

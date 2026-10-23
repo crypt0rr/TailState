@@ -143,7 +143,8 @@ creates or migrates a database.
 	"admin rekey": `Usage: tailstate admin rekey -new-key-file PATH
 
 Re-encrypt every protected value with the replacement master key. Stop the
-service first.
+service first. The replacement key is checked before the database is opened,
+and a missing or older-schema database is refused, never created or migrated.
 `,
 	"admin backup": `Usage: tailstate admin backup -out FILE
 
@@ -156,9 +157,9 @@ files are never overwritten.
 
 Rewrite the database without free pages so storage pressure and a lowered
 TAILSTATE_DATABASE_LIMIT_BYTES reflect live data. Offline: the command
-refuses to run while serve holds the data directory's service lock, and it
-never creates or migrates a database. The original file is replaced only
-after the compacted copy has been verified.
+refuses to run while serve holds the data directory's service lock or an
+admin reset is issuing a token, and it never creates or migrates a database.
+The original file is replaced only after the compacted copy has been verified.
 `,
 	"evidence": `Usage: tailstate evidence <verify|audit|public-key> [options]
 

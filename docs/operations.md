@@ -121,7 +121,8 @@ tailstate help admin backup    # one command; every command also accepts -h/--he
 | `admin rekey -new-key-file PATH` | Master-key rotation (service stopped; refused while the service lock is held) |
 | `admin backup -out FILE` | Consistent online database snapshot plus `FILE.sha256` (safe while serving) |
 | `admin compact [-incremental-vacuum]` | Release free pages (service stopped; see [Compaction](#compaction)) |
-| `evidence verify`, `evidence audit`, `evidence public-key` | Evidence verification and ledger audit |
+| `evidence verify`, `evidence audit`, `evidence public-key` | Evidence verification and ledger audit; `evidence audit` also takes `-min-sequence` and `-expect-head` to check a checkpoint kept outside the database |
+| `evidence checkpoint [-destination-id N \| -clear]` | Show, choose, or clear the notification destination for signed ledger checkpoints (safe while serving; see [Ledger checkpoints](evidence.md#ledger-checkpoints)) |
 | `version` | Print the version |
 
 Help output goes to standard output and exits `0`. Exit codes are stable for
@@ -132,7 +133,7 @@ scripts:
 | `0` | Success (including `help`, `-h`, and `--help`) |
 | `1` | Runtime error: configuration, master key, I/O, database, or network failure |
 | `2` | Usage error: unknown command or subcommand, invalid or missing option, unexpected argument |
-| `3` | The check ran and failed: `doctor` reported a blocking (error) finding, `evidence verify` rejected a pack, or `evidence audit` found a ledger integrity failure |
+| `3` | The check ran and failed: `doctor` reported a blocking (error) finding, `evidence verify` rejected a pack, or `evidence audit` found a ledger or checkpoint integrity failure |
 
 Logging is configured before configuration is validated or the database is
 opened, so startup errors, schema migration progress, and evidence-ledger

@@ -13,11 +13,12 @@ import (
 func TestEveryNotificationIncludesTailnetAndObservedTime(t *testing.T) {
 	messages := Context{Label: "prod-eu", Tailnet: "example.com", Version: "1.2.3"}
 	cases := map[string]Message{
-		"digest":    messages.Digest(DigestInput{BatchID: 7, ObservedAt: testObservedAt, Changes: []model.Change{{Kind: "created", Collector: "devices", Name: "server"}}}),
-		"unhealthy": messages.CollectorsUnhealthy([]CollectorHealth{{Collector: "devices", Reason: "auth rejected"}}, testObservedAt),
-		"recovered": messages.CollectorsRecovered([]string{"devices"}, testObservedAt),
-		"update":    messages.Update("1.2.2", "1.2.3", testObservedAt),
-		"test":      messages.Test(testObservedAt),
+		"digest":     messages.Digest(DigestInput{BatchID: 7, ObservedAt: testObservedAt, Changes: []model.Change{{Kind: "created", Collector: "devices", Name: "server"}}}),
+		"unhealthy":  messages.CollectorsUnhealthy([]CollectorHealth{{Collector: "devices", Reason: "auth rejected"}}, testObservedAt),
+		"recovered":  messages.CollectorsRecovered([]string{"devices"}, testObservedAt),
+		"update":     messages.Update("1.2.2", "1.2.3", testObservedAt),
+		"checkpoint": messages.LedgerCheckpoint(7, strings.Repeat("ab", 32), "ed25519:0011223344556677", "c2lnbmF0dXJl", testObservedAt),
+		"test":       messages.Test(testObservedAt),
 	}
 	for name, message := range cases {
 		rendered := Markdown(message)

@@ -32,13 +32,15 @@ type Message struct {
 
 // Fixed severities of system notifications: collector failures and
 // configuration changes are urgent, expiry warnings are not yet, and
-// recoveries, release notices, and the Settings test are routine.
+// recoveries, release notices, ledger checkpoints, and the Settings test are
+// routine.
 const (
 	severityUnhealthy   = model.SeverityHigh
 	severityAdminChange = model.SeverityHigh
 	severityExpiry      = model.SeverityMedium
 	severityRecovered   = model.SeverityLow
 	severityUpdate      = model.SeverityLow
+	severityCheckpoint  = model.SeverityLow
 	severityTest        = model.SeverityLow
 )
 
@@ -334,6 +336,22 @@ func (c Context) AdminChange(action string, fields []string, target, client stri
 		lines = append(lines, line(link("Open TailState settings", settingsURL)))
 	}
 	return c.message(severityAdminChange, "🔐", "TailState configuration changed", lines...)
+}
+
+// LedgerCheckpoint announces one signed evidence-ledger checkpoint. The
+// sequence, head, recorded time, key ID, and signature are shown verbatim, so
+// an auditor can pass the sequence and head to "tailstate evidence audit" and
+// check the signature against the instance public key. recordedAt must already
+// be truncated to whole seconds, as the signed statement uses that time.
+func (c Context) LedgerCheckpoint(sequence int64, head, keyID, signature string, recordedAt time.Time) Message {
+	return c.message(severityCheckpoint, "🔗", "TailState evidence checkpoint",
+		line(strong("Sequence:"), lit(" "), code(fmt.Sprint(sequence))),
+		line(strong("Ledger head:"), lit(" "), code(head)),
+		line(strong("Recorded at:"), lit(" "), code(recordedAt.UTC().Format(time.RFC3339))),
+		line(strong("Signing key:"), lit(" "), code(keyID)),
+		line(strong("Signature:"), lit(" "), code(signature)),
+		observedLine(recordedAt),
+	)
 }
 
 // Test is the message sent by the Settings "Send test" action. It names the

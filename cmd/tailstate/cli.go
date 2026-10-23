@@ -99,6 +99,7 @@ Commands:
   admin compact          Rewrite the database to release free pages (service stopped)
   evidence verify        Verify a signed evidence pack offline
   evidence audit         Audit the persisted evidence ledger
+  evidence checkpoint    Show or choose the destination that receives ledger checkpoints
   evidence public-key    Print the evidence signing public key
   version                Print the version
   help [command]         Show help for a command
@@ -161,20 +162,31 @@ refuses to run while serve holds the data directory's service lock or an
 admin reset is issuing a token, and it never creates or migrates a database.
 The original file is replaced only after the compacted copy has been verified.
 `,
-	"evidence": `Usage: tailstate evidence <verify|audit|public-key> [options]
+	"evidence": `Usage: tailstate evidence <verify|audit|checkpoint|public-key> [options]
 
   verify       Verify a signed evidence pack offline
   audit        Audit the persisted evidence ledger
+  checkpoint   Show or choose the destination that receives signed ledger checkpoints
   public-key   Print the evidence signing public key
 `,
 	"evidence verify": `Usage: tailstate evidence verify [-file PATH] [-public-key PATH]
 
 Verify a signed evidence pack. Exits 3 when verification fails.
 `,
-	"evidence audit": `Usage: tailstate evidence audit [-public-key PATH] [-batch-size N]
+	"evidence audit": `Usage: tailstate evidence audit [-public-key PATH] [-batch-size N] [-min-sequence N [-expect-head HEX]]
 
 Audit the persisted evidence ledger read-only. Exits 3 when the ledger fails
-an integrity check.
+an integrity check. With -min-sequence the ledger must also reach that sequence
+(a checkpoint kept outside the database), and with -expect-head the entry at
+that sequence must carry the given hash; -expect-head requires -min-sequence.
+`,
+	"evidence checkpoint": `Usage: tailstate evidence checkpoint [-destination-id N | -clear]
+
+With no option, show the checkpoint destination, the last checkpoint, and the
+notification destinations with their IDs. -destination-id chooses the enabled
+destination that receives a signed checkpoint of the ledger head, at most one
+every six hours and only while the ledger advances; -clear turns checkpoints
+off. Safe while the service runs; never creates or migrates a database.
 `,
 	"evidence public-key": `Usage: tailstate evidence public-key
 
@@ -274,15 +286,16 @@ func dispatch(args []string) error {
 		}, "missing admin subcommand (use admin reset, admin rekey, admin backup, or admin compact)")
 	case "evidence":
 		return dispatchGroup("evidence", args, map[string]func([]string) error{
-			"verify": evidenceVerify,
-			"audit":  evidenceAudit,
+			"verify":     evidenceVerify,
+			"audit":      evidenceAudit,
+			"checkpoint": evidenceCheckpoint,
 			"public-key": func(args []string) error {
 				if done, err := parseFlags("evidence public-key", newFlagSet("evidence public-key"), args); done {
 					return err
 				}
 				return evidencePublicKey()
 			},
-		}, "missing evidence subcommand (use evidence audit [-public-key public.key] [-batch-size N], evidence verify [-file evidence.json] [-public-key public.key], or evidence public-key)")
+		}, "missing evidence subcommand (use evidence audit [-public-key public.key] [-batch-size N] [-min-sequence N -expect-head HEX], evidence verify [-file evidence.json] [-public-key public.key], evidence checkpoint [-destination-id N | -clear], or evidence public-key)")
 	case "version", "--version", "-version":
 		if done, err := parseFlags("version", newFlagSet("version"), args); done {
 			return err
@@ -290,7 +303,7 @@ func dispatch(args []string) error {
 		fmt.Fprintf(os.Stdout, "tailstate %s\n", version)
 		return nil
 	default:
-		return usageError("", fmt.Errorf("unknown command %q (use serve, healthcheck, doctor, admin reset, admin rekey, admin backup, admin compact, evidence audit, evidence verify, evidence public-key, version, or help)", command))
+		return usageError("", fmt.Errorf("unknown command %q (use serve, healthcheck, doctor, admin reset, admin rekey, admin backup, admin compact, evidence audit, evidence verify, evidence checkpoint, evidence public-key, version, or help)", command))
 	}
 }
 

@@ -23,3 +23,39 @@ Verify an export offline with `tailstate evidence verify --file tailstate-drift-
 ## Auditing the evidence ledger
 
 Audit the persisted evidence ledger explicitly with `tailstate evidence audit`. The command opens the existing database read-only, verifies sequence continuity, predecessor hashes, signatures, key IDs, stored head, and canonical payload digests, then resumes through bounded pages until the chain is complete. Pass `--public-key public.key` to anchor verification to an independently trusted Ed25519 key; entries whose event snapshots have aged out are reported as cryptographically verified but payload-unverifiable. The audit never creates a database, runs migrations, generates keys, or changes metadata, and can run while TailState is serving from SQLite WAL mode.
+
+## Ledger checkpoints
+
+The ledger lives in the database it protects, so a database-only audit cannot tell a truncated tail, or a tail whose stored head was rewritten to match, from a complete one. A ledger checkpoint keeps evidence of the head outside the database. Choose one enabled notification destination, and TailState sends a signed statement of the newest ledger entry to it:
+
+```console
+tailstate evidence checkpoint                 # show the choice, the last checkpoint, and destination IDs
+tailstate evidence checkpoint -destination-id 3
+tailstate evidence checkpoint -clear          # turn checkpoints off
+```
+
+The command writes only the checkpoint settings, so it is safe while TailState runs. Destinations are chosen by ID because their names need not be unique; the status output lists the IDs and never prints service URLs.
+
+While the ledger advances, TailState checks every 15 minutes and sends at most one checkpoint every six hours. A checkpoint is sent only when the ledger has moved past the last one, so an idle ledger sends nothing and the same sequence is never sent twice. It is a system notification for the chosen destination only: routing and mute rules do not apply, and delivery is at-least-once like every other notification. The message shows the sequence, the ledger head (the lowercase hexadecimal SHA-256 entry hash), the recorded time in whole seconds (UTC), the signing key ID, and the Ed25519 signature. The signature covers this text, one value per line with no trailing newline:
+
+```text
+tailstate-ledger-checkpoint-v1
+<sequence>
+<head>
+<recorded time, RFC 3339, UTC, whole seconds>
+<signing key ID>
+```
+
+Verify the signature with the public key from `tailstate evidence public-key`, using any Ed25519 implementation. Before a checkpoint is sent, the ledger must still hold the entry that was last checkpointed at its sequence. A missing or changed entry is logged as an error and nothing is sent.
+
+Audit the ledger against a checkpoint kept outside the database by passing the sequence and head from the notification:
+
+```console
+tailstate evidence audit -min-sequence 42 -expect-head <head-from-notification>
+```
+
+The audit verifies the whole chain first, then exits with code 3 if the ledger ends before sequence 42 or the entry at sequence 42 has a different hash. `-expect-head` requires `-min-sequence`; `-min-sequence` alone checks only the length. A passing audit reports `checkpoint_sequence=42 checkpoint_head=matched`.
+
+A checkpoint proves the head as it was when the checkpoint was sent. It cannot prove entries that were never checkpointed, and an attacker who holds both the master key and the signing key can still issue new checkpoints. It does make a truncated or rewritten tail detectable for anyone who kept an earlier checkpoint. If the chosen destination is disabled or removed, nothing is sent and the service logs a warning until you choose another destination.
+
+The setting and the last checkpoint are stored in the existing `meta` table, so the feature adds no schema change. Releases before this feature ignore the setting and reject the `-min-sequence` and `-expect-head` flags; checkpoints that were already delivered remain valid and can still be checked against the public key.

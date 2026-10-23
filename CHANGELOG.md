@@ -22,6 +22,7 @@ rollback requires restoring the backup taken before the upgrade. See
 - Per-destination delivery counts on the status page and in the notification settings no longer build a temporary index over the whole outbox on every render. A new index on the outbox destination column serves them, and the counts are unchanged (#317).
 - A webhook trigger no longer retries for up to 24 hours when a collector answers with a partial result, such as one device whose details return `404`: the applied partial completes the trigger, while collector health and retry backoff keep tracking it. Scheduled inventory polls also keep running while triggers are due (#312).
 - Webhook events that arrive while a poll is running are reconciled together: the bounded queue and its overflow share one poll of their combined collectors, instead of one forced device fan-out per event (#308).
+- Device-detail refresh stops fanning out when Tailscale rate limits a request (`429`) or refuses it for an auth failure (such as `401`), instead of sending one request per remaining device into the same refusal. The devices that were refused or not reached keep their place at the front of the next poll rather than being recorded as refreshed (#316).
 
 ### Maintenance
 - Document a sidecar command that removes an online-backup snapshot from the data volume, since the scratch image has no `rm` (#323).

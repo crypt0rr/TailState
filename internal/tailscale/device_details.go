@@ -71,6 +71,12 @@ func (c *Client) deviceDetailsFromDevices(ctx context.Context, devices []map[str
 		go func() {
 			defer wg.Done()
 			for job := range jobs {
+				if detailCtx.Err() != nil {
+					// The fan-out stopped before this device was dispatched, so its
+					// details were never requested. Send no result: the device stays
+					// unrecorded and keeps its place at the front of the next poll.
+					continue
+				}
 				id := idFor(job.device, []string{"id", "nodeId", "nodeID"})
 				if id == "" {
 					results <- detailResult{index: job.index, err: errors.New("device detail response omitted device id")}
@@ -112,6 +118,11 @@ func (c *Client) deviceDetailsFromDevices(ctx context.Context, devices []map[str
 							combined[key] = map[string]any{"unsupported": true}
 							continue
 						}
+						if accountWideFailure(err) {
+							// A rate limit or rejected credential applies to every device,
+							// so stop dispatching and abort the requests already in flight.
+							cancel()
+						}
 						detailErr = err
 						break
 					}
@@ -122,6 +133,11 @@ func (c *Client) deviceDetailsFromDevices(ctx context.Context, devices []map[str
 					combined[key] = value
 				}
 				if detailErr != nil {
+					if detailCtx.Err() != nil && !accountWideFailure(detailErr) {
+						// A request aborted by the poll deadline or by a stop was never
+						// answered, so it sends no result (see the top of the loop).
+						continue
+					}
 					results <- detailResult{index: job.index, err: detailErr}
 					continue
 				}
@@ -148,12 +164,16 @@ func (c *Client) deviceDetailsFromDevices(ctx context.Context, devices []map[str
 	var partialErr error
 	for result := range results {
 		if result.err != nil {
-			// A request cancelled by the poll deadline was not really attempted;
-			// leave it at the front of the next poll's refresh order.
-			if ctx.Err() == nil {
+			// A rate limit or rejected credential says nothing about this device,
+			// so it keeps its place at the front of the next poll. Any other
+			// error is a per-device outcome and counts as an attempt.
+			accountWide := accountWideFailure(result.err)
+			if !accountWide {
 				completed = append(completed, result.index)
 			}
-			if partialErr == nil {
+			// Prefer the account-wide refusal that stopped the fan-out over an
+			// earlier per-device error, so the poll reports the real cause.
+			if partialErr == nil || (accountWide && !accountWideFailure(partialErr)) {
 				partialErr = result.err
 			}
 			continue
@@ -189,6 +209,15 @@ func (c *Client) deviceDetailsFromDevices(ctx context.Context, devices []map[str
 		return out, &PartialError{Err: partialErr, Count: missing}
 	}
 	return out, nil
+}
+
+// accountWideFailure reports whether err is a rate limit or a rejected
+// credential. Such a refusal applies to the whole account, so the rest of the
+// fan-out would only repeat it. Callers test IsUnsupported first: a 403 on a
+// detail endpoint means the subresource is unsupported and stays per device.
+func accountWideFailure(err error) bool {
+	category := FailureCategory(err)
+	return category == FailureRateLimited || category == FailureAuthRejected
 }
 
 // deviceDetailOrder returns device indexes ordered stalest-first: devices

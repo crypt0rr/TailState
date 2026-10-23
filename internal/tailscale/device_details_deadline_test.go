@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -100,6 +101,103 @@ func TestDeviceDetailsExpiredDeadlineNeverLooksComplete(t *testing.T) {
 	if partial.Count != len(devices)-len(resources) {
 		t.Fatalf("partial count=%d, want %d", partial.Count, len(devices)-len(resources))
 	}
+}
+
+// refusedDetailClient answers every attributes request with status and counts
+// those requests. A 429 carries a Retry-After beyond the 30 second request
+// budget, so the transport reports it at once instead of waiting. Device
+// invites always succeed.
+func refusedDetailClient(t *testing.T, status int) (*Client, *atomic.Int32) {
+	t.Helper()
+	var attributeCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/oauth/token":
+			_, _ = w.Write([]byte(`{"access_token":"access","expires_in":3600}`))
+		case strings.HasSuffix(r.URL.Path, "/attributes"):
+			attributeCalls.Add(1)
+			w.Header().Set("Retry-After", "120")
+			w.WriteHeader(status)
+		default:
+			_, _ = w.Write([]byte(`{}`))
+		}
+	}))
+	t.Cleanup(server.Close)
+	client := New(server.URL+"/api/v2", server.URL+"/oauth/token", "test", Credentials{ClientID: "id", ClientSecret: "secret"})
+	return client, &attributeCalls
+}
+
+// deviceListMaps returns n device maps with ids d0 to d(n-1) in API order.
+func deviceListMaps(n int) []map[string]any {
+	devices := make([]map[string]any, 0, n)
+	for i := 0; i < n; i++ {
+		devices = append(devices, map[string]any{"id": fmt.Sprintf("d%d", i)})
+	}
+	return devices
+}
+
+// TestDeviceDetailsRateLimitStopsFanOut covers a rate limit that outlasts the
+// request budget. The fan-out must end after about one request per worker
+// instead of one per device, report the missing devices as a PartialError, and
+// leave the devices it did not refresh at the front of the next poll.
+func TestDeviceDetailsRateLimitStopsFanOut(t *testing.T) {
+	const devices = 50
+	client, attributeCalls := refusedDetailClient(t, http.StatusTooManyRequests)
+	list := deviceListMaps(devices)
+	// d0 to d9 were refreshed by an earlier poll, so d10 onward are the stalest.
+	earlier := make([]int, 0, 10)
+	for i := 0; i < 10; i++ {
+		earlier = append(earlier, i)
+	}
+	client.recordDeviceDetailAttempts(list, earlier)
+	before := client.deviceDetailOrder(list)
+
+	resources, err := client.deviceDetailsFromDevices(context.Background(), list)
+	var partial *PartialError
+	if !errors.As(err, &partial) || partial.Count != devices || len(resources) != 0 {
+		t.Fatalf("rate-limited fan-out returned %d resources, err=%v; want a PartialError missing all %d devices", len(resources), err, devices)
+	}
+	var httpErr *HTTPError
+	if !errors.As(err, &httpErr) || httpErr.Status != http.StatusTooManyRequests {
+		t.Fatalf("rate-limited fan-out error=%v, want the upstream 429", err)
+	}
+	if got := attributeCalls.Load(); got == 0 || got > deviceDetailWorkers {
+		t.Fatalf("attribute requests=%d, want at most %d (one per worker) for %d devices", got, deviceDetailWorkers, devices)
+	}
+	if after := client.deviceDetailOrder(list); fmt.Sprint(after) != fmt.Sprint(before) {
+		t.Fatalf("refresh order after the rate limit=%v, want %v", after, before)
+	}
+}
+
+// TestDeviceDetailsCredentialStatusScope separates two refusals that share the
+// detail endpoints. A rejected credential stops the fan-out, while a 403 marks
+// the subresource unsupported and every device is still reported.
+func TestDeviceDetailsCredentialStatusScope(t *testing.T) {
+	const devices = 50
+	t.Run("rejected credential stops the fan-out", func(t *testing.T) {
+		client, attributeCalls := refusedDetailClient(t, http.StatusUnauthorized)
+		resources, err := client.deviceDetailsFromDevices(context.Background(), deviceListMaps(devices))
+		var partial *PartialError
+		if !errors.As(err, &partial) || partial.Count != devices || len(resources) != 0 {
+			t.Fatalf("rejected credential returned %d resources, err=%v; want a PartialError missing all %d devices", len(resources), err, devices)
+		}
+		if got := FailureCategory(err); got != FailureAuthRejected {
+			t.Fatalf("failure category=%q, want %q", got, FailureAuthRejected)
+		}
+		if got := attributeCalls.Load(); got >= devices {
+			t.Fatalf("attribute requests=%d for %d devices; the rejected credential did not stop the fan-out", got, devices)
+		}
+	})
+	t.Run("forbidden detail stays per device", func(t *testing.T) {
+		client, attributeCalls := refusedDetailClient(t, http.StatusForbidden)
+		resources, err := client.deviceDetailsFromDevices(context.Background(), deviceListMaps(devices))
+		if err != nil || len(resources) != devices {
+			t.Fatalf("forbidden detail returned %d resources, err=%v; want all %d devices", len(resources), err, devices)
+		}
+		if got := attributeCalls.Load(); got != devices {
+			t.Fatalf("attribute requests=%d, want one per device (%d)", got, devices)
+		}
+	})
 }
 
 func TestDeviceDetailOrderPrefersStalestDevices(t *testing.T) {

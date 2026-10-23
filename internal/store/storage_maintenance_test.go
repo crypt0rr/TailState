@@ -228,8 +228,11 @@ func TestCleanupCheckpointDoesNotWaitForReaders(t *testing.T) {
 	if err != nil || stats.SessionsDeleted != 1 || stats.WALCheckpointed {
 		t.Fatalf("cleanup with an open reader stats=%+v err=%v", stats, err)
 	}
-	if elapsed >= 100*time.Millisecond {
-		t.Fatalf("cleanup with an open reader took %s, want under 100ms", elapsed)
+	// The regression this guards is a checkpoint that waits for the 5 s busy
+	// timeout. The bound sits far below that and well above scheduling jitter
+	// on shared CI runners, where a 100 ms bound failed intermittently.
+	if elapsed >= time.Second {
+		t.Fatalf("cleanup with an open reader took %s, want under 1s", elapsed)
 	}
 	var timeout int
 	if err := st.db.QueryRowContext(ctx, "PRAGMA busy_timeout").Scan(&timeout); err != nil || timeout != 5000 {

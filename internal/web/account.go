@@ -25,9 +25,10 @@ const (
 	// requests are authenticated normally but do not count as activity for
 	// the session idle timeout.
 	refreshParameter = "refresh"
-	// passwordChangeThrottle is the limiter bucket for wrong current
-	// passwords on the authenticated change form.
-	passwordChangeThrottle credentialAction = "password_change"
+	// currentPasswordThrottle is the limiter bucket for wrong current
+	// passwords on authenticated forms: the password change form and the
+	// step-up check for persistence-granting actions share it.
+	currentPasswordThrottle credentialAction = "password_change"
 )
 
 // cookieName returns the name used for new cookies: __Host-prefixed when
@@ -144,8 +145,8 @@ func (s *Server) passwordPost(w http.ResponseWriter, r *http.Request) {
 	fail := func(message string) {
 		s.redirectWithFlash(w, r, accountSection, flashKindError, message)
 	}
-	key := s.throttleKey(passwordChangeThrottle, s.clientIP(r))
-	if _, limited := s.throttled(passwordChangeThrottle, key); limited {
+	key := s.throttleKey(currentPasswordThrottle, s.clientIP(r))
+	if _, limited := s.throttled(currentPasswordThrottle, key); limited {
 		fail("Too many incorrect current passwords. Try again later.")
 		return
 	}
@@ -169,7 +170,7 @@ func (s *Server) passwordPost(w http.ResponseWriter, r *http.Request) {
 	revoked, err := s.store.ChangePassword(ctx, r.FormValue("current_password"), password)
 	if err != nil {
 		if errors.Is(err, store.ErrCurrentPasswordMismatch) {
-			s.recordFailure(passwordChangeThrottle, key)
+			s.recordFailure(currentPasswordThrottle, key)
 			s.recordAdmin(r, auth.ref, adminChange{event: store.AuditPasswordChangeFail, outcome: store.AuditFailure}, nil, 0)
 			fail("Password was not changed: the current password is incorrect.")
 			return
@@ -191,6 +192,43 @@ func (s *Server) passwordPost(w http.ResponseWriter, r *http.Request) {
 		message = "Password changed. Every other session was signed out and every active API token was revoked."
 	}
 	s.redirectWithFlash(w, r, accountSection, flashKindSuccess, message)
+}
+
+// stepUpField names, in the audit record of a persistence-granting action,
+// that the administrator re-entered the current password for it. A refused
+// step-up is recorded as the refused action with outcome failure.
+const stepUpField = "step_up"
+
+// checkStepUp verifies the current password that a persistence-granting form
+// submits with its change (creating an API token, adding or re-pointing a
+// notification destination, clearing the webhook secret, or adding a mute
+// rule). It returns "" when the password is correct and the change may
+// proceed. Otherwise it returns the refusal message, which starts with what,
+// the caller's name for the refused change. A wrong or missing password counts
+// against the throttle the password change form uses, and is recorded as
+// attempt with outcome failure and the step_up field. A throttled or busy
+// submission is refused before the password is checked, so it is not
+// recorded. The password is never recorded or logged.
+func (s *Server) checkStepUp(r *http.Request, sessionRef string, attempt adminChange, what string) string {
+	key := s.throttleKey(currentPasswordThrottle, s.clientIP(r))
+	if _, limited := s.throttled(currentPasswordThrottle, key); limited {
+		return what + ": too many incorrect current passwords. Try again later."
+	}
+	select {
+	case s.authWork <- struct{}{}:
+		defer func() { <-s.authWork }()
+	default:
+		return what + ": the server is busy checking passwords. Try again."
+	}
+	if !s.store.Authenticate(r.Context(), r.FormValue("current_password")) {
+		s.recordFailure(currentPasswordThrottle, key)
+		attempt.outcome = store.AuditFailure
+		attempt.fields = append(attempt.fields, stepUpField)
+		s.recordAdmin(r, sessionRef, attempt, nil, 0)
+		return what + ": the current password is missing or incorrect."
+	}
+	s.clearFailures(key)
+	return ""
 }
 
 // sessionsPost signs out every session except the current one.

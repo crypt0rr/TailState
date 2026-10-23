@@ -20,7 +20,9 @@ mattermost://TailState@mattermost.example/hooks-token?icon=satellite
 For Matrix, prefer an access-token URL such as `matrix://:<access-token>@matrix.example/?rooms=!roomid:matrix.example`. A `matrix://user:password@host/...` URL makes Shoutrrr log in to the homeserver on the first send through each sender, inside the same 15-second send timeout as the message. TailState creates a sender for every delivery attempt and every test send, so each one logs in once; saving a destination does not log in. Those logins use TailState's bounded, redirect-rejecting transport, and a rejected or rate-limited login is classified like any other provider response, but frequent logins can still hit homeserver login rate limits (for example Synapse's `rc_login`) and each one issues a new access token. Token URLs authenticate without a login request.
 
 Destinations are added, edited, tested, and removed on the Settings page; see
-[Web interface](operations.md#web-interface).
+[Web interface](operations.md#web-interface). Adding a destination, or changing
+its URL, asks for the current administrator password (see
+[Step-up](security.md#step-up-for-persistence-granting-actions)).
 
 ## Message content and rendering
 
@@ -440,7 +442,9 @@ inventory changes and always reach every enabled destination.
 Predictable noise is reduced in the digest without losing the audit trail:
 
 - **Mute rules** are managed under **Noise controls** in Settings (CSRF
-  protected). A rule mutes a collector (`dns`), one field path of a collector
+  protected; adding one asks for the current administrator password, see
+  [Step-up](security.md#step-up-for-persistence-granting-actions)). A rule
+  mutes a collector (`dns`), one field path of a collector
   (`devices.clientVersion`, which also covers nested paths below it, and
   `device_details.deviceInvites`, which covers every invite such as
   `deviceInvites[5861427050514914].tailnetId`), every

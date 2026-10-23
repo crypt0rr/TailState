@@ -47,7 +47,10 @@
         <small id="settings-expiry-tags-help">Optional. Only warn for devices and auth keys with one of these tags (comma-separated).</small>
       </label>
     </div>
-    {{if .Webhook.Enabled}}<label class="check-label" for="settings-clear-webhook"><input id="settings-clear-webhook" type="checkbox" name="clear_webhook_secret"> <span>Remove the configured webhook secret</span></label>{{end}}
+    {{if .Webhook.Enabled}}<label class="check-label" for="settings-clear-webhook"><input id="settings-clear-webhook" type="checkbox" name="clear_webhook_secret"> <span>Remove the configured webhook secret</span></label>
+    <label for="settings-clear-password">Current password <small>Required only to remove the webhook secret.</small>
+      <input id="settings-clear-password" type="password" name="current_password" autocomplete="current-password">
+    </label>{{end}}
     <button type="submit">Test and save monitoring</button>
   </form>
 </section>
@@ -144,6 +147,9 @@
             <label for="destination-url-{{.ID}}">New Shoutrrr URL <small>Leave blank to keep the current endpoint.</small>
               <input id="destination-url-{{.ID}}" type="password" name="service_url" autocomplete="new-password" placeholder="Paste a new service URL">
             </label>
+            <label for="destination-password-{{.ID}}">Current password <small>Required only with a new URL.</small>
+              <input id="destination-password-{{.ID}}" type="password" name="current_password" autocomplete="current-password">
+            </label>
           </div>
           <input type="hidden" name="routing" value="1">
           <fieldset class="routing">
@@ -222,6 +228,9 @@
         <label for="new-destination-url">Shoutrrr URL
           <input id="new-destination-url" type="password" name="service_url" placeholder="mattermost://TailState@host/token?icon=satellite" required autocomplete="new-password">
         </label>
+        <label for="new-destination-password">Current password <small>Required to add a destination.</small>
+          <input id="new-destination-password" type="password" name="current_password" autocomplete="current-password" required>
+        </label>
       </div>
       <label class="check-label" for="new-destination-enabled"><input id="new-destination-enabled" type="checkbox" name="enabled" checked> <span>Enable this destination</span></label>
       <button type="submit">Add destination</button>
@@ -271,6 +280,9 @@
       </label>
       <label for="mute-value">Value
         <input id="mute-value" name="value" required placeholder="devices.clientVersion, keys, tag:ci, or a device name" autocomplete="off" spellcheck="false">
+      </label>
+      <label for="mute-password">Current password <small>Required to add a mute rule.</small>
+        <input id="mute-password" type="password" name="current_password" autocomplete="current-password" required>
       </label>
     </div>
     <button type="submit">Add mute rule</button>
@@ -403,6 +415,9 @@
           <option value="{{.}}"{{if eq . 90}} selected{{end}}>{{.}} days</option>
           {{- end}}
         </select>
+      </label>
+      <label for="api-token-password">Current password <small>Required to create a token.</small>
+        <input id="api-token-password" type="password" name="current_password" autocomplete="current-password" required>
       </label>
     </div>
     <fieldset class="check-row">

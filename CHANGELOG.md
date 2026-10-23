@@ -16,6 +16,9 @@ rollback requires restoring the backup taken before the upgrade. See
 ### Added
 - `scripts/restore.sh` no longer reports success when the restored service fails to come up: after `docker compose start` it waits up to two minutes for the container's Docker health check to report `healthy`, and on failure it stops the service, prints a master key or database mismatch hint, and exits non-zero. The container smoke test asserts the same healthy status, and the backup and restore smoke test covers a restore with the wrong master key (#309).
 
+### Changed
+- Creating an API token, adding a notification destination or changing its URL, removing the webhook secret, and adding a mute rule now require the current administrator password in the form's `current_password` field, including for scripts that post these Settings forms. A wrong or missing password refuses the change, counts against the password change throttle, and is audited as a failed attempt; a correct password is recorded with the `step_up` field (#326).
+
 ## [0.19.2] - 2026-10-23
 
 - **Schema:** 17 (unchanged)

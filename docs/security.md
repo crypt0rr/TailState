@@ -103,6 +103,31 @@ sign-in replaces them, and the two namings are never combined. The
 short-lived credential-form challenge cookies keep their page-scoped paths
 and therefore their existing names.
 
+## Step-up for persistence-granting actions
+
+Four Settings actions change what TailState keeps or sends, so each needs the
+current administrator password, entered again every time, even within an
+active session:
+
+- creating an API token (tokens are created only through this form);
+- adding a notification destination, or changing an existing destination's
+  URL (leave the URL blank to keep it, and no password is needed);
+- removing the stored webhook secret (the password is asked for only when a
+  secret is stored and the removal is requested);
+- adding a mute rule.
+
+Renaming a destination, changing its routing or message format, enabling,
+disabling, testing, or removing a destination, and saving monitoring settings
+without removing the webhook secret do not need it.
+
+A wrong or missing password refuses the change: nothing is stored or
+announced, and the attempt counts against the password change throttle (five
+failures per client in 15 minutes, shared with **Change password**). The
+refusal is audited as the refused action with outcome `failure` and the
+`step_up` field. A correct password proceeds, and the audit record of the
+change lists `step_up` among its changed fields. The password is never stored,
+logged, or displayed.
+
 ## Password reset
 
 Generate a one-time reset token:
@@ -182,9 +207,11 @@ durable `admin_audit` table, so a change made with a stolen session or by an
 insider is not silent. One record is written for each sign-in, failed
 sign-in, sign-out, setup claim, token password reset (listing
 `api_tokens_revoked` when it revoked API tokens), password change (likewise),
-password change refused for a wrong current password (outcome `failure`), and
-"sign out all other sessions"; for each monitoring settings save that changes
-something (tailnet, OAuth client ID, OAuth secret rotation, OAuth scopes,
+password change refused for a wrong current password (outcome `failure`),
+every step-up refused for a wrong current password (the refused change with
+outcome `failure` and the `step_up` field), and "sign out all other sessions";
+for each monitoring settings save that changes something (tailnet, OAuth
+client ID, OAuth secret rotation, OAuth scopes,
 either polling interval, expiry warning windows or tag filter, webhook secret
 set or cleared); for each notification destination added, edited (name, URL,
 enabled state, routing, message format), enabled, disabled, or removed (after
@@ -196,7 +223,9 @@ one notification). A record holds
 the event, time, outcome, the client address (taken from
 `X-Forwarded-For` only when the peer is a trusted proxy), a short reference
 to the acting session, the affected object as `kind:id`, and the **names** of
-the changed fields. Values are never recorded: the store accepts only the
+the changed fields, including `step_up` when the current password was
+re-entered for the change (see [Step-up](#step-up-for-persistence-granting-actions)).
+Values are never recorded: the store accepts only the
 fixed event vocabulary and identifier-shaped field names, so a URL, secret,
 password, or display name cannot be written by mistake. Every record is also
 logged as a structured `administrative action` line (`event`, `outcome`,
@@ -239,8 +268,9 @@ destination first.
 Machine clients (SIEM, SOAR, compliance pipelines) read TailState through a
 small read-only API instead of scraping HTML or sharing the administrator
 password. Create a token under **API tokens** in Settings: give it a name,
-one or more scopes, and an expiry of 30, 90, 180, or 365 days. The token
-(`tsapi_...`) is shown once, on the Settings page the form returns to, and
+one or more scopes, an expiry of 30, 90, 180, or 365 days, and the current
+administrator password (see [Step-up](#step-up-for-persistence-granting-actions)).
+The token (`tsapi_...`) is shown once, on the Settings page the form returns to, and
 cannot be displayed again: the form uses Post/Redirect/Get, the secret is held
 only in server memory until that page is shown to the session that created
 it (at most 60 seconds), and it is never placed in a URL, a cookie, or the

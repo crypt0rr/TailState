@@ -84,7 +84,9 @@ After claiming the installation, the authenticated Settings page asks for:
 2. OAuth client ID and secret, and the OAuth scopes to request (default
    `all:read`; see [OAuth scopes](docs/monitoring.md#oauth-scopes)).
 3. At least one notification destination using a Shoutrrr URL; see
-   [Notifications](docs/notifications.md#destinations).
+   [Notifications](docs/notifications.md#destinations). Adding it asks for the
+   current administrator password (see
+   [Step-up](docs/security.md#step-up-for-persistence-granting-actions)).
 4. Device and secondary inventory polling intervals, in whole seconds. Device
    polling accepts 15 seconds to 24 hours (86400 seconds); inventory polling
    accepts 30 seconds to 24 hours.

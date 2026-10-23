@@ -101,6 +101,22 @@ func routingFromForm(r *http.Request) (store.RoutingRules, error) {
 	})
 }
 
+// destinationStepUp reports whether a destination save needs the current
+// password, and the change it makes for the audit record of a refusal. Adding
+// a destination (id 0) and pointing an existing one at a new URL start or
+// redirect deliveries, so both need it. Renaming, routing, format, and
+// enabling changes, and a save that keeps the stored URL (serviceURL is
+// resolved to it before this call), do not.
+func destinationStepUp(destinations []store.NotificationDestination, id int64, serviceURL string) (adminChange, bool) {
+	if id <= 0 {
+		return adminChange{event: store.AuditDestinationAdded, fields: []string{"enabled", "name", "service_url"}}, true
+	}
+	if old, found := findDestination(destinations, id); found && serviceURL != old.ServiceURL {
+		return adminChange{event: store.AuditDestinationEdited, target: destinationTarget(id), fields: []string{"service_url"}}, true
+	}
+	return adminChange{}, false
+}
+
 // destinationPost handles every destination form. Each outcome, success or
 // failure, is reported with Post/Redirect/Get and a one-time flash message,
 // so reloading the resulting page never repeats a test notification, a
@@ -156,6 +172,15 @@ func (s *Server) destinationPost(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
+		// The step-up runs before prepareDestinationSave, which may send a
+		// notice to the current URL, so a refused change sends nothing.
+		attempt, gated := destinationStepUp(all, id, serviceURL)
+		if gated {
+			if msg := s.checkStepUp(r, auth.ref, attempt, "Notification destination was not saved"); msg != "" {
+				s.redirectWithFlash(w, r, "/settings", flashKindError, msg)
+				return
+			}
+		}
 		before := onlyEnabled(all)
 		change, notified := s.prepareDestinationSave(ctx, r, all, id, serviceURL, enabled, withRouting, rules, format)
 		savedID, err := s.store.SaveDestination(ctx, store.NotificationDestination{ID: id, Name: r.FormValue("name"), ServiceURL: serviceURL, Enabled: enabled})
@@ -172,6 +197,9 @@ func (s *Server) destinationPost(w http.ResponseWriter, r *http.Request) {
 		}
 		if change.event != "" {
 			change.target = destinationTarget(savedID)
+			if gated {
+				change.fields = append(change.fields, stepUpField)
+			}
 			s.recordAdmin(r, auth.ref, change, before, notified)
 		}
 		s.engine.Wake()

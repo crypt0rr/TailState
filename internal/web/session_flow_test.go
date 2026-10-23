@@ -274,7 +274,7 @@ func TestSendTestReloadNeverResends(t *testing.T) {
 		t.Fatalf("reloading the result page resent the test: sent=%d", sent.Load())
 	}
 
-	saved := coveragePost(t, server, "/settings/destinations", url.Values{"_csrf": {csrf}, "action": {"save"}, "name": {"Second"}, "service_url": {"generic://second.example/hook"}, "enabled": {"on"}}, cookies)
+	saved := coveragePost(t, server, "/settings/destinations", url.Values{"_csrf": {csrf}, "action": {"save"}, "current_password": {testAdminPassword}, "name": {"Second"}, "service_url": {"generic://second.example/hook"}, "enabled": {"on"}}, cookies)
 	if text := flashText(t, followFlash(t, server, cookies, saved), "success"); text != "Notification destination saved." {
 		t.Fatalf("save flash=%q", text)
 	}

@@ -84,7 +84,14 @@ func newAPIFixture(t *testing.T, batches int) *apiFixture {
 // secret from the page the Post/Redirect/Get redirect leads to.
 func (f *apiFixture) createToken(t *testing.T, scopes ...string) string {
 	t.Helper()
-	form := url.Values{"_csrf": {csrfFrom(t, f.cookies)}, "action": {"create"}, "name": {"SIEM"}, "expires_days": {"30"}, "scopes": scopes}
+	return f.createTokenWithPassword(t, testAdminPassword, scopes...)
+}
+
+// createTokenWithPassword is createToken for an administrator whose current
+// password, which creating a token requires, is password.
+func (f *apiFixture) createTokenWithPassword(t *testing.T, password string, scopes ...string) string {
+	t.Helper()
+	form := url.Values{"_csrf": {csrfFrom(t, f.cookies)}, "action": {"create"}, "current_password": {password}, "name": {"SIEM"}, "expires_days": {"30"}, "scopes": scopes}
 	response := coveragePost(t, f.server, "/settings/api-tokens", form, f.cookies)
 	if response.Code != http.StatusSeeOther || strings.Contains(response.Header().Get("Location"), store.APITokenPrefix) {
 		t.Fatalf("token creation %d %q", response.Code, response.Header().Get("Location"))
@@ -220,7 +227,7 @@ func TestAPITokensAreScopedAndRevocationIsImmediate(t *testing.T) {
 	if response := coveragePost(t, f.server, "/settings/api-tokens", url.Values{"action": {"create"}, "name": {"x"}, "scopes": {store.ScopeStatusRead}, "expires_days": {"30"}}, f.cookies); response.Code != http.StatusForbidden {
 		t.Fatalf("token creation without CSRF: %d", response.Code)
 	}
-	if response := coveragePost(t, f.server, "/settings/api-tokens", url.Values{"_csrf": {csrfFrom(t, f.cookies)}, "action": {"create"}, "name": {"x"}, "expires_days": {"30"}}, f.cookies); !strings.Contains(followFlash(t, f.server, f.cookies, response), "choose at least one scope") {
+	if response := coveragePost(t, f.server, "/settings/api-tokens", url.Values{"_csrf": {csrfFrom(t, f.cookies)}, "action": {"create"}, "current_password": {testAdminPassword}, "name": {"x"}, "expires_days": {"30"}}, f.cookies); !strings.Contains(followFlash(t, f.server, f.cookies, response), "choose at least one scope") {
 		t.Fatal("token without scopes was not refused with a message")
 	}
 	if response := coveragePost(t, f.server, "/settings/api-tokens", url.Values{"_csrf": {csrfFrom(t, f.cookies)}, "action": {"revoke"}, "id": {"999"}}, f.cookies); !strings.Contains(followFlash(t, f.server, f.cookies, response), "not found") {
@@ -442,7 +449,7 @@ func TestAPIStorageErrorsAreCleanFailures(t *testing.T) {
 	if response := apiGet(f.server, "/api/v1/status", token); response.Code != http.StatusServiceUnavailable {
 		t.Fatalf("token storage failure: %d", response.Code)
 	}
-	response := coveragePost(t, f.server, "/settings/api-tokens", url.Values{"_csrf": {csrfFrom(t, f.cookies)}, "action": {"create"}, "name": {"x"}, "scopes": {store.ScopeStatusRead}, "expires_days": {"30"}}, f.cookies)
+	response := coveragePost(t, f.server, "/settings/api-tokens", url.Values{"_csrf": {csrfFrom(t, f.cookies)}, "action": {"create"}, "current_password": {testAdminPassword}, "name": {"x"}, "scopes": {store.ScopeStatusRead}, "expires_days": {"30"}}, f.cookies)
 	if body := followFlash(t, f.server, f.cookies, response); !strings.Contains(body, "the token could not be stored") || strings.Contains(body, "api_tokens") {
 		t.Fatalf("token storage failure leaked detail: %s", body)
 	}
@@ -586,7 +593,7 @@ func TestAPIHistoryFiltersAndCursorsMatchHistoryPage(t *testing.T) {
 func TestNewAPITokenIsShownOnceAfterRedirect(t *testing.T) {
 	f := newAPIFixture(t, 0)
 	other := loginCookies(t, f.server, testAdminPassword)
-	form := url.Values{"_csrf": {csrfFrom(t, f.cookies)}, "action": {"create"}, "name": {"SIEM"}, "expires_days": {"30"}, "scopes": {store.ScopeStatusRead}}
+	form := url.Values{"_csrf": {csrfFrom(t, f.cookies)}, "action": {"create"}, "current_password": {testAdminPassword}, "name": {"SIEM"}, "expires_days": {"30"}, "scopes": {store.ScopeStatusRead}}
 	response := coveragePost(t, f.server, "/settings/api-tokens", form, f.cookies)
 	if response.Code != http.StatusSeeOther || response.Header().Get("Location") != "/settings#new-api-token" {
 		t.Fatalf("creation answered %d %q", response.Code, response.Header().Get("Location"))
@@ -724,7 +731,7 @@ func TestPasswordRecoveryRevokesAPITokens(t *testing.T) {
 		t.Fatalf("password change audit %+v err=%v", entries, err)
 	}
 
-	token = f.createToken(t, store.ScopeHistoryRead, store.ScopeEvidenceRead)
+	token = f.createTokenWithPassword(t, changed, store.ScopeHistoryRead, store.ScopeEvidenceRead)
 	reset, err := f.st.NewResetToken(context.Background())
 	if err != nil {
 		t.Fatal(err)

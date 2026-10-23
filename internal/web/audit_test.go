@@ -103,7 +103,7 @@ func (f *auditFixture) post(t *testing.T, path string, form url.Values) *httptes
 
 func (f *auditFixture) addDestination(t *testing.T, name, serviceURL string) int64 {
 	t.Helper()
-	response := f.post(t, "/settings/destinations", url.Values{"action": {"save"}, "name": {name}, "service_url": {serviceURL}, "enabled": {"on"}})
+	response := f.post(t, "/settings/destinations", url.Values{"action": {"save"}, "current_password": {testAdminPassword}, "name": {name}, "service_url": {serviceURL}, "enabled": {"on"}})
 	if response.Code != http.StatusSeeOther {
 		t.Fatalf("add destination %d: %s", response.Code, response.Body.String())
 	}
@@ -197,7 +197,7 @@ func TestEveryAdministrativeActionIsAuditedOnceWithoutSecrets(t *testing.T) {
 	}
 
 	id := f.addDestination(t, "Primary", auditDestinationURL("a"))
-	if entry := expect("add destination", store.AuditDestinationAdded, "enabled", "name", "service_url"); entry.Target != destinationTarget(id) {
+	if entry := expect("add destination", store.AuditDestinationAdded, "enabled", "name", "service_url", stepUpField); entry.Target != destinationTarget(id) {
 		t.Fatalf("destination target %q", entry.Target)
 	}
 	// Adding the first destination has nobody to tell; adding another tells
@@ -206,7 +206,7 @@ func TestEveryAdministrativeActionIsAuditedOnceWithoutSecrets(t *testing.T) {
 		t.Fatalf("adding the first destination queued notices: %v", queued)
 	}
 	second := f.addDestination(t, "Backup", auditDestinationURL("b"))
-	expect("add second destination", store.AuditDestinationAdded, "enabled", "name", "service_url")
+	expect("add second destination", store.AuditDestinationAdded, "enabled", "name", "service_url", stepUpField)
 	if queued := f.adminNotices(t); len(queued) != 1 || len(queued[id]) != 1 || len(queued[second]) != 0 {
 		t.Fatalf("adding a destination notified %v, want only the destination already enabled", queued)
 	}
@@ -228,8 +228,9 @@ func TestEveryAdministrativeActionIsAuditedOnceWithoutSecrets(t *testing.T) {
 	}
 	clear := settingsForm("client", "", "", "90")
 	clear.Set("clear_webhook_secret", "on")
+	clear.Set("current_password", testAdminPassword)
 	f.post(t, "/settings", clear)
-	expect("clear webhook secret", store.AuditSettingsChanged, "webhook_secret_cleared")
+	expect("clear webhook secret", store.AuditSettingsChanged, stepUpField, "webhook_secret_cleared")
 	// Expiry warning and OAuth scope options are audited by name. Restating
 	// the defaults in a different order or spelling changes nothing.
 	options := settingsForm("client", "", "", "90")
@@ -275,8 +276,8 @@ func TestEveryAdministrativeActionIsAuditedOnceWithoutSecrets(t *testing.T) {
 	if len(f.audit(t)) != seen {
 		t.Fatal("enabling an enabled destination was audited")
 	}
-	f.post(t, "/settings/mutes", url.Values{"action": {"add"}, "kind": {"collector"}, "value": {"dns"}})
-	mute := expect("add mute", store.AuditMuteAdded, "kind", "value")
+	f.post(t, "/settings/mutes", url.Values{"action": {"add"}, "current_password": {testAdminPassword}, "kind": {"collector"}, "value": {"dns"}})
+	mute := expect("add mute", store.AuditMuteAdded, "kind", stepUpField, "value")
 	f.post(t, "/settings/mutes", url.Values{"action": {"delete"}, "id": {strings.TrimPrefix(mute.Target, "mute:")}})
 	expect("remove mute", store.AuditMuteRemoved)
 
@@ -450,7 +451,7 @@ func TestHighRiskChangesNotifyDestinationsEnabledBeforeTheChange(t *testing.T) {
 	f.clearNotices(t)
 
 	oldURL := auditDestinationURL("1")
-	f.post(t, "/settings/destinations", url.Values{"action": {"save"}, "id": {strconv.FormatInt(first, 10)}, "name": {"First"}, "service_url": {auditDestinationURL("moved")}, "enabled": {"on"}})
+	f.post(t, "/settings/destinations", url.Values{"action": {"save"}, "current_password": {testAdminPassword}, "id": {strconv.FormatInt(first, 10)}, "name": {"First"}, "service_url": {auditDestinationURL("moved")}, "enabled": {"on"}})
 	notices := f.sender.notices()
 	if last := notices[len(notices)-1]; last.url != oldURL || !strings.Contains(last.message, "service_url") {
 		t.Fatalf("old endpoint not notified of the URL change: %+v", last)
@@ -485,10 +486,10 @@ func TestDestinationChangesAreRefusedWhenDestinationsCannotBeRead(t *testing.T) 
 		path string
 		form url.Values
 	}{
-		{"edit", "/settings/destinations", url.Values{"action": {"save"}, "id": {idText}, "name": {"Moved"}, "service_url": {auditDestinationURL("moved")}, "enabled": {"on"}}},
+		{"edit", "/settings/destinations", url.Values{"action": {"save"}, "current_password": {testAdminPassword}, "id": {idText}, "name": {"Moved"}, "service_url": {auditDestinationURL("moved")}, "enabled": {"on"}}},
 		{"disable", "/settings/destinations/disable", url.Values{"id": {idText}}},
 		{"remove", "/settings/destinations/delete", url.Values{"id": {idText}, "confirm": {"remove"}}},
-		{"add", "/settings/destinations", url.Values{"action": {"save"}, "name": {"Added"}, "service_url": {auditDestinationURL("c")}, "enabled": {"on"}}},
+		{"add", "/settings/destinations", url.Values{"action": {"save"}, "current_password": {testAdminPassword}, "name": {"Added"}, "service_url": {auditDestinationURL("c")}, "enabled": {"on"}}},
 	} {
 		response := f.post(t, attempt.path, attempt.form)
 		// Settings itself cannot render without the destinations, so the

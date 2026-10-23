@@ -127,6 +127,17 @@ func (s *Server) settingsPost(w http.ResponseWriter, r *http.Request) {
 		s.render(w, "settings", data)
 		return
 	}
+	// Removing a stored webhook secret needs the current password. The check
+	// runs before any Tailscale request, and a refused removal saves nothing
+	// from the form.
+	stepUp := input.ClearWebhookSecret && current.WebhookSecret != ""
+	if stepUp {
+		if message := s.checkStepUp(r, auth.ref, adminChange{event: store.AuditSettingsChanged, fields: []string{"webhook_secret_cleared"}}, "Monitoring settings were not saved"); message != "" {
+			data.Error = message
+			s.render(w, "settings", data)
+			return
+		}
+	}
 	client := tailscale.New(s.config.TailscaleBase, s.config.OAuthTokenURL, s.config.Version, tailscale.Credentials{Tailnet: input.Tailnet, ClientID: input.OAuthClientID, ClientSecret: input.OAuthClientSecret, Scopes: input.OAuthScopes})
 	// The connection test must finish, and its result page render, before
 	// the server's write deadline; otherwise a slow API produces a blank
@@ -168,6 +179,9 @@ func (s *Server) settingsPost(w http.ResponseWriter, r *http.Request) {
 	// the identity change does not dead-letter them.
 	before := s.enabledDestinations(r.Context())
 	fields := settingsChangeFields(configured, current, input)
+	if stepUp {
+		fields = append(fields, stepUpField)
+	}
 	if _, err := s.store.SaveSettings(r.Context(), input); err != nil {
 		slog.Error("save settings", "error", err)
 		data.Error = "Settings could not be saved. Check the values and try again."

@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -297,5 +298,172 @@ func TestMassRemovalGuardIsNotifiedAndRemovalsAttributed(t *testing.T) {
 	var markers int
 	if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM meta WHERE key LIKE 'removal_guard_since:%'").Scan(&markers); err != nil || markers != 0 {
 		t.Fatalf("guard attribution markers=%d err=%v after the removals were recorded", markers, err)
+	}
+}
+
+// queuedNotices counts the queued messages whose rendering contains title.
+func queuedNotices(t *testing.T, db *sql.DB, title string) int {
+	t.Helper()
+	count := 0
+	for _, payload := range renderedOutbox(t, db) {
+		if strings.Contains(payload, title) {
+			count++
+		}
+	}
+	return count
+}
+
+// TestCollectorUnhealthyNoticeSurvivesCancelledPoll is the first probe of issue
+// #315: the poll is cancelled after the failing collector has crossed the
+// failure threshold on its third failing poll. The "unhealthy" notice must
+// still be queued exactly once for that episode, and the failing polls that
+// follow must not queue another.
+func TestCollectorUnhealthyNoticeSurvivesCancelledPoll(t *testing.T) {
+	ctx := context.Background()
+	st, settings, db := monitorTestStoreWithDB(t)
+	var devicesDown atomic.Bool
+	devicesDown.Store(true)
+	var (
+		mu       sync.Mutex
+		stopPoll context.CancelFunc
+	)
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/oauth/token" {
+			_, _ = w.Write([]byte(`{"access_token":"access","expires_in":3600}`))
+			return
+		}
+		switch r.URL.Path {
+		case "/api/v2/tailnet/-/devices":
+			if devicesDown.Load() {
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			_, _ = w.Write([]byte(`{"devices":[{"id":"device-1","hostname":"server"}]}`))
+		case "/api/v2/tailnet/-/users":
+			mu.Lock()
+			stop := stopPoll
+			mu.Unlock()
+			if stop != nil {
+				// The shutdown arrives while the users request is in flight, after
+				// devices has failed for the third time. The request is held until
+				// the client gives up on it.
+				stop()
+				<-r.Context().Done()
+				return
+			}
+			_, _ = w.Write([]byte(`{"users":[]}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer api.Close()
+	engine := New(st, api.URL+"/api/v2", api.URL+"/oauth/token", "test")
+	engine.ConfigureNotifications("lab", "")
+	collectors := []string{"devices", "users"}
+	poll := func(pollCtx context.Context) bool {
+		client := tailscale.New(api.URL+"/api/v2", api.URL+"/oauth/token", "test", tailscale.Credentials{Tailnet: "-", ClientID: "client", ClientSecret: "secret"})
+		return engine.poll(pollCtx, client, settings, collectors, true)
+	}
+	for attempt := 1; attempt <= 2; attempt++ {
+		if poll(ctx) {
+			t.Fatalf("failing poll %d succeeded", attempt)
+		}
+	}
+	pollCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	mu.Lock()
+	stopPoll = cancel
+	mu.Unlock()
+	if poll(pollCtx) {
+		t.Fatal("cancelled poll succeeded")
+	}
+	mu.Lock()
+	stopPoll = nil
+	mu.Unlock()
+	if got := queuedNotices(t, db, "collector unhealthy"); got != 1 {
+		t.Fatalf("cancelled third failing poll queued %d unhealthy notices, want 1: %q", got, renderedOutbox(t, db))
+	}
+	for attempt := 1; attempt <= 2; attempt++ {
+		poll(ctx)
+	}
+	if got := queuedNotices(t, db, "collector unhealthy"); got != 1 {
+		t.Fatalf("later failing polls of the same episode left %d unhealthy notices, want 1", got)
+	}
+	devicesDown.Store(false)
+	if !poll(ctx) {
+		t.Fatal("recovery poll failed")
+	}
+	if got := queuedNotices(t, db, "collector recovered"); got != 1 {
+		t.Fatalf("recovery queued %d recovered notices, want 1", got)
+	}
+}
+
+// TestFailedApplyBatchDoesNotSendRecoveredNotice is the second probe of issue
+// #315: when ApplyBatch cannot commit the poll that would recover a collector,
+// the collector stays unhealthy and no "recovered" notice is queued. The next
+// poll that stores its results queues exactly one.
+func TestFailedApplyBatchDoesNotSendRecoveredNotice(t *testing.T) {
+	ctx := context.Background()
+	st, settings, db := monitorTestStoreWithDB(t)
+	var devicesDown atomic.Bool
+	devicesDown.Store(true)
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/oauth/token" {
+			_, _ = w.Write([]byte(`{"access_token":"access","expires_in":3600}`))
+			return
+		}
+		if r.URL.Path != "/api/v2/tailnet/-/devices" {
+			http.NotFound(w, r)
+			return
+		}
+		if devicesDown.Load() {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		_, _ = w.Write([]byte(`{"devices":[{"id":"device-1","hostname":"server"}]}`))
+	}))
+	defer api.Close()
+	engine := New(st, api.URL+"/api/v2", api.URL+"/oauth/token", "test")
+	engine.ConfigureNotifications("lab", "")
+	collectors := []string{"devices"}
+	poll := func() bool {
+		client := tailscale.New(api.URL+"/api/v2", api.URL+"/oauth/token", "test", tailscale.Credentials{Tailnet: "-", ClientID: "client", ClientSecret: "secret"})
+		return engine.poll(ctx, client, settings, collectors, true)
+	}
+	for attempt := 1; attempt <= 3; attempt++ {
+		if poll() {
+			t.Fatalf("failing poll %d succeeded", attempt)
+		}
+	}
+	if got := queuedNotices(t, db, "collector unhealthy"); got != 1 {
+		t.Fatalf("third failing poll queued %d unhealthy notices, want 1", got)
+	}
+
+	// Refuse the collector state writes of the batch that would recover devices,
+	// so ApplyBatch aborts and the collector must stay unhealthy.
+	if _, err := db.ExecContext(ctx, "CREATE TRIGGER refuse_collector_state BEFORE UPDATE ON collector_state BEGIN SELECT RAISE(ABORT, 'refused'); END"); err != nil {
+		t.Fatal(err)
+	}
+	devicesDown.Store(false)
+	if poll() {
+		t.Fatal("poll whose batch was refused reported success")
+	}
+	if got := queuedNotices(t, db, "collector recovered"); got != 0 {
+		t.Fatalf("refused batch queued %d recovered notices, want none", got)
+	}
+	if unhealthy, err := st.CollectorWasUnhealthyWithError(ctx, settings.Generation, "devices"); err != nil || !unhealthy {
+		t.Fatalf("refused batch cleared the unhealthy state: unhealthy=%v err=%v", unhealthy, err)
+	}
+	if _, err := db.ExecContext(ctx, "DROP TRIGGER refuse_collector_state"); err != nil {
+		t.Fatal(err)
+	}
+	if !poll() {
+		t.Fatal("recovery poll failed")
+	}
+	if got := queuedNotices(t, db, "collector recovered"); got != 1 {
+		t.Fatalf("recovery queued %d recovered notices, want 1", got)
+	}
+	if got := queuedNotices(t, db, "collector unhealthy"); got != 1 {
+		t.Fatalf("recovery left %d unhealthy notices in total, want 1", got)
 	}
 }

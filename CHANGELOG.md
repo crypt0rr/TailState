@@ -14,6 +14,7 @@ rollback requires restoring the backup taken before the upgrade. See
 ## [Unreleased]
 
 ### Fixed
+- Collector-health notifications are committed with their suppression state. The "unhealthy" notice for a collector that crosses the failure threshold is queued in the same transaction that marks it notified, before the poll's results are applied, so a restart or shutdown during that poll no longer drops it. "Recovered" is queued only after the poll's results are stored, so a failed apply no longer sends an early or duplicate "recovered" (#315).
 - The README build path tags a local build as `tailstate:local` instead of the pinned release image name, and its example image tag now names a released version (#322).
 - History filters that combine, such as event type with resource or resource with severity, list only batches with an event that matches every filter. Previously a page could come back empty with a next cursor of `0`, so "Load older changes" and API `next` links looped on the same page, and the evidence pack for that query failed verification (#310).
 - `admin rekey` now reads and checks the replacement key before it touches the database, and it refuses a missing or older-schema database with an error instead of creating or migrating one and reporting the rotation as successful (#313).

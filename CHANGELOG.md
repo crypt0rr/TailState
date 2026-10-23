@@ -13,6 +13,11 @@ rollback requires restoring the backup taken before the upgrade. See
 
 ## [Unreleased]
 
+## [0.20.0] - 2026-10-23
+
+- **Schema:** 17 (unchanged)
+- **Rollback:** image-only rollback to 0.19.2 is safe.
+
 ### Added
 - `scripts/restore.sh` no longer reports success when the restored service fails to come up: after `docker compose start` it waits up to two minutes for the container's Docker health check to report `healthy`, and on failure it stops the service, prints a master key or database mismatch hint, and exits non-zero. The container smoke test asserts the same healthy status, and the backup and restore smoke test covers a restore with the wrong master key (#309).
 - Queue-age gauges show how long the oldest pending webhook trigger and the oldest pending notification for each destination (labelled by its numeric ID) have waited, and when a retention pass last finished without error: `tailstate_webhook_trigger_oldest_pending_age_seconds`, `tailstate_outbox_oldest_pending_age_seconds{destination}`, and `tailstate_cleanup_last_success_timestamp_seconds`. Three example alert rules in `docs/prometheus/alerts.yml` use them (#325).

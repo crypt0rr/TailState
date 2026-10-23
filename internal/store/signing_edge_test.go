@@ -108,7 +108,7 @@ func TestEvidenceSigningKeyAccessorsAndLedgerHeadFallbacks(t *testing.T) {
 	}
 }
 
-func signedEvidencePackFixture(t *testing.T) ([]byte, ed25519.PublicKey) {
+func signedEvidencePackFixture(t testing.TB) ([]byte, ed25519.PublicKey) {
 	t.Helper()
 	public, private, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {

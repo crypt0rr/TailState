@@ -4,6 +4,10 @@ name: Scheduled vulnerability scan
 # scan re-checks main with govulncheck and the published images with Grype,
 # and opens (or updates) one tracking issue when anything fails. A manual run
 # reports to the tracking issue only when its `report` input is set.
+#
+# The fuzz job runs each native fuzz target for 30 seconds. A failing target
+# fails this run and uploads its crashing inputs, but it does not open the
+# tracking issue, which records vulnerability findings only.
 on:
   schedule:
     - cron: "17 5 * * *"
@@ -119,3 +123,50 @@ jobs:
             gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --label security --body "$body" \
               || gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "$body"
           fi
+
+  # Native fuzz targets for the untrusted-input parsers, kept off the
+  # pull-request path. Pull requests still run each target's seed inputs
+  # through the ordinary go test run in the ci workflow.
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Fuzz untrusted-input parsers
+        run: |
+          set -uo pipefail
+          targets=(
+            ./internal/webhook:FuzzVerify
+            ./internal/webhook:FuzzVerifyRejectsMutatedBody
+            ./internal/webhook:FuzzParseSignature
+            ./internal/notify:FuzzPartitionLines
+            ./internal/notify:FuzzTruncate
+            ./internal/notify:FuzzFitMessage
+            ./internal/notify:FuzzEscapeUntrusted
+            ./internal/notify:FuzzRenderFlavours
+            ./internal/store:FuzzVerifyEvidencePack
+            ./internal/store:FuzzParseEvidencePublicKey
+          )
+          status=0
+          for entry in "${targets[@]}"; do
+            package="${entry%%:*}"
+            target="${entry#*:}"
+            echo "::group::${target} (${package})"
+            go test -run='^$' -fuzz="^${target}\$" -fuzztime=30s "$package" || status=1
+            echo "::endgroup::"
+          done
+          exit "$status"
+      - name: Keep failing fuzz inputs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fuzz-crashers
+          path: internal/*/testdata/fuzz
+          if-no-files-found: ignore
+          retention-days: 14

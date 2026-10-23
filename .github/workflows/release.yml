@@ -81,7 +81,7 @@ jobs:
           go_version="$(awk '$1 == "go" { print $2; exit }' go.mod)"
           printf 'release compiler: go%s\nrelease targets: linux/amd64,linux/arm64\nsource commit: %s\n' \
             "$go_version" "$GITHUB_SHA"
-      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}

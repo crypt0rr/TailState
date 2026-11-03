@@ -296,7 +296,8 @@ Releases before 0.11.16 are described in their
 [GitHub release notes](https://github.com/crypt0rr/TailState/releases); their
 schema versions are listed in [UPGRADING.md](UPGRADING.md#schema-history).
 
-[Unreleased]: https://github.com/crypt0rr/TailState/compare/v0.19.1...HEAD
+[Unreleased]: https://github.com/crypt0rr/TailState/compare/v0.20.1...HEAD
+[0.20.1]: https://github.com/crypt0rr/TailState/compare/v0.20.0...v0.20.1
 [0.19.1]: https://github.com/crypt0rr/TailState/compare/v0.19.0...v0.19.1
 [0.19.0]: https://github.com/crypt0rr/TailState/compare/v0.18.2...v0.19.0
 [0.18.2]: https://github.com/crypt0rr/TailState/compare/v0.18.1...v0.18.2

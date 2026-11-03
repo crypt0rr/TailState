@@ -13,6 +13,19 @@ rollback requires restoring the backup taken before the upgrade. See
 
 ## [Unreleased]
 
+## [0.20.1] - 2026-11-03
+
+- **Schema:** 17 (unchanged)
+- **Rollback:** image-only rollback to 0.20.0 is safe.
+
+### Security
+- Update the networking dependency `golang.org/x/net` to v0.62.0 (#352).
+
+### Maintenance
+- Update SQLite to v1.61.0 and Shoutrrr to v0.22.1 (#350, #351).
+- Refresh the Alpine runtime-files image digest and update the workflow security linter to v1.32.0 (#353, #354).
+
+
 ## [0.20.0] - 2026-10-23
 
 - **Schema:** 17 (unchanged)

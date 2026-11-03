@@ -13,6 +13,19 @@ rollback requires restoring the backup taken before the upgrade. See
 
 ## [Unreleased]
 
+## [0.20.1] - 2026-11-03
+
+- **Schema:** 17 (unchanged)
+- **Rollback:** image-only rollback to 0.20.0 is safe.
+
+### Security
+- Update the networking dependency `golang.org/x/net` to v0.62.0 (#352).
+
+### Maintenance
+- Update SQLite to v1.61.0 and Shoutrrr to v0.22.1 (#350, #351).
+- Refresh the Alpine runtime-files image digest and update the workflow security linter to v1.32.0 (#353, #354).
+
+
 ## [0.20.0] - 2026-10-23
 
 - **Schema:** 17 (unchanged)
@@ -283,7 +296,8 @@ Releases before 0.11.16 are described in their
 [GitHub release notes](https://github.com/crypt0rr/TailState/releases); their
 schema versions are listed in [UPGRADING.md](UPGRADING.md#schema-history).
 
-[Unreleased]: https://github.com/crypt0rr/TailState/compare/v0.19.1...HEAD
+[Unreleased]: https://github.com/crypt0rr/TailState/compare/v0.20.1...HEAD
+[0.20.1]: https://github.com/crypt0rr/TailState/compare/v0.20.0...v0.20.1
 [0.19.1]: https://github.com/crypt0rr/TailState/compare/v0.19.0...v0.19.1
 [0.19.0]: https://github.com/crypt0rr/TailState/compare/v0.18.2...v0.19.0
 [0.18.2]: https://github.com/crypt0rr/TailState/compare/v0.18.1...v0.18.2

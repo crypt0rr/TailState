@@ -6,7 +6,7 @@ require (
 	github.com/nicholas-fedor/shoutrrr v0.22.1
 	golang.org/x/crypto v0.58.0
 	golang.org/x/net v0.62.0
-	modernc.org/sqlite v1.61.0
+	modernc.org/sqlite v1.61.1
 )
 
 require (

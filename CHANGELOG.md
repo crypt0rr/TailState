@@ -13,6 +13,21 @@ rollback requires restoring the backup taken before the upgrade. See
 
 ## [Unreleased]
 
+## [0.20.2] - 2026-11-10
+
+- **Schema:** 17 (unchanged)
+- **Rollback:** image-only rollback to 0.20.1 is safe for the database; remove any Shoutrrr v0.23-only URL options before rolling back.
+
+### Changed
+- Update Shoutrrr to v0.23.0, which validates notification URLs and send configuration more strictly. Review existing destinations and send a Settings test after upgrading; see [notification URL validation](docs/notifications.md#url-validation) (#360).
+
+### Security
+- Update the digest-pinned BuildKit builder to v0.34.2 in CI and releases, including its resolver-cache and control-API security fixes (#356).
+
+### Maintenance
+- Update SQLite to v1.62.0 and its required libc dependency to v1.80.1 without changing the database schema (#357).
+- Update the release registry login action to v4.8.0 and the Prometheus alert-rule validator to v3.16.0 (#358, #359).
+
 ## [0.20.1] - 2026-11-03
 
 - **Schema:** 17 (unchanged)

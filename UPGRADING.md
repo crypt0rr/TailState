@@ -55,6 +55,18 @@ migration without performing it.
   Changes recorded by the newer release after the upgrade are lost; export
   evidence packs first if you need them.
 
+## Upgrading to 0.20.2
+
+The database stays at schema 17. Shoutrrr v0.23.0 tightens notification URL
+and send validation, so review [notification URL validation](docs/notifications.md#url-validation)
+and test each enabled destination in Settings after upgrading. Existing URLs
+are preserved, including any options that the new validator rejects; edit
+those destinations to restore delivery.
+
+Rolling back to 0.20.1 needs no database restore. If you added URL options
+introduced by Shoutrrr v0.23.0 (such as `skiptlsverify` for ntfy or MQTT),
+remove them before rolling back because the older parser rejects them.
+
 ## Schema history
 
 | Schema | First release | Notes |

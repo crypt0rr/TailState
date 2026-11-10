@@ -24,6 +24,31 @@ Destinations are added, edited, tested, and removed on the Settings page; see
 its URL, asks for the current administrator password (see
 [Step-up](security.md#step-up-for-persistence-granting-actions)).
 
+### URL validation
+
+Shoutrrr v0.23.0 validates URLs and send configuration more strictly. A URL
+accepted by an older TailState release can fail validation or delivery after
+an upgrade. In particular:
+
+- Discord webhook and thread IDs must be numeric; Twilio account SIDs must
+  be `AC` followed by 32 hexadecimal characters.
+- Google Chat URLs must include their space path, Zulip URLs need an API key,
+  and a Lark token must be a single path segment.
+- MQTT topics cannot contain `+`, `#`, or a null character. MQTT and SMTP
+  ports must be between 1 and 65535.
+- Rocket.Chat and Zulip reject unknown query keys. Queries cannot contain
+  malformed escapes or literal semicolons (except in ntfy), a setting cannot
+  appear under two spellings such as `title` and `Title`, and URLs cannot
+  end in a bare `#`.
+- A Matrix send without configured rooms fails if the account has joined
+  none.
+
+After upgrading, use **Test** for every enabled destination in Settings and
+correct rejected URLs using the provider's current format. TailState does
+not rewrite stored destination URLs. For a self-hosted HTTPS endpoint, use
+a certificate trusted by TailState; `disabletls` selects an unencrypted
+connection and must not be used to solve certificate verification failures.
+
 ## Message content and rendering
 
 - Every notification names the tailnet (prefixed by `TAILSTATE_INSTANCE_LABEL` when set) in its title and states when it was observed, in a compact UTC form such as `6 Oct 2026 09:14 UTC` (History and the API keep full RFC 3339 times): digests on their closing context line, other notifications on an `Observed at` line. With `TAILSTATE_PUBLIC_URL` set, digests link to their History batch (`/history?batch=<id>`) and health alerts and expiry warnings to `/status`. The Settings test message names the instance, tailnet, TailState version, and time.

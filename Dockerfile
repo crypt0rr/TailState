@@ -4,7 +4,7 @@
 # The builder runs on the build host's native platform and cross-compiles the
 # pure-Go binary for each target, so multi-architecture builds do not compile
 # under QEMU emulation.
-FROM --platform=$BUILDPLATFORM golang:1.27.3-alpine3.24@sha256:f2c872bcee949b7be9c490efd02b48a8a2fbf947cdf533f1c58525ec9d8170fd AS builder
+FROM --platform=$BUILDPLATFORM golang:1.27.3-alpine3.24@sha256:fa3d596898d9f126af7c01d14ee7597bab3f39cccf392ef36b69fe77cd681f18 AS builder
 ARG VERSION=dev
 ARG TARGETOS
 ARG TARGETARCH
@@ -21,7 +21,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 
 # CA certificates and the empty /data directory are architecture-independent,
 # so this stage also runs natively on the build platform.
-FROM --platform=$BUILDPLATFORM alpine:3.24@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a AS runtime-files
+FROM --platform=$BUILDPLATFORM alpine:3.24@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf AS runtime-files
 # The data volume holds the SQLite database and its WAL; keep it private to
 # the service user so a fresh named volume is not readable by other users.
 RUN mkdir -p /data \

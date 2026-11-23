@@ -13,6 +13,20 @@ rollback requires restoring the backup taken before the upgrade. See
 
 ## [Unreleased]
 
+## [0.20.3] - 2026-11-23
+
+- **Schema:** 17 (unchanged)
+- **Rollback:** image-only rollback to 0.20.2 is safe for the database.
+
+### Security
+- Build with Go 1.27.4 to include the standard-library HTTP security fix ([GO-2026-6859](https://pkg.go.dev/vuln/GO-2026-6859), #365).
+- Update `golang.org/x/crypto` to v0.59.0 ([GO-2026-5932](https://pkg.go.dev/vuln/GO-2026-5932), #366).
+
+### Maintenance
+- Update `golang.org/x/net` to v0.63.0 (#371).
+- Update the pinned BuildKit builder and Dockerfile frontend used to build the container (#367, #368).
+- Update the Go setup action and Zizmor workflow auditor (#370, #373).
+
 ## [0.20.2] - 2026-11-10
 
 - **Schema:** 17 (unchanged)
@@ -311,7 +325,9 @@ Releases before 0.11.16 are described in their
 [GitHub release notes](https://github.com/crypt0rr/TailState/releases); their
 schema versions are listed in [UPGRADING.md](UPGRADING.md#schema-history).
 
-[Unreleased]: https://github.com/crypt0rr/TailState/compare/v0.20.1...HEAD
+[Unreleased]: https://github.com/crypt0rr/TailState/compare/v0.20.3...HEAD
+[0.20.3]: https://github.com/crypt0rr/TailState/compare/v0.20.2...v0.20.3
+[0.20.2]: https://github.com/crypt0rr/TailState/compare/v0.20.1...v0.20.2
 [0.20.1]: https://github.com/crypt0rr/TailState/compare/v0.20.0...v0.20.1
 [0.19.1]: https://github.com/crypt0rr/TailState/compare/v0.19.0...v0.19.1
 [0.19.0]: https://github.com/crypt0rr/TailState/compare/v0.18.2...v0.19.0

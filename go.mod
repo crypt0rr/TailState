@@ -3,7 +3,7 @@ module github.com/crypt0rr/tailstate
 go 1.27.4
 
 require (
-	github.com/nicholas-fedor/shoutrrr v0.23.0
+	github.com/nicholas-fedor/shoutrrr v0.25.1
 	golang.org/x/crypto v0.59.0
 	golang.org/x/net v0.63.0
 	modernc.org/sqlite v1.62.0
@@ -12,7 +12,7 @@ require (
 require (
 	github.com/BurntSushi/toml v1.4.1-0.20240526193622-a339e1f7089c // indirect
 	github.com/dustin/go-humanize v1.1.0 // indirect
-	github.com/eclipse/paho.golang v0.23.0 // indirect
+	github.com/eclipse/paho.golang v0.24.0 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/gorilla/websocket v1.5.4-0.20240701034025-d67f41855da4 // indirect
 	github.com/mattn/go-colorable v0.1.16 // indirect
@@ -21,7 +21,7 @@ require (
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
 	golang.org/x/exp/typeparams v0.0.0-20231108232855-2478ac86f678 // indirect
 	golang.org/x/mod v0.43.0 // indirect
-	golang.org/x/oauth2 v0.37.0 // indirect
+	golang.org/x/oauth2 v0.38.0 // indirect
 	golang.org/x/sync v0.25.0 // indirect
 	golang.org/x/sys v0.50.0 // indirect
 	golang.org/x/telemetry v0.0.0-20261116191925-e77a43154acb // indirect

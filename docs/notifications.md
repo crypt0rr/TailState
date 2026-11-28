@@ -26,9 +26,9 @@ its URL, asks for the current administrator password (see
 
 ### URL validation
 
-Shoutrrr v0.23.0 validates URLs and send configuration more strictly. A URL
-accepted by an older TailState release can fail validation or delivery after
-an upgrade. In particular:
+Shoutrrr v0.23.0 and later releases validate URLs and send configuration
+more strictly. A URL accepted by an older TailState release can fail
+validation or delivery after an upgrade. In particular:
 
 - Discord webhook and thread IDs must be numeric; Twilio account SIDs must
   be `AC` followed by 32 hexadecimal characters.
@@ -40,8 +40,12 @@ an upgrade. In particular:
   malformed escapes or literal semicolons (except in ntfy), a setting cannot
   appear under two spellings such as `title` and `Title`, and URLs cannot
   end in a bare `#`.
-- A Matrix send without configured rooms fails if the account has joined
-  none.
+- A Matrix send joins each configured room before posting, even when the
+  destination specifies a room ID. The account must be able to join the room.
+  A send without configured rooms fails if the account has joined none.
+- A Microsoft Teams workflow URL must include a non-empty `sig` query
+  parameter. Use the signed URL from a workflow trigger that accepts requests
+  without sign-in.
 
 After upgrading, use **Test** for every enabled destination in Settings and
 correct rejected URLs using the provider's current format. TailState does

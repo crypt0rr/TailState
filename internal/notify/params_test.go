@@ -189,7 +189,7 @@ const (
 	pushoverURL   = "pushover://shoutrrr:apitoken@userkey"
 	ntfyURL       = "ntfy://ntfy.sh/tailstate"
 	pushbulletURL = "pushbullet://o.tokentokentokentokentokentokent1"
-	teamsURL      = "teams://?host=https%3A%2F%2Fprod-00.westus.logic.azure.com%2Fworkflows%2Fabc%2Ftriggers%2Fmanual%2Fpaths%2Finvoke"
+	teamsURL      = "teams://?host=https%3A%2F%2Fprod-00.westus.logic.azure.com%2Fworkflows%2Fabc%2Ftriggers%2Fmanual%2Fpaths%2Finvoke%3Fsig%3Dtest-signature"
 	googleChatURL = "googlechat://chat.googleapis.com/v1/spaces/FOO/messages?key=bar&token=baz"
 	wecomURL      = "wecom://abc-123"
 )

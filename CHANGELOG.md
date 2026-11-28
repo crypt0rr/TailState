@@ -13,6 +13,14 @@ rollback requires restoring the backup taken before the upgrade. See
 
 ## [Unreleased]
 
+## [0.20.4] - 2026-11-28
+
+- **Schema:** 17 (unchanged)
+- **Rollback:** image-only rollback to 0.20.3 is safe for the database and reintroduces the WebSocket vulnerability fixed in this release.
+
+### Security
+- Update the Gorilla WebSocket dependency to fix weak client masking keys ([GO-2026-6278](https://pkg.go.dev/vuln/GO-2026-6278)).
+
 ## [0.20.3] - 2026-11-23
 
 - **Schema:** 17 (unchanged)
@@ -325,7 +333,8 @@ Releases before 0.11.16 are described in their
 [GitHub release notes](https://github.com/crypt0rr/TailState/releases); their
 schema versions are listed in [UPGRADING.md](UPGRADING.md#schema-history).
 
-[Unreleased]: https://github.com/crypt0rr/TailState/compare/v0.20.3...HEAD
+[Unreleased]: https://github.com/crypt0rr/TailState/compare/v0.20.4...HEAD
+[0.20.4]: https://github.com/crypt0rr/TailState/compare/v0.20.3...v0.20.4
 [0.20.3]: https://github.com/crypt0rr/TailState/compare/v0.20.2...v0.20.3
 [0.20.2]: https://github.com/crypt0rr/TailState/compare/v0.20.1...v0.20.2
 [0.20.1]: https://github.com/crypt0rr/TailState/compare/v0.20.0...v0.20.1

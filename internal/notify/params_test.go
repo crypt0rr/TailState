@@ -395,12 +395,12 @@ func TestTitleParameterRules(t *testing.T) {
 		t.Fatalf("ascii ntfy title encoded: %q", got)
 	}
 	for serviceURL, want := range map[string]bool{
-		telegramURL:                         true,
-		telegramURL + "&parsemode=None":     true,
-		telegramURL + "&parsemode=Markdown": true,
-		telegramURL + "&ParseMode=HTML":     true,
-		discordURL + "?json=yes":            false,
-		discordURL + "?json=no":             true,
+		telegramURL:                                                   true,
+		telegramURL + "&parsemode=None":                               true,
+		telegramURL + "&parsemode=Markdown":                           true,
+		telegramURL + "&ParseMode=HTML":                               true,
+		discordURL + "?json=yes":                                      false,
+		discordURL + "?json=no":                                       true,
 		"smtp://mail.example:25/?from=a@example.com&to=b@example.com": true,
 		"generic+https://hooks.example/x":                             false,
 		"%%invalid":                                                   false,

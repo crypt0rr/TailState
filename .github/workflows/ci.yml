@@ -126,12 +126,12 @@ jobs:
           docker pull "$backup_image"
           docker tag "$backup_image" tailstate:backup-sidecar
       - name: Scan backup sidecar
-        uses: anchore/scan-action@27805bf3b4e84b4a5c980df22ed233c00390a439 # v7.4.2
+        uses: anchore/scan-action@11983a512817154c80a9db660c1a184be7513ed6 # v7.4.3
         with:
           image: tailstate:backup-sidecar
           fail-build: true
           severity-cutoff: high
-      - uses: anchore/scan-action@27805bf3b4e84b4a5c980df22ed233c00390a439 # v7.4.2
+      - uses: anchore/scan-action@11983a512817154c80a9db660c1a184be7513ed6 # v7.4.3
         with:
           image: tailstate:ci
           fail-build: true

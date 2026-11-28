@@ -26,9 +26,9 @@ its URL, asks for the current administrator password (see
 
 ### URL validation
 
-Shoutrrr v0.23.0 validates URLs and send configuration more strictly. A URL
-accepted by an older TailState release can fail validation or delivery after
-an upgrade. In particular:
+Shoutrrr v0.23.0 and later releases validate URLs and send configuration
+more strictly. A URL accepted by an older TailState release can fail
+validation or delivery after an upgrade. In particular:
 
 - Discord webhook and thread IDs must be numeric; Twilio account SIDs must
   be `AC` followed by 32 hexadecimal characters.

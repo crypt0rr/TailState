@@ -13,6 +13,9 @@ rollback requires restoring the backup taken before the upgrade. See
 
 ## [Unreleased]
 
+### Changed
+- Update Shoutrrr to v0.25.1. Matrix sends join each configured room before posting, and Teams workflow URLs must include a signature. Re-test affected destinations after upgrading (#369).
+
 ## [0.20.4] - 2026-11-28
 
 - **Schema:** 17 (unchanged)

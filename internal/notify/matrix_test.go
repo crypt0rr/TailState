@@ -10,12 +10,13 @@ import (
 	"testing"
 )
 
-// homeserver is a minimal Matrix client-server API mock that counts logins
-// and room messages.
+// homeserver is a minimal Matrix client-server API mock that records logins,
+// room joins, and messages.
 type homeserver struct {
 	mu       sync.Mutex
 	logins   int
 	flows    int
+	joins    []string
 	messages []string
 	// login, when set, replaces the successful password-login response.
 	login http.HandlerFunc
@@ -35,6 +36,9 @@ func (h *homeserver) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		_, _ = w.Write([]byte(`{"access_token":"session-token","user_id":"@bot:example","device_id":"SHDEVICE"}`))
+	case r.Method == http.MethodPost && r.URL.Path == "/_matrix/client/v3/join/!room:example":
+		h.joins = append(h.joins, r.Header.Get("Authorization"))
+		_, _ = w.Write([]byte(`{"room_id":"!room:example"}`))
 	case r.Method == http.MethodPut && strings.HasPrefix(r.URL.Path, "/_matrix/client/v3/rooms/!room:example/send/m.room.message/"):
 		h.messages = append(h.messages, r.Header.Get("Authorization"))
 		_, _ = w.Write([]byte(`{"event_id":"$event"}`))
@@ -67,6 +71,9 @@ func TestMatrixPasswordURLLogsInOncePerDelivery(t *testing.T) {
 	if flows != 1 || logins != 1 || messages != 1 {
 		t.Fatalf("one delivery made %d login-flow requests, %d logins, %d messages; want 1, 1, 1", flows, logins, messages)
 	}
+	if len(mock.joins) != 1 || mock.joins[0] != "Bearer session-token" {
+		t.Fatal("room join did not use the delivery token exactly once")
+	}
 	if mock.messages[0] != "Bearer session-token" {
 		t.Fatalf("message used authorization %q", mock.messages[0])
 	}
@@ -88,6 +95,9 @@ func TestMatrixTokenURLNeverLogsIn(t *testing.T) {
 	flows, logins, messages := mock.counts()
 	if flows != 0 || logins != 0 || messages != 1 {
 		t.Fatalf("token URL made %d login-flow requests, %d logins, %d messages; want 0, 0, 1", flows, logins, messages)
+	}
+	if len(mock.joins) != 1 || mock.joins[0] != "Bearer access-token" {
+		t.Fatal("room join did not use the delivery token exactly once")
 	}
 	if mock.messages[0] != "Bearer access-token" {
 		t.Fatalf("message used authorization %q", mock.messages[0])
